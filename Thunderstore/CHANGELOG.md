@@ -1,5 +1,7 @@
 # Changelog
 
+## 1.18.1
+- Same code as 1.18.0. The 1.18.0 upload was recorded by the legacy upload handler as NSFW content, which keeps a package out of the community listing and out of search; this version is published with the flag off. Download the 1.18.1 package.
 ## 1.18.0
 - Settlement titles are JSON-configurable, each with its own description: total damage, minor/elite/BOSS kills, melee and Scout kills. A player takes only a metric they lead the squad in outright, that is enabled, weighted above zero and has real data; the choice is the candidate with the largest actual contribution to the final score, negative metrics by their real severity. A tie or an all-equal squad awards nothing, and no qualifying candidate falls back to the neutral title. The old `ZeroScore` bypass is gone, so a displayed zero no longer overrides the top rule.
 - Kill cells gain a sleeping / awake / unknown split of the same count, in the existing cell, with no new metric and no new row. A sleeping kill is worth twice an awake one of the same class by default (`SleepingKillMultiplier`, 1-10). The state is read from the enemy before the killing blow; a state that cannot be read stays unknown and never counts as awake or asleep.

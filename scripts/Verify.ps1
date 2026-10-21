@@ -75,7 +75,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Config watcher tests failed with exit code $LASTEXITCODE" }
 
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ($manifest.name -ne 'CombatPanel' -or $manifest.version_number -ne '1.18.0') {
+    if ($manifest.name -ne 'CombatPanel' -or $manifest.version_number -ne '1.18.1') {
         throw 'Thunderstore package name/version mismatch.'
     }
     if ($manifest.dependencies.Count -ne 1 -or $manifest.dependencies[0] -ne 'BepInEx-BepInExPack_GTFO-3.2.3') {

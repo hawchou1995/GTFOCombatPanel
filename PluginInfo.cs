@@ -7,5 +7,5 @@ internal static class PluginInfo
 {
     internal const string Guid = "HawChow.GTFOCombatPanel";
     internal const string Name = "GTFOCombatPanel";
-    internal const string Version = "1.18.0";
+    internal const string Version = "1.18.1";
 }

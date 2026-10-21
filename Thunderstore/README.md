@@ -1,10 +1,15 @@
-# CombatPanel 1.18.0
+# CombatPanel 1.18.1
 
 独立 GTFO 战斗统计面板：局内查看战斗数据，成功或失败结算查看队伍贡献。仅依赖 **BepInEx-BepInExPack_GTFO-3.2.3**。
 
 **源码 / Source：[GitHub — hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)**
 
 反馈：[qingju.me](https://qingju.me) ｜ [小黑盒语音](https://chat.xiaoheihe.cn/in1wpsjd)
+## 1.18.1 更新
+
+**本版代码与 1.18.0 完全相同，只修正 Thunderstore 上的版本可见性。** 1.18.0 上传时被旧上传处理器标成 NSFW，导致它在 GTFO 社区列表和搜索里不显示；1.18.1 以 NSFW=否重新发布，内容、SHA 逻辑与 1.18.0 一致。
+
+以下为 1.18.0 的功能说明。
 
 ## 1.18.0 更新
 
