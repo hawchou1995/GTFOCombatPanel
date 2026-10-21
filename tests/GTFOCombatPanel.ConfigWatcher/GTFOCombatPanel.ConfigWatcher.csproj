@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <GTFO_DIR Condition="'$(GTFO_DIR)' == ''">C:\Program Files (x86)\Steam\steamapps\common\GTFO</GTFO_DIR>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../ConfigWatcher.cs" Link="ConfigWatcher.cs" />
+    <Compile Include="../../ReloadGate.cs" Link="ReloadGate.cs" />
+    <Reference Include="BepInEx.Core"><HintPath>$(GTFO_DIR)\BepInEx\core\BepInEx.Core.dll</HintPath></Reference>
+  </ItemGroup>
+</Project>

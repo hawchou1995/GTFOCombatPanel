@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>GTFOCombatPanel</AssemblyName>
+    <RootNamespace>HawChow.GTFOCombatPanel</RootNamespace>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <OutputPath>bin\$(Configuration)\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GTFO_DIR Condition="'$(GTFO_DIR)' == ''">C:\Program Files (x86)\Steam\steamapps\common\GTFO</GTFO_DIR>
+    <!-- EWC projectile events bind at runtime; every profile uses the same dependency-free build. -->
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="tests/**/*.cs;Thunderstore/**/*.cs" />
+    <_GTFOAssembly Include="$(GTFO_DIR)\BepInEx\core\*.dll" Exclude="$(GTFO_DIR)\BepInEx\core\dobby.dll" />
+    <_GTFOAssembly Include="$(GTFO_DIR)\BepInEx\interop\*.dll" />
+    <Reference Include="@(_GTFOAssembly)">
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

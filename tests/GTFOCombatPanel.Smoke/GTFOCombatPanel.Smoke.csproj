@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\CombatStats.cs" Link="CombatStats.cs" />
+    <Compile Include="..\..\LayoutPolicy.cs" Link="LayoutPolicy.cs" />
+    <Compile Include="..\..\EwcReconcile.cs" Link="EwcReconcile.cs" />
+    <Compile Include="..\..\ProjectileAccuracyLedger.cs" Link="ProjectileAccuracyLedger.cs" />
+    <Compile Include="..\..\OptionalProjectileEvents.cs" Link="OptionalProjectileEvents.cs" />
+    <Compile Include="..\..\EwcProjectileBridge.cs" Link="EwcProjectileBridge.cs" />
+    <Compile Include="..\..\ResultLayout.cs" Link="ResultLayout.cs" />
+    <Compile Include="..\..\Localization.cs" Link="Localization.cs" />
+    <Compile Include="..\..\ImpactMetrics.cs" Link="ImpactMetrics.cs" />
+    <Compile Include="..\..\ImpactBoard.cs" Link="ImpactBoard.cs" />
+    <Compile Include="..\..\ScanSession.cs" Link="ScanSession.cs" />
+    <Compile Include="..\..\ToolImpactLedger.cs" Link="ToolImpactLedger.cs" />
+    <Compile Include="..\..\ExpeditionMetadata.cs" Link="ExpeditionMetadata.cs" />
+    <Compile Include="..\..\FriendlyFireAttributionLedger.cs" Link="FriendlyFireAttributionLedger.cs" />
+    <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
+    <Compile Include="..\..\ResultsLog.cs" Link="ResultsLog.cs" />
+    <Compile Include="..\..\SettlementArchive.cs" Link="SettlementArchive.cs" />
+    <Compile Include="..\..\SyncProtocol.cs" Link="SyncProtocol.cs" />
+    <Compile Include="..\..\CombatMerge.cs" Link="CombatMerge.cs" />
+    <Compile Include="..\..\ScoringSettings.cs" Link="ScoringSettings.cs" />
+    <Compile Include="..\..\SquadPackets.cs" Link="SquadPackets.cs" />
+    <Compile Include="..\..\SquadNet.cs" Link="SquadNet.cs" />
+    <Compile Include="..\..\HandshakePolicy.cs" Link="HandshakePolicy.cs" />
+    <Compile Include="..\..\OverlayPolicy.cs" Link="OverlayPolicy.cs" />
+    <Compile Include="..\..\ResultVisibility.cs" Link="ResultVisibility.cs" />
+    <Compile Include="..\..\BlinkCompletionLedger.cs" Link="BlinkCompletionLedger.cs" />
+    <Compile Include="..\..\ReloadGate.cs" Link="ReloadGate.cs" />
+    <Compile Include="..\..\SquadExchange.cs" Link="SquadExchange.cs" />
+    <Compile Include="..\..\ReviveAttributionLedger.cs" Link="ReviveAttributionLedger.cs" />
+    <Compile Include="..\..\EnemyDeathLedger.cs" Link="EnemyDeathLedger.cs" />
+    <Compile Include="..\..\HealthLossLedger.cs" Link="HealthLossLedger.cs" />
+    <Compile Include="..\..\SentryShotLedger.cs" Link="SentryShotLedger.cs" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,91 @@
+using System;
+using System.Collections.Generic;
+
+namespace HawChow.GTFOCombatPanel;
+
+// What one sweep did about one enemy: Rejected when the radar was only updating, First when this
+// sweep revealed the enemy for the squad, Repeat when somebody had already revealed it.
+public enum ScanMark { Rejected, First, Repeat }
+
+// One reveal namespace per expedition, shared by every scanner in the squad. The first sweep that
+// puts an enemy on the bio tracker takes the credit; an enemy that is already revealed scores
+// nothing for anybody afterwards, whoever sweeps it again and however many times they do.
+public sealed class ScanReveals
+{
+    private readonly HashSet<int> _revealed = new HashSet<int>();
+
+    public int Count { get { return _revealed.Count; } }
+
+    // True only for the sweep that reveals this enemy first. Zero is never an enemy identity.
+    public bool Reveal(int identity) { return identity != 0 && _revealed.Add(identity); }
+
+    public void Clear() { _revealed.Clear(); }
+}
+
+// One scanner: its own tag-attempt edges, its own bot callback throttle, and the expedition's
+// shared reveal ledger. Passive radar updates do not count as attempts. Bot static callbacks have
+// no owner: attribution and timing remain estimates.
+public sealed class ScanSession
+{
+    private readonly ScanReveals _reveals;
+    private readonly HashSet<int> _sweepMarks = new HashSet<int>();
+    private bool _tagging;
+    // Whether the sweep now under way has already contributed its one denominator, so a reveal that was
+    // never credited by the tag flag can still credit the sweep it evidences exactly once.
+    private bool _countedThisSweep;
+    private float _lastBotTag = float.NegativeInfinity;
+
+    // A session on its own is its own ledger, which is what a single scanner's tests want. The
+    // tracker hands every squad member's session the same expedition ledger instead.
+    public ScanSession() : this(new ScanReveals()) { }
+
+    public ScanSession(ScanReveals reveals) { _reveals = reveals ?? new ScanReveals(); }
+
+    // The rising edge starts one sweep. A build whose flag is never readable still gets its first
+    // sweep counted below, from the reveals themselves.
+    public bool ObserveTagging(bool active, ImpactCounters counters)
+    {
+        bool started = active && !_tagging;
+        if (started) _sweepMarks.Clear();
+        _tagging = active;
+        if (!active) { _countedThisSweep = false; return false; }
+        if (started && counters != null) { counters.CreditScan(0); _countedThisSweep = true; }
+        return started;
+    }
+
+    // Each enemy contributes once to the current sweep, while the first-mark score still counts
+    // expedition-unique reveals. If the tag flag is unavailable, only a new reveal is evidence.
+    public ScanMark Observe(int identity, ImpactCounters counters, bool bot = false)
+    {
+        if (counters == null || identity == 0) return ScanMark.Rejected;
+        bool first = _reveals.Reveal(identity);
+        if (_tagging ? _sweepMarks.Add(identity) : first) counters.CreditScanMark();
+        if (!first) return ScanMark.Repeat;
+        if (!_countedThisSweep) { counters.CreditScan(0); _countedThisSweep = true; }
+        counters.ScanFirstMarks++;
+        return ScanMark.First;
+    }
+
+    public ScanMark ObserveConfirmed(int identity, ImpactCounters counters, bool confirmed, bool bot = false)
+        => confirmed ? Observe(identity, counters, bot) : ScanMark.Rejected;
+
+    public void EndBotTag() => _tagging = false;
+
+    public bool MarkEnemy(int identity, ImpactCounters counters, bool bot = false)
+        => Observe(identity, counters, bot) == ScanMark.First;
+
+
+    public bool BeginBotTag(float time, float duration, ImpactCounters counters)
+    {
+        if (counters == null || !float.IsFinite(time)) return false;
+        // A callback burst within the game's tag duration is one estimated attempt.
+        float interval = float.IsFinite(duration) && duration > 0 ? Math.Max(0.25f, duration) : 1f;
+        if (time - _lastBotTag < interval) { _tagging = true; return false; }
+        _lastBotTag = time;
+        _sweepMarks.Clear();
+        _tagging = true;
+        counters.CreditScan(0, true);
+        _countedThisSweep = true;
+        return true;
+    }
+}
