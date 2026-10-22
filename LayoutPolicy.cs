@@ -275,6 +275,48 @@ public static class PanelGeometry
         return Build(metrics, 0f, fontPixels, rows, density, fontShrink, null, minimumRowEm);
     }
 
+    // Spreads a measured table across the width the page offers without touching its height, its glyph
+    // size or the width of any field.
+    //
+    // The room the table does not need goes to the columns that hold figures, never to the row label: a
+    // label column that grew would push its text in from the plate's own left edge, because a column that
+    // is not right-aligned centres its group in whatever room it was given. Every figure column receives
+    // the same amount, so the player columns keep the one width they share, and the fields inside each of
+    // them keep their own slots. The result is never wider than the target: the share is a division, so
+    // the last figure column gives back whatever fraction of a pixel it overhangs by.
+    public static PanelGrid FillWidth(PanelGrid grid, float targetWidth)
+    {
+        if (grid == null || grid.Columns == 0 || grid.CellWidths.Length != grid.Columns) return grid;
+        if (!float.IsFinite(targetWidth) || targetWidth <= 0f) return grid;
+        float extra = targetWidth - grid.Width;
+        if (!(extra > 0.01f)) return grid;
+        int columns = grid.Columns;
+        int sharing = 0;
+        for (int index = 0; index < columns; index++) if (grid.IsRightAligned(index)) sharing++;
+        // A table with no right-aligned figure column has nothing to spread a label against, and widening the
+        // label column itself would push its text in from the plate's own left edge, so the grid is left alone.
+        if (sharing == 0) return grid;
+        float share = extra / sharing;
+        var widths = new float[columns];
+        int last = -1;
+        for (int index = 0; index < columns; index++)
+        {
+            bool widens = grid.IsRightAligned(index);
+            widths[index] = widens ? Math.Max(0f, grid.CellWidths[index] + share) : grid.CellWidths[index];
+            if (widens) last = index;
+        }
+        PanelGrid filled = new PanelGrid(widths, grid.FieldWidths, grid.SeparatorWidth, grid.Gap, grid.RowHeight,
+            grid.FontPixels, grid.Rows, grid.Density, grid.RightAligned);
+        float overrun = filled.Width - targetWidth;
+        if (overrun > 0f && last >= 0)
+        {
+            widths[last] = Math.Max(0f, widths[last] - overrun);
+            filled = new PanelGrid(widths, grid.FieldWidths, grid.SeparatorWidth, grid.Gap, grid.RowHeight,
+                grid.FontPixels, grid.Rows, grid.Density, grid.RightAligned);
+        }
+        return filled;
+    }
+
     // Fraction of an em that one glyph occupies. Digits and punctuation are the common case in
     // this panel, CJK players and headers supply the wide case.
     private static float CharacterWidth(char glyph)
@@ -566,5 +608,136 @@ public static class FailureAlignment
         float top = ResultsPlacement.Top(alignedBottom, offsetY, gap);
         strip = new ResultsSafeArea(top, strip.Bottom);
         return strip.Fits;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// How large the settlement board's glyph should be.
+//
+// The board used to be laid out at the sharing size and then multiplied by one guess, which is why it sat
+// small in the middle of a 2560x1440 page with most of the strip above the lobby button unused. Fitting it
+// is a measurement problem rather than a guess: the table is measured at a candidate glyph size, the strip
+// between the completion section and the button and the width the page offers say whether that size uses
+// the room it was given, and the largest size that does is the one that is drawn. Nothing here holds a
+// Unity type, so the whole of it is asserted headlessly.
+// ---------------------------------------------------------------------------------------------------
+
+// What one measurement of the table at one glyph size produced. A table with no extent is not a table,
+// so a failed or empty measurement is never evidence that a larger glyph fits.
+public readonly struct ResultTableSize
+{
+    public readonly float Width, Height;
+    public ResultTableSize(float width, float height) { Width = width; Height = height; }
+    public static ResultTableSize None { get { return new ResultTableSize(0f, 0f); } }
+    public bool Usable => float.IsFinite(Width) && float.IsFinite(Height) && Width > 0f && Height > 0f;
+}
+
+public static class ResultsFontGrowth
+{
+    // The readability ceiling, as a multiple of the glyph size the in-level table shares. Past this the
+    // board stops reading as a table and starts reading as a poster, so the climb ends here whatever the
+    // strip would still accept. It is applied by this method itself, not only by its caller.
+    public const float MaximumSeedMultiple = 3.5f;
+    // The band the board is meant to fill: below the floor it still leaves the strip looking empty, and
+    // above the ceiling it would be pressed against the button the player has to press.
+    public const float StripFillFloor = 0.92f;
+    public const float StripFillCeiling = 0.96f;
+    // The width counts as used once the table is this close to the width the page offers.
+    public const float WidthFillRatio = 0.98f;
+    // A measured width is text plus padding, so a table can come back a fraction of a pixel over the box
+    // it was asked for. This is the tolerance that keeps such a table usable instead of refusing it.
+    public const float WidthSlack = 0.5f;
+    // Hard bound on how many times the caller's measure is invoked. Bisection needs about six probes for a
+    // 3.5x climb; the bound only exists so a caller whose measurement is not monotone cannot spin here.
+    public const int MaximumMeasurements = 64;
+
+    // The glyph size to draw the settlement board at.
+    //
+    // `seedPixels` is the size the in-level table shares and the size the board has always been drawn at;
+    // `minimumPixels` is the smallest size the caller will accept as readable; `maximumPixels` is the
+    // caller's own ceiling, which is additionally clamped to `MaximumSeedMultiple` times the seed.
+    // `stripHeight` is the height between the page's completion section and the lobby button, `boardWidth`
+    // the width the page offers, and `measure` returns the table's natural extents at a candidate size.
+    //
+    // The answer is the largest size that is both readable and inside the band: its table is at most
+    // `StripFillCeiling` of the strip tall and at most `boardWidth` wide, and the climb stops early the
+    // moment the table is already inside the band or has used the width. A seed that already fills the
+    // strip is returned unchanged, so asking twice for the same strip gives the same size twice.
+    public static int FitResultFontSize(int seedPixels, int minimumPixels, int maximumPixels, float stripHeight,
+        float boardWidth, Func<int, ResultTableSize> measure)
+    {
+        int seed = seedPixels < 1 ? 1 : seedPixels;
+        // A page whose strip or width could not be measured has nothing to fit to, and a caller with no
+        // measurement at all has no evidence: every one of those keeps the size the board already uses.
+        if (measure == null) return seed;
+        if (!float.IsFinite(stripHeight) || stripHeight <= 0f) return seed;
+        if (!float.IsFinite(boardWidth) || boardWidth <= 0f) return seed;
+        int ceiling = Ceiling(seed, maximumPixels);
+        if (ceiling <= seed) return seed;
+
+        ResultTableSize first = Measured(measure, seed);
+        if (!first.Usable) return seed;
+        // A board that already overruns its box cannot be fixed by making it bigger; that is the caller's
+        // problem to place, and growing here only makes it worse.
+        if (!Fits(first, stripHeight, boardWidth)) return seed;
+        if (Filled(first, stripHeight, boardWidth)) return seed;
+
+        // The readable floor is the first size above the seed that may be tried. A floor that does not fit
+        // is not a reason to overrun the strip, so the seed is kept instead.
+        int low = seed;
+        if (minimumPixels > seed)
+        {
+            int readable = Math.Min(minimumPixels, ceiling);
+            ResultTableSize probe = Measured(measure, readable);
+            if (!probe.Usable || !Fits(probe, stripHeight, boardWidth)) return seed;
+            low = readable;
+            if (Filled(probe, stripHeight, boardWidth)) return readable;
+        }
+        if (low >= ceiling) return low;
+
+        ResultTableSize top = Measured(measure, ceiling);
+        if (top.Usable && Fits(top, stripHeight, boardWidth)) return ceiling;
+
+        // `low` is known to fit and `high` is known not to, so the largest size that fits lies between
+        // them. Bisection, not a multiplication: every step is a real measurement of the table.
+        int high = ceiling;
+        int guard = 0;
+        while (high - low > 1 && guard++ < MaximumMeasurements)
+        {
+            int middle = low + (high - low) / 2;
+            ResultTableSize probe = Measured(measure, middle);
+            if (!probe.Usable || !Fits(probe, stripHeight, boardWidth)) { high = middle; continue; }
+            low = middle;
+            // The strip is used once the table is inside its band, which is where the climb was heading.
+            if (Filled(probe, stripHeight, boardWidth)) break;
+        }
+        return low;
+    }
+
+    // The table is inside the box it was given: tall enough to be the point of the page, short enough to
+    // stay clear of the button, and never wider than the width the page offers.
+    private static bool Fits(ResultTableSize size, float stripHeight, float boardWidth)
+        => size.Height <= stripHeight * StripFillCeiling + 0.5f && size.Width <= boardWidth + WidthSlack;
+
+    // The strip is already being used: either the table has reached the band's floor, or it has used the
+    // width, in which case growing further would only cost height for nothing.
+    private static bool Filled(ResultTableSize size, float stripHeight, float boardWidth)
+        => size.Height >= stripHeight * StripFillFloor || size.Width >= boardWidth * WidthFillRatio;
+
+    private static ResultTableSize Measured(Func<int, ResultTableSize> measure, int fontSize)
+    {
+        try { return measure(fontSize); }
+        catch { return ResultTableSize.None; }
+    }
+
+    // The climb's hard ceiling: the caller's own limit and the readability multiple of the seed, whichever
+    // is smaller, and never below the seed itself.
+    private static int Ceiling(int seed, int maximumPixels)
+    {
+        double scaled = Math.Floor(seed * (double)MaximumSeedMultiple);
+        int readable = scaled >= int.MaxValue ? int.MaxValue : (int)scaled;
+        int requested = maximumPixels < 1 ? readable : maximumPixels;
+        int ceiling = Math.Min(readable, requested);
+        return ceiling < seed ? seed : ceiling;
     }
 }

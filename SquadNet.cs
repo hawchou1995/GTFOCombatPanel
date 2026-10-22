@@ -20,11 +20,23 @@ namespace HawChow.GTFOCombatPanel;
 // The bytes are assembled and taken apart by `SquadPackets`, which has no Unity, SNet or Harmony
 // reference and is therefore asserted headlessly, including every length and version rule.
 //
-// Nothing leaves this class that the owner of the evidence has not cleared. `MaySend` is the last gate
-// before `SNet.Core.SendBytes`: a peer the exchange holds no evidence about is refused here as well, so
-// a mistake higher up cannot turn into a custom packet - a hello included - in a machine that runs no
-// mod. A gate that was never set refuses everything, which is the safe reading of "nobody said this
-// machine may speak".
+// Two transports carry the same packet. `TryBindApi` binds GTFO-API's free-sized event when the library is
+// loaded, and that is the path this build prefers: the event already carries a fixed replicator key, a long
+// magic and a version signature, it is what StatDisplay, AccuracyTracker and the rest of the scene broadcast
+// on, and a machine that runs no mod drops those bytes without any handler being asked for one. The game's
+// own byte channel remains underneath for a machine without the library:
+//
+//   send    `SNet.Core.SendBytes(bytes, quality, channel, player)` puts that run on the wire.
+//   receive every packet passes `SNet_Replication.RecieveBytes`, which this mod takes in a Harmony
+//           prefix. A packet of ours is recognised by an unused key plus a magic string, and returning
+//           false from the prefix keeps the game from ever looking for a replicator that does not exist.
+//
+// `MaySend` is still the last gate before either route. It is no longer a rule about evidence alone - the
+// default shares with the whole slot list, because that is what every other mod on this transport does and
+// because requiring a peer to prove itself first left two modded machines greeting nothing at each other -
+// but a mistake higher up still cannot turn into a packet for a peer this machine has decided to stay silent
+// with. A gate that was never set refuses everything, which is the safe reading of "nobody said this machine
+// may speak".
 //
 // The receive callback is queued, not run in place. The replication layer's thread is not this mod's to
 // assume: a decoded packet is parked in a bounded queue (256) and drained from `CombatSync.Tick`, which
@@ -45,8 +57,174 @@ internal static class SquadNet
     internal const int MaxQueue = 256;
     private struct Queued { public SquadPacketKind Kind; public ulong Sender; public ulong HelloOwner; public uint Generation; public uint Version; public SyncSnapshot Snapshot; }
     private static readonly ConcurrentQueue<Queued> Queue = new ConcurrentQueue<Queued>();
+    // Which transport each peer has been heard on: true for GTFO-API's event, false for the game's own byte
+    // channel. Written when a packet arrives, read when one is sent, so a mixed squad converges on a route
+    // that is known to work in both directions instead of each half sending into the other's blind side.
+    private static readonly ConcurrentDictionary<ulong, bool> Route = new ConcurrentDictionary<ulong, bool>();
+
+    // A new expedition, or a new lobby: what was learned about who answers on which transport described the last
+    // session and not this one. Forgetting it puts every peer back to "unknown", which is the state that sends
+    // both ways and therefore cannot be wrong about a peer whose route changed with the session.
+    internal static void ResetRoutes() => Route.Clear();
     private static int _queued;
     private static bool _loggedOverflow, _loggedReadError, _loggedWithheld;
+
+    // ---------------------------------------------------------------- the GTFO-API transport
+
+    // The event name this build registers on GTFO-API. It is a name, not a version: the protocol version
+    // travels inside the packet, so two builds on either side of an update still greet each other and say
+    // which version they speak rather than silently disagreeing about an event name.
+    private const string ApiEvent = "CombatPanelSquad";
+    private static System.Reflection.MethodInfo _apiSend;
+    private static bool _apiBound, _apiDisabled;
+    private static int _apiFailures, _apiAttempts;
+    private static object _apiChannel;
+    private static bool _loggedApiBound, _loggedApiAbsent, _loggedApiFailed;
+    // Frames to wait between binding attempts. The API's assembly is loaded by the chain loader, and which of
+    // the two plugins is loaded first is not something this build can choose, so a first attempt that found
+    // nothing is retried from the main loop rather than written off for the session.
+    private static int _bindCooldown;
+
+    // Whether the API transport is the one this machine will send on. Read by the arm diagnostic and by the
+    // retry in `CombatSync.Tick`.
+    internal static bool ApiBound => _apiBound;
+
+    // Binds the API if this machine loads it. Everything is done reflectively: the plugin keeps no compile-time
+    // reference to GTFO-API, so a profile without it still loads this build and falls back to the game channel.
+    // Registering before the API is ready is safe - it caches the registration and replays it when its own
+    // component wakes - which matters because plugin load order is not ours to choose.
+    internal static bool TryBindApi()
+    {
+        if (_apiBound) return true;
+        if (_apiDisabled) return false;
+        if (_bindCooldown > 0) { _bindCooldown--; return false; }
+        _bindCooldown = 60;
+        try
+        {
+            Type api = null;
+            foreach (System.Reflection.Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                Type candidate = assembly.GetType("GTFO.API.NetworkAPI", false);
+                if (candidate != null) { api = candidate; break; }
+            }
+            if (api == null)
+            {
+                if (!_loggedApiAbsent)
+                {
+                    _loggedApiAbsent = true;
+                    Plugin.Logger?.LogInfo("[DIAG] squad sync transport: GTFO-API is not loaded on this machine, so the exchange uses the game's own byte channel through SNet.Core.SendBytes.");
+                }
+                return false;
+            }
+            System.Reflection.MethodInfo register = null, send = null;
+            foreach (System.Reflection.MethodInfo method in api.GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+            {
+                // The generic overloads carry a payload type; the free-sized pair is not generic and is the one
+                // this build can bind without inventing a struct with a native pointer store.
+                if (method.IsGenericMethodDefinition) continue;
+                System.Reflection.ParameterInfo[] parameters = method.GetParameters();
+                if (method.Name == "RegisterFreeSizedEvent" && parameters.Length == 2
+                    && parameters[0].ParameterType == typeof(string)) register = method;
+                else if (method.Name == "InvokeFreeSizedEvent" && parameters.Length == 4
+                    && parameters[0].ParameterType == typeof(string)
+                    && parameters[1].ParameterType == typeof(byte[])
+                    && parameters[2].ParameterType.Name == "SNet_Player") send = method;
+            }
+            if (register == null || send == null)
+            {
+                if (!_loggedApiAbsent)
+                {
+                    _loggedApiAbsent = true;
+                    Plugin.Logger?.LogWarning("[DIAG] squad sync transport: GTFO-API is loaded but does not expose the free-sized event pair this build binds to, so the exchange stays on the game's own byte channel.");
+                }
+                return false;
+            }
+            System.Reflection.MethodInfo handler = typeof(SquadNet).GetMethod(nameof(OnApiPayload),
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            if (handler == null) return false;
+            Delegate callback = Delegate.CreateDelegate(register.GetParameters()[1].ParameterType, handler);
+            register.Invoke(null, new object[] { ApiEvent, callback });
+            _apiChannel = Enum.Parse(send.GetParameters()[3].ParameterType, "GameOrderCritical");
+            _apiSend = send;
+            _apiBound = true;
+            if (!_loggedApiBound)
+            {
+                _loggedApiBound = true;
+                Plugin.Logger?.LogInfo("[DIAG] squad sync transport: bound to GTFO-API's free-sized event '" + ApiEvent + "', which every other mod on that transport already broadcasts on; packets carry the API's own key, magic and version signature.");
+            }
+            return true;
+        }
+        catch (Exception error)
+        {
+            // Not fatal and not final. A registration that failed because the API's own component had not woken
+            // yet - or because the game had not finished loading - succeeds on a later attempt, so the bind is
+            // retried at a slow cadence instead of being written off for the session. Only a bind that keeps
+            // failing is retired, and the game's own byte channel carries the exchange meanwhile either way.
+            _apiAttempts++;
+            if (_apiAttempts >= 20) _apiDisabled = true;
+            _bindCooldown = 600;
+            if (!_loggedApiAbsent)
+            {
+                _loggedApiAbsent = true;
+                Plugin.Logger?.LogWarning("[DIAG] squad sync transport: GTFO-API could not be bound on the first attempt and the exchange uses the game's own byte channel meanwhile; the bind is retried slowly. "
+                    + (error.InnerException ?? error).GetType().Name + ": " + (error.InnerException ?? error).Message);
+            }
+            return false;
+        }
+    }
+
+    private static bool TryApiSend(byte[] packet, SNet_Player target)
+    {
+        if (!_apiBound || _apiDisabled || _apiSend == null) return false;
+        try
+        {
+            // The channel value is resolved once, when the method is bound: an enum member that this build's game
+            // does not have would otherwise be re-parsed on every packet, and the failures it produced would be
+            // counted against the transport rather than against the parse.
+            _apiSend.Invoke(null, new object[] { ApiEvent, packet, target, _apiChannel });
+            // A send that worked is proof the API is serving this machine, so the strike count starts again. The
+            // latch is on *consecutive* failures: three isolated hiccups - a target destroyed between the roster
+            // read and the invoke, a lobby teardown - must not retire a transport that is working.
+            _apiFailures = 0;
+            return true;
+        }
+        catch (Exception error)
+        {
+            _apiFailures++;
+            if (_apiFailures >= 5 && !_apiDisabled)
+            {
+                _apiDisabled = true;
+                if (!_loggedApiFailed)
+                {
+                    _loggedApiFailed = true;
+                    Plugin.Logger?.LogWarning("[DIAG] squad sync transport: five consecutive GTFO-API sends failed, so this machine fell back to the game's own byte channel for the rest of the session: "
+                        + (error.InnerException ?? error).GetType().Name + ": " + (error.InnerException ?? error).Message);
+                }
+            }
+            return false;
+        }
+    }
+
+    // Called by GTFO-API on whichever thread it received the event on. Only parsing happens here; the decoded
+    // packet is parked for the main thread exactly as the game-channel path parks its own.
+    private static void OnApiPayload(ulong sender, byte[] payload)
+    {
+        try
+        {
+            if (payload == null || payload.Length == 0) return;
+            SquadPacket packet = SquadPackets.Parse(payload, payload.Length);
+            if (!packet.IsOurs) return;
+            Enqueue(packet, sender, true);
+        }
+        catch (Exception error)
+        {
+            if (!_loggedReadError)
+            {
+                _loggedReadError = true;
+                Plugin.Logger?.LogWarning("a squad packet received over GTFO-API could not be read and was dropped: " + error.Message);
+            }
+        }
+    }
 
     internal static void SendHello(SNet_Player target, ulong owner, uint generation)
     {
@@ -68,10 +246,40 @@ internal static class SquadNet
             if (!_loggedWithheld)
             {
                 _loggedWithheld = true;
-                Plugin.Logger?.LogWarning("a squad packet was withheld: this machine holds no evidence that the target runs this build, so nothing - a greeting included - is put on the wire for it.");
+                Plugin.Logger?.LogWarning("a squad packet was withheld: this machine has decided to stay silent with that peer - it speaks another protocol version, or sharing is restricted to named and proven players and it is neither - so nothing, a greeting included, is put on the wire for it.");
             }
             return;
         }
+        // Two transports, one packet shape. GTFO-API's free-sized event is the one the rest of the scene shares
+        // on and the one this build prefers: its bytes carry the API's own key, magic and version signature, so a
+        // machine that runs no mod drops them without a handler ever being asked for one. The game's own byte
+        // channel carries the same packet behind this build's own key and magic and is understood by every
+        // machine that runs this mod, whether or not it also runs the API.
+        //
+        // Which one a peer answers on is a fact this machine learns rather than assumes: a build with the API
+        // bound and a build without it would otherwise talk past each other in one direction for the whole run.
+        // Until a peer's route is known the packet goes out both ways; once it has been heard from, only the
+        // route it actually used is kept, so the duplicate costs one packet per peer rather than one per second.
+        bool knownApi = false, knownRaw = false;
+        ulong lookup = 0UL;
+        try { lookup = target.Lookup; } catch (Exception) { }
+        if (lookup != 0UL && Route.TryGetValue(lookup, out bool viaApi))
+        {
+            knownApi = viaApi;
+            knownRaw = !viaApi;
+        }
+        // Raw goes out unless this peer is known to answer on the API alone. An unknown peer gets both, because
+        // the one packet that proves which route it uses is the one that arrives - and a peer known to be on the
+        // API still gets the raw copy when the API send did not happen, because a transport that has retired
+        // itself must never be the reason a squad goes silent.
+        bool apiSent = !knownRaw && TryApiSend(packet, target);
+        if (!knownApi || !apiSent) SendRaw(packet, target);
+    }
+
+    // The game's own byte channel: a run of bytes behind this build's key and magic, taken back in the
+    // `SNet_Replication.RecieveBytes` prefix.
+    private static void SendRaw(byte[] packet, SNet_Player target)
+    {
         var channelType = SNet_ChannelType.GameOrderCritical;      // ordered: a snapshot must not overtake the one before it
         SNet.GetSendSettings(ref channelType, out SNet_SendGroup _, out SNet_SendQuality quality, out int channel);
         Il2CppStructArray<byte> bytes = packet;
@@ -116,7 +324,7 @@ internal static class SquadNet
             // Ours, so it is consumed here whatever happens next: handing a half-read packet to the game
             // would make it look for a replicator that does not exist.
             claimed = true;
-            Enqueue(packet, sender);
+            Enqueue(packet, sender, false);
             return true;
         }
         catch (Exception error)
@@ -135,13 +343,20 @@ internal static class SquadNet
         }
     }
 
-    private static void Enqueue(in SquadPacket packet, ulong sender)
+    private static void Enqueue(in SquadPacket packet, ulong sender, bool viaApi)
     {
         if (packet.Kind == SquadPacketKind.Foreign) return;
-        while (Interlocked.Increment(ref _queued) > MaxQueue)
+        // Which transport this peer actually answered on. The first packet heard decides it, so a squad that
+        // mixes a machine with GTFO-API and one without settles on a route that works instead of each half
+        // sending into the other's blind side for the rest of the run.
+        if (sender != 0UL) Route[sender] = viaApi;
+        // Bounded, and bounded by dropping the oldest: the counter is raised once and lowered once per drop,
+        // so a stalled main thread cannot grow the queue without limit and the queue cannot be emptied by the
+        // very act of noticing that it is full.
+        int queued = Interlocked.Increment(ref _queued);
+        while (queued > MaxQueue && Queue.TryDequeue(out _))
         {
-            if (Queue.TryDequeue(out _)) Interlocked.Decrement(ref _queued);
-            else { Interlocked.Decrement(ref _queued); break; }
+            queued = Interlocked.Decrement(ref _queued);
             if (!_loggedOverflow)
             {
                 _loggedOverflow = true;

@@ -106,9 +106,26 @@ internal static partial class Program
         catch (Exception) { nullThrew = true; }
         Check(!nullThrew, "G21: a null target is a no-op rather than an exception in the send path");
 
+        // ---- the default this build repairs to -------------------------------
+        var sharing = new SquadCapability();
+        sharing.SetBroadcast(true);
+        Check(sharing.MaySend(9400UL, out SquadEvidence whyShared) && whyShared == SquadEvidence.Broadcast,
+            "G22: a machine that shares with its slot list may greet and send to a peer it has never heard from, which is the rule whose absence left two modded machines silent for a whole run");
+        Check(sharing.Describe(9400UL).Contains("slot list"),
+            "G23: the diagnostic names sharing as the reason rather than reporting missing evidence");
+        Check(!sharing.MaySend(0UL), "G24: broadcasting still never addresses a lookup of zero");
+        Check(sharing.NoteInbound(9400UL) && sharing.MaySend(9400UL, out SquadEvidence whyProvenShared)
+            && whyProvenShared == SquadEvidence.Proven,
+            "G25: proof from the peer outranks the broadcast flag in the diagnostic");
+        Check(sharing.NoteIncompatible(9400UL) && !sharing.MaySend(9400UL),
+            "G26: a peer on another protocol version stays silent even while broadcasting, because nothing this build sends can be read by it");
+        sharing.SetBroadcast(false);
+        Check(!sharing.MaySend(9500UL), "G27: turning sharing off restores the older rule without a restart");
+
         SquadNet.MaySend = null;
 
         RunSquadIsolationScenarios();
+        RunSquadBroadcastScenarios();
     }
 
     // The case the shipped default actually produces: two players who both run this build, sharing a host
@@ -142,5 +159,39 @@ internal static partial class Program
             "I4: naming the other client in the configuration pairs the two directly, with no host in between");
         Check(vanilla.HellosSeen == 0 && vanilla.SnapshotsSeen == 0,
             "I5: and the unmodded host is still sent nothing, because naming a client says nothing about the host");
+    }
+
+    // The default this build ships: every machine shares with its whole slot list, nothing has to be named and
+    // nothing has to speak first. This is the case two real logs ended in - "not one packet heard from any of
+    // them" on the host and on the client at the same time - and the one a host that runs no mod must survive.
+    private static void RunSquadBroadcastScenarios()
+    {
+        var wire = new Wire();
+        var host = new Node(0x71UL, 0) { IsMaster = true };
+        var clientA = new Node(0x72UL, 1) { Isolated = true };
+        var clientB = new Node(0x73UL, 2) { Isolated = true };
+        wire.Add(host); wire.Add(clientA); wire.Add(clientB);
+        // Nothing is named anywhere, and nobody has spoken yet: sharing is the only reason any of them speaks.
+        host.Exchange.Capability.SetBroadcast(true);
+        clientA.Exchange.Capability.SetBroadcast(true);
+        clientB.Exchange.Capability.SetBroadcast(true);
+        host.Row(0x71UL).Total.AddEnemyDamage(300);
+        clientA.Row(0x72UL).Total.AddAccuracy(21, 15, 6);
+        clientA.Row(0x72UL).Impact.HealthLost = 40;
+        clientB.Row(0x73UL).Total.AddAccuracy(9, 4, 1);
+        for (int tick = 0; tick < 24; tick++) wire.Tick(tick * 0.25f);
+        List<CombatPlayer> aRows = clientA.Exchange.Project(clientA.Store, clientA.Lookup);
+        List<CombatPlayer> bRows = clientB.Exchange.Project(clientB.Store, clientB.Lookup);
+        List<CombatPlayer> hRows = host.Exchange.Project(host.Store, host.Lookup);
+        Check(aRows.Count == 3 && bRows.Count == 3 && hRows.Count == 3,
+            "B3: with sharing on and nothing named, every machine still ends up holding every seat - the deadlock that silenced two modded machines is gone");
+        Check(Row(aRows, 0x71UL) != null && Near(Row(aRows, 0x71UL)?.Total.EnemyDamage, 300),
+            "B3: a client sees the host's own measurement without either side having named the other");
+        Check(Row(aRows, 0x73UL) != null && Row(aRows, 0x73UL).Total.ShotsFired == 9,
+            "B3: and the row of the other client, which the host described to it");
+        Check(Row(hRows, 0x72UL) != null && Row(hRows, 0x72UL).Total.Hits == 15,
+            "B3: the host folds in the aim only that client could count");
+        Check(Near(Row(hRows, 0x72UL)?.Impact.HealthLost, 40),
+            "B3: and the life that client lost travels with its row, so a host can print blood loss for a player it never applied a blow to");
     }
 }

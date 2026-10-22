@@ -62,6 +62,14 @@ internal static class CombatSync
     private static ConfigEntry<string> _allowlistEntry;
     private static string _allowlistText;
     private static readonly List<ulong> Allowlist = new List<ulong>();
+    // Whether this machine shares with the whole slot list. The default is on: the transport this build uses
+    // is the one the rest of the scene broadcasts on, and a machine that runs no mod drops those bytes. Off
+    // keeps the previous release's rule for an operator who wants a lobby of named machines only.
+    private static ConfigEntry<bool> _shareEntry;
+    private static bool _share = true;
+    private static bool _shareApplied;
+    // Guards `BindDiscoveryConfig` against being re-entered from the two appliers it calls.
+    private static bool _binding;
 
     private static int PrimarySlot => (int)InventorySlot.GearStandard;
     private static int SpecialSlot => (int)InventorySlot.GearSpecial;
@@ -116,13 +124,18 @@ internal static class CombatSync
             // configuration is read the gate refuses everything, which is the safe answer.
             SquadNet.MaySend = MayBeSpokenTo;
             BindDiscoveryConfig();
-            Plugin.Logger.LogInfo("[DIAG] squad sync armed: nothing is put on the wire - a hello included - for a peer this machine"
-                + " has no evidence about. A peer is spoken to when its lookup is named in [Squad Sync] AllowlistedPeers, or after"
-                + " it has itself sent this machine a packet of this build's protocol; the greeting then runs at its usual cadence"
-                + " (2s burst, 10s keep-alive), the host sends its squad rows each second and a client sends only its own"
-                + " measurements. SNet_Replication.RecieveBytes supplies the transport sender identity; snapshot Owner identifies"
-                + " the player described, not the sender. Received rows are queued for main-thread authority checks and display"
-                + " projection.");
+            // GTFO-API is the transport this build prefers: its free-sized event already carries a fixed
+            // replicator key, a long magic and a version signature, which is why the rest of the scene can
+            // broadcast on it. The game's own byte channel stays armed underneath for a machine that does not
+            // run that API, so a squad is never silent merely because one half of it lacks the library.
+            bool api = SquadNet.TryBindApi();
+            Plugin.Logger.LogInfo("[DIAG] squad sync armed: sharing with "
+                + (ShareMode ? "every player in the slot list" : "named and proven players only")
+                + "; transport=" + (api ? "GTFO-API free-sized event" : "SNet.Core.SendBytes with a key+magic gate")
+                + ". The greeting runs at its usual cadence (2s burst, 10s keep-alive), the host sends its squad rows"
+                + " each second and a client sends only its own measurements. Received rows are queued for main-thread"
+                + " authority checks and display projection; snapshot Owner identifies the player described, not the"
+                + " sender.");
         }
         catch (Exception error)
         {
@@ -146,22 +159,40 @@ internal static class CombatSync
             ConfigFile config = Plugin.Instance != null ? Plugin.Instance.Config : null;
             if (config == null)
             {
-                Plugin.Logger.LogWarning("[DIAG] squad sync discovery: the configuration file is not reachable yet, so no peer is"
-                    + " allowlisted and this machine speaks to nobody until one of them speaks first.");
+                Plugin.Logger.LogWarning("[DIAG] squad sync discovery: the configuration file is not reachable yet, so this"
+                    + " machine shares with every player in its slot list and keeps no allowlist. A configuration failure must"
+                    + " never be able to silence sharing, so the default is applied here rather than waited for.");
+                _share = true;
+                _shareApplied = true;
+                Exchange.Capability.SetBroadcast(true);
                 return;
             }
+            // Sharing with the whole slot list is the default. The bytes ride GTFO-API's own free-sized event,
+            // which is the transport StatDisplay and AccuracyTracker share on: every machine that does not run
+            // this build drops the packet without a handler being involved, so a broadcast is not a probe of a
+            // machine that cannot answer. Off restores the previous rule, for a lobby the operator wants to keep
+            // to named machines only.
+            _shareEntry = config.Bind("Squad Sync", "ShareWithEveryPlayer", true,
+                "Share this machine's rows with every player in the squad by default. The packets ride GTFO-API's own"
+                + " network event, which every other mod on that transport already uses in lobbies that hold unmodded"
+                + " players: a machine that runs no mod has no handler for it and drops the bytes, exactly as it drops"
+                + " every other mod packet it receives. Set this to false to share only with players named in"
+                + " AllowlistedPeers, or with those that have themselves sent this machine a packet of this build's"
+                + " protocol - that pair works, but two machines that both wait for the other to speak first share"
+                + " nothing, which is what this build repairs.");
+            ApplyShareMode(true);
             _allowlistEntry = config.Bind("Squad Sync", "AllowlistedPeers", string.Empty,
-                "SteamID64 lookups of players known to run CombatPanel, separated by commas. Nothing is sent to a player who is"
-                + " not named here until that player has itself sent this machine a packet of this mod's protocol, and a greeting"
-                + " counts as one: a machine that runs no mod never produces one, so it is never sent anything to probe it."
-                + " Leave this empty to share only with players who speak first. The number is the one the game's own lobby"
-                + " associates with the player; a value that is not a plain decimal number is ignored rather than guessed at.");
+                "SteamID64 lookups of players known to run CombatPanel, separated by commas. Only consulted when"
+                + " ShareWithEveryPlayer is false: then nothing is sent to a player who is not named here until that"
+                + " player has itself sent this machine a packet of this mod's protocol, and a greeting counts as one."
+                + " The number is the one the game's own lobby associates with the player; a value that is not a plain"
+                + " decimal number is ignored rather than guessed at.");
             ApplyAllowlist(true);
         }
         catch (Exception error)
         {
-            Plugin.Logger.LogWarning("squad sync discovery: the allowlist could not be read, so this machine speaks to nobody"
-                + " until a peer speaks first: " + error.GetType().Name + ": " + error.Message);
+            Plugin.Logger.LogWarning("squad sync discovery: the share configuration could not be read, so this machine"
+                + " keeps the previous values and the panel continues: " + error.GetType().Name + ": " + error.Message);
         }
     }
 
@@ -169,16 +200,51 @@ internal static class CombatSync
     // while the game runs, and a lookup added there has to take effect without a restart.
     private static void ApplyAllowlist(bool force)
     {
-        if (_allowlistEntry == null) return;
+        if (_allowlistEntry == null)
+        {
+            if (!_binding) { _binding = true; try { BindDiscoveryConfig(); } finally { _binding = false; } }
+            if (_allowlistEntry == null) return;
+        }
         string text = _allowlistEntry.Value ?? string.Empty;
         if (!force && text == _allowlistText) return;
         _allowlistText = text;
         int accepted = SquadCapability.ParseAllowlist(text, Allowlist);
         Exchange.SetAllowlist(Allowlist);
-        Plugin.Logger.LogInfo("[DIAG] squad sync discovery: " + accepted + " peer lookup(s) allowlisted by this machine's"
-            + " configuration; every other peer is sent nothing until it has itself sent this machine a packet of this build's"
-            + " protocol. Nothing here proves who is online, and no packet is sent to find out.");
+        Plugin.Logger.LogInfo("[DIAG] squad sync discovery: " + accepted + " peer lookup(s) named in this machine's"
+            + " configuration. They are only consulted when ShareWithEveryPlayer is false: with it on, every player in the slot"
+            + " list is shared with, and with it off every other peer is sent nothing until it has itself sent this machine a"
+            + " packet of this build's protocol. Nothing here proves who is online, and no packet is sent to find out.");
     }
+
+    // The share switch, re-read every tick for the same reason the allowlist is: the file can be edited
+    // while the game runs, and a lobby the operator wants to keep to named machines has to be reachable
+    // without a restart.
+    private static void ApplyShareMode(bool force)
+    {
+        if (_shareEntry == null)
+        {
+            // The configuration was not reachable when this plugin armed - the file may not have existed yet, or
+            // the plugin instance was still being built. Binding it here is what makes the switch and the list
+            // usable for the rest of the session instead of leaving them permanently unavailable.
+            if (!_binding) { _binding = true; try { BindDiscoveryConfig(); } finally { _binding = false; } }
+            if (_shareEntry == null) return;
+        }
+        bool share = _shareEntry.Value;
+        if (!force && share == _share && _shareApplied) return;
+        _share = share;
+        _shareApplied = true;
+        Exchange.Capability.SetBroadcast(share);
+        Plugin.Logger.LogInfo(share
+            ? "[DIAG] squad sync discovery: sharing with every player in this machine's slot list. The greeting and the rows ride"
+                + " GTFO-API's free-sized event, so a player who runs no mod drops them without a handler; nothing here proves who is"
+                + " online and no packet is sent to find out."
+            : "[DIAG] squad sync discovery: sharing is restricted to players named in AllowlistedPeers, and to those that have"
+                + " themselves sent this machine a packet of this build's protocol. Two machines that both restrict share nothing"
+                + " until one of them is named.");
+    }
+
+    // Whether this machine greets and sends to the whole slot list. Read by the arm diagnostic.
+    internal static bool ShareMode => _shareApplied && _share;
 
     // The transport's gate. Read from the main thread only, where every send of this mod is decided.
     private static bool MayBeSpokenTo(ulong lookup)
@@ -192,6 +258,7 @@ internal static class CombatSync
     internal static void ResetExpedition()
     {
         Heard.Clear(); SentTo.Clear(); Confirmed.Clear(); Mismatched.Clear();
+        SquadNet.ResetRoutes();
         Exchange.Configure(OwnLookup(), PrimarySlot, SpecialSlot, ClassSlot, MeleeSlot);
         Exchange.ResetForExpedition();
     }
@@ -202,6 +269,9 @@ internal static class CombatSync
         // and only parks a decoded packet, so the main thread is where every handler that reads game state
         // must run - and a packet must be taken out of the queue even before the exchange is armed.
         SquadNet.Drain();
+        // The API transport is bound as soon as its assembly is loaded, which may be after this plugin's own
+        // load. `TryBindApi` throttles itself, so a machine that never loads it pays one lookup a second.
+        if (!SquadNet.ApiBound) SquadNet.TryBindApi();
         if (!_armed) return;
         try
         {
@@ -219,6 +289,13 @@ internal static class CombatSync
                 if (state == eGameStateName.Lobby || state == eGameStateName.NoLobby)
                 {
                     Heard.Clear(); SentTo.Clear(); Confirmed.Clear();
+                    // Which transport each peer answered on described the lobby that just ended, so every peer is
+                    // back to "unknown" and the next packet goes out both ways until it answers again.
+                    SquadNet.ResetRoutes();
+                    // A peer that went incompatible inside the old lobby proves itself again in the new one, so the
+                    // once-per-peer latch has to go with the evidence: otherwise a rejoin is never re-marked and the
+                    // exchange keeps greeting a machine that cannot read a packet of this build.
+                    Mismatched.Clear();
                     Exchange.ResetPeers();
                 }
             }
@@ -227,7 +304,8 @@ internal static class CombatSync
             if (local == 0UL) return;
             Exchange.Configure(local, PrimarySlot, SpecialSlot, ClassSlot, MeleeSlot);
             Exchange.SetRoster(Roster(local), master);
-            // A lookup added to the file while the game runs takes effect here, without a restart.
+            // A lookup or a switch changed in the file while the game runs takes effect here, without a restart.
+            ApplyShareMode(false);
             ApplyAllowlist(false);
 
             // One line each way, once per level. Together they say whether the exchange is running at all and
@@ -253,13 +331,13 @@ internal static class CombatSync
             if (rows > 0 && !_loggedOutboundRows)
             {
                 _loggedOutboundRows = true;
-                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build and {Exchange.WithheldPeers} are being sent nothing. A row goes only to a peer with that evidence, and this send receipt alone does not prove remote acceptance.");
+                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build, {Exchange.WithheldPeers} are being sent nothing, sharing={(ShareMode ? "every player in the slot list" : "named and proven players only")}. This send receipt alone does not prove remote acceptance.");
             }
             if (!_loggedNoInbound && _levelSince >= 0f && now - _levelSince >= NoInboundSeconds
                 && Exchange.HumanPeers > 0 && Heard.Count == 0)
             {
                 _loggedNoInbound = true;
-                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {now - _levelSince:0}s in the level with {Exchange.HumanPeers} human peer(s) in the roster and not one packet heard from any of them, so no other player's row can appear on this screen. {Exchange.WithheldPeers} of them are being sent nothing because this machine holds no evidence that they run this build; name a player's lookup in [Squad Sync] AllowlistedPeers to start the exchange, or wait for it to greet this machine first. Greetings that were allowed keep going on the keep-alive cadence, and a peer on another protocol version answers with its version and is then left alone on purpose, which is what this line exists to show.");
+                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {now - _levelSince:0}s in the level with {Exchange.HumanPeers} human peer(s) in the roster and not one packet heard from any of them, so no other player's row can appear on this screen. Outbound sharing is {(ShareMode ? "on for the whole slot list" : "restricted to named and proven players")} and {Exchange.WithheldPeers} peer(s) are being sent nothing. If this machine is broadcasting and still hears nothing, the two builds are not reaching each other's transport - read the armed line above for which transport this machine uses - or a peer answered with another protocol version and was then left alone on purpose. Greetings keep going on the keep-alive cadence either way.");
             }
         }
         catch (Exception error)

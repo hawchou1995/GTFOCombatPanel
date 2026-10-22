@@ -3,23 +3,31 @@ using System.Collections.Generic;
 
 namespace HawChow.GTFOCombatPanel;
 
-// Why this machine is allowed to put a packet of its own protocol on the wire for one peer.
+// Who this machine is allowed to put a packet of its own protocol on the wire for.
 //
-// The squad channel is a private protocol riding the game's own byte channel: a machine that runs no
-// mod has no handler for key 0xFFFE and cannot tell these bytes from a corrupt packet belonging to
-// the game. So a peer is spoken to - a hello included, because a hello is already a packet only this
-// build can produce - only after something outside this mod's protocol has said that peer runs this
-// build. Two such signals exist, and neither of them is a probe:
+// The squad exchange rides a transport the rest of the GTFO modding scene already uses for the same
+// job: GTFO-API's free-sized network event (`SquadNet`). That event carries a fixed replicator key, a
+// long ASCII magic and a version signature, and every machine that does not run this build drops the
+// packet without a handler being involved - which is why StatDisplay, AccuracyTracker and every other
+// mod built on that API can broadcast in a lobby that also holds vanilla players. Broadcasting is
+// therefore the default here, and the previous release's rule - speak only to a peer that is named in
+// a configuration file or that spoke first - is what left two modded machines greeting nothing at each
+// other and sharing nothing at all, which is the failure this build repairs.
 //
-//   * Allowlisted: the operator named this player's lookup in this machine's configuration. It is the
-//     only route that can open a conversation between two machines that have never met, and it is
-//     checkable by hand: the lookup is the same number the game's own lobby lists for that player.
-//   * Proven: the peer sent this machine a packet of this build's own protocol. Nothing was sent to it
-//     to find that out, so the signal is read-only - a machine without this mod never produces one.
+// Three signals decide one peer, strongest first:
 //
-// Anything else - no entry, a lookup of zero, a peer that answered with a protocol this build does not
-// speak - is met with silence: no hello, no row, not one byte. The failure mode of a missing signal is
-// a panel that shows what this machine measured itself, never a packet in a stranger's mailbox.
+//   * Proven: the peer sent this machine a packet of this build's own protocol. It is the only signal
+//     that proves the *other* side runs this build, and it is read, never probed for.
+//   * Broadcast: this machine shares with every human in its slot list, which is the default and the
+//     behaviour every other mod on this transport has. The bytes are gated by the transport's own key
+//     and magic, so a machine that runs no mod ignores them exactly as it ignores every other mod
+//     packet it already receives.
+//   * Allowlisted: the operator named this player's lookup in this machine's configuration. With
+//     broadcast off, this is the only route that can open a conversation between two machines that
+//     have never met, and it is checkable by hand.
+//
+// One answer is silence in every case: a lookup of zero, and a peer that answered with a protocol this
+// build does not speak. Nothing this build sends can be read by such a machine, so nothing is sent.
 //
 // Nothing in this class touches the network, Unity, SNet or the configuration file, so every rule
 // below is asserted headlessly.
@@ -30,8 +38,11 @@ public enum SquadEvidence
     // Named in this machine's own configuration as a machine that runs this build.
     Allowlisted = 1,
     // Proved it by sending this machine a packet of this build's protocol, unprompted.
-    Proven = 2
+    Proven = 2,
+    // This machine shares with the whole slot list, which is the default.
+    Broadcast = 3
 }
+
 
 public sealed class SquadCapability
 {
@@ -43,6 +54,16 @@ public sealed class SquadCapability
     private readonly Dictionary<ulong, SquadEvidence> _evidence = new Dictionary<ulong, SquadEvidence>();
     private readonly HashSet<ulong> _allowlist = new HashSet<ulong>();
     private readonly HashSet<ulong> _incompatible = new HashSet<ulong>();
+    // Whether this machine shares with every human in its slot list. Configuration, not session state,
+    // so `ResetEvidence` leaves it standing.
+    private bool _broadcast;
+
+    // Sharing with the whole slot list is the default this build repairs to: the previous release
+    // required a peer to prove itself before a greeting could go out, and two machines that both waited
+    // therefore never spoke. Off means the older rule - the configuration list and proof from the peer.
+    public bool Broadcast { get { return _broadcast; } }
+
+    public void SetBroadcast(bool broadcast) { _broadcast = broadcast; }
 
     public int Allowlisted { get { return _allowlist.Count; } }
 
@@ -148,10 +169,10 @@ public sealed class SquadCapability
 
     public bool MaySend(ulong peer) { return MaySend(peer, out _); }
 
-    // Two signals, one answer: a lookup the operator named is exactly as good as one that spoke first.
-    // The order only decides which sentence the diagnostic uses - proof from the peer is reported in
-    // preference to the operator's own note, because it is the stronger of the two and the only one
-    // that cannot be a typo in a text file.
+    // One answer for the wire. Proof from the peer is reported in preference to everything else - it is
+    // the only signal that cannot be a typo or a stale list - then the broadcast this build defaults to,
+    // then the operator's own note. A peer on another protocol version, or a lookup of zero, is refused
+    // before any of that is consulted.
     public bool MaySend(ulong peer, out SquadEvidence why)
     {
         why = EvidenceOf(peer);
@@ -164,6 +185,7 @@ public sealed class SquadCapability
         if (_incompatible.Contains(peer)) return SquadEvidence.Nothing;
         if (_evidence.TryGetValue(peer, out SquadEvidence evidence) && evidence != SquadEvidence.Nothing)
             return evidence;
+        if (_broadcast) return SquadEvidence.Broadcast;
         return _allowlist.Contains(peer) ? SquadEvidence.Allowlisted : SquadEvidence.Nothing;
     }
 
@@ -176,6 +198,7 @@ public sealed class SquadCapability
         {
             case SquadEvidence.Allowlisted: return "it is named in this machine's AllowlistedPeers";
             case SquadEvidence.Proven: return "it proved it runs this build by sending this machine its own packet";
+            case SquadEvidence.Broadcast: return "this machine shares with every player in its slot list";
             default: return "there is no evidence it runs this build, so it is sent nothing";
         }
     }

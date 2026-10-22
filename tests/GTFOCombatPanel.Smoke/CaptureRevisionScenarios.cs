@@ -109,15 +109,23 @@ internal static partial class Program
         Check(ledger.Complete(inner, 0, true) && !ledger.Complete(outer, 0, true), "nested lethal damage credits inner cause once");
 
         var loss = new HealthLossLedger();
-        var damage = loss.Begin(enemy, 100, 100);
-        var nested = loss.Begin(enemy, 100, 100);
-        Check(loss.Complete(nested, 75, 100, true) == 0 && loss.Complete(damage, 75, 100, true) == 25, "nested damage methods count actual health loss once");
-        Check(loss.Complete(damage, 50, 100, true) == 0, "duplicate completion cannot add health loss");
-        Check(loss.Complete(loss.Begin(enemy, 50, 100), 60, 100, true) == 0, "healing never subtracts or adds cumulative health loss");
-        Check(loss.Complete(loss.Begin(enemy, 100, 100), 80, 80, true) == 0, "maximum health reduction is not blood loss");
-        Check(loss.Complete(loss.Begin(enemy, 10, 100), -20, 100, true) == 10, "overkill counts only actual available life");
-        Check(loss.Complete(loss.Begin(enemy, 50, 100), 20, 100, false) == 0, "failed callbacks do not invent health loss");
-        Check(loss.Complete(loss.Begin(enemy, 50, 100), double.NaN, 100, true) == 0, "unknown health is not a measurement");
+        Check(loss.Observe(enemy, 0xAAUL, 100, 100) == 0, "the first reading of a player only sets the mark, because this machine never saw them live before it");
+        Check(loss.Observe(enemy, 0xAAUL, 75, 100) == 25, "a drop in life is credited once against the mark");
+        Check(loss.Observe(enemy, 0xAAUL, 75, 100) == 0, "the same figure reported again by another path - the damage event and the replicated health update - is never counted twice");
+        Check(loss.Observe(enemy, 0xAAUL, 90, 100) == 0, "healing raises the mark and never subtracts or adds health loss");
+        Check(loss.Observe(enemy, 0xAAUL, 100, 150) == 0, "a maximum that rises - infection, a max-health modifier - is not blood loss, so the reading re-bases instead of scaling");
+        Check(loss.Observe(enemy, 0xAAUL, 100, 80) == 0, "and a maximum that drops is not blood loss either: the life did not go down, only the ceiling did");
+        Check(loss.Observe(enemy, 0xAAUL, 40, 80) == 40, "the next drop is measured against the re-based mark, in absolute points of the new maximum");
+        var overkill = new HealthLossLedger();
+        Check(overkill.Observe(enemy, 0xAAUL, 10, 100) == 0 && overkill.Observe(enemy, 0xAAUL, -20, 100) == 10,
+            "overkill counts only the life that was actually there");
+        var infected = new HealthLossLedger();
+        Check(infected.Observe(enemy, 0xAAUL, 100, 100) == 0 && infected.Observe(enemy, 0xAAUL, 95, 150) == 5,
+            "a blow that lands in the same observation that raises the maximum is still counted, because a higher ceiling cannot have pressed the figure down");
+        Check(overkill.Observe(IntPtr.Zero, 0xAAUL, 50, 100) == 0, "an unknown player identity is never a measurement");
+        Check(overkill.Observe(enemy, 0xAAUL, double.NaN, 100) == 0, "unknown health is not a measurement");
+        Check(overkill.Observe(enemy, 0xBBUL, 55, 100) == 0 && overkill.Observe(enemy, 0xBBUL, 45, 100) == 10,
+            "a pooled pointer handed to another player starts its own mark instead of inheriting the previous occupant's life");
 
         var giver = new ImpactCounters(); var receiver = new ImpactCounters();
         var use = new SupplyUse(); use.AddChange(20, 40, 20); use.AddChange(10, 30, 20);

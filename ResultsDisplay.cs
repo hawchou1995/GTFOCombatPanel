@@ -281,26 +281,38 @@ internal static class ResultsDisplay
             Kinds = board.Kinds
         };
         if (room <= 0f) return;
-        // The strip between the completion section and the button is usually far taller than the table needs,
-        // and the screen far wider, so the table grows into the room it has instead of sitting small in the
-        // middle of it: it is built once at the sharing size, and when that leaves most of the strip empty it
-        // is rebuilt larger. The growth is capped so a stray measurement cannot balloon the table, the width
-        // keeps a margin at both sides, and the grid's own fit factor still shrinks a table that would
-        // overrun the strip - so growing can never push it over the icons or the button.
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
-        PanelGrid grid = HudTable.BuildGrid(content, PanelBehaviour.FontSizeForSharing, Plugin.Density, boardWidth, room);
-        if (grid != null && grid.Height > 1f && grid.Height < room * 0.92f)
-        {
-            float grown = Mathf.Min(PanelBehaviour.FontSizeForSharing * (succeeded ? 2.5f : 2.75f), PanelBehaviour.FontSizeForSharing * (room * 0.94f / grid.Height));
-            if (grown > PanelBehaviour.FontSizeForSharing * 1.02f)
-            {
-                PanelGrid bigger = HudTable.BuildGrid(content, Mathf.RoundToInt(grown), Plugin.Density, boardWidth, room);
-                if (bigger != null) grid = bigger;
-            }
-        }
+        PanelGrid grid = FitBoard(content, room, boardWidth);
         if (grid == null) return;
         Fit(strip, grid, content, board, report, succeeded);
         _placed = true; _placedSucceeded = succeeded;
+    }
+
+    // The glyph size the settlement board is drawn at, and the grid that size produces.
+    //
+    // The strip between the page's completion section and the lobby button is usually far taller than the table
+    // needs, and the screen far wider, so the board is grown into the room it has instead of sitting small in
+    // the middle of it. `ResultsFontGrowth` decides the size from real measurements of this very content - the
+    // table is built once per candidate size and its own extents handed back - and the columns are then spread
+    // across the width the page offers. Neither step can push the board over the icons, the title or the button:
+    // the fit's own ceiling stays below the strip, and `PanelGeometry.FillWidth` never widens past the width it
+    // was given. Both result screens come through here, so success and failure are laid out by one rule.
+    private static PanelGrid FitBoard(TableContent content, float room, float boardWidth)
+    {
+        int seed = Mathf.Max(1, PanelBehaviour.FontSizeForSharing);
+        int fontSize = ResultsFontGrowth.FitResultFontSize(seed, seed, int.MaxValue, room, boardWidth,
+            size => NaturalSize(content, size));
+        PanelGrid grid = HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, room);
+        return grid == null ? null : PanelGeometry.FillWidth(grid, boardWidth);
+    }
+
+    // The table's own extents at one glyph size, measured without a box to fit into: the box is what is being
+    // chosen here, so measuring inside one would only report that box back instead of the table's real size.
+    private static ResultTableSize NaturalSize(TableContent content, int fontSize)
+    {
+        PanelGrid measured = HudTable.BuildGrid(content, fontSize, Plugin.Density, float.PositiveInfinity, float.PositiveInfinity);
+        if (measured == null) return ResultTableSize.None;
+        return new ResultTableSize(measured.Width, measured.Height);
     }
 
     // Result snapshots continue arriving after the page opens. Refresh the displayed board and its existing
@@ -327,7 +339,9 @@ internal static class ResultsDisplay
         if (measured != null && !GridCovers(_grid, measured)
             && Placement(page, succeeded, out _, out float room, out BoardStrip strip) && room > 0f)
         {
-            PanelGrid resized = HudTable.BuildGrid(content, Mathf.Max(1, Mathf.RoundToInt(_grid.FontPixels)), Plugin.Density, boardWidth, room);
+            // The strip may have grown since the board arrived, so the same fit the first placement used is run
+            // again rather than reusing the glyph size it happened to land on: a refreshed snapshot re-measures.
+            PanelGrid resized = FitBoard(content, room, boardWidth);
             if (resized != null) Fit(strip, resized, content, board, report, succeeded);
         }
         _content = content;
@@ -435,7 +449,8 @@ internal static class ResultsDisplay
             if (!_loggedDraw)
             {
                 _loggedDraw = true;
-                Plugin.Logger.LogInfo($"[DIAG] influence board {board.ColumnCount} columns x {board.Rows} rows ({report.Entries.Count} players), {grid.Width:0}x{grid.Height:0} px at ({x:0},{y:0}) of a {Screen.width}x{Screen.height} window, {(succeeded ? "success" : "failure")} screen; drawn by IMGUI, no vanilla report card was modified.");
+                float stripHeight = Math.Max(1f, strip.Bottom - strip.Top);
+                Plugin.Logger.LogInfo($"[DIAG] influence board {board.ColumnCount} columns x {board.Rows} rows ({report.Entries.Count} players), {grid.Width:0}x{grid.Height:0} px at ({x:0},{y:0}) of a {Screen.width}x{Screen.height} window, {(succeeded ? "success" : "failure")} screen, glyph {grid.FontPixels:0}px filling {grid.Height * 100f / stripHeight:0}% of the {stripHeight:0}px strip between the completion section and the lobby button ({grid.Width * 100f / Math.Max(1f, Screen.width - 48f):0}% of the {Screen.width - 48}x width it was fitted to); drawn by IMGUI, no vanilla report card was modified.");
             }
             return;
         }
