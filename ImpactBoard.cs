@@ -206,6 +206,10 @@ public static class ImpactBoard
         ImpactInput input = entry.Input;
         if (!input.StatisticsAvailable || !input.ScoreComparable) return CombatStrings.ReasonUnavailable;
         ImpactCounters counters = input.Counters ?? new ImpactCounters();
+        // A template the player emptied means this row carries no explanation at all - not a dash for a figure
+        // the board could not observe, and not a bare estimate marker. Either of those would be this build
+        // talking over the player's own edit, which is the one thing a customisable line must not do.
+        if (CombatStrings.ReasonOverrideSuppressed(entry.Rating)) return string.Empty;
         switch (entry.Rating)
         {
             case ImpactRating.ZeroScore: return CombatStrings.ReasonNoScore;

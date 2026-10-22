@@ -19,7 +19,7 @@ public sealed class ScoringSettings
 {
     public static readonly string[] MetricNames = { "TotalDamage", "Stagger", "Kills", "Revives", "WeakspotRate", "Accuracy", "SupplyEfficiency", "ToolEfficiency", "LoneSurvivor", "Downs", "FriendlyFire", "MeleeKills", "ScoutKills" };
 
-    public string Guidance { get; set; } = "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚。MeleeKills / ScoutKills 分别按近战击杀与 Scout 击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingMeleeKillMultiplier / SleepingScoutKillMultiplier 分别为近战击杀、触手击杀中沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的那一部分，状态未知按清醒计；小怪/精英/BOSS 三档不再使用睡眠倍率，只统计总数。旧的 SleepingKillMultiplier 保留，作为文件中缺少这两项时的回退来源。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。无效文件保留上次有效配置，缺失时自动创建默认文件。";
+    public string Guidance { get; set; } = "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚。MeleeKills / ScoutKills 分别按近战击杀与 Scout 击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingMeleeKillMultiplier / SleepingScoutKillMultiplier 分别为近战击杀、触手击杀中沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的那一部分，状态未知按清醒计；小怪/精英/BOSS 三档不再使用睡眠倍率，只统计总数。旧的 SleepingKillMultiplier 保留，作为文件中缺少这两项时的回退来源。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。Reasons 为每一句结算说明的模板，占位符只允许 ReasonTokens 里列出的名字：TeamPillar {damage} {count}、Damage {damage} {share}、Stagger / MinorKills / EliteKills / BossKills / Revives / LoneSurvivor / Downs {count}、Weakspot {weakspots} {hits}、Accuracy {hits} {shots}、Supply {uses} {efficiency}、Scan {uses} {firstMarks}、FriendlyFire {damage} {deaths}、MeleeKills {kills} {damage}、ScoutKills {kills}，ZeroScore 无占位符；每句上限 96 字符，空串表示该行不显示说明，留出厂模板即跟随语言设置，未知占位符或超长会导致该文件被当作无效并保留上次有效配置，缺失时自动创建默认文件。";
 
     public Dictionary<string, double> Weights { get; set; } = DefaultWeights();
     public string[] EnabledMetrics { get; set; }
@@ -76,6 +76,68 @@ public sealed class ScoringSettings
         return titles;
     }
 
+    // ---- the explanation line under each sentence ------------------------------------------------
+    // `Title` says what the player is called and `Description` what that sentence means; the reason line
+    // under the two is what the title was actually earned with, in the player's own figures. One template
+    // per sentence, and the placeholders a template may use are named by `ReasonTokens` - the one table the
+    // validator reads, the guidance quotes and the display layer supplies - so the three can never drift.
+    // An entry left exactly as shipped keeps following the language setting, the same rule `Titles` has.
+    public const int MaxReasonLength = 96;
+    public static readonly Dictionary<string, string[]> ReasonTokens = new Dictionary<string, string[]>(StringComparer.Ordinal)
+    {
+        { "TeamPillar", new[] { "damage", "count" } },
+        { "ZeroScore", Array.Empty<string>() },
+        { "Damage", new[] { "damage", "share" } },
+        { "Stagger", new[] { "count" } },
+        { "MinorKills", new[] { "count" } },
+        { "EliteKills", new[] { "count" } },
+        { "BossKills", new[] { "count" } },
+        { "Revives", new[] { "count" } },
+        { "Weakspot", new[] { "weakspots", "hits" } },
+        { "Accuracy", new[] { "hits", "shots" } },
+        { "Supply", new[] { "uses", "efficiency" } },
+        { "Scan", new[] { "uses", "firstMarks" } },
+        { "LoneSurvivor", new[] { "count" } },
+        { "Downs", new[] { "count" } },
+        { "FriendlyFire", new[] { "damage", "deaths" } },
+        { "MeleeKills", new[] { "kills", "damage" } },
+        { "ScoutKills", new[] { "kills" } }
+    };
+    public Dictionary<string, string> Reasons { get; set; } = DefaultReasons();
+
+    // The factory template of every sentence. The three kill classes carry their own class name rather than
+    // a placeholder, because the class is what the sentence is about and not something data can vary.
+    public static Dictionary<string, string> DefaultReasons()
+    {
+        var reasons = new Dictionary<string, string>();
+        foreach (string name in TitleNames) reasons[name] = ShippedReason(name);
+        return reasons;
+    }
+
+    private static string ShippedReason(string name)
+    {
+        switch (name)
+        {
+            case "TeamPillar": return "伤害 {damage}，击杀 {count} 只";
+            case "ZeroScore": return "本局没有任何计分贡献";
+            case "Damage": return "伤害 {damage}，占全队 {share}";
+            case "Stagger": return "打断敌人攻击 {count} 次";
+            case "MinorKills": return "击杀小怪 {count} 只";
+            case "EliteKills": return "击杀精英 {count} 只";
+            case "BossKills": return "击杀 BOSS {count} 只";
+            case "Revives": return "救起队友 {count} 次";
+            case "Weakspot": return "弱点命中 {weakspots}/{hits} 发";
+            case "Accuracy": return "命中 {hits}/{shots} 发";
+            case "Supply": return "补给 {uses} 次，有效 {efficiency}";
+            case "Scan": return "扫描 {uses} 次，首次标记 {firstMarks} 只";
+            case "LoneSurvivor": return "独自存活 {count} 次";
+            case "Downs": return "阵亡 {count} 次";
+            case "FriendlyFire": return "友伤 {damage}，致倒 {deaths} 次";
+            case "MeleeKills": return "近战击杀 {kills} 次，伤害 {damage}";
+            case "ScoutKills": return "Scout 击杀 {kills} 只";
+            default: return string.Empty;
+        }
+    }
     public static Dictionary<string, double> DefaultWeights()
     {
         var weights = new Dictionary<string, double>();
@@ -148,8 +210,10 @@ public sealed class ScoringSettings
             settings.EnabledMetrics = settings.EnabledMetrics.Distinct().ToArray();
         }
         // Sentence wording is canonicalised before it is validated, so a key typed with the wrong case is
-        // read, stored and rewritten under the one spelling the board looks up.
+        // read, stored and rewritten under the one spelling the board looks up. The explanation templates
+        // follow the same path, so a sparse file's missing entries come from the shipped text.
         settings.NormalizeTitles();
+        settings.NormalizeReasons();
         settings.Validate();
         return settings;
     }
@@ -180,6 +244,7 @@ public sealed class ScoringSettings
         ValidateNames(SupportToolNames, "SupportToolNames");
         ValidateNames(ExcludedTools, "ExcludedTools");
         ValidateTitles();
+        ValidateReasons();
     }
 
     // One entry per sentence the board can print, all present, each a single line of usable text: a title
@@ -271,6 +336,31 @@ public sealed class ScoringSettings
         Titles = ordered;
     }
 
+    // The same rules one level down: keys are matched without case, an unknown or repeated key is refused,
+    // a missing entry is filled from the factory template, and a null value reads as the empty template that
+    // hides a row's explanation - the one thing a template may be and still be useful.
+    private void NormalizeReasons()
+    {
+        if (Reasons == null || Reasons.Count == 0)
+        {
+            Reasons = DefaultReasons();
+            return;
+        }
+        var normalized = new Dictionary<string, string>();
+        foreach (KeyValuePair<string, string> pair in Reasons)
+        {
+            string canonical = CanonicalTitleName(pair.Key);
+            if (canonical == null) throw new FormatException("Reasons contains an unknown sentence: " + pair.Key + ".");
+            if (normalized.ContainsKey(canonical)) throw new FormatException("Reasons repeats " + canonical + ".");
+            normalized[canonical] = pair.Value == null ? string.Empty : pair.Value.Trim();
+        }
+        Dictionary<string, string> shipped = DefaultReasons();
+        var ordered = new Dictionary<string, string>();
+        foreach (string name in TitleNames)
+            ordered[name] = normalized.TryGetValue(name, out string entry) ? entry : shipped[name];
+        Reasons = ordered;
+    }
+
     // Installs this file's wording into the display layer. A half that still reads exactly as shipped is
     // left to the language setting, so only the text the user really changed is pinned down.
     public void ApplyTitles()
@@ -282,6 +372,60 @@ public sealed class ScoringSettings
             string title = entry != null && !IsShippedText(entry.Title, CombatStrings.DefaultTitle(rating)) ? entry.Title : null;
             string description = entry != null && !IsShippedText(entry.Description, CombatStrings.DefaultTitleDescription(rating)) ? entry.Description : null;
             CombatStrings.SetTitleOverride(rating, title, description);
+        }
+    }
+
+    // Every template is one line of the width the reason row has, and may only use placeholders the display
+    // layer really fills in: anything else would be printed to the player as a raw `{word}`. An empty
+    // template is allowed on purpose, because that is how a row is told to print no explanation at all.
+    private void ValidateReasons()
+    {
+        if (Reasons == null || Reasons.Count != TitleNames.Length)
+            throw new FormatException("Reasons must carry exactly one entry per settlement sentence.");
+        foreach (string name in TitleNames)
+        {
+            if (!Reasons.ContainsKey(name)) throw new FormatException("Reasons is missing " + name + ".");
+            RequireTemplate(Reasons[name], ReasonTokens[name], "Reasons." + name);
+        }
+    }
+
+    private static void RequireTemplate(string template, string[] allowed, string field)
+    {
+        string trimmed = template == null ? string.Empty : template.Trim();
+        if (trimmed.Length > MaxReasonLength) throw new FormatException(field + " must be at most " + MaxReasonLength + " characters.");
+        if (trimmed.IndexOfAny(new[] { '\r', '\n', '\t' }) >= 0) throw new FormatException(field + " must be a single line of text.");
+        for (int index = 0; index < trimmed.Length; index++)
+        {
+            if (trimmed[index] == '}') throw new FormatException(field + " closes a placeholder that was never opened, so its braces are not paired.");
+            if (trimmed[index] != '{') continue;
+            int close = trimmed.IndexOf('}', index + 1);
+            if (close < 0) throw new FormatException(field + " opens a placeholder it never closes, so its braces are not paired.");
+            string token = trimmed.Substring(index + 1, close - index - 1);
+            if (Array.IndexOf(allowed, token) < 0)
+                throw new FormatException(field + " uses the unknown placeholder {" + token + "}; it may only use " + DescribeTokens(allowed) + ".");
+            index = close;
+        }
+    }
+
+    private static string DescribeTokens(string[] tokens)
+    {
+        if (tokens == null || tokens.Length == 0) return "no placeholder at all";
+        return string.Join(" ", tokens.Select(token => "{" + token + "}"));
+    }
+
+    // Installs this file's explanation templates into the display layer. A template that still reads exactly
+    // as the factory wrote it is left to the language setting, so only what the user really changed is pinned
+    // down - and an empty template is a change, because it is how a row is told to print no reason at all.
+    public void ApplyReasons()
+    {
+        Dictionary<string, string> shipped = DefaultReasons();
+        foreach (string name in TitleNames)
+        {
+            ImpactRating rating = RatingOf(name);
+            string template = Reasons != null && Reasons.TryGetValue(name, out string found) ? found : null;
+            string trimmed = template == null ? null : template.Trim();
+            string custom = trimmed != null && !string.Equals(trimmed, shipped[name], StringComparison.Ordinal) ? trimmed : null;
+            CombatStrings.SetReasonOverride(rating, custom);
         }
     }
 
@@ -311,6 +455,11 @@ public sealed class ScoringSettings
             text.Append(name).Append('=').Append(entry != null ? entry.Title : string.Empty)
                 .Append('/').Append(entry != null ? entry.Description : string.Empty).Append(';');
         }
+        // A rewritten explanation line is the same kind of change as a rewritten title: the settlement board
+        // has to be rebuilt for it, so the templates are part of what "this file changed" means.
+        text.Append("reasons=");
+        foreach (string name in TitleNames)
+            text.Append(name).Append('=').Append(Reasons != null && Reasons.TryGetValue(name, out string reason) ? reason : string.Empty).Append(';');
         text.Append("floor=").Append(RescueFloor).Append('/').Append(AccuracyConfidencePellets);
         return text.ToString();
     }

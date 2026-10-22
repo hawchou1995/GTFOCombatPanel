@@ -1,5 +1,7 @@
+using System;
 using System.Globalization;
 using System.Collections.Generic;
+using System.Text;
 
 namespace HawChow.GTFOCombatPanel;
 
@@ -271,13 +273,86 @@ public static class CombatStrings
     // of these under every rating, so a title is never a bare word: each line carries the number it
     // came from. They are kept short on purpose - a value column is as wide as its widest cell, and a
     // long line would shrink every other column of the board.
-    public static string ReasonNoScore { get { return Pick("本局没有任何计分贡献", "no scoring contribution this run"); } }
-    public static string ReasonUnavailable { get { return Placeholder; } }
-    public static string ReasonDamage(string damage, string share) { return Pick("伤害 " + damage + "，占全队 " + share, "damage " + damage + ", " + share + " of the squad"); }
-    public static string ReasonTeam(string damage, long kills) { return Pick("伤害 " + damage + "，击杀 " + Count(kills) + " 只", "damage " + damage + ", " + Count(kills) + " kills"); }
-    public static string ReasonStagger(long count) { return Pick("打断敌人攻击 " + Count(count) + " 次", "interrupted " + Count(count) + " attacks"); }
+    //
+    // A line is the scoring file's when the file carries a template for that sentence, and the shipping
+    // wording otherwise: exactly the rule the titles follow, so a template nobody edited keeps following
+    // the language setting instead of freezing the Chinese default into a file nobody touched.
+    private static readonly Dictionary<ImpactRating, string> CustomReasons = new Dictionary<ImpactRating, string>();
+
+    // A null template clears the override, which is how "follow the language setting" is said. An empty
+    // template is a real instruction rather than a missing one: it is how a row is told to print no
+    // explanation at all, so it is stored instead of being treated as blank.
+    public static void SetReasonOverride(ImpactRating rating, string template)
+    {
+        if (template == null) CustomReasons.Remove(rating);
+        else CustomReasons[rating] = template.Trim();
+    }
+
+    public static void ClearReasonOverrides() { CustomReasons.Clear(); }
+
+    public static bool HasReasonOverride(ImpactRating rating) { return CustomReasons.ContainsKey(rating); }
+
+    // The player emptied this sentence's template: the row is meant to carry no explanation at all. The board
+    // asks this before it decides on a dash or an estimate marker, because either of those would be this build
+    // printing something the player deleted.
+    public static bool ReasonOverrideSuppressed(ImpactRating rating)
+        => CustomReasons.TryGetValue(rating, out string template) && string.IsNullOrEmpty(template);
+
+    // `{name}` is replaced by the value of that name and by nothing else. A placeholder the caller never
+    // supplied is left exactly as the user wrote it rather than being swallowed, so a hand-typed line can
+    // never come out with an empty hole where a figure should stand.
+    private static string Substitute(string template, params (string Key, string Value)[] values)
+    {
+        if (string.IsNullOrEmpty(template)) return template ?? string.Empty;
+        if (values == null || values.Length == 0) return template;
+        var text = new StringBuilder(template.Length + 16);
+        int index = 0;
+        while (index < template.Length)
+        {
+            int open = template.IndexOf('{', index);
+            int close = open < 0 ? -1 : template.IndexOf('}', open + 1);
+            if (open < 0 || close < 0)
+            {
+                text.Append(template, index, template.Length - index);
+                break;
+            }
+            text.Append(template, index, open - index);
+            string name = template.Substring(open + 1, close - open - 1);
+            string value = null;
+            for (int slot = 0; slot < values.Length; slot++)
+            {
+                if (!string.Equals(values[slot].Key, name, StringComparison.Ordinal)) continue;
+                value = values[slot].Value;
+                break;
+            }
+            if (value != null) text.Append(value);
+            else text.Append(template, open, close - open + 1);
+            index = close + 1;
+        }
+        return text.ToString();
+    }
+
+    private static bool TryReason(ImpactRating rating, out string template) { return CustomReasons.TryGetValue(rating, out template); }
+
+    public static string ReasonNoScore { get { return TryReason(ImpactRating.ZeroScore, out string template) ? Substitute(template) : Pick("本局没有任何计分贡献", "no scoring contribution this run"); } }
+    public static string ReasonUnavailable { get { return TryReason(ImpactRating.Unavailable, out string template) ? Substitute(template) : Placeholder; } }
+    public static string ReasonDamage(string damage, string share)
+        => TryReason(ImpactRating.Damage, out string template)
+            ? Substitute(template, ("damage", damage), ("share", share))
+            : Pick("伤害 " + damage + "，占全队 " + share, "damage " + damage + ", " + share + " of the squad");
+    public static string ReasonTeam(string damage, long kills)
+        => TryReason(ImpactRating.TeamPillar, out string template)
+            ? Substitute(template, ("damage", damage), ("count", Count(kills)))
+            : Pick("伤害 " + damage + "，击杀 " + Count(kills) + " 只", "damage " + damage + ", " + Count(kills) + " kills");
+    public static string ReasonStagger(long count)
+        => TryReason(ImpactRating.Stagger, out string template)
+            ? Substitute(template, ("count", Count(count)))
+            : Pick("打断敌人攻击 " + Count(count) + " 次", "interrupted " + Count(count) + " attacks");
     public static string ReasonKills(KillTier tier, long count)
     {
+        // The three classes are three sentences of their own, so a custom template is looked up by the
+        // rating the class is scored as - the same mapping the board's own sentence row uses.
+        if (TryReason(ReasonRatingOf(tier), out string template)) return Substitute(template, ("count", Count(count)));
         switch (tier)
         {
             case KillTier.Minor: return Pick("击杀小怪 " + Count(count) + " 只", Count(count) + " minor kills");
@@ -285,16 +360,58 @@ public static class CombatStrings
             default: return Pick("击杀 BOSS " + Count(count) + " 只", Count(count) + " boss kills");
         }
     }
-    public static string ReasonRevives(long count) { return Pick("救起队友 " + Count(count) + " 次", "picked up " + Count(count) + " teammates"); }
-    public static string ReasonWeakspot(long weakspots, long hits) { return Pick("弱点命中 " + Count(weakspots) + "/" + Count(hits) + " 发", Count(weakspots) + "/" + Count(hits) + " weakspot pellets"); }
-    public static string ReasonAccuracy(long hits, long shots) { return Pick("命中 " + Count(hits) + "/" + Count(shots) + " 发", Count(hits) + "/" + Count(shots) + " pellets on target"); }
-    public static string ReasonSupply(long uses, string efficiency) { return Pick("补给 " + Count(uses) + " 次，有效 " + efficiency, Count(uses) + " resupply uses, " + efficiency + " effective"); }
-    public static string ReasonScan(long uses, long firstMarks) { return Pick("扫描 " + Count(uses) + " 次，首次标记 " + Count(firstMarks) + " 只", "scanned " + Count(uses) + "x, first-marked " + Count(firstMarks) + " enemies"); }
-    public static string ReasonLoneSurvivor(long count) { return Pick("独自存活 " + Count(count) + " 次", "last one standing " + Count(count) + "x"); }
-    public static string ReasonDowns(long count) { return Pick("阵亡 " + Count(count) + " 次", "downed " + Count(count) + "x"); }
-    public static string ReasonFriendlyFire(string damage, long deaths) => Pick("友伤 " + damage + "，致倒 " + Count(deaths) + " 次", "friendly fire " + damage + ", downed teammates " + Count(deaths) + "x");
-    public static string ReasonMeleeKills(long kills, string damage) => Pick("近战击杀 " + Count(kills) + " 次，伤害 " + damage, Count(kills) + " melee kills, damage " + damage);
-    public static string ReasonScoutKills(long kills) => Pick("Scout 击杀 " + Count(kills) + " 只", Count(kills) + " Scouts killed");
+    public static string ReasonRevives(long count)
+        => TryReason(ImpactRating.Revives, out string template)
+            ? Substitute(template, ("count", Count(count)))
+            : Pick("救起队友 " + Count(count) + " 次", "picked up " + Count(count) + " teammates");
+    public static string ReasonWeakspot(long weakspots, long hits)
+        => TryReason(ImpactRating.Weakspot, out string template)
+            ? Substitute(template, ("weakspots", Count(weakspots)), ("hits", Count(hits)))
+            : Pick("弱点命中 " + Count(weakspots) + "/" + Count(hits) + " 发", Count(weakspots) + "/" + Count(hits) + " weakspot pellets");
+    public static string ReasonAccuracy(long hits, long shots)
+        => TryReason(ImpactRating.Accuracy, out string template)
+            ? Substitute(template, ("hits", Count(hits)), ("shots", Count(shots)))
+            : Pick("命中 " + Count(hits) + "/" + Count(shots) + " 发", Count(hits) + "/" + Count(shots) + " pellets on target");
+    public static string ReasonSupply(long uses, string efficiency)
+        => TryReason(ImpactRating.Supply, out string template)
+            ? Substitute(template, ("uses", Count(uses)), ("efficiency", efficiency))
+            : Pick("补给 " + Count(uses) + " 次，有效 " + efficiency, Count(uses) + " resupply uses, " + efficiency + " effective");
+    public static string ReasonScan(long uses, long firstMarks)
+        => TryReason(ImpactRating.Scan, out string template)
+            ? Substitute(template, ("uses", Count(uses)), ("firstMarks", Count(firstMarks)))
+            : Pick("扫描 " + Count(uses) + " 次，首次标记 " + Count(firstMarks) + " 只", "scanned " + Count(uses) + "x, first-marked " + Count(firstMarks) + " enemies");
+    public static string ReasonLoneSurvivor(long count)
+        => TryReason(ImpactRating.LoneSurvivor, out string template)
+            ? Substitute(template, ("count", Count(count)))
+            : Pick("独自存活 " + Count(count) + " 次", "last one standing " + Count(count) + "x");
+    public static string ReasonDowns(long count)
+        => TryReason(ImpactRating.Downs, out string template)
+            ? Substitute(template, ("count", Count(count)))
+            : Pick("阵亡 " + Count(count) + " 次", "downed " + Count(count) + "x");
+    public static string ReasonFriendlyFire(string damage, long deaths)
+        => TryReason(ImpactRating.FriendlyFire, out string template)
+            ? Substitute(template, ("damage", damage), ("deaths", Count(deaths)))
+            : Pick("友伤 " + damage + "，致倒 " + Count(deaths) + " 次", "friendly fire " + damage + ", downed teammates " + Count(deaths) + "x");
+    public static string ReasonMeleeKills(long kills, string damage)
+        => TryReason(ImpactRating.MeleeKills, out string template)
+            ? Substitute(template, ("kills", Count(kills)), ("damage", damage))
+            : Pick("近战击杀 " + Count(kills) + " 次，伤害 " + damage, Count(kills) + " melee kills, damage " + damage);
+    public static string ReasonScoutKills(long kills)
+        => TryReason(ImpactRating.ScoutKills, out string template)
+            ? Substitute(template, ("kills", Count(kills)))
+            : Pick("Scout 击杀 " + Count(kills) + " 只", Count(kills) + " Scouts killed");
+
+    // The rating each kill class is scored as, so a custom template for 小怪/精英/BOSS takes effect on
+    // the one sentence it names.
+    private static ImpactRating ReasonRatingOf(KillTier tier)
+    {
+        switch (tier)
+        {
+            case KillTier.Minor: return ImpactRating.MinorKills;
+            case KillTier.Elite: return ImpactRating.EliteKills;
+            default: return ImpactRating.BossKills;
+        }
+    }
     // The melee and Scout rows carry the same three figures in the same order - total kills, the part of
     // them landed while the enemy was asleep, and the damage that went with them - so the two rows read
     // alike and the label above each one names all three.

@@ -192,11 +192,19 @@ public sealed class Plugin : BasePlugin
 
     // The settlement sentences in force: the scoring file's wording when it is usable, the shipped wording
     // otherwise. An entry the file leaves exactly as published is not pinned, so it keeps following the
-    // language setting; a sentence the file really changes is the user's from then on.
+    // language setting; a sentence the file really changes is the user's from then on. The explanation line
+    // under each sentence follows the same rule, so both halves are installed from this one place and a
+    // language change or a scoring-file edit can never leave one half behind.
     internal static void ApplyTitles()
     {
-        if (Scoring != null) Scoring.ApplyTitles();
-        else CombatStrings.ResetTitleOverrides();
+        if (Scoring != null)
+        {
+            Scoring.ApplyTitles();
+            Scoring.ApplyReasons();
+            return;
+        }
+        CombatStrings.ResetTitleOverrides();
+        CombatStrings.ClearReasonOverrides();
     }
 
     // Whether an equipped tool marks its owner as support: the scoring file's rules when it is usable,

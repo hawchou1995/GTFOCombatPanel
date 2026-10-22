@@ -1669,6 +1669,8 @@ internal static partial class Program
         RunRowHeightScenarios();
         // ---- the settlement board's size: a search, not a guess --------------------------------
         ResultsGrowthScenarios.RunInto(Check);
+        // ---- the explanation line under each title: a template a player may edit --------------
+        ReasonTemplateScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------
         // EWC announces a shot when the weapon fires and a hit when the pellet lands, in two separate
         // updates; the second one carries hits with a count of zero. Reading each update as one complete
