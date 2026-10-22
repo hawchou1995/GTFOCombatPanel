@@ -27,9 +27,9 @@ internal static partial class Program
 
     private static void SyncRevisionRoundTrip()
     {
-        Check(SyncProtocol.Version == 7, "R1: the wire is protocol 7, so a v6 peer is refused by name instead of decoded");
-        Check(SyncProtocol.SnapshotSize == 352 && SquadPackets.SnapshotBytes == 368 && SquadPackets.HelloBytes == 24,
-            "R1: the snapshot grew from 304 to exactly 352 bytes and the envelope states that length (" + SyncProtocol.SnapshotSize + ")");
+        Check(SyncProtocol.Version == 8, "R1: the wire is protocol 8, so a v7 peer is refused by name instead of decoded");
+        Check(SyncProtocol.SnapshotSize == 360 && SquadPackets.SnapshotBytes == 376 && SquadPackets.HelloBytes == 24,
+            "R1: the snapshot grew from 352 to exactly 360 bytes and the envelope states that length (" + SyncProtocol.SnapshotSize + ")");
 
         var source = new CombatPlayer(0x1001UL) { Name = "Owner" };
         source.Total.AddAccuracy(40, 25, 9);
@@ -51,6 +51,7 @@ internal static partial class Program
         impact.SelfSupplyUses = 6;
         impact.SelfAmmoUses = 4;
         impact.HealthLost = 148.5;
+        impact.AddScoutDamage(87.5, true);
 
         SyncSnapshot captured = SyncProtocol.Capture(source, 0, 1, 2, 3, 1234, true);
         Check(captured.SleepingMinorKills == 5 && captured.SleepingEliteKills == 3 && captured.SleepingBossKills == 1
@@ -61,19 +62,24 @@ internal static partial class Program
             "R1: capture carries the kills whose pre-death state could not be observed, apart from both awake and sleeping");
         Check(captured.SelfSupplyUses == 6 && captured.SelfAmmoUses == 4, "R1: capture carries the player's own consumption pair");
         Check(Math.Abs(captured.HealthLost - 148.5f) < 0.01f, "R1: capture carries the health the player actually lost");
+        Check(captured.Has2(SyncFlags2.ScoutDamageObserved) && captured.Has2(SyncFlags2.ScoutDamageEstimated)
+            && Math.Abs(captured.ScoutEnemyDamage - 87.5f) < 0.01f,
+            "R1: capture carries the damage that went into Scouts and marks it as this machine's own estimate");
         Check(captured.Has(SyncFlags.SquadDamageKnown) && !captured.Has(SyncFlags.SquadDamagePartial),
             "R1: a complete host total is stamped as measured, not as partial");
 
         byte[] wire = SyncProtocol.Encode(captured);
-        Check(wire.Length == 352, "R1: one snapshot is exactly 352 bytes on the wire");
+        Check(wire.Length == 360, "R1: one snapshot is exactly 360 bytes on the wire");
         Check(SyncProtocol.Decode(wire, 0, wire.Length, out SyncSnapshot read)
             && read.SleepingMinorKills == 5 && read.SleepingEliteKills == 3 && read.SleepingBossKills == 1
             && read.SleepingMeleeKills == 2 && read.SleepingScoutKills == 1
             && read.UnknownStateMinorKills == 2 && read.UnknownStateEliteKills == 1 && read.UnknownStateBossKills == 1
             && read.UnknownStateMeleeKills == 1 && read.UnknownStateScoutKills == 0
             && read.SelfSupplyUses == 6 && read.SelfAmmoUses == 4
-            && Math.Abs(read.HealthLost - 148.5f) < 0.01f,
-            "R1: every v7 field survives the snapshot wire unchanged");
+            && Math.Abs(read.HealthLost - 148.5f) < 0.01f
+            && read.Has2(SyncFlags2.ScoutDamageObserved) && read.Has2(SyncFlags2.ScoutDamageEstimated)
+            && Math.Abs(read.ScoutEnemyDamage - 87.5f) < 0.01f,
+            "R1: every v8 field survives the snapshot wire unchanged");
         Check(SyncProtocol.Encode(read).SequenceEqual(wire), "R1: decoding a packet and re-encoding it is byte-identical");
         Check(CounterRoundTrips(), "R1: each of the thirteen new figures survives on its own, so no two fields share a slot");
 
@@ -190,7 +196,7 @@ internal static partial class Program
         Check(SquadPackets.Parse(v6Hello, v6Hello.Length).Kind == SquadPacketKind.VersionMismatch,
             "R2: a v6 hello is refused by name rather than decoded");
         Check(SquadPackets.Parse(v6Row, v6Row.Length).Kind == SquadPacketKind.VersionMismatch,
-            "R2: and so is a v6 row, whose body is 304 bytes where this build reads 352");
+            "R2: and so is a v6 row, whose body is 304 bytes where this build reads 360");
         Check(SquadPackets.Parse(v6Row, v6Row.Length).IsOurs && SquadPackets.Parse(v6Hello, v6Hello.Length).IsOurs,
             "R2: both are still recognised as this mod's packets, so neither is handed back to the game's replication layer");
         Check(SquadNet.TryAccept(v6Row, (uint)v6Row.Length, 0x3002UL), "R2: the transport consumes a v6 row instead of passing it on");
@@ -392,6 +398,9 @@ internal static partial class Program
             new SquadPeer(0x91UL, 1, false, false, false),
             new SquadPeer(0x92UL, 2, false, false, false)
         }, true);
+        // The rows leave only for a machine this one may speak to, so the scenario names its peers the way an
+        // operator would: the host has these two lookups in its own configuration.
+        exchange.SetAllowlist(new[] { 0x91UL, 0x92UL });
         var hostRow = new CombatPlayer(0x90UL) { DisplaySlot = 0 };
         hostRow.Total.AddEnemyDamage(100);
         var known = new CombatPlayer(0x91UL) { DisplaySlot = 1 };

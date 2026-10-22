@@ -139,7 +139,7 @@ internal static class ResultsDisplay
     // for the edge to stop moving before the one and only measurement is taken; after that the board is
     // fixed for the life of the page, which is what keeps a redraw or a hover from resizing it.
     private static float _seedButtonTop = float.NaN;
-    private static int _seedSettleFrames, _seedAttempts;
+    private static int _seedSettleFrames, _seedAttempts, _seedButtonMisses;
     private const int ButtonSettleFrames = 2;
     private const int ButtonSettleAttempts = 120;
     private static readonly CompletionReadiness Readiness = new CompletionReadiness();
@@ -150,7 +150,7 @@ internal static class ResultsDisplay
         _holdValid = false;
         _holdBoard = default;
         _holdOpacity = 0f;
-        _seedButtonTop = float.NaN; _seedSettleFrames = 0; _seedAttempts = 0;
+        _seedButtonTop = float.NaN; _seedSettleFrames = 0; _seedAttempts = 0; _seedButtonMisses = 0;
         Readiness.Forget();
         // A new result screen reports its own board: the layout line belongs to the screen, not to the
         // session. A page pointer is reused across a session's runs, so a once-per-session latch left every
@@ -237,7 +237,7 @@ internal static class ResultsDisplay
         HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity);
 
         if (!_succeeded && HeadingReports.Add("failure-board-placed"))
-            Plugin.Logger?.LogInfo($"[DIAG] failure board placed: board=({_origin.X:0},{_origin.Y:0},{_grid.Width:0}x{_grid.Height:0}), successBoardTop={(FailureAlignment.AnchorKnown(Screen.height) ? _origin.Y.ToString("0") : "unseen")}, the two result screens carry their board in the same strip and neither overlaps the lobby button.");
+            Plugin.Logger?.LogInfo($"[DIAG] failure board placed: board=({_origin.X:0},{_origin.Y:0},{_grid.Width:0}x{_grid.Height:0}), successBoardTop={(FailureAlignment.AnchorKnown(Screen.height) ? FailureAlignment.Anchor.ToString("0") : "unseen")}, the two result screens carry their board in the same strip and neither overlaps the lobby button.");
     }
 
     // The result pages animate their own content in over the first frames, so the board has to attach
@@ -473,14 +473,7 @@ internal static class ResultsDisplay
             // fixes the table permanently below the room the settled page actually offers. Wait for the edge
             // to stop moving (bounded, in case a hover keeps nudging it), then measure once and fix it for
             // the life of the page - which is also why nothing here ever enlarges it afterwards.
-            if (buttonMeasured && float.IsFinite(buttonTop))
-            {
-                bool steady = float.IsFinite(_seedButtonTop) && Math.Abs(buttonTop - _seedButtonTop) <= 1f;
-                _seedSettleFrames = steady ? _seedSettleFrames + 1 : 0;
-                _seedButtonTop = buttonTop;
-                _seedAttempts++;
-                if (_seedSettleFrames < ButtonSettleFrames && _seedAttempts < ButtonSettleAttempts) return false;
-            }
+            if (!ButtonSettled(buttonMeasured, buttonTop)) return false;
             strip = new BoardStrip(top, bottom, buttonMeasured, buttonTop);
             room = Math.Min(bottom, Screen.height - 8f) - top;
             return room > 0f;
@@ -491,21 +484,51 @@ internal static class ResultsDisplay
         // nothing that counts as "the page stopped changing" - a page that never finishes drawing never gets its
         // board, and this is asked again on every frame the board is not yet up.
         if (!CompletionReady(page)) return false;
-        if (!SuccessRegion(page, out area))
+        bool measuredButton;
+        float measuredTop;
+        if (!SuccessRegion(page, out area, out measuredButton, out measuredTop))
         {
             // Neither edge could be read on this build, so the board keeps the historical fraction of the
             // window. Only the top of the page is cleared in that case, never a measured element drawn over.
             // The readiness gate above has already established that the completion section is really on screen;
             // what is unreadable here is its rectangle, not whether it has been drawn.
             area = ResultsRegion.Resolve(false, 0f, false, 0f, Screen.height, MessageGap);
+            measuredButton = false;
+            measuredTop = float.NaN;
             if (HeadingReports.Add("success-region-fallback"))
                 Plugin.Logger?.LogInfo("[DIAG] success region: the completion section and the lobby button could not both be measured, so the board falls back to the historical fraction of the window; both elements remain above and below it regardless.");
         }
+        // The success page animates its footer in too, so its one measurement is taken against a settled
+        // button edge as well. A strip read mid-reveal would be permanently shorter than the page really
+        // offers, and the board is measured once and then kept for the life of the page.
+        // The footer is revealed from zero alpha, and a control nobody can see is deliberately not a bound - so
+        // the first frames of a freshly opened page offer no edge at all. Waiting for the reveal is what buys
+        // the board the height that is really there above the button; the wait is bounded, so a page whose
+        // button never becomes acceptable is still laid out with the historical fraction of the window.
+        else if (!measuredButton)
+        {
+            if (++_seedButtonMisses < ButtonSettleAttempts) return false;
+        }
+        else if (!ButtonSettled(measuredButton, measuredTop)) return false;
         if (!area.Fits) return false;
         top = Math.Max(0f, area.Top) + Mathf.Max(0f, Plugin.ResultsOffsetY.Value);
         room = Math.Min(area.Bottom, Screen.height - 8f) - top;
-        strip = new BoardStrip(top, top + room, false, float.NaN);
+        // The measured button travels with the strip: it is the edge the board may never reach, on either page.
+        strip = new BoardStrip(top, top + room, measuredButton, measuredTop);
         return room > 0f;
+    }
+
+    // The footer of a result page animates in, so the button's own top edge is only trusted once it has
+    // stopped moving. A page whose button could not be measured has nothing to wait for, and the wait is
+    // bounded so a hover that keeps nudging the edge cannot hold the board back for ever.
+    private static bool ButtonSettled(bool measured, float top)
+    {
+        if (!measured || !float.IsFinite(top)) return true;
+        bool steady = float.IsFinite(_seedButtonTop) && Math.Abs(top - _seedButtonTop) <= 1f;
+        _seedSettleFrames = steady ? _seedSettleFrames + 1 : 0;
+        _seedButtonTop = top;
+        _seedAttempts++;
+        return _seedSettleFrames >= ButtonSettleFrames || _seedAttempts >= ButtonSettleAttempts;
     }
 
     private static string _completionState;
@@ -544,9 +567,11 @@ internal static class ResultsDisplay
     // The success page's completion section and its lobby button, reduced to the strip between them. Both
     // are read from the page itself: the sector box, its header and the four cleared-sector icons make up
     // the completion section, and the deepest edge the page actually drew is the one the board must clear.
-    private static bool SuccessRegion(Component page, out ResultsSafeArea area)
+    private static bool SuccessRegion(Component page, out ResultsSafeArea area, out bool buttonMeasured, out float buttonTop)
     {
         area = default;
+        buttonMeasured = false;
+        buttonTop = float.NaN;
         var success = page != null ? page.TryCast<CM_PageExpeditionSuccess>() : null;
         if (success == null) return false;
         float completion = float.NaN, button = float.NaN;
@@ -558,6 +583,8 @@ internal static class ResultsDisplay
             completion = ResultsRegion.LowestBottom(Bottom(success.m_sectorIconSecond), completion);
             completion = ResultsRegion.LowestBottom(Bottom(success.m_sectorIconThird), completion);
             completion = ResultsRegion.LowestBottom(Bottom(success.m_sectorIconAllCompleted), completion);
+            // Only a button the player can really see bounds the strip; ButtonBand answers for every button
+            // the page has actually drawn, which includes the one this build does not know by name.
             button = ResultsRegion.HighestTop(VisibleTop(success.m_btnLeaveExpedition), button);
             button = ButtonBand(page, button);
         }
@@ -573,10 +600,11 @@ internal static class ResultsDisplay
         // failure board is aligned to later in the same window. Recorded from the same measurement the
         // success board itself uses, so the two can never disagree.
         if (completionMeasured) FailureAlignment.RememberCompletion(completion, Screen.height);
-        bool buttonMeasured = float.IsFinite(button);
-        area = ResultsRegion.Resolve(completionMeasured, completion, buttonMeasured, button, Screen.height, MessageGap);
+        buttonMeasured = float.IsFinite(button);
+        buttonTop = buttonMeasured ? button : float.NaN;
+        area = ResultsRegion.Resolve(completionMeasured, completion, buttonMeasured, buttonTop, Screen.height, MessageGap);
         if (HeadingReports.Add("success-region"))
-            Plugin.Logger?.LogInfo($"[DIAG] success region: completion={(completionMeasured ? completion.ToString("0") : "unmeasurable")}, lobbyButton={(buttonMeasured ? button.ToString("0") : "unmeasurable")}, boardTop={area.Top:0}, room={area.Height:0} of a {Screen.height} window; all four players scale into the strip rather than being trimmed to it.");
+            Plugin.Logger?.LogInfo($"[DIAG] success region: completion={(completionMeasured ? completion.ToString("0") : "unmeasurable")}, lobbyButton={(buttonMeasured ? buttonTop.ToString("0") : "unmeasurable")}, boardTop={area.Top:0}, room={area.Height:0} of a {Screen.height} window; the strip runs from the completion section to the visible button's own upper edge, not to a hidden, transparent or off-page control, and all four players scale into it rather than being trimmed to it.");
         return area.Fits;
     }
 
@@ -605,16 +633,66 @@ internal static class ResultsDisplay
     private static float Bottom(GameObject host) => host == null ? float.NaN : Bottom(host.transform);
     private static float Top(Component element) => TryScreenRect(element, out LayoutRect rect) ? rect.Y : float.NaN;
 
-    // Same figure, but only for a control the player can actually see. The failure page keeps a restart
-    // control in its hierarchy with a rect above the lobby button while it is not shown at all, and reading
-    // it cost the board 143 px of height on a 2560x1440 screen. This is scoped to the buttons that bound
-    // the failure strip on purpose: the success page measures its own footer with `Top`, and changing that
-    // shared reading would move a layout nobody has reported a problem with.
+    // The top edge of the part of a page control the player can actually see, or NaN when the control is not
+    // on this page at all. Three things are asked of it, and all three have cost the board height before:
+    // the control has to be switched on, it has to be drawn (its canvas group and its own graphics are not
+    // faded out), and it has to lie on the frame the player is looking at. The edge returned is the highest
+    // renderer the control draws - the real upper edge of the button, not the container's padded rect - so
+    // the strip runs from the heading down to the button the player presses and no further.
     private static float VisibleTop(Component element)
     {
         if (element == null) return float.NaN;
-        try { if (!element.gameObject.activeInHierarchy) return float.NaN; } catch { return float.NaN; }
-        return TryScreenRect(element, out LayoutRect rect) ? rect.Y : float.NaN;
+        bool active;
+        try { active = element.gameObject.activeInHierarchy; } catch { return float.NaN; }
+        if (!active) return float.NaN;
+        float top = float.NaN, bottom = float.NaN;
+        try
+        {
+            var renderers = element.GetComponentsInChildren<Renderer>(true);
+            if (renderers != null)
+                foreach (Renderer child in renderers)
+                {
+                    if (child == null || !child.enabled) continue;
+                    if (!TryScreenRect(child, out LayoutRect nested)) continue;
+                    top = float.IsFinite(top) ? Math.Min(top, nested.Y) : nested.Y;
+                    bottom = float.IsFinite(bottom) ? Math.Max(bottom, nested.Bottom) : nested.Bottom;
+                }
+        }
+        catch { }
+        // A control that draws nothing measurable is read from its own rect instead.
+        if (!float.IsFinite(top) && TryScreenRect(element, out LayoutRect own)) { top = own.Y; bottom = own.Bottom; }
+        if (!float.IsFinite(top)) return float.NaN;
+        return ResultsButtonPolicy.Visible(active, ControlAlpha(element), top, bottom, Screen.width, Screen.height)
+            ? top : float.NaN;
+    }
+
+    // How visible a control is, as the product of every canvas group above it and the strongest colour
+    // alpha among its own graphics. An alpha that cannot be read is reported as 1 so a control nobody could
+    // measure is protected rather than dropped.
+    private static float ControlAlpha(Component element)
+    {
+        if (element == null) return 1f;
+        float alpha = 1f;
+        try
+        {
+            Transform node = element.transform;
+            int guard = 0;
+            while (node != null && guard++ < 32)
+            {
+                var group = node.TryCast<CanvasGroup>();
+                if (group != null && float.IsFinite(group.alpha)) alpha *= Mathf.Clamp01(group.alpha);
+                node = node.parent;
+            }
+            float drawn = float.NaN;
+            foreach (Graphic graphic in element.GetComponentsInChildren<Graphic>(true))
+            {
+                if (graphic == null || !float.IsFinite(graphic.color.a)) continue;
+                drawn = float.IsFinite(drawn) ? Math.Max(drawn, graphic.color.a) : graphic.color.a;
+            }
+            if (float.IsFinite(drawn)) alpha *= Mathf.Clamp01(drawn);
+            return Mathf.Clamp01(alpha);
+        }
+        catch { return 1f; }
     }
 
     // The rect of a button component can include layout padding above the control a player actually sees,
@@ -784,8 +862,11 @@ internal static class ResultsDisplay
             {
                 if (button == null) continue;
                 var element = button.TryCast<Component>();
-                if (element == null || !element.gameObject.activeInHierarchy) continue;
-                best = ResultsRegion.HighestTop(Top(element), best);
+                if (element == null) continue;
+                // Only a button the player can really see bounds the board: a control this page keeps in its
+                // hierarchy switched off, faded to nothing or laid out past the frame is not one of them, and
+                // the edge taken is the button's own visible upper edge rather than its padded container.
+                best = ResultsRegion.HighestTop(VisibleTop(element), best);
             }
         }
         catch (Exception error)

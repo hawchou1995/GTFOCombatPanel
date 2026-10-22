@@ -58,6 +58,24 @@ public static class CombatStrings
     public static string TotalHeader { get { return Pick("综合统计", "TOTAL"); } }
     public static string WeaponsHeader { get { return Pick("武器", "WEAPONS"); } }
     public static string SquadHeader { get { return Pick("玩家/综合", "Player/TOTAL"); } }
+    // ---- the one cell separator of the settlement board -------------------------------------------
+    // Every compound cell of the influence board holds fields of the same kind, and they are held apart
+    // by this and nothing else: no brackets, no comma, no run of spaces. What each field counts, and in
+    // which unit, is named once - in the row label or in the header above the column - so a cell is only
+    // values: `3 / 1 / 123.4`. A figure nobody could observe is the placeholder, an estimate keeps `~`
+    // and a percentage keeps `%`.
+    public const string CellSeparator = " / ";
+    public static string Compound(params string[] fields)
+    {
+        if (fields == null || fields.Length == 0) return Placeholder;
+        var kept = new List<string>(fields.Length);
+        for (int index = 0; index < fields.Length; index++)
+        {
+            if (fields[index] == null) continue;
+            kept.Add(fields[index]);
+        }
+        return kept.Count == 0 ? Placeholder : string.Join(CellSeparator, kept);
+    }
 
     // ---- The influence board ------------------------------------------------------------
     // Rows of the result board, in order: the player's place and name, the score, the sentence, the
@@ -87,23 +105,28 @@ public static class CombatStrings
     public static string ImpactMetricHeader { get { return Pick("指标", "Metrics"); } }
 
     // One metric row's label; the order is the display order, which is also ImpactMetric's.
+    //
+    // The label is where a compound cell says what its fields are: the cell itself holds nothing but the
+    // values, so `250.0 / 25.0%` is read under `总伤害 / 占比`, and `3 / 1 / 123.4` under
+    // `近战击杀 / 沉睡 / 伤害`. The kill tiers print one bare total each - no state split, no unit word -
+    // which is why their labels stay plain.
     public static string MetricLabel(ImpactMetric metric)
     {
         switch (metric)
         {
-            case ImpactMetric.TotalDamage: return Pick("总伤害", "Total damage");
+            case ImpactMetric.TotalDamage: return Pick("总伤害 / 占比", "Total damage / share");
             case ImpactMetric.Stagger: return Pick("硬直阻止", "Stagger");
             case ImpactMetric.Kills: return Pick("击杀", "Kills");
             case ImpactMetric.Revives: return Pick("救援队友", "Revives");
             case ImpactMetric.WeakspotRate: return Pick("弱点命中率", "Weakspot rate");
             case ImpactMetric.Accuracy: return Pick("命中率", "Hit rate");
-            case ImpactMetric.SupplyEfficiency: return Pick("补给效率", "Supply efficiency");
+            case ImpactMetric.SupplyEfficiency: return Pick("补给效率 / 本人 / 弹药", "Supply efficiency / self / ammo");
             case ImpactMetric.ToolEfficiency: return Pick("工具效率", "Tool efficiency");
             case ImpactMetric.LoneSurvivor: return Pick("单人存活", "Lone survivor");
-            case ImpactMetric.Downs: return Pick("阵亡", "Downs");
-            case ImpactMetric.FriendlyFire: return Pick("友伤/致倒", "Friendly fire / downs");
-            case ImpactMetric.MeleeKills: return Pick("近战击杀", "Melee kills");
-            case ImpactMetric.ScoutKills: return Pick("触手击杀", "Scout kills");
+            case ImpactMetric.Downs: return Pick("阵亡 / 失血", "Downs / health lost");
+            case ImpactMetric.FriendlyFire: return Pick("友伤 / 致倒", "Friendly fire / downs");
+            case ImpactMetric.MeleeKills: return Pick("近战击杀 / 沉睡 / 伤害", "Melee kills / sleeping / damage");
+            case ImpactMetric.ScoutKills: return Pick("触手击杀 / 沉睡 / 伤害", "Scout kills / sleeping / damage");
             default: return string.Empty;
         }
     }
@@ -272,38 +295,37 @@ public static class CombatStrings
     public static string ReasonFriendlyFire(string damage, long deaths) => Pick("友伤 " + damage + "，致倒 " + Count(deaths) + " 次", "friendly fire " + damage + ", downed teammates " + Count(deaths) + "x");
     public static string ReasonMeleeKills(long kills, string damage) => Pick("近战击杀 " + Count(kills) + " 次，伤害 " + damage, Count(kills) + " melee kills, damage " + damage);
     public static string ReasonScoutKills(long kills) => Pick("Scout 击杀 " + Count(kills) + " 只", Count(kills) + " Scouts killed");
-    public static string MeleeKillsCell(string kills, string damage) => Pick("击杀 " + kills + " / 伤害 " + damage, kills + " kills / " + damage + " damage");
-    public static string FriendlyFireCell(string damage, string deaths) => damage + " / " + deaths;
-    public static string ToolScan(bool estimated, string uses, string marks, string totalMarks) => (estimated ? "~" : string.Empty) + Pick("扫描 " + uses + " 次 首次标记 " + marks + " 只 累计标记 " + totalMarks + " 只", "Scan " + uses + "x first-marked " + marks + " cumulative " + totalMarks);
+    // The melee and Scout rows carry the same three figures in the same order - total kills, the part of
+    // them landed while the enemy was asleep, and the damage that went with them - so the two rows read
+    // alike and the label above each one names all three.
+    public static string FriendlyFireCell(string damage, string deaths) => Compound(damage, deaths);
+    // The tool detail is the one cell whose meaning cannot live in a shared row label: every player at the
+    // table may hold a different tool, so each figure keeps its own one-word tag and the fields are held
+    // apart by the board's one separator instead of by a run of spaces.
+    public static string ToolScan(bool estimated, string uses, string marks, string totalMarks)
+        => (estimated ? "~" : string.Empty) + Compound(Pick("扫描 " + uses + " 次", "scan " + uses + "x"),
+            Pick("首次 " + marks + " 只", "first " + marks), Pick("累计 " + totalMarks + " 只", "cumulative " + totalMarks));
     public static string ToolScanUnavailable => Pick("扫描 —", "Scan —");
-    public static string ToolSentry(string shots, string hits, string damage) => Pick("射击 " + shots + " 命中 " + hits + " 伤害 " + damage, "shots " + shots + " hits " + hits + " damage " + damage);
-    public static string ToolMine(string deployed, string triggered, string damage) => Pick("部署 " + deployed + " 触发 " + triggered + " 伤害 " + damage, "deployed " + deployed + " triggered " + triggered + " damage " + damage);
-    public static string ToolGlue(string shots, string hits, string glued) => Pick("射击 " + shots + " 命中 " + hits + " 胶住 " + glued, "shots " + shots + " hits " + hits + " stuck " + glued);
+    public static string ToolSentry(string shots, string hits, string damage)
+        => Compound(Pick("射击 " + shots, "shots " + shots), Pick("命中 " + hits, "hits " + hits), Pick("伤害 " + damage, "damage " + damage));
+    public static string ToolMine(string deployed, string triggered, string damage)
+        => Compound(Pick("部署 " + deployed, "deployed " + deployed), Pick("触发 " + triggered, "triggered " + triggered), Pick("伤害 " + damage, "damage " + damage));
+    public static string ToolGlue(string shots, string hits, string glued)
+        => Compound(Pick("射击 " + shots, "shots " + shots), Pick("命中 " + hits, "hits " + hits), Pick("胶住 " + glued, "stuck " + glued));
 
-    // ---- the new cells -----------------------------------------------------------------------
-    // The state a kill was landed in, appended to the count it belongs to. Nothing is appended when
-    // every kill was awake and every state was readable, so an ordinary tier row keeps its bare count;
-    // a state nobody could read prints as 未知 instead of being folded into the awake figure.
-    public static string KillStateSuffix(long sleeping, long awake, long unknown)
-    {
-        if (sleeping <= 0 && unknown <= 0) return string.Empty;
-        if (English) return " (asleep " + Count(sleeping) + " awake " + Count(awake) + " unknown " + Count(unknown) + ")";
-        return "（沉睡 " + Count(sleeping) + " 清醒 " + Count(awake) + " 未知 " + Count(unknown) + "）";
-    }
-    // The supply cell: the utilization the score was built from, and - once this player's own pack use
-    // has been observed - how many packs they actually consumed and how many of those were ammo.
+    // The supply cell: the utilization the score was built from, then how many packs this player actually
+    // consumed and how many of those were ammo. `补给效率 / 本人 / 弹药` names the three in that order.
     public static string SupplyCell(string efficiency, long selfUses, long ammoUses)
     {
         if (selfUses <= 0 && ammoUses <= 0) return efficiency;
-        if (English) return efficiency + " (self " + Count(selfUses) + " / ammo " + Count(ammoUses) + ")";
-        return efficiency + "（本人 " + Count(selfUses) + " / 弹药 " + Count(ammoUses) + "）";
+        return Compound(efficiency, Count(selfUses), Count(ammoUses));
     }
-    // The down cell: how often, and - once anything was lost - how much lifetime that actually cost.
+    // The down cell: how often, then - once anything was lost - how much lifetime that actually cost.
+    // `阵亡 / 失血` names the pair.
     public static string DownsCell(string count, double healthLost)
     {
         if (!double.IsFinite(healthLost) || healthLost <= 0) return count;
-        string lost = CombatStatsFormatter.FormatDamage(healthLost);
-        return English ? count + " (lost " + lost + " hp)" : count + "（失血 " + lost + "）";
+        return Compound(count, CombatStatsFormatter.FormatDamage(healthLost));
     }
 
     private static string Count(long value) { return (value > 0 ? value : 0).ToString(CultureInfo.InvariantCulture); }

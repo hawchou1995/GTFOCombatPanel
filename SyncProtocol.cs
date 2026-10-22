@@ -48,6 +48,14 @@ public enum SyncFlags : uint
     // whole squad as the sending host counted it.
     SquadDamagePartial = 1u << 31,
 }
+// The flags word is full: every bit of `SyncFlags` is spoken for, and a snapshot that needs a new one gets
+// a second word rather than a renumbering. Only the two below are in it so far.
+public enum SyncFlags2 : uint
+{
+    // The Scout row's damage, which only the machine that dealt the blow can count.
+    ScoutDamageObserved = 1u << 0,
+    ScoutDamageEstimated = 1u << 1,
+}
 // Everything a peer cannot work out on its own, as a struct a network serializer can copy field by
 // field. Every member is a primitive: no strings, no collections, no game types. Names travel as
 // packed UTF-8 words, so the whole file is exercised by the smoke suite without Unity.
@@ -101,10 +109,22 @@ public struct SyncSnapshot
     // figure somebody did report; see SyncProtocol.CombineAmount.
     public float HealthLost;
 
+    // ---- v8: the damage that went into Scouts, which is the third field of that row. Appended after the
+    // v7 members together with a second flags word, so every earlier field keeps its offset and the old
+    // word keeps every bit it had; only the length changed, and the receiver checks that exactly.
+    public uint Flags2;
+    public float ScoutEnemyDamage;
+
     public bool Has(SyncFlags flag) => (Flags & (uint)flag) != 0;
     public void Set(SyncFlags flag, bool on)
     {
         if (on) Flags |= (uint)flag; else Flags &= ~(uint)flag;
+    }
+
+    public bool Has2(SyncFlags2 flag) => (Flags2 & (uint)flag) != 0;
+    public void Set2(SyncFlags2 flag, bool on)
+    {
+        if (on) Flags2 |= (uint)flag; else Flags2 &= ~(uint)flag;
     }
 
     public void SetPrimaryName(string name)
@@ -159,7 +179,10 @@ public static class SyncProtocol
     // its cumulative health lost travel with the row, and a host whose squad total covers only the rows it
     // could measure says so. A v6 peer is therefore refused by name (`VersionMismatch`) rather than being
     // read with the wrong length: its body is 304 bytes where this build reads 352.
-    public const uint Version = 7;
+    // 8: the damage that went into Scouts travels with the row. A v7 peer is refused by name
+    // (`VersionMismatch`) rather than read with the wrong length: its body is 352 bytes where this build
+    // reads 360.
+    public const uint Version = 8;
     // The two packet kinds the envelope carries. They live here (rather than in the Unity-facing transport)
     // so the headless framing tests and the runtime sender agree on them by construction.
     public const ushort KindHello = 1;
@@ -300,6 +323,11 @@ public static class SyncProtocol
         snap.SelfSupplyUses = Clamp(impact.SelfSupplyUses);
         snap.SelfAmmoUses = Clamp(impact.SelfAmmoUses);
         snap.HealthLost = PositiveFinite((float)impact.HealthLost);
+        // The Scout row's damage. Zero is not a measurement here any more than it is for health lost, so the
+        // observed flag is what carries "this machine counted it and the answer was nothing yet".
+        snap.ScoutEnemyDamage = PositiveFinite((float)impact.ScoutDamage);
+        snap.Set2(SyncFlags2.ScoutDamageObserved, impact.ScoutDamageObserved);
+        snap.Set2(SyncFlags2.ScoutDamageEstimated, impact.ScoutDamageEstimated);
 
         WeaponCombatStats primary = SlotOf(player, primarySlot);
         if (primary != null)
@@ -419,6 +447,9 @@ public static class SyncProtocol
         impact.SelfSupplyUses = snap.SelfSupplyUses;
         impact.SelfAmmoUses = snap.SelfAmmoUses;
         impact.HealthLost = PositiveFinite(snap.HealthLost);
+        impact.ScoutDamage = PositiveFinite(snap.ScoutEnemyDamage);
+        impact.ScoutDamageObserved = snap.Has2(SyncFlags2.ScoutDamageObserved);
+        impact.ScoutDamageEstimated = snap.Has2(SyncFlags2.ScoutDamageEstimated);
         if (snap.Has(SyncFlags.PrimaryPresent))
         {
             WeaponCombatStats weapon = target.Weapon(primarySlot, snap.PrimaryArchetypeId,
@@ -562,6 +593,14 @@ public static class SyncProtocol
         // erases a figure the other side reported. The host applied the damage, so its figure is the one
         // that survives a tie.
         result.HealthLost = CombineAmount(existing.HealthLost, existingIsHost, incoming.HealthLost, incomingIsHost);
+        // The Scout row's damage follows the same rule as health lost: an amount where a zero means "this
+        // side did not report it", and the host's figure surviving a tie because the host applied the blow.
+        // Only the two bits of the second word that belong to this field move with it.
+        Choose2(existing.ScoutEnemyDamage, existing.Flags2, SyncFlags2.ScoutDamageObserved, SyncFlags2.ScoutDamageEstimated, existingIsHost,
+            incoming.ScoutEnemyDamage, incoming.Flags2, SyncFlags2.ScoutDamageObserved, SyncFlags2.ScoutDamageEstimated, incomingIsHost, true,
+            out float scoutDamage, out uint scoutFlags);
+        result.ScoutEnemyDamage = scoutDamage;
+        result.Flags2 = (result.Flags2 & ~((uint)SyncFlags2.ScoutDamageObserved | (uint)SyncFlags2.ScoutDamageEstimated)) | scoutFlags;
         float oldSentryDamage = PositiveFinite(existing.SentryDamage), newSentryDamage = PositiveFinite(incoming.SentryDamage);
         float oldMineDamage = PositiveFinite(existing.MineDamage), newMineDamage = PositiveFinite(incoming.MineDamage);
         result.SentryDamage = newSentryDamage > 0 ? newSentryDamage : oldSentryDamage;
@@ -765,6 +804,29 @@ public static class SyncProtocol
     {
         if ((flags & (uint)observed) == 0) return 0;
         return (flags & (uint)estimated) != 0 ? 1 : 2;
+    }
+
+    // The same decision against the second flags word. It exists rather than renumbering `SyncFlags`,
+    // because every bit of that word is already spoken for and a v7 peer has to keep reading it as it was;
+    // the two words are merged by the same rule, so an estimate never displaces a measurement.
+    private static bool Choose2(float existingValue, uint existingFlags, SyncFlags2 existingObserved, SyncFlags2 existingEstimated, bool existingIsHost,
+        float incomingValue, uint incomingFlags, SyncFlags2 incomingObserved, SyncFlags2 incomingEstimated, bool incomingIsHost, bool preferHostOnTie,
+        out float value, out uint flags)
+    {
+        int existingRank = Rank2(existingFlags, existingObserved, existingEstimated);
+        int incomingRank = Rank2(incomingFlags, incomingObserved, incomingEstimated);
+        bool ours = incomingRank > existingRank
+            || incomingRank == existingRank && incomingRank > 0
+               && (existingIsHost == incomingIsHost ? true : preferHostOnTie == incomingIsHost);
+        value = ours ? incomingValue : existingValue;
+        flags = (ours ? incomingFlags : existingFlags) & ((uint)existingObserved | (uint)existingEstimated);
+        return ours;
+    }
+
+    private static int Rank2(uint flags, SyncFlags2 observed, SyncFlags2 estimated)
+    {
+        if ((flags & (uint)observed) == 0) return 0;
+        return (flags & (uint)estimated) == 0 ? 2 : 1;
     }
 
     private static WeaponCombatStats SlotOf(CombatPlayer player, int slot)

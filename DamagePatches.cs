@@ -11,8 +11,13 @@ internal static class DamageTargets
 {
     internal static IEnumerable<MethodBase> Methods(string name)
     {
-        yield return AccessTools.DeclaredMethod(typeof(Dam_EnemyDamageBase), name);
-        yield return AccessTools.DeclaredMethod(typeof(Dam_PlayerDamageBase), name);
+        // A method the game does not have is skipped, never yielded as null: Harmony's patch processor throws
+        // on a null target, Plugin.PatchAll does not guard the call, and a throw there costs every patch class
+        // that comes after it - which is how one renamed game method silently empties the whole panel.
+        MethodBase enemy = AccessTools.DeclaredMethod(typeof(Dam_EnemyDamageBase), name);
+        if (enemy != null) yield return enemy;
+        MethodBase player = AccessTools.DeclaredMethod(typeof(Dam_PlayerDamageBase), name);
+        if (player != null) yield return player;
     }
 }
 
@@ -99,20 +104,47 @@ internal static class LocalBulletDamagePatch
 {
     private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(Dam_EnemyDamageLimb), "BulletDamage");
 
+    // What the blow is worth is read as the health the enemy actually lost, never from the `dam`
+    // argument. That argument is the figure the weapon carries before the game applies the armour of the
+    // limb that was struck and the precision multiplier of the hit, so a shot that landed on a weakspot
+    // was recorded as though every hit were the same - which is exactly why a precise primary could read
+    // lower than the same rifle fired into a body. The health before the call and after it is the applied
+    // damage, the same measurement the receive path above takes from its own packet.
+    //
+    // A finalizer rather than a postfix, so the figure is read exactly once whether the call returns or
+    // throws, and a fault in this mod never replaces what the game was going to do.
     [HarmonyPrefix]
-    private static void Prefix(Dam_EnemyDamageLimb __instance, float dam, Agent sourceAgent, uint gearCategoryId)
-        => CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, dam, DamageKind.Bullet, gearCategoryId);
+    private static void Prefix(Dam_EnemyDamageLimb __instance, out float __state)
+        => __state = CombatTracker.LimbHealth(__instance);
+
+    [HarmonyFinalizer]
+    private static Exception Finalizer(Dam_EnemyDamageLimb __instance, Agent sourceAgent, uint gearCategoryId,
+        float __state, Exception __exception)
+    {
+        CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, __state, DamageKind.Bullet, gearCategoryId);
+        return __exception;
+    }
 }
 
 // Melee travels its own method and carries the same two parameters that matter, so it gets its own hook.
+// The amount is read the same way: a backstab, a weakspot blow and a sleeper multiplier all live between
+// the argument and the health the enemy lost, so the argument is never the figure printed.
 [HarmonyPatch]
 internal static class LocalMeleeDamagePatch
 {
     private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(Dam_EnemyDamageLimb), "MeleeDamage");
 
     [HarmonyPrefix]
-    private static void Prefix(Dam_EnemyDamageLimb __instance, float dam, Agent sourceAgent, uint gearCategoryId)
-        => CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, dam, DamageKind.Melee, gearCategoryId);
+    private static void Prefix(Dam_EnemyDamageLimb __instance, out float __state)
+        => __state = CombatTracker.LimbHealth(__instance);
+
+    [HarmonyFinalizer]
+    private static Exception Finalizer(Dam_EnemyDamageLimb __instance, Agent sourceAgent, uint gearCategoryId,
+        float __state, Exception __exception)
+    {
+        CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, __state, DamageKind.Melee, gearCategoryId);
+        return __exception;
+    }
 }
 
 // Explosive damage, which this build had no hook for at all until a modded plasma gun showed 0/0/0 while it

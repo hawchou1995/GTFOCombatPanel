@@ -1,5 +1,5 @@
 {
-  "Guidance": "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚。MeleeKills / ScoutKills 分别按近战击杀与 Scout 击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingKillMultiplier 为沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的击杀，状态未知按清醒计。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。无效文件保留上次有效配置，缺失时自动创建默认文件。",
+  "Guidance": "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚。MeleeKills / ScoutKills 分别按近战击杀与 Scout 击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingMeleeKillMultiplier / SleepingScoutKillMultiplier 分别为近战击杀、触手击杀中沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的那一部分，状态未知按清醒计；小怪/精英/BOSS 三档不再使用睡眠倍率，只统计总数。旧的 SleepingKillMultiplier 保留，作为文件中缺少这两项时的回退来源。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。无效文件保留上次有效配置，缺失时自动创建默认文件。",
   "Weights": {
     "TotalDamage": 0.95,
     "Stagger": 1.4,
@@ -22,6 +22,8 @@
   "EliteKillWeight": 1,
   "BossKillWeight": 1.5,
   "SleepingKillMultiplier": 2,
+  "SleepingMeleeKillMultiplier": 2,
+  "SleepingScoutKillMultiplier": 2,
   "FirepowerBonus": 1.15,
   "UtilityBonus": 1,
   "SupportToolNames": [

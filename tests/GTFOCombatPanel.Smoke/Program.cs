@@ -32,6 +32,7 @@ internal static partial class Program
         Check(shot.Hits == 0, "contacts outside a firing window do not manufacture hits");
         shot.BeginPellet(); shot.Contact(false); shot.Contact(true); shot.Contact(true);
         Check(shot.Fired == 1 && shot.Hits == 1 && shot.WeakspotHits == 1, "penetration contacts count once and upgrade weakspot once");
+        RunSquadGateScenarios();
         var shotgun = new ShotSample();
         for (int i = 0; i < 8; i++) { shotgun.BeginPellet(); if (i < 4) { shotgun.Contact(i < 2); shotgun.Contact(false); } }
         Check(shotgun.Fired == 8 && shotgun.Hits == 4 && shotgun.WeakspotHits == 2, "shotgun pellets, misses, penetration and weakspots are independently counted");
@@ -199,7 +200,7 @@ internal static partial class Program
         // one build writes is what the other reads back, and a packet too short to hold one is refused
         // rather than read as a half-filled row.
         byte[] wire = SyncProtocol.Encode(round);
-        Check(SyncProtocol.SnapshotSize == 352 && wire.Length == 352, "the v7 snapshot carries new state and consumption counters with native alignment");
+        Check(SyncProtocol.SnapshotSize == 360 && wire.Length == 360, "the v8 snapshot carries the Scout damage beside every earlier figure, with native alignment");
         Check(SyncProtocol.Decode(wire, 0, wire.Length, out SyncSnapshot readBack), "a snapshot that was written is read back");
         Check(readBack.Owner == round.Owner && readBack.EnemyDamage == round.EnemyDamage && readBack.KillBoss == round.KillBoss
             && readBack.GetPrimaryName() == round.GetPrimaryName() && readBack.GetClassName() == round.GetClassName(),
@@ -835,7 +836,7 @@ internal static partial class Program
         supplier.Counters.CreditScan(4);
         var supplyBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { supplier }, ImpactScoring.DefaultWeights, 1.0, 1.0), false, true);
         Check(supplyBoard.Joined(21, 1) == "30.0%", "one measured supply use displays its utilization");
-        Check(supplyBoard.Joined(22, 1) == "扫描 1 次 首次标记 4 只 累计标记 4 只", "the scanner cell shows attempts, first marks and cumulative marks without a comma");
+        Check(supplyBoard.Joined(22, 1) == "扫描 1 次 / 首次 4 只 / 累计 4 只", "the scanner cell shows attempts, first marks and cumulative marks, one field per clause");
         Check(supplyBoard.Tone(21, 1) == ImpactTone.Gold, "the only supplier leads the supply row");
         var dry = new ImpactInput { Name = "Dry", ToolName = "Bio Tracker" };
         var dryBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { dry }, ImpactScoring.DefaultWeights, 1.0, 1.0), false, true);
@@ -867,7 +868,7 @@ internal static partial class Program
         Check(CombatStrings.KillTierLabel(KillTier.Boss) == "BOSS", "the boss weight class has its own label");
         Check(CombatStrings.Placeholder == "—", "the placeholder is a single dash");
         CombatStrings.Language = "en";
-        Check(CombatStrings.ImpactRowLabels()[0] == "Player" && CombatStrings.ImpactRowLabels()[1] == "Score" && CombatStrings.ImpactRowLabels()[2] == "Rating" && CombatStrings.MetricLabel(ImpactMetric.Downs) == "Downs", "the board's labels follow the language setting");
+        Check(CombatStrings.ImpactRowLabels()[0] == "Player" && CombatStrings.ImpactRowLabels()[1] == "Score" && CombatStrings.ImpactRowLabels()[2] == "Rating" && CombatStrings.MetricLabel(ImpactMetric.Downs) == "Downs / health lost", "the board's labels follow the language setting, and a label that names two figures names both");
         Check(CombatStrings.Title(ImpactRating.Damage) == "Firepower core" && CombatStrings.RankWord(1) == "gold", "the sentences follow the language setting too");
         Check(CombatStrings.KillTierLabel(KillTier.Minor) == "minor", "the weight classes follow the language setting");
         Check(ImpactBoard.Build(report, false, true).Cell(1, 1)[0] == board.Cell(1, 1)[0], "the score itself does not depend on the language");
@@ -988,10 +989,10 @@ internal static partial class Program
         ImpactEntry scanEntry = scanReport.Entries[0];
         Check(ImpactScoring.RawValue(scanEntry.Input, ImpactMetric.ToolEfficiency) == 5,
             "ToolEfficiency score still uses first scan marks");
-        Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "扫描 2 次 首次标记 5 只 累计标记 9 只",
+        Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "扫描 2 次 / 首次 5 只 / 累计 9 只",
             "an equipped scanner shows attempts then first marks in detail");
         scanEntry.Counters.ScanEstimated = true;
-        Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "~扫描 2 次 首次标记 5 只 累计标记 9 只",
+        Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "~扫描 2 次 / 首次 5 只 / 累计 9 只",
             "estimated scan counters retain the marker with the unified format");
         scanEntry.Counters.ScanUses = 0; scanEntry.Counters.ScanFirstMarks = 0; scanEntry.Counters.ScanMarks = 0;
         Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "扫描 —",
@@ -999,9 +1000,10 @@ internal static partial class Program
         // The 总伤害 metric row carries the figure it is named for and its share of the squad total in
         // one cell, and prints the bare figure when no host measured a total to divide by.
         var shareEntry = new ImpactEntry(new ImpactInput { Name = "Share", EnemyDamage = 250 }, null, null, 50, 1, ImpactRating.Damage, (int)ImpactMetric.TotalDamage);
-        Check(ImpactBoard.MetricFields(shareEntry, ImpactMetric.TotalDamage, KillTier.Minor, false, true, squadDamage: 1000)[0] == "250.0 (25.0%)",
-            "the total-damage metric row carries its percentage share of the squad total beside the damage");
-        Check(ImpactBoard.MetricFields(shareEntry, ImpactMetric.TotalDamage, KillTier.Minor, false, true, squadDamage: 0)[0] == "250.0",
+        string[] shareFields = ImpactBoard.MetricFields(shareEntry, ImpactMetric.TotalDamage, KillTier.Minor, false, true, squadDamage: 1000);
+        Check(shareFields.Length == 2 && shareFields[0] == "250.0" && shareFields[1] == "25.0%",
+            "the total-damage metric row carries its percentage share of the squad total as its second field, one figure per field");
+        Check(ImpactBoard.MetricFields(shareEntry, ImpactMetric.TotalDamage, KillTier.Minor, false, true)[0] == "250.0",
             "a squad total nobody measured leaves the total-damage row as the bare figure");
 
         // A hit whose ray this build never saw still has to be scored, and the rate that follows has to say
@@ -1069,7 +1071,7 @@ internal static partial class Program
         var estimatedScan = new ImpactInput { Name = "Scout", ToolName = "Bio Tracker" };
         estimatedScan.Counters.CreditScan(3, true);
         var estimatedBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { estimatedScan }, ImpactScoring.DefaultWeights, 1, 1), false, true);
-        Check(estimatedBoard.Joined(22, 1) == "~扫描 1 次 首次标记 3 只 累计标记 3 只", "estimated scan counters show cumulative marks and keep the estimate marker");
+        Check(estimatedBoard.Joined(22, 1) == "~扫描 1 次 / 首次 3 只 / 累计 3 只", "estimated scan counters show cumulative marks and keep the estimate marker");
         estimatedScan.Counters.Reset();
         Check(!estimatedScan.Counters.ScanEstimated && estimatedScan.Counters.ScanUses == 0 && estimatedScan.Counters.ScanFirstMarks == 0 && estimatedScan.Counters.ScanMarks == 0, "new expeditions clear both scan counts and estimate flags");
         Check(board.Cell(-1, 1).Length == 0 && board.Cell(0, 999).Length == 0 && board.Tone(999, 999) == ImpactTone.Neutral, "board bounds are safe");
@@ -1303,7 +1305,7 @@ internal static partial class Program
         Check(SquadPackets.HeaderBytes == 16 && SquadPackets.HelloBytes == 24 && SquadPackets.SnapshotBytes == SquadPackets.HeaderBytes + SyncProtocol.SnapshotSize,
             "the envelope is key, magic, kind, protocol and the run counter, then the body");
         Check(SquadPackets.Key == 0xFFFE && SquadPackets.Key > 65533, "the packet key is outside the range the game's own replicators use");
-        Check(SyncProtocol.Version == 7, "the protocol is v7 for state and consumption counters");
+        Check(SyncProtocol.Version == 8, "the protocol is v8 for the Scout damage that travels beside every earlier figure");
         byte[] helloBytes = SquadPackets.Hello(0x1234UL, 7u, SyncProtocol.Version);
         SquadPacket helloPacket = SquadPackets.Parse(helloBytes, helloBytes.Length);
         Check(helloPacket.Kind == SquadPacketKind.Hello && helloPacket.Sender == 0x1234UL && helloPacket.Generation == 7u && helloPacket.IsOurs,

@@ -177,6 +177,7 @@ public sealed class Plugin : BasePlugin
         {
             ImpactScoring.SetKillWeights(Scoring.MinorKillWeight, Scoring.EliteKillWeight, Scoring.BossKillWeight);
             ImpactScoring.SetSleepingKillMultiplier(Scoring.SleepingKillMultiplier);
+            ImpactScoring.SetSleepingKillMultipliers(Scoring.SleepingMeleeKillMultiplier, Scoring.SleepingScoutKillMultiplier);
             return;
         }
         ImpactScoring.SetKillWeights(
@@ -186,6 +187,7 @@ public sealed class Plugin : BasePlugin
         // The sleeping multiplier has no .cfg entry of its own: with the file off or unusable the published
         // default stands, which is what a build carrying no file at all scores with.
         ImpactScoring.SetSleepingKillMultiplier(ImpactScoring.DefaultSleepingKillMultiplier);
+        ImpactScoring.SetSleepingKillMultipliers(ImpactScoring.DefaultSleepingKillMultiplier, ImpactScoring.DefaultSleepingKillMultiplier);
     }
 
     // The settlement sentences in force: the scoring file's wording when it is usable, the shipped wording

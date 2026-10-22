@@ -19,7 +19,7 @@ public sealed class ScoringSettings
 {
     public static readonly string[] MetricNames = { "TotalDamage", "Stagger", "Kills", "Revives", "WeakspotRate", "Accuracy", "SupplyEfficiency", "ToolEfficiency", "LoneSurvivor", "Downs", "FriendlyFire", "MeleeKills", "ScoutKills" };
 
-    public string Guidance { get; set; } = "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚。MeleeKills / ScoutKills 分别按近战击杀与 Scout 击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingKillMultiplier 为沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的击杀，状态未知按清醒计。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。无效文件保留上次有效配置，缺失时自动创建默认文件。";
+    public string Guidance { get; set; } = "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚。MeleeKills / ScoutKills 分别按近战击杀与 Scout 击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingMeleeKillMultiplier / SleepingScoutKillMultiplier 分别为近战击杀、触手击杀中沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的那一部分，状态未知按清醒计；小怪/精英/BOSS 三档不再使用睡眠倍率，只统计总数。旧的 SleepingKillMultiplier 保留，作为文件中缺少这两项时的回退来源。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。无效文件保留上次有效配置，缺失时自动创建默认文件。";
 
     public Dictionary<string, double> Weights { get; set; } = DefaultWeights();
     public string[] EnabledMetrics { get; set; }
@@ -34,6 +34,11 @@ public sealed class ScoringSettings
     // Bounded to one and up: the multiplier exists to reward the state a kill was landed in, and a value
     // below one would punish it. The JSON carries it and the plugin applies it to the running scoring.
     public double SleepingKillMultiplier { get; set; } = ImpactScoring.DefaultSleepingKillMultiplier;
+    // Nullable backing fields preserve explicit overrides regardless of JSON member order. A legacy-only
+    // file supplies both values through its old multiplier; sparse new files retain that fallback per field.
+    private double? _sleepingMelee, _sleepingScout;
+    public double SleepingMeleeKillMultiplier { get => _sleepingMelee ?? SleepingKillMultiplier; set => _sleepingMelee = value; }
+    public double SleepingScoutKillMultiplier { get => _sleepingScout ?? SleepingKillMultiplier; set => _sleepingScout = value; }
     public double FirepowerBonus { get; set; } = 1.15;
     public double UtilityBonus { get; set; } = 1.0;
     public string[] SupportToolNames { get; set; } = Split(SupportTools.DefaultNames);
@@ -164,6 +169,8 @@ public sealed class ScoringSettings
         // A sleeping kill may be worth several awake ones, never less: the multiplier is the value of a
         // stealth kill, so one is its floor and the documented maximum its ceiling.
         Bound(SleepingKillMultiplier, 1, ImpactScoring.MaxSleepingKillMultiplier, "SleepingKillMultiplier");
+        Bound(SleepingMeleeKillMultiplier, 1, ImpactScoring.MaxSleepingKillMultiplier, "SleepingMeleeKillMultiplier");
+        Bound(SleepingScoutKillMultiplier, 1, ImpactScoring.MaxSleepingKillMultiplier, "SleepingScoutKillMultiplier");
         Bound(FirepowerBonus, 1, ImpactScoring.MaxRoleBonus, "FirepowerBonus");
         Bound(UtilityBonus, 1, ImpactScoring.MaxRoleBonus, "UtilityBonus");
         if (RescueFloor < 0 || RescueFloor > 100) throw new FormatException("RescueFloor must be between 0 and 100.");
@@ -295,7 +302,8 @@ public sealed class ScoringSettings
         text.Append("sup=").Append(string.Join("|", SupportToolNames)).Append('/').Append(string.Join("|", ExcludedTools)).Append('/').Append(OtherToolsAreSupport).Append(';');
         // The sentences and the sleeping multiplier belong here too: a title the user renamed is exactly the
         // kind of change that has to rebuild the settlement board.
-        text.Append("sleep=").Append(SleepingKillMultiplier.ToString("R", CultureInfo.InvariantCulture)).Append(';');
+        text.Append("sleepMelee=").Append(SleepingMeleeKillMultiplier.ToString("R", CultureInfo.InvariantCulture)).Append(';');
+        text.Append("sleepScout=").Append(SleepingScoutKillMultiplier.ToString("R", CultureInfo.InvariantCulture)).Append(';');
         text.Append("titles=");
         foreach (string name in TitleNames)
         {

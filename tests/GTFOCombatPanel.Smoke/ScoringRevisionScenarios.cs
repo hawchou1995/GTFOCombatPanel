@@ -52,18 +52,31 @@ internal static partial class Program
         Check(Math.Abs(ImpactScoring.DefaultSleepingKillMultiplier - 2.0) < 1e-9 && Math.Abs(ImpactScoring.SleepingKillMultiplier - 2.0) < 1e-9,
             "a sleeping kill is worth two awake ones by default");
         Check(Math.Abs(ImpactScoring.WeightedKills(2, 0, 0) - 1.0) < 1e-9, "two awake minor kills are worth one minor-kill point");
-        Check(Math.Abs(ImpactScoring.WeightedKills(2, 0, 0, 2, 0, 0) - 2.0) < 1e-9,
-            "two sleeping minor kills are worth double the awake pair");
-        Check(Math.Abs(ImpactScoring.WeightedKills(1, 1, 1, 1, 1, 1) - 6.0) < 1e-9,
-            "the multiplier applies to every tier");
-        Check(Math.Abs(ImpactScoring.WeightedKills(1, 0, 0, 5, 0, 0) - 1.0) < 1e-9,
-            "a sleeping subset that outran its total cannot create extra kills");
+        Check(Math.Abs(new ImpactCounters { MinorKills = 2, SleepingMinorKills = 2 }.WeightedKills - 1.0) < 1e-9,
+            "two sleeping minor kills are worth exactly what two awake ones are: a weight class scores its total and nothing else");
+        Check(Math.Abs(ImpactScoring.WeightedKills(1, 1, 1) - 3.0) < 1e-9,
+            "the sleeping share never reaches the weight of a tier");
+        Check(Math.Abs(new ImpactCounters { MinorKills = 1, SleepingMinorKills = 5 }.WeightedKills - 0.5) < 1e-9,
+            "a sleeping subset that outran its total cannot change a class total either");
         var awakeAndUnknown = new ImpactCounters { MinorKills = 4, UnknownStateMinorKills = 4 };
         Check(Math.Abs(awakeAndUnknown.WeightedKills - 2.0) < 1e-9,
             "kills of unreadable state are worth an awake kill, never a sleeping one");
+        // The three fields are separate on purpose: the tier rows score their total, and only the melee and
+        // Scout rows carry a multiplier of their own, so a stealth-heavy squad cannot inflate the weight
+        // classes and a melee player does not silently inherit the Scout's tuning.
         ImpactScoring.SetSleepingKillMultiplier(3.0);
-        Check(Math.Abs(ImpactScoring.WeightedKills(2, 0, 0, 2, 0, 0) - 3.0) < 1e-9,
-            "the sleeping multiplier is configurable");
+        Check(Math.Abs(new ImpactCounters { MinorKills = 2, SleepingMinorKills = 2 }.WeightedKills - 1.0) < 1e-9,
+            "the legacy multiplier no longer reaches any tier row, which is the whole point of the split");
+        Check(Math.Abs(ImpactScoring.SleepingWeighted(2, 2) - 6.0) < 1e-9,
+            "the legacy multiplier still drives the generic sleeping-weighted count the two rows are built on");
+        ImpactScoring.SetSleepingKillMultipliers(3.0, 4.0);
+        Check(Math.Abs(ImpactScoring.RawValue(new ImpactInput { Counters = new ImpactCounters { MeleeKills = 2, SleepingMeleeKills = 2 } }, ImpactMetric.MeleeKills) - 6.0) < 1e-9
+            && Math.Abs(ImpactScoring.RawValue(new ImpactInput { Counters = new ImpactCounters { ScoutKills = 2, SleepingScoutKills = 2 } }, ImpactMetric.ScoutKills) - 8.0) < 1e-9,
+            "the melee and Scout rows carry a multiplier each, so one can be tuned without the other");
+        ImpactScoring.SetSleepingKillMultipliers(0.5, 50);
+        Check(Math.Abs(ImpactScoring.SleepingMeleeKillMultiplier - ImpactScoring.DefaultSleepingKillMultiplier) < 1e-9
+            && Math.Abs(ImpactScoring.SleepingScoutKillMultiplier - ImpactScoring.MaxSleepingKillMultiplier) < 1e-9,
+            "each of the two is bounded like the legacy field: below one falls back to the default, above the ceiling is clamped");
         ImpactScoring.SetSleepingKillMultiplier(0.5);
         Check(Math.Abs(ImpactScoring.SleepingKillMultiplier - ImpactScoring.DefaultSleepingKillMultiplier) < 1e-9,
             "a multiplier below one falls back to the published default instead of punishing a stealth kill");
@@ -71,10 +84,21 @@ internal static partial class Program
         Check(Math.Abs(ImpactScoring.SleepingKillMultiplier - ImpactScoring.MaxSleepingKillMultiplier) < 1e-9,
             "the multiplier is bounded by its documented ceiling");
         ImpactScoring.ResetThresholds();
-        Check(Math.Abs(ImpactScoring.SleepingKillMultiplier - 2.0) < 1e-9, "ResetThresholds restores the sleeping multiplier");
+        Check(Math.Abs(ImpactScoring.SleepingKillMultiplier - 2.0) < 1e-9
+            && Math.Abs(ImpactScoring.SleepingMeleeKillMultiplier - 2.0) < 1e-9
+            && Math.Abs(ImpactScoring.SleepingScoutKillMultiplier - 2.0) < 1e-9,
+            "ResetThresholds restores all three sleeping multipliers");
 
         // The JSON carries it, and its bounds are enforced like every other figure.
         Check(Math.Abs(ScoringSettings.Defaults().SleepingKillMultiplier - 2.0) < 1e-9, "the scoring file's default multiplier is two");
+        Check(Math.Abs(ScoringSettings.Defaults().SleepingMeleeKillMultiplier - 2.0) < 1e-9
+            && Math.Abs(ScoringSettings.Defaults().SleepingScoutKillMultiplier - 2.0) < 1e-9,
+            "a fresh file carries the melee and Scout multipliers too, each defaulting to two");
+        ScoringSettings splitFile = ScoringSettings.Parse("{\"SleepingKillMultiplier\": 3, \"SleepingScoutKillMultiplier\": 5}");
+        Check(Math.Abs(splitFile.SleepingMeleeKillMultiplier - 3.0) < 1e-9 && Math.Abs(splitFile.SleepingScoutKillMultiplier - 5.0) < 1e-9,
+            "the older field still feeds the melee row when the newer one is absent, and the newer one wins where it is written");
+        Check(Math.Abs(ScoringSettings.Parse("{\"SleepingScoutKillMultiplier\": 4}").SleepingMeleeKillMultiplier - 2.0) < 1e-9,
+            "a file that names neither falls back to the published default rather than to zero");
         Check(Math.Abs(ScoringSettings.Parse("{\"SleepingKillMultiplier\": 3}").SleepingKillMultiplier - 3.0) < 1e-9,
             "the multiplier round trips through the scoring file");
         Check(Math.Abs(ScoringSettings.Parse(ScoringSettings.Defaults().ToJson()).SleepingKillMultiplier - 2.0) < 1e-9,
@@ -155,23 +179,35 @@ internal static partial class Program
         lost.AddHealthLost(120); lost.AddHealthLost(double.NaN); lost.AddHealthLost(-5); lost.AddHealthLost(80);
         Check(Math.Abs(lost.HealthLost - 200) < 1e-9, "lifetime lost accumulates only real losses");
 
-        // ---- the two cells that gained a figure ------------------------------------------------------
-        Check(CombatStrings.KillStateSuffix(1, 2, 0) == "（沉睡 1 清醒 2 未知 0）", "a sleeping kill prints its full split");
-        Check(CombatStrings.KillStateSuffix(0, 3, 0) == string.Empty, "a fully awake tier keeps its bare count");
-        Check(CombatStrings.KillStateSuffix(0, 0, 2) == "（沉睡 0 清醒 0 未知 2）", "an unreadable state is printed as unknown, not as awake");
+        // ---- the cells that carry a figure beyond their count -------------------------------------------
+        // The three weight classes print their total and nothing else: the sleeping share of a kill is not a
+        // quality of the class, so it neither scores there nor appears there. The melee and Scout rows are
+        // the two that do report a sleeping subset, and each reports it as its own column.
         var splitCounters = new ImpactCounters { MinorKills = 3, SleepingMinorKills = 1, UnknownStateMinorKills = 1 };
         var splitEntry = new ImpactEntry(new ImpactInput { Name = "Split", Counters = splitCounters }, null, null, 40, 1, ImpactRating.MinorKills, (int)ImpactMetric.Kills);
-        Check(ImpactBoard.MetricFields(splitEntry, ImpactMetric.Kills, KillTier.Minor, true, true)[0] == "3（沉睡 1 清醒 1 未知 1）",
-            "the split kill row shows the total and its sleeping / awake / unknown split in the one cell");
+        Check(ImpactBoard.MetricFields(splitEntry, ImpactMetric.Kills, KillTier.Minor, true, true)[0] == "3",
+            "a weight class prints its total only, so a sleeping or unreadable share never reaches that cell");
         Check(ImpactBoard.MetricFields(splitEntry, ImpactMetric.Kills, KillTier.Elite, true, true)[0] == "0",
-            "a tier with nothing to split keeps its plain count");
+            "a tier with nothing in it keeps its plain zero");
         string[] mergedFields = ImpactBoard.MetricFields(splitEntry, ImpactMetric.Kills, KillTier.Minor, false, true);
-        Check(mergedFields.Length == 3 && mergedFields[0] == "3小怪（沉睡 1 清醒 1 未知 1）" && mergedFields[1] == "0精英",
-            "the legacy merged row carries the same split after its weight-class word");
+        Check(mergedFields.Length == 3 && mergedFields[0] == "3小怪" && mergedFields[1] == "0精英" && mergedFields[2] == "0BOSS",
+            "the legacy merged row carries the same bare totals, each with the class word its label cannot hold");
+        var scoutRow = new ImpactCounters { ScoutKills = 2, SleepingScoutKills = 1 };
+        scoutRow.AddScoutDamage(120.5);
+        var scoutEntry = new ImpactEntry(new ImpactInput { Name = "Scout", Counters = scoutRow }, null, null, 40, 1, ImpactRating.ScoutKills, (int)ImpactMetric.ScoutKills);
+        string[] scoutFields = ImpactBoard.MetricFields(scoutEntry, ImpactMetric.ScoutKills, KillTier.Minor, true, true);
+        Check(scoutFields.Length == 3 && scoutFields[0] == "2" && scoutFields[1] == "1"
+            && scoutFields[2] == CombatStatsFormatter.FormatDamage(120.5),
+            "the Scout row is three columns in one cell: its total kills, the part landed on a sleeping one, and the damage that went into them");
+        var meleeRow = new ImpactCounters { MeleeKills = 4, MeleeKillsObserved = true };
+        var meleeEntry = new ImpactEntry(new ImpactInput { Name = "Melee", Counters = meleeRow }, null, null, 40, 1, ImpactRating.MeleeKills, (int)ImpactMetric.MeleeKills);
+        string[] meleeFields = ImpactBoard.MetricFields(meleeEntry, ImpactMetric.MeleeKills, KillTier.Minor, true, true);
+        Check(meleeFields.Length == 3 && meleeFields[0] == "4" && meleeFields[1] == "0",
+            "the melee row reports its sleeping column even when it is empty, so the two rows line up column for column");
         var supplyCounters = new ImpactCounters();
         supplyCounters.RecordSupply(30, 100); supplyCounters.CreditSelfSupply(true);
         var supplyEntry = new ImpactEntry(new ImpactInput { Name = "Supplier", Counters = supplyCounters }, null, null, 40, 1, ImpactRating.Supply, (int)ImpactMetric.SupplyEfficiency);
-        Check(ImpactBoard.MetricFields(supplyEntry, ImpactMetric.SupplyEfficiency, KillTier.Minor, false, true)[0] == "30.0%（本人 1 / 弹药 1）",
+        Check(ImpactBoard.MetricFields(supplyEntry, ImpactMetric.SupplyEfficiency, KillTier.Minor, false, true)[0] == "30.0% / 1 / 1",
             "the supply cell shows the utilization and this player's own pack use");
         var efficiencyOnly = new ImpactCounters();
         efficiencyOnly.RecordSupply(30, 100);
@@ -184,7 +220,7 @@ internal static partial class Program
         var downCounters = new ImpactCounters();
         downCounters.CreditDown(); downCounters.AddHealthLost(150);
         var downEntry = new ImpactEntry(new ImpactInput { Name = "Downed", Counters = downCounters }, null, null, 40, 1, ImpactRating.Downs, (int)ImpactMetric.Downs);
-        Check(ImpactBoard.MetricFields(downEntry, ImpactMetric.Downs, KillTier.Minor, false, true)[0] == "1（失血 150.0）",
+        Check(ImpactBoard.MetricFields(downEntry, ImpactMetric.Downs, KillTier.Minor, false, true)[0] == "1 / 150.0",
             "the down cell shows the count and the lifetime it cost");
         var plainDownEntry = new ImpactEntry(new ImpactInput { Name = "Undamaged", Counters = new ImpactCounters() }, null, null, 40, 1, ImpactRating.Downs, (int)ImpactMetric.Downs);
         Check(ImpactBoard.MetricFields(plainDownEntry, ImpactMetric.Downs, KillTier.Minor, false, true)[0] == "0",
@@ -193,9 +229,9 @@ internal static partial class Program
         Check(noRowsAdded.Rows == 30 && ImpactBoard.FixedRows == 14, "the new figures arrive inside existing cells; no row was added");
         string previousLanguage = CombatStrings.Language;
         CombatStrings.Language = "en";
-        Check(CombatStrings.KillStateSuffix(1, 1, 1) == " (asleep 1 awake 1 unknown 1)" && CombatStrings.SupplyCell("30.0%", 1, 1) == "30.0% (self 1 / ammo 1)"
-            && CombatStrings.DownsCell("1", 150) == "1 (lost 150.0 hp)",
-            "the three new cell formats follow the language setting");
+        Check(CombatStrings.SupplyCell("30.0%", 1, 1) == "30.0% / 1 / 1"
+            && CombatStrings.DownsCell("1", 150) == "1 / 150.0",
+            "the cell formats follow the language setting");
         CombatStrings.Language = previousLanguage;
 
         // ---- sentences: only a real, unique lead earns one -------------------------------------------
@@ -269,8 +305,8 @@ internal static partial class Program
         double bossValue = ImpactScoring.WeightedKillValue(minorCounters, KillTier.Boss);
         Check(Math.Abs(minorValue + eliteValue + bossValue - minorCounters.WeightedKills) < 1e-9,
             "the three class values add back up to the kill row exactly, so no kill is scored twice");
-        Check(Math.Abs(minorValue - 3.0) < 1e-9 && eliteValue == 0 && bossValue == 0,
-            "the class value is the tier weight applied to the sleeping-shifted count");
+        Check(Math.Abs(minorValue - 2.0) < 1e-9 && eliteValue == 0 && bossValue == 0,
+            "the class value is the tier weight applied to the class total, and a sleeping kill is worth one kill here too");
         var totalDamageLeader = new ImpactInput { Name = "Boomer", EnemyDamage = 900, Counters = new ImpactCounters { MinorKills = 1 } };
         var tierAndDamage = ImpactScoring.Evaluate(new[] { totalDamageLeader, minorKing, bossKing }, ImpactScoring.DefaultWeights, 1.0, 1.0);
         Check(tierAndDamage.Entries.First(entry => entry.Name == "Boomer").Rating == ImpactRating.Damage,

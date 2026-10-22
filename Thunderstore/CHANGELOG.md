@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.0
+- Weapon damage is now the damage the game actually applied, not the figure the weapon carried into the strike: the armour of the limb that was hit and the precision / weakspot multiplier are included, for bullets, melee, explosives and EWC's delayed, burst and damage-over-time weapons alike. A client whose host runs no panel of its own reads the enemy's health before and after its own blow, so its row no longer reads low against a host that does run one.
+- Nothing is put on the wire for a player this machine has no evidence about - a greeting included. A peer is spoken to when its SteamID64 is named in `[Squad Sync] AllowlistedPeers`, or after it has itself sent this machine a packet of this build's protocol; a machine that runs no mod, a bot and a stranger are never handed bytes they have no handler for. Leave the list empty and the panel shares only with players who speak first, so two modded clients behind a host that runs no mod pair up when one of them names the other.
+- This build speaks protocol 8. A mixed lobby stays silent on purpose rather than decoding each other's fields, so both machines have to be on 1.19.0 to exchange anything.
+- Only the melee and Scout (tentacle) rows carry a sleeping-kill figure, each with its own multiplier (`SleepingMeleeKillMultiplier` / `SleepingScoutKillMultiplier`, default 2, range 1-10). The three weight classes (minor / elite / BOSS) score and display their total only and no longer take a sleeping multiplier; `SleepingKillMultiplier` is kept as the fallback for the two new fields when the file omits them.
+- The melee and Scout rows are three columns - total kills, the part landed on a sleeping enemy, and the damage that went into them. The Scout row's damage now travels with the row instead of being counted only on the machine that dealt the blow.
+- Every settlement cell uses one separator, ` / `, with the unit or the meaning moved into the row label; `%`, `~` and `—` are unchanged. Settlement columns 2-5 share one width, the widest of them, so the numbers line up down the board.
+- The success page's board now runs from the completion section down to the return-to-lobby button the player can actually see: a control the page switched off, faded to zero alpha, or laid out past the window no longer costs the board its height.
+- A result page's footer animates in, so the board waits for the button edge to settle before it measures - bounded, so a hover that keeps nudging the edge cannot hold it back for ever.
 ## 1.18.1
 - Same code as 1.18.0. The 1.18.0 upload was recorded by the legacy upload handler as NSFW content, which keeps a package out of the community listing and out of search; this version is published with the flag off. Download the 1.18.1 package.
 ## 1.18.0

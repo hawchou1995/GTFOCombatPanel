@@ -146,12 +146,14 @@ public sealed class ImpactCounters
     // Lifetime actually lost this expedition. Healing does not offset it and a max-health change is not a
     // loss, so this figure only ever grows.
     public double HealthLost;
+    public double ScoutDamage;
+    public bool ScoutDamageObserved, ScoutDamageEstimated;
 
     public long Kills { get { return MinorKills + EliteKills + BossKills; } }
     public long SleepingKills { get { return SleepingMinorKills + SleepingEliteKills + SleepingBossKills; } }
     public long UnknownStateKills { get { return UnknownStateMinorKills + UnknownStateEliteKills + UnknownStateBossKills; } }
     public long AwakeKills { get { return AwakePart(Kills, SleepingKills, UnknownStateKills); } }
-    public double WeightedKills => ImpactScoring.WeightedKills(MinorKills, EliteKills, BossKills, SleepingMinorKills, SleepingEliteKills, SleepingBossKills);
+    public double WeightedKills => ImpactScoring.WeightedKills(MinorKills, EliteKills, BossKills);
     public double SupplyEfficiency { get { return SupplyUses > 0 ? Clamp01(SupplyEfficiencySum / SupplyUses) : 0; } }
     public void RecordSupply(double effective, double intended)
     {
@@ -235,29 +237,64 @@ public sealed class ImpactCounters
 
     // The state travels with the kill: true = landed while the enemy was asleep, false = awake,
     // null = the state could not be read, which gets its own bucket instead of being called awake.
+    //
+    // The three weight classes keep this record even though neither the score nor the cell reads it any
+    // more: it is what the killing blow actually happened in, it costs nothing to keep beside the total,
+    // and an archive written by an older build still reads back whole. What the split may not do is
+    // change a class total - `WeightedKillValue` and the board's tier cell both ignore it - so a sleeping
+    // kill is worth exactly one kill at every weight.
     public void CreditKillState(KillTier tier, bool? sleeping)
     {
-        if (!sleeping.HasValue) { CreditTierState(ref UnknownStateMinorKills, ref UnknownStateEliteKills, ref UnknownStateBossKills, tier); return; }
-        if (sleeping.Value) CreditTierState(ref SleepingMinorKills, ref SleepingEliteKills, ref SleepingBossKills, tier);
+        long total = KillCount(tier);
+        if (sleeping == null)
+        {
+            long room = total - AsleepPart(total, SleepingKillCount(tier)) - UnknownStateKillCount(tier);
+            if (room > 0) BumpState(tier, unknown: true);
+            return;
+        }
+        if (sleeping == true && SleepingKillCount(tier) < total) BumpState(tier, unknown: false);
     }
-    public void CreditMeleeKillState(bool? sleeping)
-    {
-        if (!sleeping.HasValue) { if (UnknownStateMeleeKills < long.MaxValue) UnknownStateMeleeKills++; return; }
-        if (sleeping.Value && SleepingMeleeKills < long.MaxValue) SleepingMeleeKills++;
-    }
-    public void CreditScoutKillState(bool? sleeping)
-    {
-        if (!sleeping.HasValue) { if (UnknownStateScoutKills < long.MaxValue) UnknownStateScoutKills++; return; }
-        if (sleeping.Value && SleepingScoutKills < long.MaxValue) SleepingScoutKills++;
-    }
-    private static void CreditTierState(ref long minor, ref long elite, ref long boss, KillTier tier)
+    // The two subsets share one switch: a class is added to exactly one of them, and neither can outrun
+    // the total it belongs to however the caller's counters arrived.
+    private void BumpState(KillTier tier, bool unknown)
     {
         switch (tier)
         {
-            case KillTier.Minor: if (minor < long.MaxValue) minor++; break;
-            case KillTier.Elite: if (elite < long.MaxValue) elite++; break;
-            default: if (boss < long.MaxValue) boss++; break;
+            case KillTier.Minor:
+                if (unknown) { if (UnknownStateMinorKills < long.MaxValue) UnknownStateMinorKills++; }
+                else if (SleepingMinorKills < long.MaxValue) SleepingMinorKills++;
+                break;
+            case KillTier.Elite:
+                if (unknown) { if (UnknownStateEliteKills < long.MaxValue) UnknownStateEliteKills++; }
+                else if (SleepingEliteKills < long.MaxValue) SleepingEliteKills++;
+                break;
+            default:
+                if (unknown) { if (UnknownStateBossKills < long.MaxValue) UnknownStateBossKills++; }
+                else if (SleepingBossKills < long.MaxValue) SleepingBossKills++;
+                break;
         }
+    }
+    // The melee and Scout rows follow the same rule as the tiers, so their two subsets are bounded by
+    // their own totals in exactly the same way. Only the sleeping column of each is printed.
+    public void CreditMeleeKillState(bool? sleeping)
+    {
+        if (sleeping == null)
+        {
+            long room = MeleeKills - AsleepPart(MeleeKills, SleepingMeleeKills) - UnknownStateMeleeKills;
+            if (room > 0 && UnknownStateMeleeKills < long.MaxValue) UnknownStateMeleeKills++;
+            return;
+        }
+        if (sleeping == true && SleepingMeleeKills < MeleeKills) SleepingMeleeKills++;
+    }
+    public void CreditScoutKillState(bool? sleeping)
+    {
+        if (sleeping == null)
+        {
+            long room = ScoutKills - AsleepPart(ScoutKills, SleepingScoutKills) - UnknownStateScoutKills;
+            if (room > 0 && UnknownStateScoutKills < long.MaxValue) UnknownStateScoutKills++;
+            return;
+        }
+        if (sleeping == true && SleepingScoutKills < ScoutKills) SleepingScoutKills++;
     }
     // One resupply this player actually consumed; `ammo` marks an ammo pack rather than a tool refill.
     public void CreditSelfSupply(bool ammo)
@@ -270,6 +307,13 @@ public sealed class ImpactCounters
     {
         if (!double.IsFinite(amount) || amount <= 0) return;
         HealthLost = Math.Min(double.MaxValue, HealthLost + amount);
+    }
+    public void AddScoutDamage(double amount, bool estimated = false)
+    {
+        if (!double.IsFinite(amount) || amount <= 0) return;
+        ScoutDamage = Math.Min(double.MaxValue, ScoutDamage + amount);
+        ScoutDamageObserved = true;
+        ScoutDamageEstimated |= estimated;
     }
     public void Reset()
     {
@@ -286,6 +330,7 @@ public sealed class ImpactCounters
         UnknownStateMinorKills = UnknownStateEliteKills = UnknownStateBossKills = UnknownStateMeleeKills = UnknownStateScoutKills = 0;
         SelfSupplyUses = SelfAmmoUses = 0;
         HealthLost = 0;
+        ScoutDamage = 0; ScoutDamageObserved = ScoutDamageEstimated = false;
     }
     public void CopyFrom(ImpactCounters other)
     {
@@ -305,6 +350,7 @@ public sealed class ImpactCounters
         UnknownStateBossKills = other.UnknownStateBossKills; UnknownStateMeleeKills = other.UnknownStateMeleeKills;
         UnknownStateScoutKills = other.UnknownStateScoutKills;
         SelfSupplyUses = other.SelfSupplyUses; SelfAmmoUses = other.SelfAmmoUses; HealthLost = other.HealthLost;
+        ScoutDamage = other.ScoutDamage; ScoutDamageObserved = other.ScoutDamageObserved; ScoutDamageEstimated = other.ScoutDamageEstimated;
     }
     private static double Clamp01(double value) { return !double.IsFinite(value) || value < 0 ? 0 : value > 1 ? 1 : value; }
 }
@@ -502,22 +548,30 @@ public static class ImpactScoring
     public const double DefaultSleepingKillMultiplier = 2.0;
     public const double MaxSleepingKillMultiplier = 10.0;
     public static double SleepingKillMultiplier { get; set; } = DefaultSleepingKillMultiplier;
+    public static double SleepingMeleeKillMultiplier { get; private set; } = DefaultSleepingKillMultiplier;
+    public static double SleepingScoutKillMultiplier { get; private set; } = DefaultSleepingKillMultiplier;
+    public static void SetSleepingKillMultipliers(double melee, double scout)
+    {
+        SleepingMeleeKillMultiplier = ValidSleepingMultiplier(melee);
+        SleepingScoutKillMultiplier = ValidSleepingMultiplier(scout);
+    }
+    private static double ValidSleepingMultiplier(double value)
+        => double.IsFinite(value) && value >= 1.0 ? Math.Min(value, MaxSleepingKillMultiplier) : DefaultSleepingKillMultiplier;
 
     public static void SetSleepingKillMultiplier(double multiplier)
         => SleepingKillMultiplier = double.IsFinite(multiplier) && multiplier >= 1.0
             ? Math.Min(multiplier, MaxSleepingKillMultiplier)
             : DefaultSleepingKillMultiplier;
 
-    // The weighted kill count the kill row scores with, in tier order. Only the sleeping part of a count
-    // is worth the multiplier: a kill whose pre-lethal state could not be read is worth exactly an awake
-    // one, because an unreadable state is never assumed to have been a stealth kill.
+    // The weighted kill count the kill row scores with, in tier order. A class is worth its own weight times
+    // its total and nothing else: the sleeping part of a count was worth the multiplier in an earlier release,
+    // and that is exactly the behaviour this one removed - a stealth-heavy squad must not be able to inflate
+    // the three weight classes, which is why only the melee and Scout rows still carry a sleeping multiplier
+    // of their own. Nothing here reads a state, and no overload takes one, so no caller can ask for it.
     public static double WeightedKills(long minor, long elite, long boss)
-        => WeightedKills(minor, elite, boss, 0, 0, 0);
-
-    public static double WeightedKills(long minor, long elite, long boss, long sleepingMinor, long sleepingElite, long sleepingBoss)
-        => TierValue(MinorKillWeight, minor, sleepingMinor)
-         + TierValue(EliteKillWeight, elite, sleepingElite)
-         + TierValue(BossKillWeight, boss, sleepingBoss);
+        => TierValue(MinorKillWeight, minor, 0)
+         + TierValue(EliteKillWeight, elite, 0)
+         + TierValue(BossKillWeight, boss, 0);
 
     // One weight class of one player's kill row, sleeping share included. The three of them add up to
     // ImpactCounters.WeightedKills exactly, which is what keeps a per-tier title share from double counting.
@@ -526,23 +580,24 @@ public static class ImpactScoring
         if (counters == null) return 0;
         switch (tier)
         {
-            case KillTier.Minor: return TierValue(MinorKillWeight, counters.MinorKills, counters.SleepingMinorKills);
-            case KillTier.Elite: return TierValue(EliteKillWeight, counters.EliteKills, counters.SleepingEliteKills);
-            default: return TierValue(BossKillWeight, counters.BossKills, counters.SleepingBossKills);
+            case KillTier.Minor: return TierValue(MinorKillWeight, counters.MinorKills, 0);
+            case KillTier.Elite: return TierValue(EliteKillWeight, counters.EliteKills, 0);
+            default: return TierValue(BossKillWeight, counters.BossKills, 0);
         }
     }
 
     // A plain count with its sleeping subset lifted: the melee and Scout rows score this way.
-    public static double SleepingWeighted(long total, long sleeping) => TierValue(1.0, total, sleeping);
+    public static double SleepingWeighted(long total, long sleeping) => SleepingWeighted(total, sleeping, SleepingKillMultiplier);
+    public static double SleepingWeighted(long total, long sleeping, double multiplier) => TierValue(1.0, total, sleeping, multiplier);
 
-    private static double TierValue(double weight, long total, long sleeping)
+    private static double TierValue(double weight, long total, long sleeping, double configuredMultiplier = 1.0)
     {
         if (total <= 0 || !double.IsFinite(weight) || weight <= 0) return 0;
         // A sleeping subset that outran its own total (a bad hand edit or a stale peer figure) is bounded
         // by the total, so no weight can ever be created out of nothing.
         long asleep = sleeping <= 0 ? 0 : Math.Min(total, sleeping);
-        double multiplier = SleepingKillMultiplier;
-        if (!double.IsFinite(multiplier) || multiplier < 1.0) multiplier = DefaultSleepingKillMultiplier;
+        double multiplier = double.IsFinite(configuredMultiplier) && configuredMultiplier >= 1.0
+            ? Math.Min(configuredMultiplier, MaxSleepingKillMultiplier) : DefaultSleepingKillMultiplier;
         return weight * (total + (multiplier - 1.0) * asleep);
     }
 
@@ -552,6 +607,7 @@ public static class ImpactScoring
         AccuracyConfidence = AccuracyConfidencePellets;
         SetKillWeights(DefaultMinorKillWeight, DefaultEliteKillWeight, DefaultBossKillWeight);
         SetSleepingKillMultiplier(DefaultSleepingKillMultiplier);
+        SetSleepingKillMultipliers(DefaultSleepingKillMultiplier, DefaultSleepingKillMultiplier);
     }
 
     // Every published default migrates; any hand-edited list remains intact. The thirteen-metric list of
@@ -669,8 +725,8 @@ public static class ImpactScoring
             case ImpactMetric.Downs: return counters.Downs > 0 ? counters.Downs : 0;
             case ImpactMetric.FriendlyFire: return FriendlyFireSeverity(player, maxFriendlyFireDamage, maxFriendlyFireDeaths);
             // A weapon kill's sleeping share is worth the sleeping multiplier, exactly like the tier rows.
-            case ImpactMetric.MeleeKills: return SleepingWeighted(counters.MeleeKills, counters.SleepingMeleeKills);
-            case ImpactMetric.ScoutKills: return SleepingWeighted(counters.ScoutKills, counters.SleepingScoutKills);
+            case ImpactMetric.MeleeKills: return SleepingWeighted(counters.MeleeKills, counters.SleepingMeleeKills, SleepingMeleeKillMultiplier);
+            case ImpactMetric.ScoutKills: return SleepingWeighted(counters.ScoutKills, counters.SleepingScoutKills, SleepingScoutKillMultiplier);
             default: return 0;
         }
     }

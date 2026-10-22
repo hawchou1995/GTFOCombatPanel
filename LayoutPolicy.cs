@@ -422,6 +422,38 @@ public static class ResultsRegion
         => float.IsFinite(candidate) && (!float.IsFinite(best) || candidate < best) ? candidate : best;
 }
 
+// Whether a control of a result page is really on the screen, and therefore whether the board has to keep
+// out of its way. Three kinds of object live in these pages without being part of them: a control the page
+// switched off for this state (the host's own lobby button on a client's fail page), a control whose canvas
+// group still holds it at zero alpha (the reveal the page animates with), and a control laid out past the
+// edge of the window by a stale anchor. None of them is a button the player can press, so none of them may
+// cost the board the height between the heading and the button that is really there.
+public static class ResultsButtonPolicy
+{
+    // Alpha at or below this reads as "not drawn": the pages reveal their footers from 0, and a control the
+    // player cannot see is not one they can press.
+    public const float VisibleAlpha = 0.02f;
+
+    public static bool Visible(bool activeInHierarchy, float alpha, float top, float bottom, float screenWidth, float screenHeight)
+    {
+        if (!activeInHierarchy) return false;
+        if (!float.IsFinite(top) || !float.IsFinite(bottom) || !(bottom > top)) return false;
+        // An alpha nobody could read is not evidence of transparency, so the control is kept.
+        if (float.IsFinite(alpha) && alpha <= VisibleAlpha) return false;
+        if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
+        // Off the page: a control above the top edge or below the bottom edge belongs to no frame the
+        // player is looking at, whatever anchor left it there.
+        if (top >= screenHeight || bottom <= 0f) return false;
+        return true;
+    }
+
+    // The highest top edge among the controls that are really there: the wall the board stays above.
+    public static float HighestTop(bool activeInHierarchy, float alpha, float top, float bottom,
+        float screenWidth, float screenHeight, float best)
+        => Visible(activeInHierarchy, alpha, top, bottom, screenWidth, screenHeight)
+            && (!float.IsFinite(best) || top < best) ? top : best;
+}
+
 // Native title visibility is independent of whether its screen-space rectangle can be read.
 public static class ResultsHeading
 {

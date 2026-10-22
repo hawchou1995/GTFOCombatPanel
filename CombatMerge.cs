@@ -131,6 +131,15 @@ public static class CombatMerge
             impact.SleepingScoutKills = snap.SleepingScoutKills;
             impact.UnknownStateScoutKills = snap.UnknownStateScoutKills;
         }
+        // The Scout row's damage is a measurement this machine only has when it made the blow or when the
+        // machine that did sent it. A row that reports the flag is taken whole - figure and marker together -
+        // and a row that does not is left alone rather than read as zero.
+        if (snap.Has2(SyncFlags2.ScoutDamageObserved))
+        {
+            impact.ScoutDamage = double.IsFinite(snap.ScoutEnemyDamage) && snap.ScoutEnemyDamage > 0 ? snap.ScoutEnemyDamage : 0;
+            impact.ScoutDamageObserved = true;
+            impact.ScoutDamageEstimated = snap.Has2(SyncFlags2.ScoutDamageEstimated);
+        }
         impact.Stagger = MergeCount(impact.Stagger, snap.Stagger);
         impact.Revives = MergeCount(impact.Revives, snap.Revives);
         long downs = MergeCount(impact.Downs, snap.Downs);

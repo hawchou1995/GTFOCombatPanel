@@ -20,6 +20,12 @@ namespace HawChow.GTFOCombatPanel;
 // The bytes are assembled and taken apart by `SquadPackets`, which has no Unity, SNet or Harmony
 // reference and is therefore asserted headlessly, including every length and version rule.
 //
+// Nothing leaves this class that the owner of the evidence has not cleared. `MaySend` is the last gate
+// before `SNet.Core.SendBytes`: a peer the exchange holds no evidence about is refused here as well, so
+// a mistake higher up cannot turn into a custom packet - a hello included - in a machine that runs no
+// mod. A gate that was never set refuses everything, which is the safe reading of "nobody said this
+// machine may speak".
+//
 // The receive callback is queued, not run in place. The replication layer's thread is not this mod's to
 // assume: a decoded packet is parked in a bounded queue (256) and drained from `CombatSync.Tick`, which
 // the main thread calls. Nothing in the queue path touches a Unity or game object - it holds only the
@@ -32,11 +38,15 @@ internal static class SquadNet
     internal static Action<ulong, uint, SyncSnapshot> OnSnapshot;
     internal static Action<ulong, uint> OnProtocolMismatch;
 
+    // Whether this machine may put one of its own packets on the wire for a peer. Set by CombatSync from
+    // the exchange's evidence; left null (and then refusing everything) until it is.
+    internal static Func<ulong, bool> MaySend;
+
     internal const int MaxQueue = 256;
     private struct Queued { public SquadPacketKind Kind; public ulong Sender; public ulong HelloOwner; public uint Generation; public uint Version; public SyncSnapshot Snapshot; }
     private static readonly ConcurrentQueue<Queued> Queue = new ConcurrentQueue<Queued>();
     private static int _queued;
-    private static bool _loggedOverflow, _loggedReadError;
+    private static bool _loggedOverflow, _loggedReadError, _loggedWithheld;
 
     internal static void SendHello(SNet_Player target, ulong owner, uint generation)
     {
@@ -52,17 +62,48 @@ internal static class SquadNet
 
     private static void Send(byte[] packet, SNet_Player target)
     {
+        if (packet == null) return;
+        if (!MaySpeakTo(target))
+        {
+            if (!_loggedWithheld)
+            {
+                _loggedWithheld = true;
+                Plugin.Logger?.LogWarning("a squad packet was withheld: this machine holds no evidence that the target runs this build, so nothing - a greeting included - is put on the wire for it.");
+            }
+            return;
+        }
         var channelType = SNet_ChannelType.GameOrderCritical;      // ordered: a snapshot must not overtake the one before it
         SNet.GetSendSettings(ref channelType, out SNet_SendGroup _, out SNet_SendQuality quality, out int channel);
         Il2CppStructArray<byte> bytes = packet;
         SNet.Core.SendBytes(bytes, quality, channel, target);
     }
 
+    // Fail closed: no gate, an unreadable target or a throwing owner all mean "not a byte".
+    private static bool MaySpeakTo(SNet_Player target)
+    {
+        try
+        {
+            Func<ulong, bool> gate = MaySend;
+            if (gate == null || target == null) return false;
+            return gate(target.Lookup);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
     // Called from the receive prefix, on whatever thread the replication layer uses. True means the packet
     // was ours and is consumed; false means it belongs to the game (or to another mod) and is passed on
-    // untouched.
+    // untouched, with its own arguments and its own execution path.
+    //
+    // The claim is precise: only a packet whose key and magic have both been read as this mod's is taken
+    // out of the game's hands. Anything that fails to parse for any other reason - including an exception
+    // thrown while the array is being read - is left exactly as the game handed it over, because a packet
+    // this mod is not sure about must never be swallowed on somebody else's behalf.
     internal static bool TryAccept(Il2CppStructArray<byte> bytes, uint size, ulong sender)
     {
+        bool claimed = false;
         try
         {
             if (bytes == null) return false;
@@ -74,19 +115,23 @@ internal static class SquadNet
             if (!packet.IsOurs) return false;
             // Ours, so it is consumed here whatever happens next: handing a half-read packet to the game
             // would make it look for a replicator that does not exist.
+            claimed = true;
             Enqueue(packet, sender);
             return true;
         }
         catch (Exception error)
         {
             // A packet that announced itself as ours but blew up while being read is still consumed. Only a
-            // reference to the exception message is kept; no game state is touched here.
+            // reference to the exception message is kept; no game state is touched here, and nothing is
+            // rethrown into the replication layer's stack.
             if (!_loggedReadError)
             {
                 _loggedReadError = true;
-                Plugin.Logger?.LogWarning("a squad packet could not be read; it was consumed rather than handed to the game: " + error.Message);
+                Plugin.Logger?.LogWarning("a squad packet could not be read; " + (claimed
+                    ? "it was consumed rather than handed to the game: "
+                    : "it was left to the game untouched: ") + error.Message);
             }
-            return true;
+            return claimed;
         }
     }
 

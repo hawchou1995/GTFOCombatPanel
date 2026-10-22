@@ -177,8 +177,8 @@ internal static partial class Program
         Check(meleeReport.Entries[meleeLeader].Score == 100 && meleeReport.Entries[meleeLeader].Rating == ImpactRating.MeleeKills
             && meleeReport.IsGold(meleeLeader, ImpactMetric.MeleeKills),
             "melee-kill normalization remains inside the 100-point composite and identifies its unique leader");
-        Check(ImpactBoard.MetricFields(meleeReport.Entries[meleeLeader], ImpactMetric.MeleeKills, KillTier.Minor, false, true)[0] == "击杀 3 / 伤害 123.4",
-            "the settlement melee row pairs kill count with the existing GearMelee damage total");
+        Check(ImpactBoard.MetricFields(meleeReport.Entries[meleeLeader], ImpactMetric.MeleeKills, KillTier.Minor, false, true)[0] == "3",
+            "the settlement melee row is three columns: its kills, the part landed on a sleeping one, and the GearMelee damage");
         var scoutWeights = new double[ImpactScoring.Order.Length]; scoutWeights[(int)ImpactMetric.ScoutKills] = 1;
         var scoutInputs = new[] { new ImpactInput { Name = "Scout", Counters = new ImpactCounters { ScoutKills = 2 } }, new ImpactInput { Name = "Other" } };
         ImpactReport scoutReport = ImpactScoring.Evaluate(scoutInputs, scoutWeights, 1, 1);
@@ -197,20 +197,20 @@ internal static partial class Program
         var sentryEntry = new ImpactEntry(new ImpactInput { ToolName = "Sentry Gun", Counters = sentryCounters }, null, null, 50, 1, ImpactRating.Scan, (int)ImpactMetric.ToolEfficiency);
         string sentryCell = ImpactBoard.ToolEfficiencyText(sentryEntry);
         Check(!sentryCell.Contains("扫描") && !sentryCell.Contains("炮台")
-            && sentryCell == "射击 10 命中 7 伤害 45.0",
+            && sentryCell == "射击 10 / 命中 7 / 伤害 45.0",
             "sentry details show actions and values without repeating the gear name or scanner wording");
         var mineCounters = new ImpactCounters { ScanUses = 3, ScanFirstMarks = 9, MineDeployments = 5, MinePickups = 2, MineTriggers = 3 };
         mineCounters.AddMineDamage(28);
         var mineEntry = new ImpactEntry(new ImpactInput { ToolName = "Mine deployer", Counters = mineCounters }, null, null, 50, 1, ImpactRating.Scan, (int)ImpactMetric.ToolEfficiency);
         string mineCell = ImpactBoard.ToolEfficiencyText(mineEntry);
         Check(!mineCell.Contains("扫描") && !mineCell.Contains("绊雷")
-            && mineCell.Contains("部署 3 触发 3 伤害 28.0"),
+            && mineCell == "部署 3 / 触发 3 / 伤害 28.0",
             "mine details show actions and values without repeating the gear name");
         var glueCounters = new ImpactCounters { ScanUses = 2, ScanFirstMarks = 4, GlueShots = 12, GlueHits = 8, GluedEnemies = 5 };
         var glueEntry = new ImpactEntry(new ImpactInput { ToolName = "Glue Gun", Counters = glueCounters }, null, null, 50, 1, ImpactRating.Scan, (int)ImpactMetric.ToolEfficiency);
         string glueCell = ImpactBoard.ToolEfficiencyText(glueEntry);
         Check(!glueCell.Contains("扫描") && !glueCell.Contains("胶枪")
-            && glueCell.Contains("射击 12 命中 8 胶住 5"),
+            && glueCell == "射击 12 / 命中 8 / 胶住 5",
             "glue details show actions and values without repeating the gear name");
         Check(ImpactScoring.RawValue(glueEntry.Input, ImpactMetric.ToolEfficiency) == 4,
             "tool-use details do not replace scan first marks as the ToolEfficiency score source");
@@ -222,17 +222,17 @@ internal static partial class Program
         var toolProjectionEntry = new ImpactEntry(toolProjectionInput, null, null, 50, 1,
             ImpactRating.Scan, (int)ImpactMetric.ToolEfficiency);
         Check(toolProjectionInput.ToolName == "Bio Tracker"
-            && ImpactBoard.ToolEfficiencyText(toolProjectionEntry) == "扫描 2 次 首次标记 7 只 累计标记 12 只",
+            && ImpactBoard.ToolEfficiencyText(toolProjectionEntry) == "扫描 2 次 / 首次 7 只 / 累计 12 只",
             "the equipped GearClass name carries the detailed scan counts into settlement");
         var scannerCounters = new ImpactCounters { ScanUses = 5, ScanFirstMarks = 10, ScanMarks = 50 };
         var scannerEntry = new ImpactEntry(new ImpactInput { ToolName = "Bio Tracker", Counters = scannerCounters }, null, null, 50, 1, ImpactRating.Scan, (int)ImpactMetric.ToolEfficiency);
-        Check(ImpactBoard.ToolEfficiencyText(scannerEntry) == "扫描 5 次 首次标记 10 只 累计标记 50 只"
+        Check(ImpactBoard.ToolEfficiencyText(scannerEntry) == "扫描 5 次 / 首次 10 只 / 累计 50 只"
             && ImpactBoard.IsScannerTool("生物追踪仪") && !ImpactBoard.ToolEfficiencyText(scannerEntry).Contains("，"),
             "scanner details show first and cumulative marks without punctuation unlike other tool cells");
         string previousLanguage = CombatStrings.Language;
         CombatStrings.Language = "en";
-        Check(ImpactBoard.ToolEfficiencyText(scannerEntry) == "Scan 5x first-marked 10 cumulative 50",
-            "the English scanner cell keeps the same unpunctuated field order");
+        Check(ImpactBoard.ToolEfficiencyText(scannerEntry) == "scan 5x / first 10 / cumulative 50",
+            "the English scanner cell keeps the same field order behind the same separator");
         CombatStrings.Language = previousLanguage;
         var ffInput = new ImpactInput { Name = "FF", FriendlyFireObserved = true, FriendlyFireDamage = 100, Counters = new ImpactCounters { FriendlyFireDeaths = 1 } };
         Check(Math.Abs(ImpactScoring.FriendlyFireSeverity(ffInput, 200, 2) - 0.5) < 1e-9,

@@ -325,7 +325,16 @@ internal static class CombatTracker
         player.RecordAccuracy(ResolveWeapon(player, owner, slot, gun), (long)shots * pellets, 0, 0, true);
         NoteAttack(owner.Lookup, (int)slot);
     }
+    // Both entry points below are called straight out of a Harmony body, so a fault of ours must not become a
+    // fault of the game's: the work is done in `CaptureCore` and `RecordDamageCore`, and each pair answers an
+    // exception by dropping the record and keeping the game's own call intact.
     internal static DamageSample Capture(Dam_SyncedDamageBase target, float health, pAgent source, DamageKind kind, uint gearCategoryId = 0)
+    {
+        try { return CaptureCore(target, health, source, kind, gearCategoryId); }
+        catch (Exception error) { LogImpact("damage capture", error); return default; }
+    }
+
+    private static DamageSample CaptureCore(Dam_SyncedDamageBase target, float health, pAgent source, DamageKind kind, uint gearCategoryId = 0)
     {
         Agent baseAgent = null;
         if (source.TryGet(out Agent resolved)) baseAgent = resolved;
@@ -356,6 +365,12 @@ internal static class CombatTracker
             enemy?.Owner != null ? Deaths.Begin(enemy.Pointer, owner.Lookup, kind, ReadSleeping(enemy), health) : null);
     }
     internal static void RecordDamage(Dam_SyncedDamageBase target, DamageSample sample, pBulletDamageData? bullet = null)
+    {
+        try { RecordDamageCore(target, sample, bullet); }
+        catch (Exception error) { LogImpact("damage record", error); }
+    }
+
+    private static void RecordDamageCore(Dam_SyncedDamageBase target, DamageSample sample, pBulletDamageData? bullet = null)
     {
         // The total is recorded even when no gear could be named for the blow: a melee push, a modded tool
         // with no archetype, or a record that arrived after the weapon was swapped all still dealt damage,
@@ -403,12 +418,21 @@ internal static class CombatTracker
         if (bullet != null && enemy != null && loss > 0f)
         {
             int limbId = bullet.Value.limbID;
-            bool weak = limbId >= 0 && limbId < enemy.DamageLimbs.Length
+            bool weak = enemy.DamageLimbs != null && limbId >= 0 && limbId < enemy.DamageLimbs.Length
                 && enemy.DamageLimbs[limbId] != null && enemy.DamageLimbs[limbId].m_type == eLimbDamageType.Weakspot;
             EwcBridge.NoteHit(sample.Player.Lookup, sample.Weapon == null ? -1 : sample.Weapon.Slot, weak);
         }
 #endif
-        if (float.IsFinite(loss) && loss > 0) sample.Player.RecordDamage(sample.Weapon, loss, victim != null);
+        if (float.IsFinite(loss) && loss > 0)
+        {
+            sample.Player.RecordDamage(sample.Weapon, loss, victim != null);
+            // The Scout row reports the damage that went into Scouts as its third field, so a blow
+            // measured here is the same blow that row carries. Only a Scout's own health pool feeds it;
+            // every other enemy leaves the figure alone, which is why a squad that killed no Scout shows
+            // a dash rather than a zero.
+            if (enemy != null && enemy.Owner != null && enemy.Owner.IsScout)
+                sample.Player.Impact.AddScoutDamage(loss, sample.Estimated);
+        }
         CompleteDamage(target, sample, null);
         // The weakspot estimate only ever fires for a weapon row, so it needs a weapon; and the limb id is
         // read defensively, because a packet that names no limb (or a negative id) must not index past the
@@ -417,36 +441,60 @@ internal static class CombatTracker
         {
             int id = bullet.Value.limbID;
             bool isToolRow = sample.Weapon.Slot == (int)InventorySlot.GearClass;
-            bool weak = id >= 0 && id < enemy.DamageLimbs.Length && enemy.DamageLimbs[id]?.m_type == eLimbDamageType.Weakspot;
+            bool weak = enemy.DamageLimbs != null && id >= 0 && id < enemy.DamageLimbs.Length
+                && enemy.DamageLimbs[id] != null && enemy.DamageLimbs[id].m_type == eLimbDamageType.Weakspot;
             // Vanilla packets have no unique pellet ID, so a remote-human damage contact is one estimated
             // hit and never a fabricated miss. A tool row deals no pellets and is left alone.
             if (!isToolRow) sample.Player.RecordAccuracy(sample.Weapon, 0, 1, weak ? 1 : 0, true);
         }
     }
 
+    // What this path covers, and what it deliberately does not: a bullet and a melee blow enter the enemy
+    // through the two limb methods hooked above. An explosion, a burn and a modded projectile enter through
+    // methods of their own, and this build does not claim to measure those on such a client - it leaves them
+    // out rather than crediting them to whichever weapon happened to be held. On a host that runs this mod
+    // every one of them is measured where the game applied it, which is the arrangement this fallback defers to.
+    //
+    // The health an enemy limb's owner carries, read before the game applies a blow. Kept in one place so
+    // the two limb hooks and the record path cannot disagree about which number is the enemy's own.
+    internal static float LimbHealth(Dam_EnemyDamageLimb limb)
+    {
+        try { return limb == null || limb.m_base == null ? float.NaN : limb.m_base.Health; }
+        catch (Exception) { return float.NaN; }
+    }
+
     // A blow this machine dealt that the game will not hand back to it. The host applies every blow and
     // every other machine is told the result, but a machine is not sent its own damage back: that is why a
     // client in a lobby whose host runs no panel of its own used to show no damage of its own at all, and
-    // with it no share and no kill of its own. The amount is the damage the blow carries, capped by the
-    // health left on the limb, which is the damage it actually applies, and it is an estimate rather than
-    // a measurement - so it goes out under the panel's estimate marker, and a host that does run this mod
-    // replaces it with the blow it applied, which outranks an estimate by construction.
+    // with it no share and no kill of its own.
+    //
+    // The amount is the health the enemy lost across the call, not the `dam` the weapon carried into it.
+    // The argument is pre-armour and pre-precision: the game multiplies it by the struck limb's resistance
+    // and by the hit's precision multiplier inside the call, so a precise shot into a weakspot was being
+    // recorded as a plain body shot. Subtracting the health afterwards is the damage that was actually
+    // applied - the same measurement the receive path takes from its packet - and it is what makes the
+    // fallback agree with a host that runs this mod instead of reading low against it.
+    //
+    // It is still an estimate rather than a measurement, so it goes out under the panel's estimate marker,
+    // and a host that does run this mod replaces it with the blow it applied, which outranks an estimate
+    // by construction.
     //
     // Nobody counts a blow here twice: the host never enters this path (it reads every blow through the
     // record path) and neither does a client whose host runs this mod (the host's record of that blow
     // reaches it). Only a client whose host runs nothing falls back to measuring its own blows locally,
     // which is the same split Dinorush's StatDisplay makes on MasterHasMod.
-    internal static void NoteLocalOutgoing(Dam_EnemyDamageLimb limb, Agent source, float damage, DamageKind kind, uint gearCategoryId = 0)
+    internal static void NoteLocalOutgoing(Dam_EnemyDamageLimb limb, Agent source, float healthBefore,
+        DamageKind kind, uint gearCategoryId = 0)
     {
         try
         {
             if (SNet.IsMaster || CombatSync.HostRunsMod) return;
-            if (limb == null || limb.m_base == null || !(damage > 0f)) return;
+            if (limb == null || limb.m_base == null || !float.IsFinite(healthBefore)) return;
             var agent = source == null ? null : source.TryCast<PlayerAgent>();
             SNet_Player owner = agent == null ? null : agent.Owner;
             if (owner == null || !owner.IsLocal || !ShouldTrack(owner)) return;
-            float health = limb.m_base.Health;
-            float amount = Math.Min(damage, Math.Max(0f, health));
+            float healthAfter = Math.Max(0f, limb.m_base.Health);
+            float amount = Math.Max(0f, Math.Max(0f, healthBefore) - healthAfter);
             if (!float.IsFinite(amount) || amount <= 0f) return;
             var player = ObservePlayer(owner);
             InventorySlot slot = kind == DamageKind.Melee
@@ -455,10 +503,15 @@ internal static class CombatTracker
             var entry = ResolveWeapon(player, owner, slot);
             RememberAttacker(limb.m_base, owner.Lookup, kind);
             player.RecordDamage(CombatPlayer.MatchDamage(player, entry, gearCategoryId), amount, false, true);
+            // The Scout row reports the damage that went into Scouts, so the same applied figure is put
+            // there too when the enemy under this limb is one. It is an estimate for the same reason the
+            // row above is: this machine measured its own blow, and a host that runs the panel overrules it.
+            if (limb.m_base.Owner != null && limb.m_base.Owner.IsScout)
+                player.Impact.AddScoutDamage(amount, true);
             if (!_loggedOutgoing)
             {
                 _loggedOutgoing = true;
-                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client whose host runs no panel of its own, so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry.Name} - because the game never sends a machine its own damage back. The figure is marked as an estimate, and a host that does run this mod replaces it with the blow it applied.");
+                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client whose host runs no panel of its own, so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry.Name}, read as the health the enemy actually lost rather than the pre-armour figure the weapon carries - because the game never sends a machine its own damage back. The figure is marked as an estimate, and a host that does run this mod replaces it with the blow it applied.");
             }
         }
         catch (Exception error) { LogImpact("local outgoing damage", error); }
@@ -545,6 +598,10 @@ internal static class CombatTracker
                 : ResolveWeapon(player, attacker, (InventorySlot)attackSlot);
             RememberAttacker(enemy, attackerLookup, DamageKind.Explosion);
             player.RecordDamage(weapon, loss, victim != null);
+            // An explosion that went into a Scout is the same blow the Scout row reports, so it feeds that
+            // figure too - the blast of a mine and the shot of a rifle are the same kind of evidence.
+            if (enemy != null && enemy.Owner != null && enemy.Owner.IsScout)
+                player.Impact.AddScoutDamage(loss);
             if (enemy != null && mineBlast && ToolStatsTracker.IsEquipmentMineBlast) ToolStatsTracker.CreditMineDamage(attackerLookup, loss);
             if (!_loggedExplosion)
             {

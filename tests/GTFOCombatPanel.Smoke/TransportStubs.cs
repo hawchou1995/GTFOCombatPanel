@@ -1,5 +1,7 @@
 // Managed boundary doubles only. SquadNet.cs itself is linked unchanged into this suite;
-// these doubles do not simulate native IL2CPP marshalling or Steam transport.
+// these doubles do not simulate native IL2CPP marshalling or Steam transport. What they do record is
+// how many byte runs actually reached `SNet.Core.SendBytes`, which is the only way a unit test can tell
+// "the exchange asked for this" from "this machine put it on the wire".
 using System;
 namespace Il2CppInterop.Runtime.InteropTypes.Arrays
 {
@@ -23,6 +25,7 @@ namespace SNetwork
 {
     public sealed class SNet_Player
     {
+        public ulong Lookup;
         public bool IsLocal = true;
         public bool IsBot;
         public HawChow.GTFOCombatPanel.CombatPlayer Stats;
@@ -33,7 +36,14 @@ namespace SNetwork
     public enum SNet_SendQuality { Reliable }
     public sealed class TestCore
     {
-        public void SendBytes(Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<byte> bytes, SNet_SendQuality quality, int channel, SNet_Player target) { }
+        // Every byte run that actually left this machine, and for whom. The send gate is asserted on these.
+        public int SendCount;
+        public ulong LastTarget;
+        public void SendBytes(Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<byte> bytes, SNet_SendQuality quality, int channel, SNet_Player target)
+        {
+            SendCount++;
+            LastTarget = target == null ? 0UL : target.Lookup;
+        }
     }
     public static class SNet
     {

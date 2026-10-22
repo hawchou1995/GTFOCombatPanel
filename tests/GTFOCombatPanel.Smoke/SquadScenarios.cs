@@ -80,8 +80,8 @@ internal static partial class Program
             "B2: and in both directions");
         Check(Row(rows2A, 0x11UL) == null && Row(rows2B, 0x11UL) == null,
             "B2: the host that runs no mod has no row anywhere, because nothing about it was ever described");
-        Check(vanilla2.HellosSeen > 0 && vanilla2.SnapshotsSeen > 0,
-            "B2: the unmodded host is greeted and is also sent rows it has no way to read - delivery no longer waits for an answer, which is the rule the client log behind this release showed to be the failure (its every greeting went unanswered and it received nothing all session)");
+        Check(vanilla2.HellosSeen == 0 && vanilla2.SnapshotsSeen == 0,
+            "B2: the unmodded host is sent nothing at all - not a greeting and not a row - because a machine that runs no mod has no handler for these bytes, and this mod does not send anything to find out whether one does");
         Check(client2A.Exchange.SquadFromHost == null && CombatStatsFormatter.FormatShare(Row(rows2A, 0x21UL).Total, client2A.Exchange.SquadFromHost) == "—",
             "B2: and with no host to add the squad up, the share is a dash rather than a share of a guessed total");
         // ---------------------------------------------------------------- B3: unmodded host, one modded client
@@ -101,8 +101,8 @@ internal static partial class Program
             "B3: with its aim exact and its damage - the part only the host could measure - marked as the estimate it is");
         Check(CombatStatsFormatter.FormatShare(rows3[0].Total, null) == "—",
             "B3: with no host to add the squad up the share is a dash rather than a share this machine guessed");
-        Check(vanilla3.HellosSeen > 0 && vanilla3.SnapshotsSeen > 0,
-            "B3: rows are sent to a peer that cannot answer as well, so a client whose return path is dead still receives; what it must never do is describe anybody, which is asserted above");
+        Check(vanilla3.HellosSeen == 0 && vanilla3.SnapshotsSeen == 0,
+            "B3: and a lone client behind an unmodded host sends it nothing either - the rule is the same for one client as for three");
         var cells = new List<string>();
         foreach (PanelColumn column in new[] { PanelColumn.DamageAndShare, PanelColumn.FriendlyFire, PanelColumn.Accuracy, PanelColumn.WeakspotAccuracy, PanelColumn.Projectiles })
             cells.AddRange(CombatStatsFormatter.Fields(rows3[0].Total, column, null));
@@ -418,6 +418,9 @@ internal static partial class Program
 
     // One machine in the scenario. `Modded` is false for the vanilla host: it has no plugin, so it is handed
     // every packet and does nothing with any of them, which is exactly what it does in the real lobby.
+    // `Allowlist` is what that machine's operator has written into `[Squad Sync] AllowlistedPeers`: it is
+    // empty unless a scenario says otherwise, so a machine here shares with nobody until somebody speaks
+    // first - the same default the shipped build has.
     private sealed class Node
     {
         public readonly ulong Lookup;
@@ -425,6 +428,17 @@ internal static partial class Program
         public bool IsMaster;
         public bool IsBot;
         public bool Modded = true;
+        // Whose lookups this machine has named in its own configuration. The wire fills this in for a
+        // scenario that models a lobby whose players know each other, and leaves it empty for the ones that
+        // model two strangers sharing a vanilla host: a machine named here is spoken to before it has said
+        // anything, and one that is not has to speak first.
+        public readonly List<ulong> Allowlist = new List<ulong>();
+        // Set when the scenario is about a machine that names nobody - the shipped default for a fresh
+        // install, and the case a vanilla host has to be protected from.
+        public bool Isolated;
+        // The protocol this machine puts on the wire. It is this build's own unless a scenario is modelling a
+        // peer that has not been updated yet.
+        public uint Protocol = SyncProtocol.Version;
         // This machine receives but cannot be heard: its own uplink is down, or its packets are being dropped
         // on the way out. It is the case the relay rule is about - a peer that has proved it runs this mod and
         // can still receive must keep being sent to.
@@ -483,6 +497,7 @@ internal static partial class Program
 
         public void Tick(float now)
         {
+            NameEachOtherOnce();
             foreach (Node node in Nodes)
             {
                 if (!node.Modded) continue;
@@ -496,6 +511,27 @@ internal static partial class Program
                 }
             }
             Drain(now);
+        }
+
+        // What an operator does once, in the configuration file: name the players known to run this build.
+        // Every scenario that is not about a machine naming nobody is handed the other modded seats, so the
+        // exchange has the evidence a real lobby would have. A vanilla host is never named here - it runs no
+        // mod, so nobody could have seen it run one - and that is what keeps it out of every send below.
+        //
+        // Re-applied every tick rather than once, because a peer that restarts gets a fresh exchange, and the
+        // list is this machine's own file: it outlives the session and has to reach the new exchange too.
+        private void NameEachOtherOnce()
+        {
+            var modded = new List<ulong>();
+            foreach (Node node in Nodes) if (node.Modded) modded.Add(node.Lookup);
+            foreach (Node node in Nodes)
+            {
+                if (!node.Modded) continue;
+                node.Allowlist.Clear();
+                if (!node.Isolated)
+                    foreach (ulong lookup in modded) if (lookup != node.Lookup) node.Allowlist.Add(lookup);
+                node.Exchange.SetAllowlist(node.Allowlist);
+            }
         }
 
         private SquadPeer[] RosterFor(Node self)

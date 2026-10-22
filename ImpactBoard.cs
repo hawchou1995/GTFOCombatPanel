@@ -63,8 +63,9 @@ public static class ImpactBoard
     public const int FixedRows = 14;
     public const int SeparatorRows = 1;
     // How the figures of one cell are held apart on the board: one value per cell, its figures split
-    // by a slash, so a cell reads as `518 41%` -> `518 / 41%` and lines up on the column's right edge.
-    public const string ValueSeparator = " / ";
+    // by the board's single separator, so a cell reads as `518 / 41%` and lines up on the column's right
+    // edge. What each figure counts is named in the row label, never inside the cell.
+    public const string ValueSeparator = CombatStrings.CellSeparator;
     private const int MetricHeaderRow = FixedRows;
 
     public static int MetricRowCount(bool splitKillTiers) { return splitKillTiers ? 15 : 13; }
@@ -250,6 +251,17 @@ public static class ImpactBoard
         return (melee.EnemyDamageEstimated ? "~" : string.Empty) + CombatStatsFormatter.FormatDamage(melee.EnemyDamage);
     }
 
+    // The Scout row's damage: the counters' own Scout total, with the same `~` / `—` discipline as every
+    // other figure - an amount nobody could observe is a dash, never a fabricated zero.
+    public static string ScoutDamageText(ImpactCounters counters)
+    {
+        if (counters == null || !counters.ScoutDamageObserved) return CombatStrings.Placeholder;
+        if (!double.IsFinite(counters.ScoutDamage) || counters.ScoutDamage < 0) return CombatStrings.Placeholder;
+        // The marker travels with the figure: a client behind a host that runs no panel of its own measured its
+        // own blow, and printing that as a measurement would be the one lie this board does not tell.
+        return (counters.ScoutDamageEstimated ? "~" : string.Empty) + CombatStatsFormatter.FormatDamage(counters.ScoutDamage);
+    }
+
     // The two damage sentences, so a share nobody could measure is a dash rather than a division by a
     // squad total the board never saw.
     private static string DamageReason(ImpactInput input, double squadDamage, bool team = false, long kills = 0)
@@ -297,25 +309,29 @@ public static class ImpactBoard
         {
             case ImpactMetric.TotalDamage:
                 {
+                    // Two fields under `总伤害 / 占比`: the damage, then its share of the squad's own total.
+                    // A share nobody could measure is left off rather than printed as a zero.
                     string damage = (entry.Input.EnemyDamageEstimated ? "~" : string.Empty) + CombatStatsFormatter.FormatDamage(entry.Input.EnemyDamage);
                     string share = Share(entry.Input.EnemyDamage, squadDamage, entry.Input.EnemyDamageEstimated);
-                    return Single(share == CombatStrings.Placeholder ? damage : damage + " (" + share + ")");
+                    return share == CombatStrings.Placeholder ? Single(damage) : new[] { damage, share };
                 }
             case ImpactMetric.Stagger: return Single(Count(counters.Stagger));
             case ImpactMetric.Kills:
+                // A weight class prints its total and nothing else: the sleeping value of a kill is not a
+                // quality of the class, and the board neither shows nor keeps an awake / unknown split here.
                 if (!split) return new[] { MergedKillText(counters, KillTier.Minor), MergedKillText(counters, KillTier.Elite), MergedKillText(counters, KillTier.Boss) };
                 return Single(TierKillText(counters, tier));
             case ImpactMetric.Revives: return Single(Count(counters.Revives));
             case ImpactMetric.WeakspotRate: return Single(RateText(entry.Input, true));
             case ImpactMetric.Accuracy: return Single(RateText(entry.Input, false));
-            // The utilization the score was built from, and this player's own pack use beside it.
+            // The utilization the score was built from, then this player's own pack use: `补给效率 / 本人 / 弹药`.
             case ImpactMetric.SupplyEfficiency:
                 return Single(counters.SupplyUses > 0 || counters.SelfSupplyUses > 0
                     ? CombatStrings.SupplyCell(counters.SupplyUses > 0 ? Percent(counters.SupplyEfficiency, 1) : CombatStrings.Placeholder, counters.SelfSupplyUses, counters.SelfAmmoUses)
                     : CombatStrings.Placeholder);
             case ImpactMetric.ToolEfficiency: return Single(ToolEfficiencyText(entry));
             case ImpactMetric.LoneSurvivor: return Single(expeditionSucceeded ? Count(counters.LoneSurvivor) : CombatStrings.Placeholder);
-            // How often, then how much lifetime it cost, once anything was actually lost.
+            // How often, then how much lifetime it cost, once anything was actually lost: `阵亡 / 失血`.
             case ImpactMetric.Downs: return Single(CombatStrings.DownsCell(Count(counters.Downs), counters.HealthLost));
             case ImpactMetric.FriendlyFire:
                 {
@@ -324,46 +340,52 @@ public static class ImpactBoard
                         : CombatStrings.Placeholder;
                     return Single(CombatStrings.FriendlyFireCell(damage, Count(counters.FriendlyFireDeaths)));
                 }
+            // The two rows that do report a sleeping subset. Both carry the same three fields in the same
+            // order - total kills, the part of them landed on a sleeping enemy, and the damage that went
+            // with them - and the row label names all three, so the cell is only values.
             case ImpactMetric.MeleeKills:
                 {
-                    string kills = counters.MeleeKills > 0 || counters.MeleeKillsObserved
-                        ? Count(counters.MeleeKills) + KillStateText(counters.MeleeKills, counters.SleepingMeleeKills, counters.UnknownStateMeleeKills)
-                        : CombatStrings.Placeholder;
+                    bool observed = counters.MeleeKills > 0 || counters.MeleeKillsObserved;
                     string damage = MeleeDamageText(entry.Input);
-                    if (kills == CombatStrings.Placeholder && damage == CombatStrings.Placeholder) return Single(CombatStrings.Placeholder);
-                    return Single(CombatStrings.MeleeKillsCell(kills, damage));
+                    if (!observed && damage == CombatStrings.Placeholder) return Single(CombatStrings.Placeholder);
+                    return new[]
+                    {
+                        observed ? Count(counters.MeleeKills) : CombatStrings.Placeholder,
+                        observed ? Count(ImpactCounters.AsleepPart(counters.MeleeKills, counters.SleepingMeleeKills)) : CombatStrings.Placeholder,
+                        damage
+                    };
                 }
             case ImpactMetric.ScoutKills:
-                return Single(counters.ScoutKills > 0 || counters.ScoutKillsObserved
-                    ? Count(counters.ScoutKills) + KillStateText(counters.ScoutKills, counters.SleepingScoutKills, counters.UnknownStateScoutKills)
-                    : CombatStrings.Placeholder);
+                {
+                    bool observed = counters.ScoutKills > 0 || counters.ScoutKillsObserved;
+                    string damage = ScoutDamageText(counters);
+                    if (!observed && damage == CombatStrings.Placeholder) return Single(CombatStrings.Placeholder);
+                    return new[]
+                    {
+                        observed ? Count(counters.ScoutKills) : CombatStrings.Placeholder,
+                        observed ? Count(ImpactCounters.AsleepPart(counters.ScoutKills, counters.SleepingScoutKills)) : CombatStrings.Placeholder,
+                        damage
+                    };
+                }
             default: return Single(CombatStrings.Placeholder);
         }
     }
 
-    // One split tier cell: the count the board has always printed, and - only once a state other than
-    // "awake" was observed - the asleep / awake / unknown split of that same count, so nothing new is
-    // added to the row and a fully awake tier still reads as a bare number.
+    // One split tier cell: the total of that weight class. Nothing is appended to it, so the three tier
+    // rows stay a plain column of numbers however the kills were landed.
     public static string TierKillText(ImpactCounters counters, KillTier tier)
     {
         if (counters == null) return CombatStrings.Placeholder;
-        return Count(counters.KillCount(tier)) + KillStateText(counters.KillCount(tier),
-            counters.SleepingKillCount(tier), counters.UnknownStateKillCount(tier));
+        return Count(counters.KillCount(tier));
     }
 
-    // The legacy merged cell keeps its weight-class word and carries the same split after it.
+    // The merged row is three fields in one cell - one per weight class - and each field names its own class,
+    // because the row label cannot: it has to hold all three. The figures are bare totals; the class word is
+    // the only thing attached to them, and it carries no state.
     public static string MergedKillText(ImpactCounters counters, KillTier tier)
     {
         if (counters == null) return CombatStrings.Placeholder;
-        return Count(counters.KillCount(tier)) + CombatStrings.KillTierMark(tier) + KillStateText(counters.KillCount(tier),
-            counters.SleepingKillCount(tier), counters.UnknownStateKillCount(tier));
-    }
-
-    private static string KillStateText(long total, long sleeping, long unknown)
-    {
-        long asleep = ImpactCounters.AsleepPart(total, sleeping);
-        long awake = ImpactCounters.AwakePart(total, sleeping, unknown);
-        return CombatStrings.KillStateSuffix(asleep, awake, Math.Max(0, total - asleep - awake));
+        return Count(counters.KillCount(tier)) + CombatStrings.KillTierLabel(tier);
     }
     // The scan pair remains the score source; the second segment only reports the equipped tool's use.
     public static string ToolEfficiencyText(ImpactEntry entry)
@@ -384,7 +406,9 @@ public static class ImpactBoard
         else if (Contains(name, "Glue") || Contains(name, "C-Foam") || Contains(name, "胶") || Contains(name, "泡沫"))
             details = CombatStrings.ToolGlue(Count(counters.GlueShots), Count(counters.GlueHits), Count(counters.GluedEnemies));
         if (scan.Length == 0) return details.Length == 0 ? CombatStrings.Placeholder : details;
-        return details.Length == 0 ? scan : scan + " | " + details;
+        // One separator for the whole board: a tool that both scans and holds a placeable would otherwise print
+        // two different joints inside one cell. The halves are one cell, so they are joined like every field.
+        return details.Length == 0 ? scan : scan + CombatStrings.CellSeparator + details;
     }
     public static bool IsScannerTool(string name)
         => Contains(name, "Bio Tracker") || Contains(name, "Biotracker") || Contains(name, "Enemy Scanner")

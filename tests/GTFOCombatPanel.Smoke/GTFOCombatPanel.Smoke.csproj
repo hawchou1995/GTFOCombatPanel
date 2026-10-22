@@ -30,6 +30,7 @@
     <Compile Include="..\..\SquadPackets.cs" Link="SquadPackets.cs" />
     <Compile Include="..\..\SquadNet.cs" Link="SquadNet.cs" />
     <Compile Include="..\..\HandshakePolicy.cs" Link="HandshakePolicy.cs" />
+    <Compile Include="..\..\SquadCapability.cs" Link="SquadCapability.cs" />
     <Compile Include="..\..\OverlayPolicy.cs" Link="OverlayPolicy.cs" />
     <Compile Include="..\..\ResultVisibility.cs" Link="ResultVisibility.cs" />
     <Compile Include="..\..\BlinkCompletionLedger.cs" Link="BlinkCompletionLedger.cs" />

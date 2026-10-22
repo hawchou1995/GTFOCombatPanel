@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using BepInEx.Configuration;
 using Player;
 using SNetwork;
 
@@ -12,12 +13,15 @@ namespace HawChow.GTFOCombatPanel;
 // to Unity, SNet or Harmony and is therefore asserted headlessly.
 //
 //   host   - reads every player's fire, damage and backpack itself, so it sends one row per slotted player
-//            to every peer that has spoken to it.
-//   client - sends its own row, and only its own row, to every peer that has spoken to it, and shows the
-//            rows the host sends it.
-//   either - greets every human peer on a cadence until it hears from that peer, so two clients behind a
-//            host that runs no mod of its own still find each other, and a peer that restarts is found
-//            again rather than being written off for the session.
+//            to every peer it may speak to. Its rows are authoritative for damage.
+//   client - sends its own row, and only its own row, to every peer it may speak to, and shows the rows
+//            the host sends it.
+//   either - greets a peer on a cadence once that peer is known to run this build: either its lookup is
+//            named in this machine's own configuration, or it has itself sent this machine one of these
+//            packets. Nothing - a greeting included - is sent to a machine there is no evidence about, so
+//            a host that runs no mod, a bot and a stranger in the lobby are never handed bytes they have
+//            no handler for. This machine therefore does not promise to pair two modded clients behind a
+//            vanilla host on its own: one of them has to name the other.
 //
 // Nothing a packet carries is ever written into the capture ledger. `CombatTracker.Store` holds only what
 // this machine measured; a received snapshot is cached raw and a row is *projected* for display by cloning
@@ -27,9 +31,9 @@ namespace HawChow.GTFOCombatPanel;
 // blanking a client's own row.
 //
 // The transport is `SquadNet`: the game's own byte channel, taken back in a prefix on
-// `SNet_Replication.RecieveBytes`. A peer that never answers is asked a bounded number of times and is
-// then left alone, so a lobby whose host does not run this mod is exchanged with only between the clients
-// that do.
+// `SNet_Replication.RecieveBytes`. `SquadNet.MaySend` is set here from the exchange's evidence, so the
+// transport refuses on its own account anything the exchange should not have asked for, a greeting
+// included.
 internal static class CombatSync
 {
     private static readonly SquadExchange Exchange = new SquadExchange();
@@ -52,6 +56,12 @@ internal static class CombatSync
     private static readonly Dictionary<ulong, int> Heard = new Dictionary<ulong, int>();
     private static readonly HashSet<ulong> SentTo = new HashSet<ulong>();
     private static readonly HashSet<ulong> Confirmed = new HashSet<ulong>();
+    // Who this machine is allowed to start a conversation with. The list is the operator's: lookups of
+    // players known to run this build, read from this plugin's own configuration file. Everything else is
+    // learned the only way a machine without a mod cannot imitate - by the peer speaking first.
+    private static ConfigEntry<string> _allowlistEntry;
+    private static string _allowlistText;
+    private static readonly List<ulong> Allowlist = new List<ulong>();
 
     private static int PrimarySlot => (int)InventorySlot.GearStandard;
     private static int SpecialSlot => (int)InventorySlot.GearSpecial;
@@ -101,7 +111,18 @@ internal static class CombatSync
             SquadNet.OnHello = OnHello;
             SquadNet.OnSnapshot = OnSnapshot;
             SquadNet.OnProtocolMismatch = OnProtocolMismatch;
-            Plugin.Logger.LogInfo("[DIAG] squad sync armed: every machine greets every human peer (2s burst, 10s keep-alive). Each second the host sends its squad rows and a client sends only its own measurements, without a handshake gate. SNet_Replication.RecieveBytes supplies the transport sender identity; snapshot Owner identifies the player described, not the sender. Received rows are queued for main-thread authority checks and display projection.");
+            // The transport's own gate. It answers from the same evidence the exchange does, so a packet the
+            // exchange should never have asked for cannot reach the wire by any other route; before the
+            // configuration is read the gate refuses everything, which is the safe answer.
+            SquadNet.MaySend = MayBeSpokenTo;
+            BindDiscoveryConfig();
+            Plugin.Logger.LogInfo("[DIAG] squad sync armed: nothing is put on the wire - a hello included - for a peer this machine"
+                + " has no evidence about. A peer is spoken to when its lookup is named in [Squad Sync] AllowlistedPeers, or after"
+                + " it has itself sent this machine a packet of this build's protocol; the greeting then runs at its usual cadence"
+                + " (2s burst, 10s keep-alive), the host sends its squad rows each second and a client sends only its own"
+                + " measurements. SNet_Replication.RecieveBytes supplies the transport sender identity; snapshot Owner identifies"
+                + " the player described, not the sender. Received rows are queued for main-thread authority checks and display"
+                + " projection.");
         }
         catch (Exception error)
         {
@@ -112,6 +133,58 @@ internal static class CombatSync
                 Plugin.Logger.LogWarning("squad sync could not be armed on this build and the panel keeps working from locally observed data only: " + error.GetType().Name + ": " + error.Message);
             }
         }
+    }
+
+    // The one signal that can start a conversation between two machines that have never met is this
+    // machine's own configuration, so it is read from the plugin's config file rather than invented. The
+    // keys live under [Squad Sync] beside the panel's own; a file that has never been edited simply names
+    // nobody, and the panel then shares with machines that spoke first and with none else.
+    private static void BindDiscoveryConfig()
+    {
+        try
+        {
+            ConfigFile config = Plugin.Instance != null ? Plugin.Instance.Config : null;
+            if (config == null)
+            {
+                Plugin.Logger.LogWarning("[DIAG] squad sync discovery: the configuration file is not reachable yet, so no peer is"
+                    + " allowlisted and this machine speaks to nobody until one of them speaks first.");
+                return;
+            }
+            _allowlistEntry = config.Bind("Squad Sync", "AllowlistedPeers", string.Empty,
+                "SteamID64 lookups of players known to run CombatPanel, separated by commas. Nothing is sent to a player who is"
+                + " not named here until that player has itself sent this machine a packet of this mod's protocol, and a greeting"
+                + " counts as one: a machine that runs no mod never produces one, so it is never sent anything to probe it."
+                + " Leave this empty to share only with players who speak first. The number is the one the game's own lobby"
+                + " associates with the player; a value that is not a plain decimal number is ignored rather than guessed at.");
+            ApplyAllowlist(true);
+        }
+        catch (Exception error)
+        {
+            Plugin.Logger.LogWarning("squad sync discovery: the allowlist could not be read, so this machine speaks to nobody"
+                + " until a peer speaks first: " + error.GetType().Name + ": " + error.Message);
+        }
+    }
+
+    // Re-read on every tick, but only re-applied when the text actually changed: the file can be edited
+    // while the game runs, and a lookup added there has to take effect without a restart.
+    private static void ApplyAllowlist(bool force)
+    {
+        if (_allowlistEntry == null) return;
+        string text = _allowlistEntry.Value ?? string.Empty;
+        if (!force && text == _allowlistText) return;
+        _allowlistText = text;
+        int accepted = SquadCapability.ParseAllowlist(text, Allowlist);
+        Exchange.SetAllowlist(Allowlist);
+        Plugin.Logger.LogInfo("[DIAG] squad sync discovery: " + accepted + " peer lookup(s) allowlisted by this machine's"
+            + " configuration; every other peer is sent nothing until it has itself sent this machine a packet of this build's"
+            + " protocol. Nothing here proves who is online, and no packet is sent to find out.");
+    }
+
+    // The transport's gate. Read from the main thread only, where every send of this mod is decided.
+    private static bool MayBeSpokenTo(ulong lookup)
+    {
+        try { return Exchange.Capability.MaySend(lookup); }
+        catch (Exception) { return false; }
     }
 
     // A new expedition starts from zero everywhere, so the figures held for other players describe the
@@ -154,6 +227,8 @@ internal static class CombatSync
             if (local == 0UL) return;
             Exchange.Configure(local, PrimarySlot, SpecialSlot, ClassSlot, MeleeSlot);
             Exchange.SetRoster(Roster(local), master);
+            // A lookup added to the file while the game runs takes effect here, without a restart.
+            ApplyAllowlist(false);
 
             // One line each way, once per level. Together they say whether the exchange is running at all and
             // in which direction it is still blind, which is the pair of facts every "nothing is shared"
@@ -178,13 +253,13 @@ internal static class CombatSync
             if (rows > 0 && !_loggedOutboundRows)
             {
                 _loggedOutboundRows = true;
-                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have answered. Every human peer is sent to without a handshake gate; this send receipt alone does not prove remote acceptance.");
+                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build and {Exchange.WithheldPeers} are being sent nothing. A row goes only to a peer with that evidence, and this send receipt alone does not prove remote acceptance.");
             }
             if (!_loggedNoInbound && _levelSince >= 0f && now - _levelSince >= NoInboundSeconds
                 && Exchange.HumanPeers > 0 && Heard.Count == 0)
             {
                 _loggedNoInbound = true;
-                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {now - _levelSince:0}s in the level with {Exchange.HumanPeers} human peer(s) in the roster and not one packet heard from any of them, so no other player's row can appear on this screen. Greetings keep going on the keep-alive cadence; a peer running a different build answers with its protocol version and the two then stay silent on purpose, which is what this line exists to show.");
+                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {now - _levelSince:0}s in the level with {Exchange.HumanPeers} human peer(s) in the roster and not one packet heard from any of them, so no other player's row can appear on this screen. {Exchange.WithheldPeers} of them are being sent nothing because this machine holds no evidence that they run this build; name a player's lookup in [Squad Sync] AllowlistedPeers to start the exchange, or wait for it to greet this machine first. Greetings that were allowed keep going on the keep-alive cadence, and a peer on another protocol version answers with its version and is then left alone on purpose, which is what this line exists to show.");
             }
         }
         catch (Exception error)
@@ -258,6 +333,9 @@ internal static class CombatSync
         // said nothing about the rest, which is why a session whose every peer was on an older build produced
         // one mismatch line next to a diagnostic saying no peer had been heard at all.
         if (!Mismatched.Add(senderLookup)) return;
+        // A peer that speaks another protocol is not a mod machine this build can talk to: every packet
+        // already put on the wire for it was unreadable, so the exchange stops sending and says so.
+        Exchange.OnPeerIncompatible(senderLookup);
         Plugin.Logger.LogWarning($"[DIAG] squad sync peer {senderLookup} speaks protocol {version} and this build speaks {SyncProtocol.Version}: the two stay silent rather than decoding each other's fields; one of them has to be updated. This line is written once per peer.");
     }
 

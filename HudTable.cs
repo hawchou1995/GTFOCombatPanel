@@ -223,47 +223,66 @@ internal static class HudTable
         catch { return 0; }
     }
 
-    // Column widths for a whole table: one slot per field, each as wide as the widest value that
-    // lands in it. Because every field keeps its own slot, the numbers of a merged column line up
-    // vertically across rows. Fields are held apart by a gap that is a fraction of the glyph, not
-    // by a drawn separator: that is what keeps a merged column narrow. The whole table is scaled
-    // down if it would outgrow the box it was given.
+    // Column widths for a whole table.
+    //
+    // The in-level HUD keeps one slot per field, each as wide as the widest value that lands in it, and the
+    // whole table is scaled down together if it would outgrow its box.
+    //
+    // The settlement board is measured differently, and deliberately so: its player columns are a table of
+    // the same kind of figure, so they are all given one width - the widest of them - and the label column
+    // is measured on its own. Equal player columns are what makes `#1`, `#2`, `#3` line up down the board
+    // instead of each finding its own width, and it is the whole table, glyph size included, that is then
+    // scaled as one to fit the screen.
     internal static PanelGrid BuildGrid(TableContent content, int fontSize, PanelDensity density, float maxWidth, float maxHeight)
     {
         if (content == null || content.ColumnCount == 0 || content.Rows == 0) return null;
         float separatorWidth = PanelGeometry.FieldGap(fontSize, density);
         var metrics = new PanelColumnMetrics[content.ColumnCount];
-        for (int column = 0; column < content.ColumnCount; column++)
+        if (content.FieldSeparator != null)
         {
-            // Settlement cells share one measured right edge; HUD fields keep their own slots.
-            if (content.FieldSeparator != null)
+            // One measured right edge per player column, so the settlement cells share one width.
+            float labelWidth = 0f, valueWidth = 0f;
+            for (int column = 0; column < content.ColumnCount; column++)
             {
+                bool label = content.Columns[column] == PanelColumn.ImpactLabel;
                 float width = PanelGeometry.MinimumWidth(content.Columns[column], fontSize);
                 for (int row = 0; row < content.Rows; row++)
                 {
                     string joined = string.Join(content.FieldSeparator, content.Cell(row, column));
                     width = Mathf.Max(width, Mathf.Max(PanelGeometry.EstimateTextWidth(joined, fontSize), Measure(joined, fontSize, true)));
                 }
-                metrics[column] = new PanelColumnMetrics(new[] { width });
-                continue;
+                if (label) labelWidth = Mathf.Max(labelWidth, width);
+                else valueWidth = Mathf.Max(valueWidth, width);
             }
-            int maxFields = 1;
-            for (int row = 0; row < content.Rows; row++) maxFields = Mathf.Max(maxFields, content.Cell(row, column).Length);
-            float floor = PanelGeometry.MinimumWidth(content.Columns[column], fontSize) / maxFields;
-            var widths = new float[maxFields];
-            for (int field = 0; field < maxFields; field++) widths[field] = floor;
-            for (int row = 0; row < content.Rows; row++)
+            for (int column = 0; column < content.ColumnCount; column++)
             {
-                string[] fields = content.Cell(row, column);
-                for (int field = 0; field < fields.Length; field++)
-                {
-                    int slot = maxFields - fields.Length + field;
-                    if (slot < 0 || slot >= maxFields) continue;
-                    float width = Mathf.Max(PanelGeometry.EstimateTextWidth(fields[field], fontSize), Measure(fields[field], fontSize));
-                    widths[slot] = Mathf.Max(widths[slot], width);
-                }
+                bool label = content.Columns[column] == PanelColumn.ImpactLabel;
+                float width = label ? Mathf.Max(labelWidth, PanelGeometry.MinimumWidth(PanelColumn.ImpactLabel, fontSize)) : valueWidth;
+                metrics[column] = new PanelColumnMetrics(new[] { width });
             }
-            metrics[column] = new PanelColumnMetrics(widths);
+        }
+        else
+        {
+            for (int column = 0; column < content.ColumnCount; column++)
+            {
+                int maxFields = 1;
+                for (int row = 0; row < content.Rows; row++) maxFields = Mathf.Max(maxFields, content.Cell(row, column).Length);
+                float floor = PanelGeometry.MinimumWidth(content.Columns[column], fontSize) / maxFields;
+                var widths = new float[maxFields];
+                for (int field = 0; field < maxFields; field++) widths[field] = floor;
+                for (int row = 0; row < content.Rows; row++)
+                {
+                    string[] fields = content.Cell(row, column);
+                    for (int field = 0; field < fields.Length; field++)
+                    {
+                        int slot = maxFields - fields.Length + field;
+                        if (slot < 0 || slot >= maxFields) continue;
+                        float width = Mathf.Max(PanelGeometry.EstimateTextWidth(fields[field], fontSize), Measure(fields[field], fontSize));
+                        widths[slot] = Mathf.Max(widths[slot], width);
+                    }
+                }
+                metrics[column] = new PanelColumnMetrics(widths);
+            }
         }
         // A column of figures is right-aligned so it shares one right edge down the board; a label or a
         // player's name reads from the left instead.
@@ -276,15 +295,32 @@ internal static class HudTable
         }
         // One measurement for the whole build: the row asks for the face's own line height at the size
         // being tried, so fitting the table to a box shrinks the row with the glyph instead of pinning it.
-        float rowEm = RowEm(fontSize);
-        PanelGrid grid = PanelGeometry.Build(metrics, separatorWidth, fontSize, content.Rows, density, 1f, rightAligned, rowEm);
+        PanelGrid grid = PanelGeometry.Build(metrics, separatorWidth, fontSize, content.Rows, density, 1f, rightAligned, RowEm(fontSize));
         float fit = grid.FitFactor(maxWidth, maxHeight);
-        if (fit < 0.999f) grid = PanelGeometry.Build(metrics, separatorWidth, fontSize, content.Rows, density, fit, rightAligned, rowEm);
+        if (fit < 0.999f)
+        {
+            if (content.FieldSeparator != null)
+            {
+                // The settlement board shrinks as one object: a smaller glyph, proportionally narrower
+                // columns and a proportionally shorter row, which is what keeps the player columns equal
+                // and the table's proportions the same at every resolution.
+                int working = Mathf.Max(6, Mathf.FloorToInt(fontSize * Mathf.Clamp(fit, PanelGeometry.MinimumShrink, 1f)));
+                int guard = 0;
+                do
+                {
+                    grid = PanelGeometry.Build(metrics, separatorWidth, fontSize, content.Rows, density, working / (float)fontSize, rightAligned, RowEm(working));
+                    if (Fits(grid, maxWidth, maxHeight)) break;
+                    working--;
+                }
+                while (working > 6 && guard++ < 400);
+            }
+            else grid = PanelGeometry.Build(metrics, separatorWidth, fontSize, content.Rows, density, fit, rightAligned, RowEm(fontSize));
+        }
         // The fit factor is a ratio, and the rebuild rounds the glyph size, so a grid can come back a
         // fraction of a pixel taller than the box it was asked to fit - which is exactly how a board that
-        // fitted in principle got refused by a `>` comparison at draw time. Shrink the glyph size until
-        // the grid really fits, or until it is too small to be worth drawing.
-        if (maxHeight > 0f && float.IsFinite(maxHeight))
+        // fitted in principle got refused by a `>` comparison at draw time. Shrink the HUD's glyph size
+        // until the grid really fits, or until it is too small to be worth drawing.
+        if (content.FieldSeparator == null && maxHeight > 0f && float.IsFinite(maxHeight))
         {
             int guard = 0;
             int working = fontSize;
@@ -295,6 +331,14 @@ internal static class HudTable
             }
         }
         return grid;
+    }
+
+    private static bool Fits(PanelGrid grid, float maxWidth, float maxHeight)
+    {
+        if (grid == null) return false;
+        if (maxWidth > 0f && float.IsFinite(maxWidth) && grid.Width > maxWidth + 0.01f) return false;
+        if (maxHeight > 0f && float.IsFinite(maxHeight) && grid.Height > maxHeight + 0.01f) return false;
+        return true;
     }
 
     internal static void Draw(PanelGrid grid, float originX, float originY, TableContent content, float opacity = 1f)

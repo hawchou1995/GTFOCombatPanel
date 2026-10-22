@@ -75,8 +75,12 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Config watcher tests failed with exit code $LASTEXITCODE" }
 
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ($manifest.name -ne 'CombatPanel' -or $manifest.version_number -ne '1.18.1') {
-        throw 'Thunderstore package name/version mismatch.'
+    # The expected version is read from the plugin itself, so this check cannot go stale the next time the
+    # version is bumped: the package and the DLL are compared against the one place the version is written.
+    $pluginInfo = Get-Content -LiteralPath (Join-Path $projectRoot 'PluginInfo.cs') -Raw
+    $pluginVersion = [regex]::Match($pluginInfo, 'Version\s*=\s*"([^"]+)"').Groups[1].Value
+    if ($manifest.name -ne 'CombatPanel' -or $manifest.version_number -ne $pluginVersion) {
+        throw "Thunderstore package name/version mismatch: the manifest says '$($manifest.version_number)', the plugin says '$pluginVersion'."
     }
     if ($manifest.dependencies.Count -ne 1 -or $manifest.dependencies[0] -ne 'BepInEx-BepInExPack_GTFO-3.2.3') {
         throw 'Package must depend on the BepInEx GTFO pack only.'
