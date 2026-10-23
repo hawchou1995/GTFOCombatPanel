@@ -73,6 +73,9 @@ try {
     Write-Host 'Running production config file watcher tests...'
     & $DotnetExe run --project (Join-Path $projectRoot 'tests\GTFOCombatPanel.ConfigWatcher\GTFOCombatPanel.ConfigWatcher.csproj') --configuration Release --verbosity minimal "-p:GTFO_DIR=$GTFO_DIR"
     if ($LASTEXITCODE -ne 0) { throw "Config watcher tests failed with exit code $LASTEXITCODE" }
+    Write-Host 'Running supply giver attribution tests...'
+    & $DotnetExe run --project (Join-Path $projectRoot 'tests\GTFOCombatPanel.Supply\GTFOCombatPanel.Supply.csproj') --configuration Release --verbosity minimal
+    if ($LASTEXITCODE -ne 0) { throw "Supply attribution tests failed with exit code $LASTEXITCODE" }
 
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     # The expected version is read from the plugin itself, so this check cannot go stale the next time the
@@ -88,10 +91,11 @@ try {
     if ($manifest.description.Length -gt 256) {
         throw "Thunderstore rejects a manifest description longer than 256 characters; this one is $($manifest.description.Length)."
     }
-    foreach ($file in @('PanelBehaviour.cs', 'ResultsDisplay.cs')) {
-        if (-not (Get-Content (Join-Path $projectRoot $file) -Raw).Contains('CombatSync.DisplayRows().OrderBy(')) {
-            throw "Display must consume the shared squad projection: $file"
-        }
+    $hudProjection = (Get-Content (Join-Path $projectRoot 'PanelBehaviour.cs') -Raw).Contains('CombatSync.DisplayRows().OrderBy(')
+    $resultProjection = (Get-Content (Join-Path $projectRoot 'ResultsDisplay.cs') -Raw).Contains('CombatTracker.SettlementView().OrderBy(')
+    $handoff = (Get-Content (Join-Path $projectRoot 'CombatTracker.cs') -Raw).Contains('ResultRows.Update(CombatSync.DisplayRows(), CombatSync.Generation)')
+    if (-not $hudProjection -or -not $resultProjection -or -not $handoff) {
+        throw 'HUD and settlement handoff must consume the shared squad projection.'
     }
     Write-Host 'DISPLAY_PROJECTION_WIRING: PASS'
     $resultsSource = Get-Content (Join-Path $projectRoot 'ResultsDisplay.cs') -Raw

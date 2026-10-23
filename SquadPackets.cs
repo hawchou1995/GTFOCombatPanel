@@ -110,6 +110,41 @@ public static class SquadPackets
         }
     }
 
+    // How many bytes the envelope in `buffer` actually occupies, as the envelope itself states it: the key,
+    // the magic and the kind decide it, never the caller's buffer.
+    //
+    // This exists for the one caller that cannot be told a packet's length. GTFO-API hands its free-sized
+    // handler `packetData.Length - HeaderSize` (NetworkAPI_Impl.HandlePacket), where `packetData` is the
+    // array the game's replication layer cached - the same array that is at least as long as the packet and
+    // often longer, which is why the raw byte channel is read against the declared `size` and never against
+    // `buffer.Length`. A payload carrying that pad has to be read as the packet the envelope names, or every
+    // packet of ours arriving over GTFO-API is refused as `Malformed` and the two machines exchange nothing:
+    // the padded body is not exactly one snapshot, so the exact-length rule that protects the struct fails
+    // on a pad rather than on a disagreement about the format.
+    //
+    // The pad itself is never read. Zero means "no complete header of ours here", and the caller then parses
+    // what it was handed, which stays `Malformed` and still counts as a packet of ours.
+    public static int FramedLength(byte[] buffer, int available)
+    {
+        if (buffer == null) return 0;
+        if (available < 0 || available > buffer.Length) available = buffer.Length;
+        if (available < HeaderBytes) return 0;
+        if (ReadU16(buffer, 0) != Key) return 0;
+        for (int index = 0; index < Magic.Length; index++)
+            if (buffer[2 + index] != Magic[index]) return 0;
+        // A header that names a kind the payload cannot hold in full is not a framed packet: zero is
+        // returned so the caller parses what it has and the packet is reported as `Malformed`, which is what
+        // a truncated packet is - never read as if the missing bytes had arrived.
+        int framed;
+        switch (ReadU16(buffer, 6))
+        {
+            case SyncProtocol.KindHello: framed = HelloBytes; break;
+            case SyncProtocol.KindSnapshot: framed = SnapshotBytes; break;
+            default: return 0;
+        }
+        return available >= framed ? framed : 0;
+    }
+
     private static void WriteHeader(byte[] packet, ushort kind, uint generation, uint version)
     {
         WriteU16(packet, 0, Key);

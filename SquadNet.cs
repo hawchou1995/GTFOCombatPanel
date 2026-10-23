@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading;
 using HarmonyLib;
 using Il2CppInterop.Runtime.InteropTypes.Arrays;
@@ -55,19 +57,60 @@ internal static class SquadNet
     internal static Func<ulong, bool> MaySend;
 
     internal const int MaxQueue = 256;
-    private struct Queued { public SquadPacketKind Kind; public ulong Sender; public ulong HelloOwner; public uint Generation; public uint Version; public SyncSnapshot Snapshot; }
+    private struct Queued { public SquadPacketKind Kind; public ulong Sender; public ulong HelloOwner; public uint Generation; public uint Version; public SyncSnapshot Snapshot; public bool ViaApi; }
     private static readonly ConcurrentQueue<Queued> Queue = new ConcurrentQueue<Queued>();
-    // Which transport each peer has been heard on: true for GTFO-API's event, false for the game's own byte
-    // channel. Written when a packet arrives, read when one is sent, so a mixed squad converges on a route
-    // that is known to work in both directions instead of each half sending into the other's blind side.
-    private static readonly ConcurrentDictionary<ulong, bool> Route = new ConcurrentDictionary<ulong, bool>();
+    // Which transport each peer has been heard on, and when that was learned: true for GTFO-API's event,
+    // false for the game's own byte channel. Written when a packet arrives, read when one is sent, so a mixed
+    // squad converges on a route that is known to work in both directions instead of each half sending into
+    // the other's blind side.
+    //
+    // A route is evidence with an age. It is recorded only for a packet of ours that actually decoded - a
+    // packet the transport handed over in a shape this build could not read proves nothing about whether the
+    // peer can read what this machine sends - and it expires after `RouteSeconds`, at which point the peer is
+    // unknown again and receives the packet both ways until it answers. Without the expiry one unusable
+    // packet was enough to lock a pair onto a transport that was delivering nothing, for the rest of the run,
+    // with no line in the log saying so.
+    private readonly struct RouteEntry
+    {
+        internal readonly bool ViaApi;
+        internal readonly float Learned;
+        internal RouteEntry(bool viaApi, float learned) { ViaApi = viaApi; Learned = learned; }
+    }
+    private const float RouteSeconds = 10f;
+    private static readonly Stopwatch Clock = Stopwatch.StartNew();
+    private static readonly ConcurrentDictionary<ulong, RouteEntry> Route = new ConcurrentDictionary<ulong, RouteEntry>();
+
+    // Seconds since this plugin loaded. Only ordering and elapsed time are read from it, never a wall clock.
+    private static float Seconds => (float)Clock.Elapsed.TotalSeconds;
+
+    // Whether this peer's route is known and still fresh. A stale entry is dropped rather than trusted, which
+    // is what puts an unknown peer back on both transports for one packet.
+    private static bool TryRoute(ulong lookup, out bool viaApi)
+    {
+        viaApi = false;
+        if (lookup == 0UL) return false;
+        if (!Route.TryGetValue(lookup, out RouteEntry entry)) return false;
+        if (Seconds - entry.Learned > RouteSeconds) { Route.TryRemove(lookup, out _); return false; }
+        viaApi = entry.ViaApi;
+        return true;
+    }
+
+    // The route a peer is currently held to, for the headless suite: true = GTFO-API, false = the game's own
+    // byte channel, and null when nothing usable has been heard from that peer lately.
+    internal static bool? RouteOf(ulong lookup) => TryRoute(lookup, out bool viaApi) ? viaApi : (bool?)null;
 
     // A new expedition, or a new lobby: what was learned about who answers on which transport described the last
     // session and not this one. Forgetting it puts every peer back to "unknown", which is the state that sends
     // both ways and therefore cannot be wrong about a peer whose route changed with the session.
     internal static void ResetRoutes() => Route.Clear();
-    private static int _queued;
+    private static int _queued, _unusable;
+    private static readonly HashSet<string> UnusableReported = new HashSet<string>();
     private static bool _loggedOverflow, _loggedReadError, _loggedWithheld;
+
+    // How many packets of this build's protocol were consumed here but could not be used - the shape the
+    // previous release produced no diagnostic for at all, which is why "nothing is shared" could not be told
+    // apart from "the packets arrive and are dropped".
+    internal static int UnusablePackets => _unusable;
 
     // ---------------------------------------------------------------- the GTFO-API transport
 
@@ -212,9 +255,7 @@ internal static class SquadNet
         try
         {
             if (payload == null || payload.Length == 0) return;
-            SquadPacket packet = SquadPackets.Parse(payload, payload.Length);
-            if (!packet.IsOurs) return;
-            Enqueue(packet, sender, true);
+            TryAcceptApiPayload(sender, payload, payload.Length);
         }
         catch (Exception error)
         {
@@ -224,6 +265,29 @@ internal static class SquadNet
                 Plugin.Logger?.LogWarning("a squad packet received over GTFO-API could not be read and was dropped: " + error.Message);
             }
         }
+    }
+
+    // The GTFO-API receive path, separated from the callback so the headless suite can drive it with the
+    // payload shape that transport actually produces.
+    //
+    // GTFO-API cannot tell its handler how long the packet is: `HandlePacket` derives the payload from
+    // `packetData.Length - HeaderSize`, and `packetData` is the array the game's replication layer cached,
+    // which is at least as long as the packet and often longer - the same fact the raw channel is read
+    // against `size` for. So the payload handed here may end in stale bytes, and the packet is read as the
+    // length its own envelope declares. Nothing past that length is ever read.
+    //
+    // `length` is whatever the caller knows the payload to be; zero or less means "all of it".
+    internal static bool TryAcceptApiPayload(ulong sender, byte[] payload, int length)
+    {
+        if (payload == null || payload.Length == 0) return false;
+        int available = length <= 0 || length > payload.Length ? payload.Length : length;
+        int framed = SquadPackets.FramedLength(payload, available);
+        // A payload with no complete header of ours is parsed as it stands, so it stays `Malformed` - counted
+        // and reported - instead of being silently ignored or guessed at.
+        SquadPacket packet = SquadPackets.Parse(payload, framed > 0 ? framed : available);
+        if (!packet.IsOurs) return false;
+        Enqueue(packet, sender, true);
+        return true;
     }
 
     internal static void SendHello(SNet_Player target, ulong owner, uint generation)
@@ -258,16 +322,15 @@ internal static class SquadNet
         //
         // Which one a peer answers on is a fact this machine learns rather than assumes: a build with the API
         // bound and a build without it would otherwise talk past each other in one direction for the whole run.
-        // Until a peer's route is known the packet goes out both ways; once it has been heard from, only the
-        // route it actually used is kept, so the duplicate costs one packet per peer rather than one per second.
-        bool knownApi = false, knownRaw = false;
+        // Until a peer's route is known the packet goes out both ways; once a packet of that peer's has been
+        // read here, only the route it actually used is kept, so the duplicate costs one packet per peer rather
+        // than one per second. That memory expires (`TryRoute`): a transport that stops delivering puts the
+        // peer back to "unknown" within `RouteSeconds` instead of silencing the pair for the rest of the run.
         ulong lookup = 0UL;
         try { lookup = target.Lookup; } catch (Exception) { }
-        if (lookup != 0UL && Route.TryGetValue(lookup, out bool viaApi))
-        {
-            knownApi = viaApi;
-            knownRaw = !viaApi;
-        }
+        bool known = TryRoute(lookup, out bool viaApi);
+        bool knownApi = known && viaApi;
+        bool knownRaw = known && !viaApi;
         // Raw goes out unless this peer is known to answer on the API alone. An unknown peer gets both, because
         // the one packet that proves which route it uses is the one that arrives - and a peer known to be on the
         // API still gets the raw copy when the API send did not happen, because a transport that has retired
@@ -346,10 +409,13 @@ internal static class SquadNet
     private static void Enqueue(in SquadPacket packet, ulong sender, bool viaApi)
     {
         if (packet.Kind == SquadPacketKind.Foreign) return;
-        // Which transport this peer actually answered on. The first packet heard decides it, so a squad that
-        // mixes a machine with GTFO-API and one without settles on a route that works instead of each half
-        // sending into the other's blind side for the rest of the run.
-        if (sender != 0UL) Route[sender] = viaApi;
+        // Which transport this peer actually answered on - and only when the packet decoded. A packet the
+        // receive path had to refuse (`Malformed`, `Unknown`) still proves the peer is running something that
+        // speaks this key and magic, but it proves nothing about which transport can carry a packet this
+        // build can read: remembering it as "this peer is on the API" is how one unusable packet switched the
+        // working route off for the whole run.
+        if (sender != 0UL && (packet.Kind == SquadPacketKind.Hello || packet.Kind == SquadPacketKind.Snapshot))
+            Route[sender] = new RouteEntry(viaApi, Seconds);
         // Bounded, and bounded by dropping the oldest: the counter is raised once and lowered once per drop,
         // so a stalled main thread cannot grow the queue without limit and the queue cannot be emptied by the
         // very act of noticing that it is full.
@@ -368,7 +434,7 @@ internal static class SquadNet
             // Transport identity is not the body identity: a host relays rows owned by other players,
             // and snapshot packets intentionally carry no sender field (Parse leaves it zero).
             Kind = packet.Kind, Sender = sender, HelloOwner = packet.Sender, Generation = packet.Generation,
-            Version = packet.Version, Snapshot = packet.Snapshot
+            Version = packet.Version, Snapshot = packet.Snapshot, ViaApi = viaApi
         });
     }
 
@@ -393,6 +459,12 @@ internal static class SquadNet
                     case SquadPacketKind.VersionMismatch:
                         OnProtocolMismatch?.Invoke(queued.Sender, queued.Version);
                         break;
+                    default:
+                        // Ours, consumed, and unusable. Silent until now: the packet left the game's hands and
+                        // nothing said so, which is why "the squad exchanges nothing" could not be told apart
+                        // from "the packets arrive in a shape this build cannot read".
+                        ReportUnusable(queued);
+                        break;
                 }
             }
             catch (Exception error)
@@ -400,6 +472,23 @@ internal static class SquadNet
                 Plugin.Logger?.LogWarning("a queued squad packet could not be applied and was skipped: " + error.Message);
             }
         }
+    }
+
+    // A packet of ours that arrived and could not be used. One line per shape and transport, never one per
+    // packet: a lobby where every peer's packet lands in the wrong shape would otherwise write a line a
+    // second for the whole run. The line names the figures the diagnosis needs - which transport, which
+    // sender, what this build expected and what it was handed - because those are the only facts that tell a
+    // padded payload apart from a peer on another build.
+    private static void ReportUnusable(in Queued queued)
+    {
+        _unusable++;
+        string transport = queued.ViaApi ? "GTFO-API free-sized event" : "SNet.Core.SendBytes";
+        string key = queued.Kind + "/" + transport;
+        if (!UnusableReported.Add(key)) return;
+        Plugin.Logger?.LogWarning("[DIAG] squad sync receive: a packet of this build's protocol was consumed here and could not be used; kind="
+            + queued.Kind + "; transport=" + transport + "; peer=" + queued.Sender + "; generation=" + queued.Generation
+            + "; this build reads " + SquadPackets.HelloBytes + "-byte hellos and " + SquadPackets.SnapshotBytes
+            + "-byte rows; the packet is dropped rather than handed to the game. This line is written once per shape and transport.");
     }
 
     internal static int QueuedCount { get { return _queued; } }

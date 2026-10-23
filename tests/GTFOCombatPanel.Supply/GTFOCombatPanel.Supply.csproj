@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The supply giver policy is plain numbers, so it is exercised without the game: the ledger and the
+    sender rule are compiled straight out of the plugin sources. SupplyTracker itself binds native types
+    (PlayerAgent, SNet_Player, pAmmoGive) and cannot be linked here; every decision it delegates is in
+    SupplyUse.cs and is covered below.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net6.0</TargetFramework>
+    <LangVersion>10.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AssemblyName>GTFOCombatPanel.Supply</AssemblyName>
+    <RootNamespace>HawChow.GTFOCombatPanel.SupplyTests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
+    <Compile Include="..\..\ImpactMetrics.cs" Link="ImpactMetrics.cs" />
+    <Compile Include="..\..\CombatStats.cs" Link="CombatStats.cs" />
+    <Compile Include="..\..\Localization.cs" Link="Localization.cs" />
+  </ItemGroup>
+</Project>

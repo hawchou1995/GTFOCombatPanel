@@ -44,6 +44,7 @@ internal static class CombatSync
     // session: the session-wide latch named whichever peer replied first and then said nothing about the
     // rest, so a lobby where every peer was on an older build read as though only one of them was.
     private static readonly HashSet<ulong> Mismatched = new HashSet<ulong>();
+    private static readonly HashSet<string> ReportedSync = new HashSet<string>();
     private static eGameStateName _lastState = eGameStateName.Lobby;
     // The level clock for the inbound diagnostic, and the two once-per-level lines it guards. A squad that
     // exchanges nothing looks identical, from either screen, to a build that cannot exchange anything, so
@@ -101,11 +102,10 @@ internal static class CombatSync
         {
             if (SNet.IsMaster) return null;
             double? host = Exchange.SquadFromHost;
-            if (host.HasValue) return host;
-            if (!Exchange.AnyPeerAnswered) return null;
+            if (!host.HasValue && !Exchange.AnyPeerAnswered) return null;
             double total = 0;
             foreach (CombatPlayer row in DisplayRows()) total += Math.Max(0, row.Total.EnemyDamage);
-            return total;
+            return host.HasValue ? Math.Max(host.Value, total) : total;
         }
     }
 
@@ -257,7 +257,7 @@ internal static class CombatSync
     // previous run and must go, and the run counter moves so that a straggler from the old run is refused.
     internal static void ResetExpedition()
     {
-        Heard.Clear(); SentTo.Clear(); Confirmed.Clear(); Mismatched.Clear();
+        Heard.Clear(); SentTo.Clear(); Confirmed.Clear(); Mismatched.Clear(); ReportedSync.Clear();
         SquadNet.ResetRoutes();
         Exchange.Configure(OwnLookup(), PrimarySlot, SpecialSlot, ClassSlot, MeleeSlot);
         Exchange.ResetForExpedition();
@@ -331,13 +331,13 @@ internal static class CombatSync
             if (rows > 0 && !_loggedOutboundRows)
             {
                 _loggedOutboundRows = true;
-                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build, {Exchange.WithheldPeers} are being sent nothing, sharing={(ShareMode ? "every player in the slot list" : "named and proven players only")}. This send receipt alone does not prove remote acceptance.");
+                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build, {Exchange.WithheldPeers} are being sent nothing, sharing={(ShareMode ? "every player in the slot list" : "named and proven players only")}, receivedButUnusable={SquadNet.UnusablePackets}. This send receipt alone does not prove remote acceptance.");
             }
             if (!_loggedNoInbound && _levelSince >= 0f && now - _levelSince >= NoInboundSeconds
                 && Exchange.HumanPeers > 0 && Heard.Count == 0)
             {
                 _loggedNoInbound = true;
-                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {now - _levelSince:0}s in the level with {Exchange.HumanPeers} human peer(s) in the roster and not one packet heard from any of them, so no other player's row can appear on this screen. Outbound sharing is {(ShareMode ? "on for the whole slot list" : "restricted to named and proven players")} and {Exchange.WithheldPeers} peer(s) are being sent nothing. If this machine is broadcasting and still hears nothing, the two builds are not reaching each other's transport - read the armed line above for which transport this machine uses - or a peer answered with another protocol version and was then left alone on purpose. Greetings keep going on the keep-alive cadence either way.");
+                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {now - _levelSince:0}s in the level with {Exchange.HumanPeers} human peer(s) in the roster and not one packet heard from any of them, so no other player's row can appear on this screen. Outbound sharing is {(ShareMode ? "on for the whole slot list" : "restricted to named and proven players")} and {Exchange.WithheldPeers} peer(s) are being sent nothing; receivedButUnusable={SquadNet.UnusablePackets} (packets of this build's protocol that reached this machine and could not be decoded - a figure above zero means the transport is delivering and the shape is wrong, a zero means nothing arrived at all). If this machine is broadcasting and still hears nothing, the two builds are not reaching each other's transport - read the armed line above for which transport this machine uses - or a peer answered with another protocol version and was then left alone on purpose. Greetings keep going on the keep-alive cadence either way.");
             }
         }
         catch (Exception error)
@@ -397,7 +397,7 @@ internal static class CombatSync
         {
             SquadDecision decision = Exchange.OnSnapshot(sender, generation, snapshot, Now);
             if (decision.Accepted) Note(sender);
-            Plugin.Logger.LogInfo($"[DIAG] squad sync row: accepted={decision.Accepted}; peer={sender}; owner={snapshot.Owner}; peerGeneration={generation}; localGeneration={Exchange.Generation};");
+            Line($"[DIAG] squad sync row: accepted={decision.Accepted}; peer={sender}; owner={snapshot.Owner}; peerGeneration={generation}; localGeneration={Exchange.Generation};");
         }
         catch (Exception error)
         {
@@ -443,6 +443,7 @@ internal static class CombatSync
     internal static List<CombatPlayer> DisplayRows()
     {
         List<CombatPlayer> rows = Exchange.Project(CombatTracker.Store.Snapshot(), OwnLookup());
+        foreach (CombatPlayer row in rows) row?.ReconcileDamageLowerBound();
         // A share is only a measurement when the denominator is the squad's. Three denominators are not: a
         // host total that says it covers only the rows that host could measure, the sum of the rows this
         // machine happened to reach, and this machine's own store when it is the host and a slotted player has
@@ -456,6 +457,8 @@ internal static class CombatSync
 
     private static bool SharesAreEstimated(List<CombatPlayer> rows)
     {
+        foreach (CombatPlayer row in rows)
+            if (row.Total.EnemyDamageEstimated) return true;
         if (SNet.IsMaster) return !CoversRoster(rows);
         if (Exchange.SquadFromHost.HasValue) return Exchange.SquadFromHostPartial;
         return Exchange.AnyPeerAnswered;
@@ -495,6 +498,7 @@ internal static class CombatSync
 
     private static void Line(string text)
     {
+        if (ReportedSync.Count >= 256 || !ReportedSync.Add(text)) return;
         try { Plugin.Logger.LogInfo(text); }
         catch (Exception error) { if (!_loggedSendError) { _loggedSendError = true; Plugin.Logger?.LogWarning("a squad diagnostic line could not be written: " + error.Message); } }
     }

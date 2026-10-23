@@ -32,6 +32,20 @@ try {
         }
         Write-Host "EWC_EVENT: PASS $name($($actual -join ', '))"
     }
+    $damageApi = $module.GetType('EWC.API.DamageAPI')
+    if ($null -eq $damageApi) { throw 'EWC.API.DamageAPI is missing.' }
+    foreach ($kind in @('Explosive', 'Shrapnel', 'DOT')) {
+        foreach ($phase in @('Pre', 'Post')) {
+            $name = $phase + $kind + 'Damage'
+            $event = $damageApi.Events | Where-Object Name -EQ $name | Select-Object -First 1
+            if ($null -eq $event -or -not $event.AddMethod.IsPublic -or -not $event.AddMethod.IsStatic) { throw "Public static event is missing: $name" }
+            $invoke = $event.EventType.Resolve().Methods | Where-Object Name -EQ 'Invoke' | Select-Object -First 1
+            $actual = @($invoke.Parameters | ForEach-Object { $_.ParameterType.FullName })
+            $expected = @('System.Single', 'Enemies.EnemyAgent', 'Dam_EnemyDamageLimb', 'Player.PlayerAgent', 'EWC.CustomWeapon.Structs.pCWC')
+            if ($invoke.ReturnType.FullName -ne 'System.Void' -or ($actual -join '|') -ne ($expected -join '|')) { throw "EWC damage signature mismatch: $name ($($actual -join ', '))" }
+            Write-Host "EWC_DAMAGE_EVENT: PASS $name"
+        }
+    }
 
     # Every entry is the exact member the bridge reads at runtime, by declaring type and by name.
     $members = @(
@@ -44,7 +58,8 @@ try {
         @('CustomWeaponComponent', 'Owner', 'IOwnerComp'),
         @('CustomWeaponComponent', 'Weapon', 'IWeaponComp'),
         @('IOwnerComp', 'Player', 'PlayerAgent'),
-        @('IWeaponComp', 'InventorySlot', 'InventorySlot')
+        @('IWeaponComp', 'InventorySlot', 'InventorySlot'),
+        @('pCWC', 'slot', 'InventorySlot')
     )
     foreach ($spec in $members) {
         $type = Find-Type $spec[0]
@@ -59,6 +74,6 @@ try {
     $cwc = Find-Type 'CustomWeaponComponent'
     if ($null -eq $cwc -or $cwc.BaseType.FullName -ne 'UnityEngine.MonoBehaviour') { throw 'CWC is not a Unity component.' }
     $strongName = $assembly.Name
-    Write-Host "EWC_API_CONTRACT: PASS; assembly=$($strongName.Name) $($strongName.Version); public events=4; bridge members=10; SHA256=$((Get-FileHash -LiteralPath $EwcDll -Algorithm SHA256).Hash)"
+    Write-Host "EWC_API_CONTRACT: PASS; assembly=$($strongName.Name) $($strongName.Version); public events=10; bridge members=11; SHA256=$((Get-FileHash -LiteralPath $EwcDll -Algorithm SHA256).Hash)"
 }
 finally { $assembly.Dispose() }

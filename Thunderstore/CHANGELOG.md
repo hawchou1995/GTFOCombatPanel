@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.2
+- Decode GTFO-API payloads using the CombatPanel frame length rather than trailing buffer capacity. Learn routes only from decoded packets and expire route hints after 10 seconds.
+- Keep detached settlement rows for the current expedition, refresh late data, and retain known cumulative values across transient empty projections and departing slots. Unobserved total damage is unavailable rather than zero; observed weapon subtotals can supply a marked lower bound.
+- Bind EWC explosive, shrapnel and DOT pre/post damage events without an assembly dependency; measure actual health loss and subtract native credit to avoid duplicate damage. Attribute delayed damage using the original pCWC slot.
+- Remember ammo pack givers at GiveAmmoRel and pair replicated applications by receiver and shares. Do not treat the forwarding host or a stale sender outside receive dispatch as the giver. Add native receive-scope confirmation for remote tracker tags.
+- Scout sleeping kills mean no actual scream yet: patrol, tendril contact and charge-up remain sleeping; DoStartScream latches awake for the rest of that spawn. Other enemies retain their existing sleep rules.
+- Independent review fixes: only the host awards lone-survivor credit; repeated sync diagnostics are bounded and deduplicated per expedition; retained kill groups keep their legacy subset fields together.
+- Protocol remains v8. Native callbacks, Steam multiplayer and in-game rendering have not been verified in this round; this is a local candidate, not an automatic installation or publication.
+
 ## 1.19.1
 - **Squad sharing works again, which is what 1.19.0 broke.** 1.19.0 refused to send anything - a greeting included - to a player it had no proof about, and required either a named SteamID64 or a packet from the other side first. Two machines that both waited therefore shared nothing at all, which is exactly what both logs from that session say: `not one packet heard from any of them`, on the host and on the client. This build shares with every player in the slot list by default, over the transport the rest of the GTFO modding scene already broadcasts on (GTFO-API's free-sized network event), whose bytes carry their own key, magic and version signature and are dropped by a machine that runs no mod without a handler being asked for one. A client also sends its own row straight to the other clients, so two clients no longer depend on what a host could measure about them.
 - `[Squad Sync] ShareWithEveryPlayer` (`true` by default) turns that off for a lobby that should stay restricted; `[Squad Sync] AllowlistedPeers` is then the way in, exactly as before. Both are re-read while the game runs, and a configuration file that cannot be read falls back to sharing rather than to silence.
@@ -84,7 +93,7 @@
 ## 1.17.12
 - Fixes a client that could see only the host and itself. `SquadExchange.HostRows` filtered the rows it described with `IsHuman`, which answers whether a peer can be *addressed* on this channel - the right question for the recipient loop, the wrong one for whose row is worth sending. A bot never answers and runs no plugin, but the host measures its damage, staggers, kills and revives exactly as it measures a human's, and a client can measure none of that for itself, so a bot's row had no source anywhere. Every slotted player with a lookup is now described to every human peer; the recipient filter in `Tick` is unchanged, so nothing is ever addressed to a bot.
 - Regression under the shipped parser and queue: a headless host with one client and one bot now asserts the client receives the bot's row carrying the host's figure. It fails on the previous rule with `FAIL: B8: and it sees the bot's row as the host measured it - a seat no client can measure for itself, and the row the host never used to put on the wire`, and passes now. 1109 -> 1112 assertions.
-- The client log behind this build shows the shape of it: `squad sync outbound: 1 row(s) put on the wire; firstTarget=76561199011390103; 1 of 1 human peer(s) have answered`, and inbound rows whose owner is only the host or the client itself - 134 rows each over a whole run, never a third owner.
+- The client log behind this build showed one outbound row and inbound rows for only the host or the client itself, never a third owner. Player identifiers are omitted from public release notes.
 - Not published.
 
 

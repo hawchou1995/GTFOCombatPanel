@@ -368,7 +368,7 @@ internal static class ResultsDisplay
     private static ImpactReport BuildReport(bool countLoneSurvivor)
     {
         var inputs = new List<ImpactInput>();
-        foreach (CombatPlayer player in CombatSync.DisplayRows().OrderBy(entry => entry.DisplaySlot))
+        foreach (CombatPlayer player in CombatTracker.SettlementView().OrderBy(entry => entry.DisplaySlot))
         {
             WeaponCombatStats primary = WeaponOf(player, InventorySlot.GearStandard);
             WeaponCombatStats secondary = WeaponOf(player, InventorySlot.GearSpecial);

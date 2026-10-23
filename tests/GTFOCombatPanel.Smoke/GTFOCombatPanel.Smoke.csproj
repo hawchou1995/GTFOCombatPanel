@@ -24,6 +24,9 @@
     <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
     <Compile Include="..\..\ResultsLog.cs" Link="ResultsLog.cs" />
     <Compile Include="..\..\SettlementArchive.cs" Link="SettlementArchive.cs" />
+    <Compile Include="..\..\SettlementRows.cs" Link="SettlementRows.cs" />
+    <Compile Include="..\..\ScoutSleepPolicy.cs" Link="ScoutSleepPolicy.cs" />
+    <Compile Include="..\..\OptionalDamageEvents.cs" Link="OptionalDamageEvents.cs" />
     <Compile Include="..\..\SyncProtocol.cs" Link="SyncProtocol.cs" />
     <Compile Include="..\..\CombatMerge.cs" Link="CombatMerge.cs" />
     <Compile Include="..\..\ScoringSettings.cs" Link="ScoringSettings.cs" />

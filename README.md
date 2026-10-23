@@ -1,10 +1,10 @@
-# CombatPanel 1.19.1
+# CombatPanel 1.19.2
 
 源码：[hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)。当前功能、JSON 称号示例和多人协议要求以 `Thunderstore/README.md` 为准；下方旧版本记录仅作历史说明。
 
-1.19.1 修 1.19.0 的三处回归与一处旧缺陷。**多人共享恢复**：1.19.0 要求"对端被点名或先发包"才肯发，两台机器于是互相等死——两份现场日志都写着 `not one packet heard from any of them`。现在默认**与名册内每个玩家共享**，走 GTFO-API 的 free-sized 事件（StatDisplay、AccuracyTracker 同一条路，字节带 key/magic/版本签名，未装 mod 的机器无 handler 直接丢弃），无该库时回落游戏自带字节通道；对端第一次回包决定它走哪条路，未知时两条都发。客机之间也直接互发各自的行。开关：`[Squad Sync] ShareWithEveryPlayer`（默认 true）；设为 false 即回到旧的"点名 + 先到先得"。**失血量改按水位线计量**：每次观测记录绝对血量与当时上限，只有"上限未变且血量下降"才计入，重复上报不重复计，上限升降只重新定基；补丁面覆盖 `ReceiveSetHealth`（主客机之间真正传血的通道）、`OnRevive`、`Setup` 播种等。**结算表格改为测量拟合**：二分逼近到条带 92–96%，再把余宽按右对齐列均分铺满，2560×1440 上从约 600×370 变为约 1960×880 并铺到 2512 宽。另修掉包队列溢出后永久失真的旧缺陷。
+1.19.2 修复 API 填充缓冲拒收与错误路由学习，补充 EWC 爆炸/破片/DOT 伤害事件和弹药用包者回配；结算保留本局已知投影并接受晚到明细，缺失总伤害不再伪装为零。触手以实际尖叫为界，巡逻、触手探测及蓄力均仍算沉睡。独立 review 另修客户端误领单人存活和高频同步日志。
 
-协议仍为 **v8**，但 1.19.0 不发包，两台机器都要升到 1.19.1 才能交换。本轮仅自动化验证，不安装、不启动游戏，不将托管回归等同实机。变更记录见 `Thunderstore/CHANGELOG.md`，验收报告见 `reports/1.19.1-acceptance-20261022.md`（未纳入公开仓）。
+协议仍为 **v8**；需要共享数据的各端建议统一 1.19.2。本轮只构建本地候选，不安装、不启动游戏、不发布；Steam 多人与原生回调未完成实机验证。变更记录见 `Thunderstore/CHANGELOG.md`，验收报告见 `reports/1.19.2-acceptance-20261023.md`（未纳入公开仓）。
 
 ## 历史开发记录（1.17.x 及更早，仅作历史说明）
 **1.17.18 fixes missing settlement tool data**: result rows now carry the equipped GearClass name into the tool and Tool Efficiency formatter, so observed scanner/sentry/mine/glue values can render. Both overlays use the GTFO TMP CJK font source when available, with a shared renderer and explicit system-font fallback. Published to Thunderstore GTFO / Client Mods as `HawChow-CombatPanel`; gameplay rendering remains to be confirmed in a new session. See `reports/release-1.17.18.md`.

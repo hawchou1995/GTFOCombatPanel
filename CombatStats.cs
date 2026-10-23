@@ -227,6 +227,21 @@ public sealed class CombatPlayer
         }
         return copy;
     }
+    // A projection can combine a missing total with real per-weapon rows from another source.
+    // Their sum is a known lower bound, not a new damage event and not an exact squad total.
+    public void ReconcileDamageLowerBound()
+    {
+        double enemy = 0, friendly = 0;
+        foreach (WeaponCombatStats weapon in _weapons.Values)
+        {
+            if (weapon.Counters.EnemyDamageObserved) enemy += weapon.Counters.EnemyDamage;
+            if (weapon.Counters.FriendlyFireObserved) friendly += weapon.Counters.FriendlyFireDamage;
+        }
+        if (double.IsFinite(enemy) && enemy > Total.EnemyDamage + Math.Max(0.01, enemy * 0.00001))
+            Total.RestoreEnemyDamage(enemy, true, true);
+        if (double.IsFinite(friendly) && friendly > Total.FriendlyFireDamage + Math.Max(0.01, friendly * 0.00001))
+            Total.RestoreFriendlyFireDamage(friendly, true, true);
+    }
 
 
     // Which weapon a damage record belongs to. Every bullet and melee record carries the gear

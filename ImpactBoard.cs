@@ -313,6 +313,7 @@ public static class ImpactBoard
         {
             case ImpactMetric.TotalDamage:
                 {
+                    if (!entry.Input.EnemyDamageObserved && entry.Input.EnemyDamage <= 0) return Single(CombatStrings.Placeholder);
                     // Two fields under `总伤害 / 占比`: the damage, then its share of the squad's own total.
                     // A share nobody could measure is left off rather than printed as a zero.
                     string damage = (entry.Input.EnemyDamageEstimated ? "~" : string.Empty) + CombatStatsFormatter.FormatDamage(entry.Input.EnemyDamage);

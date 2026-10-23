@@ -24,6 +24,11 @@ internal static partial class Program
             Console.WriteLine("DEFAULT-SCORING-WRITTEN " + Path.Combine(args[1], ScoringFiles.FileName));
             return;
         }
+        SettlementHandoffScenarios();
+        RunScoutSleepScenarios();
+        RunEwcDamageScenarios();
+        RunSquadTransportFramingScenarios();
+        RunReviewFixScenarios();
         CaptureRevisionScenarios();
         RunScoringRevisionScenarios();
         RunSyncRevisionScenarios();

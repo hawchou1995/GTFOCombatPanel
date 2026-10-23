@@ -47,6 +47,12 @@ internal static class CombatTracker
 {
     internal static readonly CombatStatsStore Store = new CombatStatsStore();
     private static readonly ExpeditionLifecycle Lifecycle = new ExpeditionLifecycle();
+    private static readonly SettlementRows ResultRows = new SettlementRows();
+    private static readonly DamageCreditLedger EnemyCredits = new DamageCreditLedger();
+    internal static double DamageCredit(Dam_EnemyDamageBase enemy, ulong owner) => EnemyCredits.Read(enemy.Pointer, owner);
+    private static bool _inResults;
+    internal static List<CombatPlayer> SettlementView()
+        => ResultRows.Update(CombatSync.DisplayRows(), CombatSync.Generation);
     internal static FireCapture ActiveFire;
     internal static PlayerAgent ToolOwner;
     private static readonly Dictionary<ulong, ColorRecord> Colors = new Dictionary<ulong, ColorRecord>();
@@ -68,14 +74,22 @@ internal static class CombatTracker
         {
             if (!SNet.IsMaster) return CombatSync.SquadTotal;
             double total = 0;
-            foreach (var player in Store.Players) total += Math.Max(0, player.Total.EnemyDamage);
+            foreach (var player in CombatSync.DisplayRows()) total += Math.Max(0, player.Total.EnemyDamage);
             return total;
         }
     }
     internal static void ObserveState(eGameStateName state)
     {
+        bool results = state == eGameStateName.ExpeditionSuccess || state == eGameStateName.ExpeditionFail;
+        if (results && !_inResults)
+        {
+            try { ResultRows.Update(CombatSync.DisplayRows(), CombatSync.Generation); }
+            catch (Exception error) { LogImpact("settlement handoff", error); }
+        }
+        _inResults = results;
         CombatSync.Tick(state, UnityEngine.Time.realtimeSinceStartup);
         EwcProjectileBridge.EnsureInitialized();
+        EwcDamageBridge.EnsureInitialized();
         if (!Lifecycle.ShouldReset(state.ToString()))
         {
             // Every frame the level is up, the signals no event reports are compared with their own
@@ -84,7 +98,9 @@ internal static class CombatTracker
             if (state == eGameStateName.InLevel) Tick();
             return;
         }
+        EwcDamageBridge.Reset();
         Store.Reset(); ToolStatsTracker.Reset(); Colors.Clear(); PendingRemoteShots.Clear(); ActiveFire = null;
+        ResultRows.Clear(); EnemyCredits.Clear();
         LastAttacker.Clear(); LastDamageKind.Clear(); Deaths.Clear(); PendingEnemySpawns.Clear(); Alive.Clear(); ScanLedger.Clear(); ScanRevealed.Clear();
         ReviveLedger.Clear();
         InterruptedFrame.Clear();
@@ -333,6 +349,29 @@ internal static class CombatTracker
         try { return CaptureCore(target, health, source, kind, gearCategoryId); }
         catch (Exception error) { LogImpact("damage capture", error); return default; }
     }
+    internal static DamageSample CaptureEwcDamage(Dam_EnemyDamageBase target, PlayerAgent source, int sourceSlot, DamageKind kind)
+    {
+        if (GameStateManager.CurrentStateName != eGameStateName.InLevel || target?.Owner == null || !ShouldTrack(source?.Owner)) return default;
+        var player = ObservePlayer(source.Owner);
+        InventorySlot slot = (InventorySlot)sourceSlot;
+        WeaponCombatStats weapon = slot == InventorySlot.GearStandard || slot == InventorySlot.GearSpecial || slot == InventorySlot.GearClass || slot == InventorySlot.GearMelee
+            ? ResolveWeapon(player, source.Owner, slot) : null;
+        RememberAttacker(target, source.Owner.Lookup, kind);
+        return new DamageSample(target.Health, player, weapon, false, kind,
+            deathScope: Deaths.Begin(target.Pointer, source.Owner.Lookup, kind, ReadSleeping(target), target.Health));
+    }
+    internal static void CompleteEwcDamage(Dam_EnemyDamageBase target, DamageSample sample, double recordedBefore)
+    {
+        if (target == null || sample.Player == null) return;
+        double amount = DamageObservation.Uncredited(sample.HealthBefore, target.Health, recordedBefore, DamageCredit(target, sample.Player.Lookup));
+        if (amount > 0)
+        {
+            sample.Player.RecordDamage(sample.Weapon, amount, false);
+            EnemyCredits.Add(target.Pointer, sample.Player.Lookup, amount);
+            if (target.Owner != null && target.Owner.IsScout) sample.Player.Impact.AddScoutDamage(amount, false);
+        }
+        CompleteDamage(target, sample, null);
+    }
 
     private static DamageSample CaptureCore(Dam_SyncedDamageBase target, float health, pAgent source, DamageKind kind, uint gearCategoryId = 0)
     {
@@ -426,6 +465,7 @@ internal static class CombatTracker
         if (float.IsFinite(loss) && loss > 0)
         {
             sample.Player.RecordDamage(sample.Weapon, loss, victim != null);
+            if (enemy != null) EnemyCredits.Add(enemy.Pointer, sample.Player.Lookup, loss);
             // The Scout row reports the damage that went into Scouts as its third field, so a blow
             // measured here is the same blow that row carries. Only a Scout's own health pool feeds it;
             // every other enemy leaves the figure alone, which is why a squad that killed no Scout shows
@@ -598,6 +638,7 @@ internal static class CombatTracker
                 : ResolveWeapon(player, attacker, (InventorySlot)attackSlot);
             RememberAttacker(enemy, attackerLookup, DamageKind.Explosion);
             player.RecordDamage(weapon, loss, victim != null);
+            if (enemy != null) EnemyCredits.Add(enemy.Pointer, player.Lookup, loss);
             // An explosion that went into a Scout is the same blow the Scout row reports, so it feeds that
             // figure too - the blast of a mine and the shot of a rifle are the same kind of evidence.
             if (enemy != null && enemy.Owner != null && enemy.Owner.IsScout)
@@ -869,13 +910,14 @@ internal static class CombatTracker
     {
         if (damage?.Owner == null || !PendingEnemySpawns.Remove(damage.Owner.Pointer)) return;
         IntPtr pointer = damage.Pointer;
-        Deaths.Spawn(pointer); LastAttacker.Remove(pointer); LastDamageKind.Remove(pointer); InterruptedFrame.Remove(pointer);
+        Deaths.Spawn(pointer); EnemyCredits.Spawn(pointer); LastAttacker.Remove(pointer); LastDamageKind.Remove(pointer); InterruptedFrame.Remove(pointer);
     }
 
     private static bool? ReadSleeping(Dam_EnemyDamageBase enemy)
     {
         try
         {
+            ScoutWitness.Refresh(enemy);
             var locomotion = enemy?.Owner?.Locomotion;
             if (locomotion == null) return null;
             var state = locomotion.CurrentStateEnum;
@@ -973,7 +1015,7 @@ internal static class CombatTracker
                 Alive[player.Lookup] = standing;
                 if (standing) { alive++; lastStanding = player; }
             }
-            if (alive == 1 && !_loneSurvivorAwarded && Store.Players != null)
+            if (SNet.IsMaster && alive == 1 && !_loneSurvivorAwarded && Store.Players != null)
             {
                 int tracked = 0;
                 foreach (var player in Store.Players) tracked++;
@@ -996,7 +1038,7 @@ internal static class CombatTracker
     // ---- The scan ledger ---------------------------------------------------------------------
     private sealed class ScanProbe
     {
-        public bool Announced;
+        public bool Announced, RemoteAnnounced;
         public readonly ScanSession Session;
         public ScanProbe(ScanReveals reveals) { Session = new ScanSession(reveals); }
     }
@@ -1081,6 +1123,22 @@ internal static class CombatTracker
             Ledger(owner).Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
         }
         catch (Exception error) { LogImpact("confirmed tag", error); }
+    }
+    internal static void CreditRemoteScanTag(EnemyAgent enemy, SNet_Player sender)
+    {
+        if (!SNet.IsMaster || GameStateManager.CurrentStateName != eGameStateName.InLevel
+            || !ShouldTrack(sender) || enemy == null || !enemy.IsTagged) return;
+        EnemyScanner scanner = ResolveScanner(sender);
+        if (scanner == null) return; // Never attribute another kind of marker to a nearby tracker.
+        ObserveHumanScan(scanner);
+        var player = ObservePlayer(sender);
+        long before = player.Impact.ScanMarks;
+        Ledger(sender).Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
+        if (player.Impact.ScanMarks > before && !Ledger(sender).RemoteAnnounced)
+        {
+            Ledger(sender).RemoteAnnounced = true;
+            Plugin.Logger?.LogInfo($"[DIAG] remote scan confirmed: owner={sender.Lookup}; first={player.Impact.ScanFirstMarks}; marks={player.Impact.ScanMarks}; source=native receive sender+confirmed enemy tag.");
+        }
     }
 
     internal static void ObserveHumanScan(EnemyScanner scanner)

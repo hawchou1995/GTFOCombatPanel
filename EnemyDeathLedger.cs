@@ -5,6 +5,11 @@ namespace HawChow.GTFOCombatPanel;
 
 // A receive callback can notify death before its postfix sees the final health.
 // Keep that notification inside the damage scope until actual health loss is known.
+//
+// The sleeping reading the caller brings is the game's own answer - `ES_StateEnum.Hibernate` - which
+// covers every enemy but the Scout. ScoutSleepPolicy holds this machine's capture of the Scout's own
+// state and overrides that reading only for an enemy it captured, so the two rules stay separate: an
+// enemy nobody captured keeps exactly the answer the game gave.
 internal sealed class EnemyDeathLedger
 {
     internal sealed class Scope
@@ -23,7 +28,7 @@ internal sealed class EnemyDeathLedger
     {
         if (enemy == IntPtr.Zero || attacker == 0 || !float.IsFinite(before) || before <= 0) return null;
         _active.TryGetValue(enemy, out Scope parent);
-        var scope = new Scope { Enemy = enemy, Attacker = attacker, Cause = cause, Sleeping = sleeping, Before = before, Parent = parent };
+        var scope = new Scope { Enemy = enemy, Attacker = attacker, Cause = cause, Sleeping = ScoutSleepPolicy.Resolve(enemy, sleeping), Before = before, Parent = parent };
         _active[enemy] = scope;
         return scope;
     }
@@ -40,6 +45,8 @@ internal sealed class EnemyDeathLedger
         return succeeded && float.IsFinite(after) && after <= 0.0001f && after < scope.Before && _credited.Add(scope.Enemy);
     }
     internal bool TryClaimUnscoped(IntPtr enemy) => enemy != IntPtr.Zero && !IsReceiving(enemy) && _credited.Add(enemy);
-    internal void Spawn(IntPtr enemy) { _active.Remove(enemy); _credited.Remove(enemy); }
-    internal void Clear() { _active.Clear(); _credited.Clear(); }
+    // A spawn hands this pointer to a new enemy, so the Scout capture of the previous occupant goes too.
+    internal void Spawn(IntPtr enemy) { _active.Remove(enemy); _credited.Remove(enemy); ScoutSleepPolicy.Spawn(enemy); }
+    // One expedition's captures mean nothing in the next.
+    internal void Clear() { _active.Clear(); _credited.Clear(); ScoutSleepPolicy.Clear(); }
 }
