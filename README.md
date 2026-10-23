@@ -4,7 +4,7 @@
 
 1.19.2 修复 API 填充缓冲拒收与错误路由学习，补充 EWC 爆炸/破片/DOT 伤害事件和弹药用包者回配；结算保留本局已知投影并接受晚到明细，缺失总伤害不再伪装为零。触手以实际尖叫为界，巡逻、触手探测及蓄力均仍算沉睡。独立 review 另修客户端误领单人存活和高频同步日志。
 
-协议仍为 **v8**；需要共享数据的各端建议统一 1.19.2。本轮只构建本地候选，不安装、不启动游戏、不发布；Steam 多人与原生回调未完成实机验证。变更记录见 `Thunderstore/CHANGELOG.md`，验收报告见 `reports/1.19.2-acceptance-20261023.md`（未纳入公开仓）。
+协议仍为 **v8**；需要共享数据的各端建议统一 1.19.2。已于 2026-10-23 发布至 Thunderstore GTFO（HawChow-CombatPanel-1.19.2），下载回包与本地发布包 SHA256 一致。未安装或启动游戏；Steam 多人与原生回调仍未完成实机验证。变更记录见 `Thunderstore/CHANGELOG.md`，验收报告见 `reports/1.19.2-acceptance-20261023.md`（未纳入公开仓）。
 
 ## 历史开发记录（1.17.x 及更早，仅作历史说明）
 **1.17.18 fixes missing settlement tool data**: result rows now carry the equipped GearClass name into the tool and Tool Efficiency formatter, so observed scanner/sentry/mine/glue values can render. Both overlays use the GTFO TMP CJK font source when available, with a shared renderer and explicit system-font fallback. Published to Thunderstore GTFO / Client Mods as `HawChow-CombatPanel`; gameplay rendering remains to be confirmed in a new session. See `reports/release-1.17.18.md`.
