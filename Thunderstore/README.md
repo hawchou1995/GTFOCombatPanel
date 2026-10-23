@@ -1,11 +1,17 @@
-# CombatPanel 1.19.2
+# CombatPanel 1.19.3
 
 独立 GTFO 战斗统计面板：局内查看战斗数据，成功或失败结算查看队伍贡献。仅依赖 **BepInEx-BepInExPack_GTFO-3.2.3**。
 
 **源码 / Source：[GitHub — hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)**
 
 反馈：[qingju.me](https://qingju.me) ｜ [小黑盒语音](https://chat.xiaoheihe.cn/in1wpsjd)
-## 1.19.2 更新
+## 1.19.3 启动闪退热修
+
+- 删除 1.19.2 新增的 ScoutDetection / ScoutScream 全部 Harmony 挂点与 `ES_Base` 反查敌人路径，消除日志中 JSON 加载阶段进入 Scout 回调并触发原生访问错误的路径。
+- 保留伤害入口只读采样：观察到实际尖叫阶段后锁存清醒，蓄力仍算沉睡。未被采样观察到的尖叫可能漏测，不再以不安全回调补抓。
+- 增加编译 DLL 的挂点安全门禁，防止危险钩子重新进入包。协议仍为 v8，其余 1.19.2 统计与同步修复不变。双 profile 自动化验证通过；未安装或启动游戏，原生启动与 Steam 多人仍待实机确认。
+
+## 1.19.2 更新（历史）
 
 - 修复 GTFO-API free-sized 接收缓冲尾部填充导致整包拒收、错误学习路由后持续静默的问题；只有解码成功的包才确认路由，路由失效会重新选择。
 - 结算保留进入结果页时的本局投影，并继续接收晚到明细；退槽、空行和较旧同精度快照不再抹掉已有累计数据。未观测总伤害显示 `—`，仅有武器明细时可用其已知下限并标记 `~`，不与总量相加。

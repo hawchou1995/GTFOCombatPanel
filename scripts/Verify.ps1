@@ -52,6 +52,7 @@ try {
     & $DotnetExe build $pluginProject --configuration Release --verbosity minimal "-p:GTFO_DIR=$GTFO_DIR" "-p:EWC_DIR=$ewcDirectory" "-p:OutputPath=$outputPath"
     if ($LASTEXITCODE -ne 0) { throw "Plugin build failed with exit code $LASTEXITCODE" }
     if (-not (Test-Path -LiteralPath $pluginDll -PathType Leaf)) { throw "Build did not produce $pluginDll" }
+    & (Join-Path $PSScriptRoot 'Test-ScoutHookSafety.ps1') -PluginDll $pluginDll -CecilDll (Join-Path $GTFO_DIR 'BepInEx\core\Mono.Cecil.dll')
     $pluginReferences = @([Reflection.Assembly]::LoadFrom($pluginDll).GetReferencedAssemblies() | ForEach-Object { $_.Name })
     # The public DLL must never carry an ExtraWeaponCustomization reference: it has to run on a profile
     # that does not have EWC at all. The projectile bridge is always compiled in instead, and binds EWC's

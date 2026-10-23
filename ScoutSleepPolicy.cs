@@ -4,7 +4,7 @@ using System.Collections.Generic;
 namespace HawChow.GTFOCombatPanel;
 
 // Scouts do not use ordinary Hibernate semantics. Patrol, tendril detection and scream charge-up
-// remain sleeping until the actual DoStartScream witness or the Scream subphase is observed.
+// remain sleeping until an actual Scream/Response/Done subphase is sampled from a damage context.
 // The latch belongs to one spawn of the damage-base pointer; returning to detection cannot undo it.
 // Ordinary enemies keep the caller's existing Hibernate reading. Capture is taken before damage,
 // so a lethal hit that prevents the scream retains its pre-scream state.

@@ -16,8 +16,13 @@ internal static partial class Program
         Check(sync.Contains("ReportedSync.Count >= 256 || !ReportedSync.Add(text)") && sync.Contains("ReportedSync.Clear()")
             && !sync.Contains("Plugin.Logger.LogInfo($\"[DIAG] squad sync row:"), "runtime packet diagnostics are bounded and deduplicated per expedition");
         string scout = File.ReadAllText(Path.Combine(root.FullName, "ImpactPatches.cs"));
-        Check(scout.Contains("typeof(ES_ScoutScream), \"DoStartScream\"") && !scout.Contains("typeof(ES_ScoutScream), \"ActivateState\""),
-            "Scout charge-up activation is not the actual scream witness");
+        Check(!scout.Contains("typeof(ES_Scout") && !scout.Contains("Owner(ES_Base")
+            && !scout.Contains("Postfix(ES_Scout"),
+            "Scout state detours and reverse owner lookup must not return after the startup access violation");
+        Check(scout.Contains("Refresh(Dam_EnemyDamageBase damage)") && tracker.Contains("ScoutWitness.Refresh(enemy)")
+            && scout.Contains("ScoutScreamState.Scream") && scout.Contains("ScoutScreamState.Response")
+            && scout.Contains("ScoutScreamState.Done") && !scout.Contains("ScoutScreamState.Chargeup"),
+            "typed damage context samples actual scream phases, not charge-up");
         string supply = File.ReadAllText(Path.Combine(root.FullName, "SupplyTracker.cs"));
         Check(supply.Contains("SNet.IsMaster && ScanReceiveScopePatch.Depth > 0"), "stale last sender outside receive dispatch cannot supply a pack giver");
         var cache = new SettlementRows();

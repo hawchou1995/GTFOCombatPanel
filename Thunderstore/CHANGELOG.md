@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.19.3
+- Startup crash hotfix: remove all ScoutDetection/ScoutScream Harmony detours and the ES_Base-to-enemy reverse lookup. The 1.19.2 crash log enters that callback during JSON loading and fails in native Unity object comparison; shared native code is suspected, not RVA-proven.
+- Retain read-only Scout sampling from typed damage contexts. Charge-up is still sleeping; an observed Scream/Response/Done phase latches awake for that spawn. Screams outside those samples can be missed; stability takes priority over the removed callback coverage.
+- Verify the compiled DLL contains no Scout state detours or reverse owner lookup, in addition to managed regression tests. Native game startup and Steam multiplayer remain unverified; protocol v8 is unchanged.
+
 ## 1.19.2
 - Decode GTFO-API payloads using the CombatPanel frame length rather than trailing buffer capacity. Learn routes only from decoded packets and expire route hints after 10 seconds.
 - Keep detached settlement rows for the current expedition, refresh late data, and retain known cumulative values across transient empty projections and departing slots. Unobserved total damage is unavailable rather than zero; observed weapon subtotals can supply a marked lower bound.
@@ -146,7 +151,7 @@
 
 ## 1.17.4
 
-- **修复「局内客机只看到自己」的第二个根因：数据发送曾经依赖对方的应答。** 朋友的客机日志（1.17.1，`D:\R2mod\GTFO\profiles\tian2`）给出了确凿事实：`authority` 行说明它**认得主机**，但整局**没有任何一条收包记录**（无 `accepted/refused`、无 `direction` 行），局内表 `3 columns x 2 rows`（只有自己），结算板 `(1 players)`。上版的发送门槛是「只发给应答过的 peer」——于是只要那条**反向链路**不通（招呼丢包、对端读条中被错过、或别的模组的前缀吃掉包），数据就永远不来。现在**不再有任何门槛**：每个人类 peer 每秒都收到行，应答交换只保留为诊断与「对方装了模组」的证据。这与现成实现（StatDisplay 的 `SenderMode.OtherPlayers`）一致：它们也是不问、直接发。
+- **修复「局内客机只看到自己」的第二个根因：数据发送曾经依赖对方的应答。** 朋友的客机日志（1.17.1，测试 profile 路径已脱敏）给出了确凿事实：`authority` 行说明它**认得主机**，但整局**没有任何一条收包记录**（无 `accepted/refused`、无 `direction` 行），局内表 `3 columns x 2 rows`（只有自己），结算板 `(1 players)`。上版的发送门槛是「只发给应答过的 peer」——于是只要那条**反向链路**不通（招呼丢包、对端读条中被错过、或别的模组的前缀吃掉包），数据就永远不来。现在**不再有任何门槛**：每个人类 peer 每秒都收到行，应答交换只保留为诊断与「对方装了模组」的证据。这与现成实现（StatDisplay 的 `SenderMode.OtherPlayers`）一致：它们也是不问、直接发。
 - **`RecieveBytes` 前缀提高优先级**：朋友机上这个方法有 **4 个前缀**（GTFO-API、AWO replicator、AddEvents、DamageSync）。任何一个前缀返回 false 或抛异常，都会把它后面的人挡掉，而我此前可能排在最后。现在 `[HarmonyPriority(Priority.High)]`，先读自己的包。
 - **快照缓存的第二道锁不再永久拒绝重启的对端**（真实缺陷）：`HandshakePolicy` 有「对端坚持旧序号就采信」的自愈规则，但 `SnapshotCache` 是另一道独立的序号锁、**没有**这条规则——于是对端重开游戏/热重载后，握手已采信新序号，行仍被缓存**永久拒收**，两台机器此后整局不再共享。现在缓存接受握手的判定（`recovered`），并且恢复时**不与上一局的行做字段合并**（那是两次不同的远征，合并会把上一局的数字带进来）。B5 场景正是在新发送规则下暴露了这一点，现已修复并有断言。
 - **结算页不再压住主机那个「送所有囚犯回大厅」按钮**：该按钮是**原版** `m_btnGoToLobby`（只是主机才有），而本模组此前在此页**量不到它**时就退回「铺到屏幕底部 − 8」，于是盖住按钮。现在 (1) 板子的下边界改为**量不到按钮时也不超过窗口的 0.66**（实测最靠下的页面页脚是窗口的 0.705，720 高窗口的那个是 0.83，0.66 对它们全部安全）；(2) 不再只量两个已知字段，而是**遍历页面上所有按钮**取最高的一条边，因此自定义/主客不同的结算页也自适应；(3) `BuildGrid` 本来就会按给定高度缩放，量到更短的条带后板子会自己缩小而不是越界。

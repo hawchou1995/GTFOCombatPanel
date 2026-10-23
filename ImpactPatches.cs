@@ -103,19 +103,14 @@ internal static class EnemySpawnLedgerPatch
     }
 }
 
-// ---- Scouts -----------------------------------------------------------------------------------
-// A Scout has no hibernation state to read. It is unaware while it stands in `ScoutDetection`,
-// sweeping with its tendrils, and awake from the moment it enters `ScoutScream`: the scream is what
-// wakes the room, and it is the only thing that ends a Scout's sleep. Nothing below changes a game
-// state - every witness is read from the object the hook already carries and handed to
-// ScoutSleepPolicy, which the death ledger asks when a blow opens.
+// Scout state methods may share native code with unrelated IL2CPP methods. Never detour them.
+// Read only from the typed enemy/damage context already supplied by established combat hooks.
+// A sampled actual scream latches awake for this spawn; charge-up alone does not.
 internal static class ScoutWitness
 {
     private static bool _wired, _logged;
 
-    // The frame is the generation a capture belongs to: one spawn runs several of these hooks and
-    // their order inside a frame is not this mod's to choose, so a spawn's own reset must not discard
-    // evidence that frame already produced.
+    // Keep the capture generation aligned with the enemy death ledger.
     private static void Ready()
     {
         ScoutSleepPolicy.Now = Time.frameCount;
@@ -148,61 +143,6 @@ internal static class ScoutWitness
         catch (Exception error) { Log("the enemy's spawn state", error); }
     }
 
-    // `ScoutDetection` being set up again is that Scout's own fresh start: unaware again, its tendrils
-    // at whatever length the next sweep begins with.
-    internal static void Fresh(ES_ScoutDetection state)
-    {
-        try
-        {
-            Ready();
-            IntPtr enemy = Enemy(Owner(state));
-            if (enemy == IntPtr.Zero) return;
-            ScoutSleepPolicy.Spawn(enemy);
-            ScoutSleepPolicy.Scout(enemy);
-        }
-        catch (Exception error) { Log("the Scout's detection setup", error); }
-    }
-
-    // Entering the detection state is the Scout standing there unaware. After a scream the game sends it
-    // back here to keep looking, so this is a capture and never a reset.
-    internal static void Dormant(ES_ScoutDetection state)
-    {
-        try
-        {
-            Ready();
-            IntPtr enemy = Enemy(Owner(state));
-            if (enemy != IntPtr.Zero) ScoutSleepPolicy.Scout(enemy);
-        }
-        catch (Exception error) { Log("the Scout's detection state", error); }
-    }
-
-    // A tendril has registered a player. The Scout is alert, its tendril is out and may be pulled back
-    // in - none of that is a scream, so it is still asleep.
-    internal static void Alerted(ES_ScoutDetection state)
-    {
-        try
-        {
-            Ready();
-            IntPtr enemy = Enemy(Owner(state));
-            if (enemy != IntPtr.Zero) ScoutSleepPolicy.Alerted(enemy);
-        }
-        catch (Exception error) { Log("the Scout's detection result", error); }
-    }
-
-    // DoStartScream is the actual scream, not ActivateState/Enter's charge-up.
-    // Tendril motion and the charge-up remain sleeping until this witness.
-    internal static void Screamed(ES_ScoutScream state)
-    {
-        try
-        {
-            Ready();
-            EnemyAgent agent = Owner(state);
-            IntPtr enemy = Enemy(agent);
-            if (enemy != IntPtr.Zero) ScoutSleepPolicy.Screamed(enemy, Tendrils(agent));
-        }
-        catch (Exception error) { Log("the Scout's scream state", error); }
-    }
-
     // Every blow that lands re-reads the enemy it landed on: a Scout is confirmed there, and a witness
     // left behind by the previous occupant of a pooled pointer is dropped once the enemy under it is
     // plainly not a Scout - `IsScout` is the same figure the kill itself is graded by.
@@ -229,17 +169,7 @@ internal static class ScoutWitness
         catch (Exception error) { Log("the damaged enemy", error); }
     }
 
-    private static EnemyAgent Owner(ES_Base state)
-    {
-        if (state == null) return null;
-        EnemyAgent agent = state.m_enemyAgent;
-        if (agent != null) return agent;
-        EnemyLocomotion locomotion = state.m_locomotion;
-        return locomotion == null ? null : locomotion.m_agent;
-    }
-
-    // A Scout carries the two Scout states on its locomotion and nothing else does, so their presence
-    // identifies one even before the game's own flag is readable.
+    // Use the same game identity flag as kill classification.
     private static bool IsScout(EnemyAgent agent)
     {
         if (agent == null) return false;
@@ -250,75 +180,10 @@ internal static class ScoutWitness
         catch { return false; }
     }
 
-    // Read-only and best effort: which tendrils the Scout had out at the instant it woke. That says
-    // nothing about the sleeping rule, and it is here to show that a tendril never was the witness.
-    private static string Tendrils(EnemyAgent agent)
-    {
-        try
-        {
-            EnemyLocomotion locomotion = agent?.Locomotion;
-            ScoutAntennaDetection antennas = locomotion?.ScoutDetection?.m_antennaDetection;
-            if (antennas == null) return "tendrils unreadable";
-            Il2CppSystem.Collections.Generic.List<ScoutAntenna> active = antennas.m_activeTendrils;
-            int extended = 0, total = 0;
-            if (active != null)
-            {
-                for (int i = 0; i < active.Count; i++)
-                {
-                    ScoutAntenna tendril = active[i];
-                    if (tendril == null) continue;
-                    total++;
-                    ScoutAntenna.eTendrilState phase = tendril.State;
-                    if (phase == ScoutAntenna.eTendrilState.MovingOut || phase == ScoutAntenna.eTendrilState.WaitingOut) extended++;
-                }
-            }
-            return $"tendrils {extended}/{total} out, wants={(antennas.m_wantsToHaveTendrils ? "out" : "in")}, locomotion={locomotion.CurrentStateEnum}";
-        }
-        catch { return "tendrils unreadable"; }
-    }
-
     private static void Log(string what, Exception error)
     {
         if (_logged) return;
         _logged = true;
         Plugin.Logger?.LogWarning($"[DIAG] the Scout sleeping capture could not read {what}, so that witness is missing: {error.Message}");
     }
-}
-
-// The Scout's own state objects are the only witness of whether it has screamed yet.
-[HarmonyPatch]
-internal static class ScoutDetectionSetupPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(ES_ScoutDetection), "Setup");
-
-    [HarmonyPostfix]
-    private static void Postfix(ES_ScoutDetection __instance) => ScoutWitness.Fresh(__instance);
-}
-
-[HarmonyPatch]
-internal static class ScoutDetectionEnterPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(ES_ScoutDetection), "Enter", "SyncEnter");
-
-    [HarmonyPostfix]
-    private static void Postfix(ES_ScoutDetection __instance) => ScoutWitness.Dormant(__instance);
-}
-
-[HarmonyPatch]
-internal static class ScoutDetectionAlertPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(ES_ScoutDetection), "OnDetectFoundPlayer");
-
-    [HarmonyPostfix]
-    private static void Postfix(ES_ScoutDetection __instance) => ScoutWitness.Alerted(__instance);
-}
-
-// Observe the actual start, not the earlier activation or charge-up state.
-[HarmonyPatch]
-internal static class ScoutScreamPatch
-{
-    private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(ES_ScoutScream), "DoStartScream");
-
-    [HarmonyPostfix]
-    private static void Postfix(ES_ScoutScream __instance) => ScoutWitness.Screamed(__instance);
 }

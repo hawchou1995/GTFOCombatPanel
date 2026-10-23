@@ -1,10 +1,10 @@
-# CombatPanel 1.19.2
+# CombatPanel 1.19.3
 
 源码：[hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)。当前功能、JSON 称号示例和多人协议要求以 `Thunderstore/README.md` 为准；下方旧版本记录仅作历史说明。
 
-1.19.2 修复 API 填充缓冲拒收与错误路由学习，补充 EWC 爆炸/破片/DOT 伤害事件和弹药用包者回配；结算保留本局已知投影并接受晚到明细，缺失总伤害不再伪装为零。触手以实际尖叫为界，巡逻、触手探测及蓄力均仍算沉睡。独立 review 另修客户端误领单人存活和高频同步日志。
+1.19.3 是启动闪退热修：删除 1.19.2 新增的全部 Scout 状态方法 Harmony 挂点及 `ES_Base` 反查 Owner 路径。日志确认该回调在 JSON 加载阶段进入并触发原生访问错误；原生地址共享为强疑似机制，尚无 RVA 级证明。
 
-协议仍为 **v8**；需要共享数据的各端建议统一 1.19.2。已于 2026-10-23 发布至 Thunderstore GTFO（HawChow-CombatPanel-1.19.2），下载回包与本地发布包 SHA256 一致。未安装或启动游戏；Steam 多人与原生回调仍未完成实机验证。变更记录见 `Thunderstore/CHANGELOG.md`，验收报告见 `reports/1.19.2-acceptance-20261023.md`（未纳入公开仓）。
+保留伤害入口的只读 Scout 状态采样：实际尖叫阶段被观察到后锁存清醒，蓄力仍算沉睡；采样之外的尖叫可能漏测。协议仍为 **v8**，其余 1.19.2 统计与同步修复保留。新增编译 DLL 挂点安全门禁，旧 1.19.2 被拒绝，双 profile 验证通过。已于 2026-10-23 发布至 Thunderstore GTFO（HawChow-CombatPanel-1.19.3），下载回包与本地发布包 SHA256 一致。未安装或启动游戏，原生启动及 Steam 多人尚待实机确认。变更记录见 `Thunderstore/CHANGELOG.md`；私人日志与验收底稿不纳入公开仓。
 
 ## 历史开发记录（1.17.x 及更早，仅作历史说明）
 **1.17.18 fixes missing settlement tool data**: result rows now carry the equipped GearClass name into the tool and Tool Efficiency formatter, so observed scanner/sentry/mine/glue values can render. Both overlays use the GTFO TMP CJK font source when available, with a shared renderer and explicit system-font fallback. Published to Thunderstore GTFO / Client Mods as `HawChow-CombatPanel`; gameplay rendering remains to be confirmed in a new session. See `reports/release-1.17.18.md`.
