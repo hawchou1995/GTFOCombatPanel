@@ -83,6 +83,7 @@ internal static class CombatTracker
         bool results = state == eGameStateName.ExpeditionSuccess || state == eGameStateName.ExpeditionFail;
         if (results && !_inResults)
         {
+            if (GameStateManager.CurrentStateName == eGameStateName.InLevel) ScanTagPipeline.Drain();
             try { ResultRows.Update(CombatSync.DisplayRows(), CombatSync.Generation); }
             catch (Exception error) { LogImpact("settlement handoff", error); }
         }
@@ -102,6 +103,7 @@ internal static class CombatTracker
         Store.Reset(); ToolStatsTracker.Reset(); Colors.Clear(); PendingRemoteShots.Clear(); ActiveFire = null;
         ResultRows.Clear(); EnemyCredits.Clear();
         LastAttacker.Clear(); LastDamageKind.Clear(); Deaths.Clear(); PendingEnemySpawns.Clear(); Alive.Clear(); ScanLedger.Clear(); ScanRevealed.Clear();
+        ScanTagPipeline.Reset();
         ReviveLedger.Clear();
         InterruptedFrame.Clear();
         SupplyTracker.Reset(); HealthLossPatches.Reset();
@@ -1039,10 +1041,7 @@ internal static class CombatTracker
     private sealed class ScanProbe
     {
         public bool Announced, RemoteAnnounced;
-        // The enemies one closed sweep had on offer, and when it closed. A client's late confirmation is
-        // matched against this snapshot instead of a live scanner list.
-        public readonly List<IntPtr> SweepCandidates = new List<IntPtr>();
-        public float SweepStamp = float.NegativeInfinity;
+        // Confirmation diagnostics are per player and per expedition.
         public readonly ScanSession Session;
         public ScanProbe(ScanReveals reveals) { Session = new ScanSession(reveals); }
     }
@@ -1063,6 +1062,7 @@ internal static class CombatTracker
 
     private static void ObserveScans()
     {
+        ScanTagPipeline.Drain();
         if (SNet.Current == null || SNet.Slots?.SlottedPlayers == null) return;
         foreach (var owner in SNet.Slots.SlottedPlayers)
         {
@@ -1073,29 +1073,25 @@ internal static class CombatTracker
         }
     }
 
-    // The instance owns its attribution. A rising tag flag counts an attempt; radar-list growth
-    // does not. Read only taggable enemy instances, never add a second blip-identity namespace.
+    // The scanner instance names the local human while native code submits each tag request.
     internal sealed class HumanScanCapture
     {
         internal EnemyScanner Scanner;
-        internal SNet_Player Owner;
+        internal ulong Lookup;
         internal HumanScanCapture Previous;
-        internal readonly List<(EnemyAgent Enemy, float Timer)> Candidates = new();
     }
     [ThreadStatic] private static HumanScanCapture _humanScan;
+    internal static ulong ActiveHumanScanLookup => _humanScan?.Lookup ?? 0UL;
 
     internal static HumanScanCapture BeginHumanScan(EnemyScanner scanner)
     {
         try
         {
             var owner = scanner?.Owner?.Owner;
-            if (!ShouldTrack(owner) || owner.IsBot || GameStateManager.CurrentStateName != eGameStateName.InLevel) return null;
+            if (!ShouldTrack(owner) || owner.IsBot || !owner.IsLocal
+                || GameStateManager.CurrentStateName != eGameStateName.InLevel) return null;
             ObserveHumanScan(scanner);
-            var capture = new HumanScanCapture { Scanner = scanner, Owner = owner, Previous = _humanScan };
-            var enemies = scanner.m_taggableEnemies;
-            if (enemies != null)
-                for (int n = 0; n < Math.Min(enemies.Count, 4096); n++)
-                    if (enemies[n] != null) capture.Candidates.Add((enemies[n], enemies[n].EnemyTaggedTimer));
+            var capture = new HumanScanCapture { Scanner = scanner, Lookup = owner.Lookup, Previous = _humanScan };
             _humanScan = capture;
             return capture;
         }
@@ -1104,56 +1100,33 @@ internal static class CombatTracker
     internal static void EndHumanScan(HumanScanCapture capture, Exception error)
     {
         if (capture == null) return;
-        try
-        {
-            if (error == null)
-            {
-                foreach (var entry in capture.Candidates)
-                    if (entry.Enemy != null && entry.Enemy.IsTagged && entry.Enemy.EnemyTaggedTimer > entry.Timer + 0.0001f)
-                        CreditConfirmedHumanTag(entry.Enemy);
-                RecordSweep(capture.Owner, capture);
-                ObserveHumanScan(capture.Scanner);
-            }
-        }
+        try { if (error == null) ObserveHumanScan(capture.Scanner); }
         catch (Exception captureError) { LogImpact("scan end", captureError); }
         finally { if (ReferenceEquals(_humanScan, capture)) _humanScan = capture.Previous; }
     }
-    internal static void CreditConfirmedHumanTag(EnemyAgent enemy)
+
+    // Invoked only from the main-thread confirmation drain; no remote scanner object is required.
+    internal static void CreditExecutedScanTag(EnemyAgent enemy, ulong lookup, bool estimated)
     {
-        try
+        if (GameStateManager.CurrentStateName != eGameStateName.InLevel || enemy == null || !enemy.IsTagged) return;
+        var players = SNet.Slots?.SlottedPlayers;
+        if (players == null) return;
+        foreach (var owner in players)
         {
-            if (enemy == null || !enemy.IsTagged) return;
-            var owner = _humanScan?.Owner;
-            if (!ShouldTrack(owner) || owner.IsBot)
-            {
-                // A client's own mark is applied by the host and only reaches this machine after its sweep
-                // returned, so the call bracket is gone by then. Only the sweep this machine itself watched
-                // can stand in for it: the enemy has to be one of that sweep's candidates, kept with its tag
-                // timer, and the sweep has to be recent. A host never takes this path - it attributes remote
-                // marks to their sender on the packet thread, and taking both would credit one mark twice.
-                if (SNet.IsMaster) return;
-                owner = LocalSweepOwner(enemy);
-                if (owner == null) return;
-            }
+            if (!ShouldTrack(owner) || owner.IsBot || owner.Lookup != lookup) continue;
             var player = ObservePlayer(owner);
-            Ledger(owner).Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
-        }
-        catch (Exception error) { LogImpact("confirmed tag", error); }
-    }
-    internal static void CreditRemoteScanTag(EnemyAgent enemy, SNet_Player sender)
-    {
-        if (!SNet.IsMaster || GameStateManager.CurrentStateName != eGameStateName.InLevel
-            || !ShouldTrack(sender) || enemy == null || !enemy.IsTagged) return;
-        EnemyScanner scanner = ResolveScanner(sender);
-        if (scanner == null) return; // Never attribute another kind of marker to a nearby tracker.
-        ObserveHumanScan(scanner);
-        var player = ObservePlayer(sender);
-        long before = player.Impact.ScanMarks;
-        Ledger(sender).Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
-        if (player.Impact.ScanMarks > before && !Ledger(sender).RemoteAnnounced)
-        {
-            Ledger(sender).RemoteAnnounced = true;
-            Plugin.Logger?.LogInfo($"[DIAG] remote scan confirmed: owner={sender.Lookup}; first={player.Impact.ScanFirstMarks}; marks={player.Impact.ScanMarks}; source=native receive sender+confirmed enemy tag.");
+            ScanProbe probe = Ledger(owner);
+            long before = player.Impact.ScanMarks;
+            probe.Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
+            // A remote request identifies its player, but not the scanner's sweep/empty-attempt edges.
+            estimated |= !owner.IsLocal;
+            player.Impact.ScanEstimated |= estimated;
+            if (player.Impact.ScanMarks > before && !probe.RemoteAnnounced)
+            {
+                probe.RemoteAnnounced = true;
+                Plugin.Logger?.LogInfo($"[DIAG] scan execution confirmed: owner={lookup}; first={player.Impact.ScanFirstMarks}; marks={player.Impact.ScanMarks}; estimated={estimated}; source=native tag request/execution.");
+            }
+            return;
         }
     }
 
@@ -1168,7 +1141,7 @@ internal static class CombatTracker
             var player = ObservePlayer(owner);
             bool started = probe.Session.ObserveTagging(scanner.m_tagging, player.Impact);
             // Taggable entries are candidates, not evidence of successful marks.
-            // ConfirmedEnemyTagPatch and the measured timer delta credit completed marks.
+            // ToolSyncManager request/execution hooks supply completed marks independently of this poll.
             if (!probe.Announced && (scanner.m_tagging || ListCount(scanner.m_enemiesDetected) > 0))
             {
                 probe.Announced = true;
@@ -1265,44 +1238,6 @@ internal static class CombatTracker
         catch (Exception error) { LogImpact("bot proximity", error); return null; }
     }
 
-    // The sweep this machine watched most recently for one player: the enemies that sweep had on offer, each
-    // with the tag timer it carried, plus when the sweep ended. A client's own mark lands a moment later, and
-    // this is the only evidence that survives the call - nothing here reads a position or a live list.
-    private static SNet_Player LocalSweepOwner(EnemyAgent enemy)
-    {
-        try
-        {
-            var players = SNet.Slots?.SlottedPlayers;
-            if (players == null || enemy == null) return null;
-            float window = Mathf.Max(0.5f, EnemyScanner.s_tagDuration) * 2f;
-            IntPtr pointer = enemy.Pointer;
-            foreach (var owner in players)
-            {
-                if (!ShouldTrack(owner) || owner.IsBot || !owner.IsLocal) continue;
-                ScanProbe probe = Ledger(owner);
-                if (probe.SweepCandidates.Count == 0 || Time.time - probe.SweepStamp > window) continue;
-                for (int index = 0; index < probe.SweepCandidates.Count; index++)
-                    if (probe.SweepCandidates[index] == pointer) return owner;
-            }
-        }
-        catch (Exception error) { LogImpact("late scan owner", error); }
-        return null;
-    }
-
-    // Remembered on the main thread when the sweep closes, so the late confirmation above never has to read a
-    // live scanner list from a callback that may not be on this thread.
-    private static void RecordSweep(SNet_Player owner, HumanScanCapture capture)
-    {
-        if (!ShouldTrack(owner) || owner.IsBot || capture == null) return;
-        try
-        {
-            ScanProbe probe = Ledger(owner);
-            probe.SweepCandidates.Clear();
-            foreach (var entry in capture.Candidates) probe.SweepCandidates.Add(entry.Enemy.Pointer);
-            probe.SweepStamp = Time.time;
-        }
-        catch (Exception error) { LogImpact("sweep record", error); }
-    }
 
     private static EnemyScanner ResolveScanner(SNet_Player owner)
     {

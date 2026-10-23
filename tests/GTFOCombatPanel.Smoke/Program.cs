@@ -30,6 +30,7 @@ internal static partial class Program
         RunSquadTransportFramingScenarios();
         RunReviewFixScenarios();
         CaptureRevisionScenarios();
+        ScanTagScenarios();
         RunScoringRevisionScenarios();
         RunSyncRevisionScenarios();
         var shot = new ShotSample();

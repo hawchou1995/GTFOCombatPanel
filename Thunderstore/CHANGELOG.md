@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.19.5
+- Observe actual native tag requests and ToolSyncManager.DoTagEnemy execution, rather than matching late tags against per-frame candidate lists. Host validation captures the original sender without requiring a remote first-person EnemyScanner instance.
+- Queue confirmation values for main-thread resolution and counting; reject exceptions, unowned, expired and old-run events. Client pairing is estimated because broadcasts carry no scanner identity; host fallback counts are also estimated without sweep IDs. Missing receive senders never fall back to a concurrently scanning host.
+- Correction to 1.19.4: its candidate-snapshot fallback did not resolve the reported in-game scan loss. The previous claim that every StatDisplay damage difference is caused by an unmodded host was not established and is withdrawn. Damage code, actual-health-loss semantics, layout and protocol v8 are unchanged.
+- Add managed replay tests linked to the production scan patches and run them in Verify. Survival Test gameplay feedback confirms scan data for two bots; human Steam multiplayer, late client confirmation and remote fallback still require dedicated in-game verification.
+
 ## 1.19.4
 - The settlement board is drawn at the width its own cells measure instead of being spread across the page. The four player columns keep sharing one width - the widest cell of any of them - and no longer receive padding the figures did not ask for.
 - A client's own scan mark is applied by the host and only reaches that machine after the sweep returned. The late confirmation is now credited from the sweep this machine itself watched (the candidate list it recorded, inside a tag-duration window). Hosts keep attributing remote marks to their sender inside the native packet scope; nothing is attributed by proximity or by an unnamed guess. This is what left a Bio Tracker row showing `Scan —`.

@@ -18,6 +18,7 @@
     <Compile Include="..\..\ImpactMetrics.cs" Link="ImpactMetrics.cs" />
     <Compile Include="..\..\ImpactBoard.cs" Link="ImpactBoard.cs" />
     <Compile Include="..\..\ScanSession.cs" Link="ScanSession.cs" />
+    <Compile Include="..\..\ScanTagLedger.cs" Link="ScanTagLedger.cs" />
     <Compile Include="..\..\ToolImpactLedger.cs" Link="ToolImpactLedger.cs" />
     <Compile Include="..\..\ExpeditionMetadata.cs" Link="ExpeditionMetadata.cs" />
     <Compile Include="..\..\FriendlyFireAttributionLedger.cs" Link="FriendlyFireAttributionLedger.cs" />

@@ -77,6 +77,9 @@ try {
     Write-Host 'Running supply giver attribution tests...'
     & $DotnetExe run --project (Join-Path $projectRoot 'tests\GTFOCombatPanel.Supply\GTFOCombatPanel.Supply.csproj') --configuration Release --verbosity minimal
     if ($LASTEXITCODE -ne 0) { throw "Supply attribution tests failed with exit code $LASTEXITCODE" }
+    Write-Host 'Running native scan request/confirmation pipeline replay...'
+    & $DotnetExe run --project (Join-Path $projectRoot 'tests\GTFOCombatPanel.Scan\GTFOCombatPanel.Scan.csproj') --configuration Release --verbosity minimal
+    if ($LASTEXITCODE -ne 0) { throw "Scan pipeline tests failed with exit code $LASTEXITCODE" }
 
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
     # The expected version is read from the plugin itself, so this check cannot go stale the next time the

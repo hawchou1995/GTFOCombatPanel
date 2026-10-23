@@ -1,10 +1,10 @@
-# CombatPanel 1.19.4
+# CombatPanel 1.19.5
 
 源码：[hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)。当前功能、JSON 称号示例和多人协议要求以 `Thunderstore/README.md` 为准；下方旧版本记录仅作历史说明。
 
-1.19.4 把结算面板改回按自身单元格宽度绘制（第 2–5 列仍共用最宽单元格那一档，不再额外加空白），并补计客机晚到落地的扫描标记：只用本机自己那次扫描的候选快照作证据，主机侧仍按原生收包作用域归属，不按距离猜人。
+1.19.5 修复扫描获取链：观察扫描器实际提交的原生标记请求与 `ToolSyncManager.DoTagEnemy` 执行结果；客机晚到确认匹配已提交请求，主机在验证作用域保存原始发送者，不再依赖远端第一人称扫描器实例。确认排队至主线程结算；候选列表、被动雷达、距离都不用于猜归属。客机配对结果标 `~`，因为广播不携带扫描者字段。
 
-伤害口径不变，仍是敌人实际掉血；与 StatDisplay 的差值来自它在「客机 + 主机未装 StatDisplay」时改用武器携带值兜底，本版不采用该口径。协议仍为 **v8**，1.19.3 的 Scout 挂点移除与编译门禁保留。双 profile 验证通过（1732 面板 + 50 补给 + 9 配置监听断言，Release 0 警告 0 错误）；原生启动与 Steam 多人尚待实机复核。变更记录见 `Thunderstore/CHANGELOG.md`，私人日志与验收底稿不纳入公开仓。
+更正 1.19.4：其候选快照兜底未解决实机扫描缺失，不能视为修复成功。双方安装 StatDisplay 与 CombatPanel 仍可能存在伤害差额，原因尚未逐事件证明；撤回“差值必是主机未装 StatDisplay、不是漏记”的断言。本轮伤害、布局、评分和协议代码未改，协议仍为 **v8**。双 profile Verify 通过；Survival Test 简单实测反馈确认两个人机均有扫描数据，真人 Steam 多人、客机晚到确认与远端代测仍待专项实测。变更记录见 `Thunderstore/CHANGELOG.md`。
 
 ## 历史开发记录（1.17.x 及更早，仅作历史说明）
 **1.17.18 fixes missing settlement tool data**: result rows now carry the equipped GearClass name into the tool and Tool Efficiency formatter, so observed scanner/sentry/mine/glue values can render. Both overlays use the GTFO TMP CJK font source when available, with a shared renderer and explicit system-font fallback. Published to Thunderstore GTFO / Client Mods as `HawChow-CombatPanel`; gameplay rendering remains to be confirmed in a new session. See `reports/release-1.17.18.md`.

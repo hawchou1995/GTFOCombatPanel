@@ -1,6 +1,6 @@
 {
   "name": "CombatPanel",
-  "version_number": "1.19.4",
+  "version_number": "1.19.5",
   "website_url": "https://github.com/hawchou1995/GTFOCombatPanel",
   "description": "GTFO combat HUD and settlement board: squad damage, accuracy, tool details, sleeping kills, personal supply use and health lost. JSON-configurable titles and scoring. BepInEx only; optional EWC integration.",
   "dependencies": [

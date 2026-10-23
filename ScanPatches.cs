@@ -51,10 +51,3 @@ internal static class BotScanActionPatch
     private static System.Exception Finalizer(System.Exception __exception)
     { CombatTracker.EndBotScanAction(); return __exception; }
 }
-
-[HarmonyPatch(typeof(EnemyAgent), "SyncPlaceNavMarkerTag")]
-internal static class ConfirmedEnemyTagPatch
-{
-    [HarmonyPostfix]
-    private static void Postfix(EnemyAgent __instance) => CombatTracker.CreditConfirmedHumanTag(__instance);
-}
