@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.19.4
+- The settlement board is drawn at the width its own cells measure instead of being spread across the page. The four player columns keep sharing one width - the widest cell of any of them - and no longer receive padding the figures did not ask for.
+- A client's own scan mark is applied by the host and only reaches that machine after the sweep returned. The late confirmation is now credited from the sweep this machine itself watched (the candidate list it recorded, inside a tag-duration window). Hosts keep attributing remote marks to their sender inside the native packet scope; nothing is attributed by proximity or by an unnamed guess. This is what left a Bio Tracker row showing `Scan —`.
+- Damage semantics are unchanged: every figure is the health the enemy actually lost. StatDisplay falls back to the weapon's carried damage - before the limb's armour and the precision multiplier - on a client whose host runs no StatDisplay, so the two panels can differ by a few thousand on the same run. That difference is a definition, not a loss, and this build does not adopt it.
+- Protocol is still v8; 1732 panel, 50 supply and 9 config-watcher assertions pass on both profiles, Release 0 warnings / 0 errors, EWC 4.13.4 contract checked. Native startup, the late-tag path and Steam multiplayer still need an in-game run.
+
 ## 1.19.3
 - Startup crash hotfix: remove all ScoutDetection/ScoutScream Harmony detours and the ES_Base-to-enemy reverse lookup. The 1.19.2 crash log enters that callback during JSON loading and fails in native Unity object comparison; shared native code is suspected, not RVA-proven.
 - Retain read-only Scout sampling from typed damage contexts. Charge-up is still sleeping; an observed Scream/Response/Done phase latches awake for that spawn. Screams outside those samples can be missed; stability takes priority over the removed callback coverage.

@@ -1,10 +1,10 @@
-# CombatPanel 1.19.3
+# CombatPanel 1.19.4
 
 源码：[hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)。当前功能、JSON 称号示例和多人协议要求以 `Thunderstore/README.md` 为准；下方旧版本记录仅作历史说明。
 
-1.19.3 是启动闪退热修：删除 1.19.2 新增的全部 Scout 状态方法 Harmony 挂点及 `ES_Base` 反查 Owner 路径。日志确认该回调在 JSON 加载阶段进入并触发原生访问错误；原生地址共享为强疑似机制，尚无 RVA 级证明。
+1.19.4 把结算面板改回按自身单元格宽度绘制（第 2–5 列仍共用最宽单元格那一档，不再额外加空白），并补计客机晚到落地的扫描标记：只用本机自己那次扫描的候选快照作证据，主机侧仍按原生收包作用域归属，不按距离猜人。
 
-保留伤害入口的只读 Scout 状态采样：实际尖叫阶段被观察到后锁存清醒，蓄力仍算沉睡；采样之外的尖叫可能漏测。协议仍为 **v8**，其余 1.19.2 统计与同步修复保留。新增编译 DLL 挂点安全门禁，旧 1.19.2 被拒绝，双 profile 验证通过。已于 2026-10-23 发布至 Thunderstore GTFO（HawChow-CombatPanel-1.19.3），下载回包与本地发布包 SHA256 一致。未安装或启动游戏，原生启动及 Steam 多人尚待实机确认。变更记录见 `Thunderstore/CHANGELOG.md`；私人日志与验收底稿不纳入公开仓。
+伤害口径不变，仍是敌人实际掉血；与 StatDisplay 的差值来自它在「客机 + 主机未装 StatDisplay」时改用武器携带值兜底，本版不采用该口径。协议仍为 **v8**，1.19.3 的 Scout 挂点移除与编译门禁保留。双 profile 验证通过（1732 面板 + 50 补给 + 9 配置监听断言，Release 0 警告 0 错误）；原生启动与 Steam 多人尚待实机复核。变更记录见 `Thunderstore/CHANGELOG.md`，私人日志与验收底稿不纳入公开仓。
 
 ## 历史开发记录（1.17.x 及更早，仅作历史说明）
 **1.17.18 fixes missing settlement tool data**: result rows now carry the equipped GearClass name into the tool and Tool Efficiency formatter, so observed scanner/sentry/mine/glue values can render. Both overlays use the GTFO TMP CJK font source when available, with a shared renderer and explicit system-font fallback. Published to Thunderstore GTFO / Client Mods as `HawChow-CombatPanel`; gameplay rendering remains to be confirmed in a new session. See `reports/release-1.17.18.md`.

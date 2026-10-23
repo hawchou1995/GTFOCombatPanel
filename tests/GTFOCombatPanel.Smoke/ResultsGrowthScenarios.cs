@@ -141,35 +141,34 @@ internal static class ResultsGrowthScenarios
         check(measurements <= ResultsFontGrowth.MaximumMeasurements + 2,
             $"and it is probed a bounded number of times ({measurements} probes, bound {ResultsFontGrowth.MaximumMeasurements + 2})");
 
-        // ---- the columns then use the width the page offers ---------------------------------
+        // ---- the board is drawn at the width its own cells need ---------------------------------
         //
-        // The font fit is bounded by the strip more often than by the width, so the board that comes out
-        // of it is narrower than the page: the leftover is handed to every column as the same amount of
-        // white space. The four player columns stay one width - the widest of them - which is the product
-        // requirement that makes `#1`..`#4` line up, and the board never widens past the page.
+        // The font fit is bounded by the strip more often than by the width, so the board that comes out of
+        // it is narrower than the page. That leftover is NOT handed out as extra column width any more: the
+        // settlement board is drawn at exactly the width its cells measure. The four player columns stay one
+        // width - the widest of them - which is the product requirement that makes `#1`..`#4` line up and is
+        // what every one of them prints at, and nothing is spread to fill the page.
         bool[] rightAligned = { false, true, true, true, true };
         PanelGrid natural = PanelGeometry.Build(PlayerColumns(), 12f, 24, 12, PanelDensity.Compact, 1f, rightAligned);
         float naturalWidth = natural.Width;
-        float naturalHeight = natural.Height;
-        PanelGrid filled = PanelGeometry.FillWidth(natural, 2512f);
-        check(filled.Width <= 2512f + 0.01f, $"filling the width never overruns it: {filled.Width:0.###}px <= 2512px");
-        check(Math.Abs(filled.Width - 2512f) <= 0.01f,
-            $"and it really uses it: {filled.Width:0.###}px of 2512px (was {naturalWidth:0.###}px)");
-        check(Math.Abs(filled.Height - naturalHeight) <= 0.001f,
-            $"filling the width costs no height: {filled.Height:0.###}px either way");
-        check(Math.Abs(filled.FontPixels - natural.FontPixels) <= 0.001f,
-            "and no glyph size: spreading the columns is white space, not a bigger table");
         bool equalPlayers = true;
-        for (int column = 2; column < filled.Columns; column++)
-            equalPlayers &= Math.Abs(filled.CellWidths[column] - filled.CellWidths[1]) <= 0.001f;
-        check(equalPlayers, $"the player columns keep the one width they share (widest of {filled.Columns - 1} columns)");
-        check(filled.CellWidths[1] > natural.CellWidths[1],
-            "the widened columns are wider than the ones that were measured, so the board did grow into the page");
-        check(Math.Abs(filled.CellWidths[0] - natural.CellWidths[0]) <= 0.001f,
-            "and the row-label column keeps the width it was measured at, so its labels stay on the plate's own left edge");
-        PanelGrid untouched = PanelGeometry.FillWidth(natural, naturalWidth - 100f);
-        check(Math.Abs(untouched.Width - naturalWidth) <= 0.001f,
-            "a page narrower than the board is left alone instead of being squeezed");
+        for (int column = 2; column < natural.Columns; column++)
+            equalPlayers &= Math.Abs(natural.CellWidths[column] - natural.CellWidths[1]) <= 0.001f;
+        check(equalPlayers, $"the player columns print at one width, the widest of {natural.Columns - 1} columns");
+        check(naturalWidth <= 2512f + 0.01f,
+            $"the board's own width fits the page without being stretched: {naturalWidth:0.###}px <= 2512px");
+        // Nothing widens the measured board behind the layout's back: the width the board will be drawn at is
+        // the width it measured, and the row-label column keeps its own width so its text stays on the plate.
+        PanelGrid wider = PanelGeometry.Build(PlayerColumns(), 12f, 48f, 12, PanelDensity.Compact, 1f, rightAligned);
+        check(wider.Width > naturalWidth,
+            "a larger glyph widens the board only through the cells it actually prints, never through padding");
+
+        // The width-spreading helper still exists for callers that want it, and it keeps its own bounds; the
+        // settlement board is simply no longer one of those callers.
+        PanelGrid filled = PanelGeometry.FillWidth(natural, 2512f);
+        check(filled.Width <= 2512f + 0.01f, $"a caller that does ask for it never overruns the width: {filled.Width:0.###}px <= 2512px");
+        check(Math.Abs(filled.Height - natural.Height) <= 0.001f && Math.Abs(filled.FontPixels - natural.FontPixels) <= 0.001f,
+            "and spreading columns is white space, not a bigger table");
         check(ReferenceEquals(PanelGeometry.FillWidth(natural, float.NaN), natural)
               && ReferenceEquals(PanelGeometry.FillWidth(null, 2512f), null),
             "an unmeasured width is not a reason to rebuild anything");
@@ -177,9 +176,9 @@ internal static class ResultsGrowthScenarios
         // ---- the two numbers the capture showed, end to end ---------------------------------
         //
         // The strip in the 2560x1440 capture is about 940px between the completion section and the lobby
-        // button, and the page offers 2560 - 48 = 2512px. The same 12x5 board that was 600x370 now comes
-        // out at ~1960x882 and is then spread across the 2512px, so neither the icons above it nor the
-        // button below it are reached and the empty band on both sides is gone.
+        // button, and the page offers 2560 - 48 = 2512px. The 12x5 board is grown until it fills that strip
+        // and is then drawn at its own measured width, so neither the icons above it nor the button below it
+        // are reached and the columns carry no padding the figures did not ask for.
         int captureFont = ResultsFontGrowth.FitResultFontSize(15, 15, int.MaxValue, 940f, 2512f, Table(12, 1.5f, 40f));
         ResultTableSize capture = Measure(12, 1.5f, 40f, captureFont);
         check(capture.Height >= 940f * 0.92f && capture.Height <= 940f * ResultsFontGrowth.StripFillCeiling + 0.5f,

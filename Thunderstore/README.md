@@ -1,11 +1,18 @@
-# CombatPanel 1.19.3
+# CombatPanel 1.19.4
 
 独立 GTFO 战斗统计面板：局内查看战斗数据，成功或失败结算查看队伍贡献。仅依赖 **BepInEx-BepInExPack_GTFO-3.2.3**。
 
 **源码 / Source：[GitHub — hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)**
 
 反馈：[qingju.me](https://qingju.me) ｜ [小黑盒语音](https://chat.xiaoheihe.cn/in1wpsjd)
-## 1.19.3 启动闪退热修
+## 1.19.4 更新
+
+- **结算面板不再拉满页面宽度**：按自身单元格宽度绘制；第 2–5 列仍共用「四列里最宽单元格」那一档宽度，不再额外加空白。
+- **客机扫描补计**：自己的标记要等主机复制回来才落地，现在用本机自己那次扫描的候选快照（含标记计时、限定时间窗）作证据补计，仅客机生效；主机仍按原生收包作用域归属，不按距离猜人。修复部分 Bio Tracker 显示「扫描 —」。
+- **伤害口径不变**：仍是敌人实际掉血。StatDisplay 在「客机 + 主机未装 StatDisplay」时用武器携带值（未乘护甲与精准倍率）兜底，同一局两边可能差几千；这是口径差异，不是漏记，本版不采用该口径。
+- 协议仍为 v8；双 profile 自动化验证通过（1732 面板 + 50 补给 + 9 配置监听断言），Release 0 警告 0 错误。原生启动与 Steam 多人仍待实机复核。
+
+## 1.19.3 更新（历史）
 
 - 删除 1.19.2 新增的 ScoutDetection / ScoutScream 全部 Harmony 挂点与 `ES_Base` 反查敌人路径，消除日志中 JSON 加载阶段进入 Scout 回调并触发原生访问错误的路径。
 - 保留伤害入口只读采样：观察到实际尖叫阶段后锁存清醒，蓄力仍算沉睡。未被采样观察到的尖叫可能漏测，不再以不安全回调补抓。

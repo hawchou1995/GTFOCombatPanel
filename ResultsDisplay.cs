@@ -291,19 +291,20 @@ internal static class ResultsDisplay
     // The glyph size the settlement board is drawn at, and the grid that size produces.
     //
     // The strip between the page's completion section and the lobby button is usually far taller than the table
-    // needs, and the screen far wider, so the board is grown into the room it has instead of sitting small in
-    // the middle of it. `ResultsFontGrowth` decides the size from real measurements of this very content - the
-    // table is built once per candidate size and its own extents handed back - and the columns are then spread
-    // across the width the page offers. Neither step can push the board over the icons, the title or the button:
-    // the fit's own ceiling stays below the strip, and `PanelGeometry.FillWidth` never widens past the width it
-    // was given. Both result screens come through here, so success and failure are laid out by one rule.
+    // needs, so the board is grown into that height instead of sitting small in the middle of it.
+    // `ResultsFontGrowth` decides the size from real measurements of this very content - the table is built once
+    // per candidate size and its own extents handed back - and the grid is then used at exactly the width its
+    // own cells need: the four player columns already share one width, measured as the widest cell of any of
+    // them, so the board never carries padding the figures did not ask for. Neither step can push the board over
+    // the icons, the title or the button: the fit's own ceiling stays below the strip and inside the width the
+    // page offers. Both result screens come through here, so success and failure are laid out by one rule.
     private static PanelGrid FitBoard(TableContent content, float room, float boardWidth)
     {
         int seed = Mathf.Max(1, PanelBehaviour.FontSizeForSharing);
         int fontSize = ResultsFontGrowth.FitResultFontSize(seed, seed, int.MaxValue, room, boardWidth,
             size => NaturalSize(content, size));
         PanelGrid grid = HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, room);
-        return grid == null ? null : PanelGeometry.FillWidth(grid, boardWidth);
+        return grid;
     }
 
     // The table's own extents at one glyph size, measured without a box to fit into: the box is what is being

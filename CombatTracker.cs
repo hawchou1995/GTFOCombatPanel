@@ -1039,6 +1039,10 @@ internal static class CombatTracker
     private sealed class ScanProbe
     {
         public bool Announced, RemoteAnnounced;
+        // The enemies one closed sweep had on offer, and when it closed. A client's late confirmation is
+        // matched against this snapshot instead of a live scanner list.
+        public readonly List<IntPtr> SweepCandidates = new List<IntPtr>();
+        public float SweepStamp = float.NegativeInfinity;
         public readonly ScanSession Session;
         public ScanProbe(ScanReveals reveals) { Session = new ScanSession(reveals); }
     }
@@ -1107,6 +1111,7 @@ internal static class CombatTracker
                 foreach (var entry in capture.Candidates)
                     if (entry.Enemy != null && entry.Enemy.IsTagged && entry.Enemy.EnemyTaggedTimer > entry.Timer + 0.0001f)
                         CreditConfirmedHumanTag(entry.Enemy);
+                RecordSweep(capture.Owner, capture);
                 ObserveHumanScan(capture.Scanner);
             }
         }
@@ -1117,8 +1122,19 @@ internal static class CombatTracker
     {
         try
         {
+            if (enemy == null || !enemy.IsTagged) return;
             var owner = _humanScan?.Owner;
-            if (!ShouldTrack(owner) || enemy == null || !enemy.IsTagged) return;
+            if (!ShouldTrack(owner) || owner.IsBot)
+            {
+                // A client's own mark is applied by the host and only reaches this machine after its sweep
+                // returned, so the call bracket is gone by then. Only the sweep this machine itself watched
+                // can stand in for it: the enemy has to be one of that sweep's candidates, kept with its tag
+                // timer, and the sweep has to be recent. A host never takes this path - it attributes remote
+                // marks to their sender on the packet thread, and taking both would credit one mark twice.
+                if (SNet.IsMaster) return;
+                owner = LocalSweepOwner(enemy);
+                if (owner == null) return;
+            }
             var player = ObservePlayer(owner);
             Ledger(owner).Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
         }
@@ -1247,6 +1263,45 @@ internal static class CombatTracker
             return candidate;
         }
         catch (Exception error) { LogImpact("bot proximity", error); return null; }
+    }
+
+    // The sweep this machine watched most recently for one player: the enemies that sweep had on offer, each
+    // with the tag timer it carried, plus when the sweep ended. A client's own mark lands a moment later, and
+    // this is the only evidence that survives the call - nothing here reads a position or a live list.
+    private static SNet_Player LocalSweepOwner(EnemyAgent enemy)
+    {
+        try
+        {
+            var players = SNet.Slots?.SlottedPlayers;
+            if (players == null || enemy == null) return null;
+            float window = Mathf.Max(0.5f, EnemyScanner.s_tagDuration) * 2f;
+            IntPtr pointer = enemy.Pointer;
+            foreach (var owner in players)
+            {
+                if (!ShouldTrack(owner) || owner.IsBot || !owner.IsLocal) continue;
+                ScanProbe probe = Ledger(owner);
+                if (probe.SweepCandidates.Count == 0 || Time.time - probe.SweepStamp > window) continue;
+                for (int index = 0; index < probe.SweepCandidates.Count; index++)
+                    if (probe.SweepCandidates[index] == pointer) return owner;
+            }
+        }
+        catch (Exception error) { LogImpact("late scan owner", error); }
+        return null;
+    }
+
+    // Remembered on the main thread when the sweep closes, so the late confirmation above never has to read a
+    // live scanner list from a callback that may not be on this thread.
+    private static void RecordSweep(SNet_Player owner, HumanScanCapture capture)
+    {
+        if (!ShouldTrack(owner) || owner.IsBot || capture == null) return;
+        try
+        {
+            ScanProbe probe = Ledger(owner);
+            probe.SweepCandidates.Clear();
+            foreach (var entry in capture.Candidates) probe.SweepCandidates.Add(entry.Enemy.Pointer);
+            probe.SweepStamp = Time.time;
+        }
+        catch (Exception error) { LogImpact("sweep record", error); }
     }
 
     private static EnemyScanner ResolveScanner(SNet_Player owner)
