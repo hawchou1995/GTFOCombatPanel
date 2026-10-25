@@ -26,6 +26,10 @@ internal static class ResultsDisplay
     private static TableContent _content;
     private static PanelGrid _grid;
     private static LayoutRect _origin;
+
+    // The glyph floor the grid on screen was fitted with, so a refresh that has to re-measure it asks for
+    // the same floor the placement used instead of quietly falling back to the absolute minimum.
+    private static int _fontFloor = ResultsFontGrowth.MinimumReadablePixels;
     // The page the board is standing in for, kept so the vanilla blocks it replaces can be put away
     // again on every frame: the result pages animate their content in and switch it back on as they
     // go, which is what makes a one-off SetActive(false) blink back in.
@@ -204,8 +208,8 @@ internal static class ResultsDisplay
                 // A first placement still has to fit the strip the page measured: below the page's own message
                 // and above the buttons the player has to press. A board that cannot fit is not drawn rather
                 // than drawn over a button.
-                if (!FailureStrip(_page, out float top, out float bottom, out opacity, out bool buttonMeasured, out float buttonTop)) return;
-                if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, new BoardStrip(top, bottom, buttonMeasured, buttonTop), _grid.Width, _grid.Height,
+                if (!FailureStrip(_page, out float top, out float bottom, out opacity, out bool buttonMeasured, out float buttonTop, out float buttonHeight)) return;
+                if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight), _grid.Width, _grid.Height,
                     Plugin.ResultsOffsetX.Value, out LayoutRect fitted, BoardSlack))
                 {
                     if (HeadingReports.Add("fail-no-room"))
@@ -282,7 +286,7 @@ internal static class ResultsDisplay
         };
         if (room <= 0f) return;
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
-        PanelGrid grid = FitBoard(content, room, boardWidth);
+        PanelGrid grid = FitBoard(content, room, boardWidth, strip.ButtonHeight);
         if (grid == null) return;
         Fit(strip, grid, content, board, report, succeeded);
         _placed = true; _placedSucceeded = succeeded;
@@ -303,20 +307,52 @@ internal static class ResultsDisplay
     // columns and leaves the label column - and the grid's height, row height and glyph size - exactly where
     // they were. Neither step can push the board over the icons, the title or the button: the fit's own
     // ceiling stays below the strip and inside the width the page offers.
-    private static PanelGrid FitBoard(TableContent content, float room, float boardWidth)
+    private static PanelGrid FitBoard(TableContent content, float room, float boardWidth, float buttonHeight = float.NaN)
     {
         int seed = Mathf.Max(1, PanelBehaviour.FontSizeForSharing);
-        int fontSize = ResultsFontGrowth.FitIntoStrip(seed, ResultsFontGrowth.MinimumReadablePixels, int.MaxValue, room, boardWidth,
-            size => NaturalSize(content, size));
-        PanelGrid grid = HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, room);
+        // The readability floor is taken from the button the player has to press. A strip that is short
+        // leaves the table no room to grow, but it may not shrink it to a size nobody can read while that
+        // control is right underneath: the floor travels into the same build the search measures with, so
+        // the glyph size and the row height the board is drawn at honour it. A page that hands no measurable
+        // button height keeps the absolute minimum, and every figure here is what it was before.
+        int requested = ResultsFontGrowth.ReadabilityFloor(buttonHeight);
+        // The floor is a preference, not a licence to draw nothing. A strip too short to hold the table at
+        // the readable size used to end up with a grid taller than the strip, which the placement then
+        // refused - the board vanished instead of shrinking. The size is asked for from a search that
+        // reports which floor it really used, and the grid that comes out of it is checked against the strip
+        // as well: a board that still overruns is rebuilt at the absolute minimum, which is the same board
+        // this page drew before the floor existed.
+        int fontSize = ResultsFontGrowth.FitBoardIntoStrip(seed, requested, int.MaxValue, room, boardWidth,
+            size => NaturalSize(content, size, requested), out int floor);
+        PanelGrid grid = BoardGrid(content, fontSize, floor, room, boardWidth);
+        if (!InStrip(grid, room, boardWidth) && floor > ResultsFontGrowth.MinimumReadablePixels)
+        {
+            floor = ResultsFontGrowth.MinimumReadablePixels;
+            grid = BoardGrid(content, fontSize, floor, room, boardWidth);
+        }
+        // The floor the grid on screen was really built with, so a later refresh re-measures with that one
+        // instead of asking for a floor this strip already proved it cannot honour.
+        _fontFloor = floor;
+        return grid;
+    }
+
+    private static PanelGrid BoardGrid(TableContent content, int fontSize, int floor, float room, float boardWidth)
+    {
+        PanelGrid grid = HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, room, floor);
         return grid == null ? null : PanelGeometry.FillWidth(grid, boardWidth);
     }
 
+    // A board the placement will accept: no taller than the strip between the completion section and the
+    // lobby button, and no wider than the page. The half pixel is the rounding a measured width or height
+    // can leave behind; a grid a fraction over is still a board the result page refuses to draw.
+    private static bool InStrip(PanelGrid grid, float room, float boardWidth)
+        => grid != null && grid.Height <= room + 0.5f && grid.Width <= boardWidth + 0.5f;
+
     // The table's own extents at one glyph size, measured without a box to fit into: the box is what is being
     // chosen here, so measuring inside one would only report that box back instead of the table's real size.
-    private static ResultTableSize NaturalSize(TableContent content, int fontSize)
+    private static ResultTableSize NaturalSize(TableContent content, int fontSize, int minimumPixels = ResultsFontGrowth.MinimumReadablePixels)
     {
-        PanelGrid measured = HudTable.BuildGrid(content, fontSize, Plugin.Density, float.PositiveInfinity, float.PositiveInfinity);
+        PanelGrid measured = HudTable.BuildGrid(content, fontSize, Plugin.Density, float.PositiveInfinity, float.PositiveInfinity, minimumPixels);
         if (measured == null) return ResultTableSize.None;
         return new ResultTableSize(measured.Width, measured.Height);
     }
@@ -341,13 +377,13 @@ internal static class ResultsDisplay
             Kinds = board.Kinds
         };
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
-        PanelGrid measured = HudTable.BuildGrid(content, Mathf.Max(1, Mathf.RoundToInt(_grid.FontPixels)), Plugin.Density, boardWidth, _grid.Height);
+        PanelGrid measured = HudTable.BuildGrid(content, Mathf.Max(1, Mathf.RoundToInt(_grid.FontPixels)), Plugin.Density, boardWidth, _grid.Height, _fontFloor);
         if (measured != null && !GridCovers(_grid, measured)
             && Placement(page, succeeded, out _, out float room, out BoardStrip strip) && room > 0f)
         {
             // The strip may have grown since the board arrived, so the same fit the first placement used is run
             // again rather than reusing the glyph size it happened to land on: a refreshed snapshot re-measures.
-            PanelGrid resized = FitBoard(content, room, boardWidth);
+            PanelGrid resized = FitBoard(content, room, boardWidth, strip.ButtonHeight);
             if (resized != null) Fit(strip, resized, content, board, report, succeeded);
         }
         _content = content;
@@ -443,7 +479,7 @@ internal static class ResultsDisplay
         // board taller than that strip used to be accepted here and then refused at draw time, which is how a
         // whole table was dropped for a fraction of a pixel of overflow.
         if (ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, grid.Height,
-            Plugin.ResultsOffsetX.Value, out LayoutRect origin, BoardSlack))
+            Plugin.ResultsOffsetX.Value, out LayoutRect origin, BoardSlack, bottomAligned: true))
         {
             _origin = origin;
             _content = content; _grid = grid;
@@ -488,14 +524,14 @@ internal static class ResultsDisplay
         top = 0f; room = 0f; strip = default;
         if (!succeeded)
         {
-            if (!FailureStrip(page, out top, out float bottom, out _, out bool buttonMeasured, out float buttonTop)) return false;
+            if (!FailureStrip(page, out top, out float bottom, out _, out bool buttonMeasured, out float buttonTop, out float buttonHeight)) return false;
             // The footer animates in, and a button measured mid-animation sits higher than the one the
             // player ends up pressing. A held board is never enlarged, so a first measurement taken too early
             // fixes the table permanently below the room the settled page actually offers. Wait for the edge
             // to stop moving (bounded, in case a hover keeps nudging it), then measure once and fix it for
             // the life of the page - which is also why nothing here ever enlarges it afterwards.
             if (!ButtonSettled(buttonMeasured, buttonTop)) return false;
-            strip = new BoardStrip(top, bottom, buttonMeasured, buttonTop);
+            strip = new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight);
             room = Math.Min(bottom, Screen.height - 8f) - top;
             return room > 0f;
         }
@@ -507,7 +543,8 @@ internal static class ResultsDisplay
         if (!CompletionReady(page)) return false;
         bool measuredButton;
         float measuredTop;
-        if (!SuccessRegion(page, out area, out measuredButton, out measuredTop))
+        float measuredHeight;
+        if (!SuccessRegion(page, out area, out measuredButton, out measuredTop, out measuredHeight))
         {
             // Neither edge could be read on this build, so the board keeps the historical fraction of the
             // window. Only the top of the page is cleared in that case, never a measured element drawn over.
@@ -516,6 +553,7 @@ internal static class ResultsDisplay
             area = ResultsRegion.Resolve(false, 0f, false, 0f, Screen.height, MessageGap);
             measuredButton = false;
             measuredTop = float.NaN;
+            measuredHeight = float.NaN;
             if (HeadingReports.Add("success-region-fallback"))
                 Plugin.Logger?.LogInfo("[DIAG] success region: the completion section and the lobby button could not both be measured, so the board falls back to the historical fraction of the window; both elements remain above and below it regardless.");
         }
@@ -535,7 +573,9 @@ internal static class ResultsDisplay
         top = Math.Max(0f, area.Top) + Mathf.Max(0f, Plugin.ResultsOffsetY.Value);
         room = Math.Min(area.Bottom, Screen.height - 8f) - top;
         // The measured button travels with the strip: it is the edge the board may never reach, on either page.
-        strip = new BoardStrip(top, top + room, measuredButton, measuredTop);
+        // The measured button travels with the strip: it is the edge the board may never reach, on either
+        // page, and its own height is the size the board's readability floor is measured against.
+        strip = new BoardStrip(top, top + room, measuredButton, measuredTop, measuredHeight);
         return room > 0f;
     }
 
@@ -588,14 +628,20 @@ internal static class ResultsDisplay
     // The success page's completion section and its lobby button, reduced to the strip between them. Both
     // are read from the page itself: the sector box, its header and the four cleared-sector icons make up
     // the completion section, and the deepest edge the page actually drew is the one the board must clear.
-    private static bool SuccessRegion(Component page, out ResultsSafeArea area, out bool buttonMeasured, out float buttonTop)
+    private static bool SuccessRegion(Component page, out ResultsSafeArea area, out bool buttonMeasured, out float buttonTop, out float buttonHeight)
     {
         area = default;
         buttonMeasured = false;
         buttonTop = float.NaN;
+        buttonHeight = float.NaN;
         var success = page != null ? page.TryCast<CM_PageExpeditionSuccess>() : null;
         if (success == null) return false;
         float completion = float.NaN, button = float.NaN;
+        // The lobby button's rectangle is measured inside the guarded block and its height is needed after
+        // it, so both are declared here and only filled there.
+        LayoutRect lobbyRect = default;
+        bool lobbyRead = false;
+        float lobbyTop = float.NaN;
         try
         {
             completion = ResultsRegion.LowestBottom(Bottom(success.m_sectorsWhiteBox), completion);
@@ -609,7 +655,12 @@ internal static class ResultsDisplay
             // the highest of them cost the board a band of the page it then could not use. `ButtonBand`
             // answers for every button that has actually been drawn - including the one this build does not
             // know by name - and is kept as the fallback for a page whose own lobby button cannot be read.
-            float lobbyTop = VisibleTop(success.m_btnLeaveExpedition);
+            // The lobby button is measured once, as a rectangle: its upper edge bounds the strip, and its own
+            // height is the size of the control the player has to press - which is what the board's readability
+            // floor is derived from. A page whose button cannot be read at all keeps the drawn band below.
+            lobbyRect = default;
+            lobbyRead = VisibleRect(success.m_btnLeaveExpedition, out lobbyRect);
+            lobbyTop = lobbyRead ? lobbyRect.Y : float.NaN;
             bool lobbyMeasured = float.IsFinite(lobbyTop);
             float bandTop = ButtonBand(page, float.NaN);
             button = ResultsRegion.LobbyEdge(lobbyMeasured, lobbyTop, bandTop, Screen.height);
@@ -628,6 +679,9 @@ internal static class ResultsDisplay
         if (completionMeasured) FailureAlignment.RememberCompletion(completion, Screen.height);
         buttonMeasured = float.IsFinite(button);
         buttonTop = buttonMeasured ? button : float.NaN;
+        // The height of that same button, and only of that button: when the bound came from the drawn band
+        // there is no single control to measure, and the board keeps its absolute readability floor.
+        buttonHeight = buttonMeasured && lobbyRead && button == lobbyTop ? lobbyRect.Height : float.NaN;
         area = ResultsRegion.Resolve(completionMeasured, completion, buttonMeasured, buttonTop, Screen.height, MessageGap);
         if (HeadingReports.Add("success-region"))
             Plugin.Logger?.LogInfo($"[DIAG] success region: completion={(completionMeasured ? completion.ToString("0") : "unmeasurable")}, lobbyButton={(buttonMeasured ? buttonTop.ToString("0") : "unmeasurable")}, boardTop={area.Top:0}, room={area.Height:0} of a {Screen.height} window; the strip runs from the completion section to the visible button's own upper edge, not to a hidden, transparent or off-page control, and all four players scale into it rather than being trimmed to it.");
@@ -659,18 +713,20 @@ internal static class ResultsDisplay
     private static float Bottom(GameObject host) => host == null ? float.NaN : Bottom(host.transform);
     private static float Top(Component element) => TryScreenRect(element, out LayoutRect rect) ? rect.Y : float.NaN;
 
-    // The top edge of the part of a page control the player can actually see, or NaN when the control is not
-    // on this page at all. Three things are asked of it, and all three have cost the board height before:
-    // the control has to be switched on, it has to be drawn (its canvas group and its own graphics are not
-    // faded out), and it has to lie on the frame the player is looking at. The edge returned is the highest
-    // renderer the control draws - the real upper edge of the button, not the container's padded rect - so
-    // the strip runs from the heading down to the button the player presses and no further.
-    private static float VisibleTop(Component element)
+    // The whole screen-space rectangle of the part of a page control the player can actually see, or false
+    // when the control is not on this page at all. Three things are asked of it, and all three have cost
+    // the board height before: the control has to be switched on, it has to be drawn (its canvas group and
+    // its own graphics are not faded out), and it has to lie on the frame the player is looking at. The
+    // rectangle spans the highest and lowest renderer the control draws - the real edges of the button, not
+    // the container's padded rect - so the strip can run from the heading down to the button the player
+    // presses, and that button's own height says how large the control being pressed really is.
+    private static bool VisibleRect(Component element, out LayoutRect rect)
     {
-        if (element == null) return float.NaN;
+        rect = default;
+        if (element == null) return false;
         bool active;
-        try { active = element.gameObject.activeInHierarchy; } catch { return float.NaN; }
-        if (!active) return float.NaN;
+        try { active = element.gameObject.activeInHierarchy; } catch { return false; }
+        if (!active) return false;
         float top = float.NaN, bottom = float.NaN;
         try
         {
@@ -687,10 +743,21 @@ internal static class ResultsDisplay
         catch { }
         // A control that draws nothing measurable is read from its own rect instead.
         if (!float.IsFinite(top) && TryScreenRect(element, out LayoutRect own)) { top = own.Y; bottom = own.Bottom; }
-        if (!float.IsFinite(top)) return float.NaN;
-        return ResultsButtonPolicy.Visible(active, ControlAlpha(element), top, bottom, Screen.width, Screen.height)
-            ? top : float.NaN;
+        if (!float.IsFinite(top) || !float.IsFinite(bottom)) return false;
+        if (!ResultsButtonPolicy.Visible(active, ControlAlpha(element), top, bottom, Screen.width, Screen.height))
+            return false;
+        float x = 0f, width = Screen.width;
+        if (TryScreenRect(element, out LayoutRect bounds) && float.IsFinite(bounds.X) && float.IsFinite(bounds.Width) && bounds.Width > 0f)
+        {
+            x = bounds.X; width = bounds.Width;
+        }
+        rect = new LayoutRect(x, top, width, Math.Max(0f, bottom - top));
+        return true;
     }
+
+    // The visible top edge alone: the edge the strip's lower bound is built from, and the only thing most
+    // callers need. It is the same measurement, so the two can never disagree.
+    private static float VisibleTop(Component element) => VisibleRect(element, out LayoutRect rect) ? rect.Y : float.NaN;
 
     // How visible a control is, as the product of every canvas group above it and the strongest colour
     // alpha among its own graphics. An alpha that cannot be read is reported as 1 so a control nobody could
@@ -782,13 +849,14 @@ internal static class ResultsDisplay
     // The button's own top edge comes back with the strip: the button is the one edge a board that is
     // already up is still held to, so the draw path can keep that promise without re-measuring the whole
     // strip it was placed in.
-    private static bool FailureStrip(Component page, out float top, out float bottom, out float opacity, out bool buttonMeasured, out float buttonTop)
+    private static bool FailureStrip(Component page, out float top, out float bottom, out float opacity, out bool buttonMeasured, out float buttonTop, out float buttonHeight)
     {
         top = Screen.height * 0.34f;
         bottom = Screen.height - 8f;
         opacity = 1f;
         buttonMeasured = false;
         buttonTop = float.NaN;
+        buttonHeight = float.NaN;
         try
         {
             var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
@@ -816,13 +884,20 @@ internal static class ResultsDisplay
             // still keeps the board above whatever it did draw. That is the whole of the rule: while a named
             // button is readable, a control the page shows but this build cannot name cannot cost the board
             // its height, and when none of them is readable the band still clears every one of them.
-            float lobbyTop = fail != null
-                ? ResultsRegion.HighestTop(VisibleTop(fail.m_btnRestartCheckpoint), VisibleTop(fail.m_btnGoToLobby))
-                : float.NaN;
+            // The height of the very button the strip's lower bound came from is read from the same
+            // rectangle as its edge, so the board's readability floor describes the control the player
+            // actually presses. A page whose bound came from the drawn band instead has no such control.
+            LayoutRect goRect = default, restartRect = default;
+            float restartTop = fail != null && VisibleRect(fail.m_btnRestartCheckpoint, out restartRect) ? restartRect.Y : float.NaN;
+            float goTop = fail != null && VisibleRect(fail.m_btnGoToLobby, out goRect) ? goRect.Y : float.NaN;
+            float lobbyTop = ResultsRegion.HighestTop(restartTop, goTop);
             bool lobbyMeasured = float.IsFinite(lobbyTop);
             float bandTop = ButtonBand(page, float.NaN);
             buttonTop = ResultsRegion.LobbyEdge(lobbyMeasured, lobbyTop, bandTop, Screen.height);
             buttonMeasured = float.IsFinite(buttonTop);
+            buttonHeight = lobbyTop == restartTop ? restartRect.Height
+                : lobbyTop == goTop ? goRect.Height
+                : float.NaN;
             // The message is moved so its bottom edge is the line the success page's completion section
             // ended on, and the board starts the same gap under it - the very rule the success board uses.
             float aligned;
@@ -850,6 +925,7 @@ internal static class ResultsDisplay
             if (HeadingReports.Add("title-read-error")) Plugin.Logger?.LogWarning("[DIAG] failure strip read failed; using visible screen-space fallback: " + error.Message);
             buttonMeasured = false;
             buttonTop = float.NaN;
+            buttonHeight = float.NaN;
             return true;
         }
     }

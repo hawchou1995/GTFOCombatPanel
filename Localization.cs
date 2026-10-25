@@ -419,9 +419,24 @@ public static class CombatStrings
     // The tool detail is the one cell whose meaning cannot live in a shared row label: every player at the
     // table may hold a different tool, so each figure keeps its own one-word tag and the fields are held
     // apart by the board's one separator instead of by a run of spaces.
+    //
+    // The cumulative figure is only printed when it really differs from the first-mark figure: while both
+    // counts were driven by the same reveal they were always equal, so the third clause repeated the
+    // second one and cost the cell a third of its width for nothing. Equal counts - both of them whole
+    // and non-negative, which is how the board formats them - print the two clauses; differing counts
+    // print all three, with the separator and the estimate marker untouched.
     public static string ToolScan(bool estimated, string uses, string marks, string totalMarks)
-        => (estimated ? "~" : string.Empty) + Compound(Pick("扫描 " + uses + " 次", "scan " + uses + "x"),
-            Pick("首次 " + marks + " 只", "first " + marks), Pick("累计 " + totalMarks + " 只", "cumulative " + totalMarks));
+        => (estimated ? "~" : string.Empty) + (SameMarkCount(totalMarks, marks)
+            ? Compound(Pick("扫描 " + uses + " 次", "scan " + uses + "x"), Pick("首次 " + marks + " 只", "first " + marks))
+            : Compound(Pick("扫描 " + uses + " 次", "scan " + uses + "x"),
+                Pick("首次 " + marks + " 只", "first " + marks), Pick("累计 " + totalMarks + " 只", "cumulative " + totalMarks)));
+    // The two figures arrive formatted by the board itself, so an identical string is an identical count;
+    // the numeric comparison is the same answer for any other pair of plain whole numbers.
+    private static bool SameMarkCount(string totalMarks, string marks)
+        => string.Equals(totalMarks, marks, StringComparison.Ordinal)
+            || long.TryParse(totalMarks, NumberStyles.Integer, CultureInfo.InvariantCulture, out long total)
+            && long.TryParse(marks, NumberStyles.Integer, CultureInfo.InvariantCulture, out long first)
+            && total == first && total >= 0;
     public static string ToolScanUnavailable => Pick("扫描 —", "Scan —");
     public static string ToolSentry(string shots, string hits, string damage)
         => Compound(Pick("射击 " + shots, "shots " + shots), Pick("命中 " + hits, "hits " + hits), Pick("伤害 " + damage, "damage " + damage));

@@ -181,7 +181,7 @@ internal static class ToolStatsTracker
             SNet_Player owner = source?.Owner;
             if (projectile == null || !CombatTracker.ShouldTrack(owner) || source.Inventory?.WieldedSlot != InventorySlot.GearClass) return;
             if (!PlayerBackpackManager.TryGetItem(owner, InventorySlot.GearClass, out BackpackItem tool) || tool?.Instance?.TryCast<GlueGun>() == null) return;
-            Ledger.BeginGlueProjectile(projectile.Pointer);
+            Ledger.BeginGlueProjectile(owner.Lookup, projectile.Pointer);
             CombatTracker.ObservePlayer(owner).Impact.CreditGlueShot();
             if (!_glueShotReported) { _glueShotReported = true; Plugin.Logger?.LogInfo("[DIAG] glue projectile launch counted from Fire owner parameter; pooled projectile identity reset."); }
         }
@@ -240,7 +240,9 @@ internal static class ToolStatsTracker
         try
         {
             if (!sample.IsValid || !Ledger.TryGlueDoorHit(sample.Door, sample.Attacker, sample.SearchId, sample.Frame)) return;
-            if (TryPlayer(sample.Owner, out CombatPlayer player)) player.Impact.CreditGlueHit();
+            // An enemy swinging at a door this player glued long ago is a melee exchange, not a shot landing:
+            // the glue gun fired nothing here, so nothing is added to the hit column. The door-hit ledger
+            // above still records the swing, which is what the glued-door figures measure.
         }
         catch (Exception error) { CombatTracker.LogToolError("glued door hit", error); }
     }

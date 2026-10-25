@@ -345,6 +345,53 @@ internal static class ResultsGrowthScenarios
             "只摊宽不改高：行高、字号与表格总高都不变");
         check(spread.Rows == fillSource.Rows && spread.Columns == fillSource.Columns,
             "铺满不改变行数与列数");
+
+        // ---- 1.19.7: the readability floor comes from the button the player presses ---------------------
+        //
+        // A 28-row board in a 470px strip is the shape that used to be drawn at ~10px above an empty band: the
+        // fit shrank the table to the absolute 6px minimum and stopped there, and nothing tied the size to the
+        // control underneath it. The lobby button measured 120px tall on the page that produced the capture, so
+        // the floor is 0.15 * 120 = 18px and the fit is asked for that instead.
+        int buttonFloor = ResultsFontGrowth.ReadabilityFloor(120f);
+        check(buttonFloor >= 18,
+            $"120px 高的返回大厅按钮给出 ≥18px 的可读下限（实际 {buttonFloor}px）");
+        check(buttonFloor <= ResultsFontGrowth.MaximumReadabilityFloor,
+            "按钮高度给出的下限仍被上限截住，不会把结算板画成海报");
+        check(ResultsFontGrowth.ReadabilityFloor(float.NaN) == ResultsFontGrowth.MinimumReadablePixels
+              && ResultsFontGrowth.ReadabilityFloor(0f) == ResultsFontGrowth.MinimumReadablePixels
+              && ResultsFontGrowth.ReadabilityFloor(-40f) == ResultsFontGrowth.MinimumReadablePixels,
+            "按钮高度不可测、为 0 或为负时退回今天的绝对下限，页面行为与今天完全一致");
+        int oldShortStrip = ResultsFontGrowth.FitIntoStrip(18, ResultsFontGrowth.MinimumReadablePixels, int.MaxValue, 470f, 2512f, Table(28, 1.5f, 40f));
+        int newShortStrip = ResultsFontGrowth.FitIntoStrip(18, buttonFloor, int.MaxValue, 470f, 2512f, Table(28, 1.5f, 40f));
+        check(oldShortStrip < buttonFloor,
+            $"同一条 470px 条带按今天 6px 的绝对下限会缩到 {oldShortStrip}px，那正是「小小的」那一版");
+        // The floor is what the board would like, never what it may cost. 28 rows at the 18px floor are 756px
+        // of a 470px strip: the size the floor asks for cannot be placed, and a board that cannot be placed is
+        // a board nobody sees - which is the regression this pins. The size is therefore asked for twice, and
+        // what is asserted is the second answer: a table that really fits the strip and is therefore drawn.
+        float shortCeiling = 470f * ResultsFontGrowth.StripFillCeiling + 0.5f;
+        check(Measure(28, 1.5f, 40f, newShortStrip).Height > shortCeiling,
+            $"按 18px 下限算出的表格本身就是 {Measure(28, 1.5f, 40f, newShortStrip).Height:0}px，放不进 470px 的条带（上限 {shortCeiling:0}px），整块不画就是这么来的");
+        int drawnShortFont = ResultsFontGrowth.FitBoardIntoStrip(18, buttonFloor, int.MaxValue, 470f, 2512f,
+            Table(28, 1.5f, 40f), out int shortFloor);
+        ResultTableSize drawnShort = Measure(28, 1.5f, 40f, drawnShortFont);
+        check(shortFloor == ResultsFontGrowth.MinimumReadablePixels && drawnShortFont < buttonFloor,
+            $"装不下可读下限时退回绝对下限 {ResultsFontGrowth.MinimumReadablePixels}px 重算，最后画的是 {drawnShortFont}px（下限 {buttonFloor}px）");
+        check(drawnShort.Height <= shortCeiling,
+            $"退回下限后产出的表格高度不超过条带的 96%+0.5，结算板一定画得出来：{drawnShort.Height:0}px <= {shortCeiling:0}px");
+        check(ResultsFontGrowth.FitBoardIntoStrip(18, buttonFloor, int.MaxValue, 470f, 2512f, Table(28, 1.5f, 40f), out _)
+              == drawnShortFont,
+            "同一段条带、同一个下限问两次得到同一个字号，刷新不会自己改变尺寸");
+        // The other half of the same rule: a strip tall enough to hold the readable size keeps it and is raised
+        // above it. 28 rows at 18px are 756px of a 1400px strip, so the floor is honoured and the search goes on
+        // to 32px of it - the floor is not a cap.
+        int tallShortFont = ResultsFontGrowth.FitBoardIntoStrip(18, buttonFloor, int.MaxValue, 1400f, 2512f,
+            Table(28, 1.5f, 40f), out int tallFloor);
+        ResultTableSize drawnTall = Measure(28, 1.5f, 40f, tallShortFont);
+        check(tallFloor == buttonFloor && tallShortFont >= buttonFloor,
+            $"条带够高时字号确实被抬到可读下限以上：{tallShortFont}px >= {buttonFloor}px（用的下限 {tallFloor}px）");
+        check(drawnTall.Height >= 1400f * ResultsFontGrowth.StripFillFloor && drawnTall.Height <= 1400f * ResultsFontGrowth.StripFillCeiling + 0.5f,
+            $"高条带里的表格落在 92%–96% 的带子里：{drawnTall.Height:0}px 是 1400px 的 {drawnTall.Height * 100f / 1400f:0.0}%");
     }
 
     // The table the real renderer measures: `rows` rows of `rowEm` ems each, the whole row `emWidth` ems

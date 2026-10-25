@@ -843,7 +843,7 @@ internal static partial class Program
         supplier.Counters.CreditScan(4);
         var supplyBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { supplier }, ImpactScoring.DefaultWeights, 1.0, 1.0), false, true);
         Check(supplyBoard.Joined(21, 1) == "30.0%", "one measured supply use displays its utilization");
-        Check(supplyBoard.Joined(22, 1) == "扫描 1 次 / 首次 4 只 / 累计 4 只", "the scanner cell shows attempts, first marks and cumulative marks, one field per clause");
+        Check(supplyBoard.Joined(22, 1) == "扫描 1 次 / 首次 4 只", "the scanner cell shows attempts then first marks, and the cumulative clause only when it differs");
         Check(supplyBoard.Tone(21, 1) == ImpactTone.Gold, "the only supplier leads the supply row");
         var dry = new ImpactInput { Name = "Dry", ToolName = "Bio Tracker" };
         var dryBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { dry }, ImpactScoring.DefaultWeights, 1.0, 1.0), false, true);
@@ -1078,7 +1078,7 @@ internal static partial class Program
         var estimatedScan = new ImpactInput { Name = "Scout", ToolName = "Bio Tracker" };
         estimatedScan.Counters.CreditScan(3, true);
         var estimatedBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { estimatedScan }, ImpactScoring.DefaultWeights, 1, 1), false, true);
-        Check(estimatedBoard.Joined(22, 1) == "~扫描 1 次 / 首次 3 只 / 累计 3 只", "estimated scan counters show cumulative marks and keep the estimate marker");
+        Check(estimatedBoard.Joined(22, 1) == "~扫描 1 次 / 首次 3 只", "estimated scan counters keep the estimate marker, and equal cumulative marks are not printed twice");
         estimatedScan.Counters.Reset();
         Check(!estimatedScan.Counters.ScanEstimated && estimatedScan.Counters.ScanUses == 0 && estimatedScan.Counters.ScanFirstMarks == 0 && estimatedScan.Counters.ScanMarks == 0, "new expeditions clear both scan counts and estimate flags");
         Check(board.Cell(-1, 1).Length == 0 && board.Cell(0, 999).Length == 0 && board.Tone(999, 999) == ImpactTone.Neutral, "board bounds are safe");
@@ -1103,6 +1103,63 @@ internal static partial class Program
         var newScanState = new ScanSession();
         newScanState.ObserveTagging(true, new ImpactCounters());
         Check(newScanState.MarkEnemy(11, new ImpactCounters()), "a fresh expedition ledger has no previous enemy identities");
+
+        // The scanner's own `m_tagging` flag is not readable while a human's confirmed tag is drained on the
+        // main thread, so the native tag-progress call is what brackets the sweep now. One enemy confirmed
+        // once in each of two brackets is one first mark - it was revealed once - and two cumulative marks,
+        // one per window. The two figures used to be pinned to the same reveal and could therefore never
+        // differ, which is why a live archive read "扫描 331 次 / 首次 1945 只 / 累计 1945 只".
+        var bracketScan = new ScanSession();
+        var bracketCounters = new ImpactCounters();
+        bracketScan.ObserveTagging(false, bracketCounters, true);
+        bracketScan.ObserveConfirmed(71, bracketCounters, true);
+        bracketScan.ObserveTagging(false, bracketCounters, true);
+        bracketScan.ObserveConfirmed(71, bracketCounters, true);
+        Check(bracketCounters.ScanFirstMarks == 1 && bracketCounters.ScanMarks == 2,
+            "an enemy confirmed once in each of two unreadable-flag brackets is one first mark and two cumulative marks");
+        Check(bracketCounters.ScanFirstMarks != bracketCounters.ScanMarks,
+            "the cumulative count is no longer pinned to the unique reveals: the window is what bounds it");
+        Check(!bracketScan.ObserveTagging(false, null) && bracketCounters.ScanMarks == 2,
+            "the tracker's own flag poll still changes nothing when the flag reads false and there is no counter");
+
+        // Every native execution confirmation now opens its own window, whoever the player is. On the host a
+        // guest's row has no scanner instance to read a flag or a bracket from - `BeginHumanScan` runs for the
+        // local human only - so its window stayed open for the whole expedition and the cumulative figure could
+        // never leave the first-mark figure. A second confirmation of the same enemy raises the cumulative marks
+        // alone: a confirmation is not an attempt, so the denominator does not move.
+        var confirmScan = new ScanSession();
+        var confirmCounters = new ImpactCounters();
+        confirmScan.BeginConfirmWindow();
+        confirmScan.ObserveConfirmed(81, confirmCounters, true);
+        Check(confirmCounters.ScanFirstMarks == 1 && confirmCounters.ScanMarks == 1 && confirmCounters.ScanUses == 1,
+            "one native confirmation is one reveal, one cumulative mark and one attempt");
+        confirmScan.BeginConfirmWindow();
+        confirmScan.ObserveConfirmed(81, confirmCounters, true);
+        Check(confirmCounters.ScanFirstMarks == 1 && confirmCounters.ScanMarks == 2 && confirmCounters.ScanUses == 1,
+            "the same enemy confirmed twice is one first mark, two cumulative marks, and the second confirmation adds no attempt");
+        // The guest row takes the same path with no readable flag at all - no `ObserveTagging` call anywhere in
+        // this block - which is exactly the host-side case for a player it has no scanner for: the cumulative
+        // figure grows by one per confirmation instead of mirroring the unique reveals.
+        var guestScan = new ScanSession();
+        var guestCounters = new ImpactCounters();
+        guestScan.BeginConfirmWindow(); guestScan.ObserveConfirmed(81, guestCounters, true);
+        guestScan.BeginConfirmWindow(); guestScan.ObserveConfirmed(81, guestCounters, true);
+        guestScan.BeginConfirmWindow(); guestScan.ObserveConfirmed(82, guestCounters, true);
+        Check(guestCounters.ScanFirstMarks == 2 && guestCounters.ScanMarks == 3 && guestCounters.ScanUses == 1,
+            "a remote player's row credited only through native confirmations accumulates one mark per confirmation instead of mirroring the first marks");
+        Check(!guestScan.ObserveTagging(false, null) && guestCounters.ScanMarks == 3 && guestCounters.ScanUses == 1,
+            "the tracker's own flag poll still changes no figure when the flag reads false and there is no counter");
+
+        // The scan cell prints the cumulative figure only when it really differs from the first-mark figure:
+        // while both came out of the same reveal they were always equal, so the third clause repeated the
+        // second one. The separator and the estimate marker are untouched, and a differing pair keeps all
+        // three clauses.
+        Check(CombatStrings.ToolScan(false, "4", "9", "9") == "扫描 4 次 / 首次 9 只"
+            && CombatStrings.ToolScan(true, "4", "9", "9") == "~扫描 4 次 / 首次 9 只",
+            "equal marks print the scan cell as two clauses, with the estimate marker still in front");
+        Check(CombatStrings.ToolScan(false, "4", "9", "13") == "扫描 4 次 / 首次 9 只 / 累计 13 只"
+            && CombatStrings.ToolScan(true, "4", "9", "13") == "~扫描 4 次 / 首次 9 只 / 累计 13 只",
+            "differing marks keep all three clauses exactly as they were");
 
         // Each scanner carries its own reveal ledger: an enemy the squad's other bio tracker already
         // revealed is still a first mark for this tracker, which is what lets two human trackers both
@@ -1575,6 +1632,24 @@ internal static partial class Program
         Check(ResultBoardHold.TryPlace(1920f, 1440f, new BoardStrip(483f, 1001f, true, 1016f), 850f, 517f, 0f, out LayoutRect fresh, 2f)
             && near(fresh.Y, 483f),
             "the strip the board was first measured against still places it, with the draw path's two pixels of slack");
+        // ---- 1.19.7: the board is bottom-aligned on the strip, and its floor comes from the button -------
+        //
+        // The strip ends where the button begins, so a table shorter than the room it was given used to keep
+        // its top edge on the completion section and leave that empty band right above the button. Placing it
+        // against the strip's lower edge puts it in the gap the player is actually looking at; nothing about
+        // the fit changes, so a board that cannot fit is still refused and an unmeasured page still places it
+        // at the top exactly as before.
+        Check(ResultBoardHold.TryPlace(1920f, 1440f, new BoardStrip(483f, 1001f, true, 1016f), 850f, 400f, 0f,
+                out LayoutRect bottomAligned, 0f, bottomAligned: true)
+            && near(bottomAligned.Bottom, 1001f) && near(bottomAligned.Y, 601f),
+            "a bottom-aligned placement puts the board's lower edge on the strip's, so the gap above the button is the one the player sees");
+        Check(ResultBoardHold.TryPlace(1920f, 1440f, new BoardStrip(483f, 1001f, true, 1016f), 850f, 400f, 0f,
+                out LayoutRect topAligned, 0f)
+            && near(topAligned.Y, 483f),
+            "and the placement that does not ask for it is still the top-aligned one it has always been");
+        Check(!ResultBoardHold.TryPlace(1920f, 1440f, new BoardStrip(483f, 1001f, true, 1016f), 850f, 600f, 0f,
+                out _, 0f, bottomAligned: true),
+            "bottom alignment never turns a board that does not fit into one that does");
         Check(ScoringFiles.DirectoryName == "CombatPanel-config" && ScoringFiles.FileName == "scoring.json",
             "the scoring file keeps its own folder and name beside the plugin");
         // Lone-survivor is the sole exception to the previous firepower ordering.

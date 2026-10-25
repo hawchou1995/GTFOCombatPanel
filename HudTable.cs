@@ -233,7 +233,8 @@ internal static class HudTable
     // is measured on its own. Equal player columns are what makes `#1`, `#2`, `#3` line up down the board
     // instead of each finding its own width, and it is the whole table, glyph size included, that is then
     // scaled as one to fit the screen.
-    internal static PanelGrid BuildGrid(TableContent content, int fontSize, PanelDensity density, float maxWidth, float maxHeight)
+    internal static PanelGrid BuildGrid(TableContent content, int fontSize, PanelDensity density, float maxWidth, float maxHeight,
+        int minimumPixels = 6)
     {
         if (content == null || content.ColumnCount == 0 || content.Rows == 0) return null;
         float separatorWidth = PanelGeometry.FieldGap(fontSize, density);
@@ -304,7 +305,11 @@ internal static class HudTable
                 // The settlement board shrinks as one object: a smaller glyph, proportionally narrower
                 // columns and a proportionally shorter row, which is what keeps the player columns equal
                 // and the table's proportions the same at every resolution.
-                int working = Mathf.Max(6, Mathf.FloorToInt(fontSize * Mathf.Clamp(fit, PanelGeometry.MinimumShrink, 1f)));
+                // The smallest glyph size this build may shrink the settlement board to. The caller passes the
+                // readability floor it derived from the lobby button's own measured height; the in-level HUD
+                // passes nothing and keeps the historical six pixels, so its behaviour is untouched.
+                int floor = minimumPixels < 6 ? 6 : minimumPixels;
+                int working = Mathf.Max(floor, Mathf.FloorToInt(fontSize * Mathf.Clamp(fit, PanelGeometry.MinimumShrink, 1f)));
                 int guard = 0;
                 do
                 {
@@ -312,7 +317,7 @@ internal static class HudTable
                     if (Fits(grid, maxWidth, maxHeight)) break;
                     working--;
                 }
-                while (working > 6 && guard++ < 400);
+                while (working > floor && guard++ < 400);
             }
             else grid = PanelGeometry.Build(metrics, separatorWidth, fontSize, content.Rows, density, fit, rightAligned, RowEm(fontSize));
         }

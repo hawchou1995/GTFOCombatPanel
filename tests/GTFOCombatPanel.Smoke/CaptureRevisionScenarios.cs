@@ -16,9 +16,9 @@ internal static partial class Program
         Check(tools.TrySentryHit(identity, 0) && !tools.TrySentryHit(identity, 0), "zero search id deduplicates contacts only within a firing window");
         tools.BeginSentryWindow(identity);
         Check(tools.TrySentryHit(identity, 0), "next firing window can hit again with the same zero id");
-        tools.BeginGlueProjectile(identity);
+        tools.BeginGlueProjectile(1, identity);
         Check(tools.TryGlueHit(1, identity) && !tools.TryGlueHit(1, identity), "one glue launch credits one contact per owner/projectile");
-        tools.BeginGlueProjectile(identity);
+        tools.BeginGlueProjectile(1, identity);
         Check(tools.TryGlueHit(1, identity), "pooled glue projectile reuse begins a new contact lifetime");
         // Sentry rounds are reported by two independent streams: the master FireBullet call (the only one
         // that knows doDamage) and the turret's native notification (which knows nothing). Each call owns a

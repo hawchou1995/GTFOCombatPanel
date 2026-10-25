@@ -1092,6 +1092,12 @@ internal static class CombatTracker
             if (!ShouldTrack(owner) || owner.IsBot || !owner.IsLocal
                 || GameStateManager.CurrentStateName != eGameStateName.InLevel) return null;
             ObserveHumanScan(scanner);
+            // The native tag-progress call is one attempt, and it brackets a confirmed mark even when the
+            // scanner's own `m_tagging` flag reads false while the confirmation is drained on the main
+            // thread. Opening the window here is what lets the cumulative count differ from the unique
+            // first-mark count instead of being pinned to it. The owner resolved above is reused; the
+            // capture, the lookup and the previous bracket are left exactly as they were.
+            Ledger(owner).Session.ObserveTagging(scanner.m_tagging, null, true);
             var capture = new HumanScanCapture { Scanner = scanner, Lookup = owner.Lookup, Previous = _humanScan };
             _humanScan = capture;
             return capture;
@@ -1118,6 +1124,11 @@ internal static class CombatTracker
             var player = ObservePlayer(owner);
             ScanProbe probe = Ledger(owner);
             long before = player.Impact.ScanMarks;
+            // One confirmation, one window, whoever the player is. A guest's row on the host has no scanner
+            // instance to read a tag flag or a bracket from (`BeginHumanScan` runs for the local human only),
+            // so without this its window stayed open for the whole expedition and the cumulative figure was
+            // pinned to the first-mark figure - two columns printing the same number off one event source.
+            probe.Session.BeginConfirmWindow();
             probe.Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
             // A remote request identifies its player, but not the scanner's sweep/empty-attempt edges.
             estimated |= !owner.IsLocal;

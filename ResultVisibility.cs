@@ -124,15 +124,20 @@ public static class CompletionDrawing
 // The strip of a result page the board may use, together with the button it may never reach. `ButtonTop`
 // is the lobby button's own measured top edge and is only meaningful when `ButtonMeasured` is set: a page
 // whose button could not be measured has nothing to protect and nothing to guess at.
+//
+// `ButtonHeight` is that same button's own measured height, and it is the one figure that says how large a
+// control the player is being asked to press. The settlement board derives its readability floor from it,
+// so a page that offers no measurable height keeps the absolute minimum and behaves exactly as before.
 public readonly struct BoardStrip
 {
     public readonly float Top, Bottom;
     public readonly bool ButtonMeasured;
     public readonly float ButtonTop;
+    public readonly float ButtonHeight;
 
-    public BoardStrip(float top, float bottom, bool buttonMeasured, float buttonTop)
+    public BoardStrip(float top, float bottom, bool buttonMeasured, float buttonTop, float buttonHeight = float.NaN)
     {
-        Top = top; Bottom = bottom; ButtonMeasured = buttonMeasured; ButtonTop = buttonTop;
+        Top = top; Bottom = bottom; ButtonMeasured = buttonMeasured; ButtonTop = buttonTop; ButtonHeight = buttonHeight;
     }
 }
 
@@ -146,8 +151,13 @@ public static class ResultBoardHold
     // The first placement: the board fits inside the strip between the two measured edges, with the same
     // tolerance the draw path allows for a button whose bounds moved between the measurement and the
     // draw. A board that cannot fit is refused here rather than pushed over a button.
+    //
+    // `bottomAligned` puts the board's lower edge on the strip's lower edge instead of its upper edge on
+    // the strip's top. The strip ends where the button begins, so a table shorter than the room it was
+    // given lands in the gap the player is really looking at - right above the button - rather than leaving
+    // an empty band there and clinging to the completion section above.
     public static bool TryPlace(float screenWidth, float screenHeight, BoardStrip strip, float width, float height,
-        float offsetX, out LayoutRect rect, float slack = 0f)
+        float offsetX, out LayoutRect rect, float slack = 0f, bool bottomAligned = false)
     {
         rect = default;
         if (!float.IsFinite(screenWidth) || !float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
@@ -158,7 +168,9 @@ public static class ResultBoardHold
         float bottom = Math.Min(strip.Bottom, screenHeight - 8f) + slack;
         if (!(bottom > top) || top + height > bottom) return false;
         float x = (screenWidth - width) * 0.5f + (float.IsFinite(offsetX) ? offsetX : 0f);
-        rect = new LayoutRect(x, top, width, height);
+        rect = bottomAligned
+            ? new LayoutRect(x, Math.Max(top, bottom - height), width, height)
+            : new LayoutRect(x, top, width, height);
         return true;
     }
 

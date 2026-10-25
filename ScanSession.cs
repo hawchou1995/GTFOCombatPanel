@@ -25,6 +25,16 @@ public sealed class ScanReveals
 // One scanner: its own tag-attempt edges, its own bot callback throttle, and the expedition's
 // shared reveal ledger. Passive radar updates do not count as attempts. Bot static callbacks have
 // no owner: attribution and timing remain estimates.
+//
+// The two mark figures answer two different questions and no longer share a gate:
+//   - first marks  (`ScanFirstMarks`) are expedition-unique reveals: the sweep that first put an enemy
+//     on the squad's bio tracker takes the credit, and nobody is credited for it again.
+//   - cumulative marks (`ScanMarks`) are per-enemy marks inside the sweep window now under way, counted
+//     again by every later sweep that marks the same enemy. One enemy contributes at most once to one
+//     window, and a window is opened by the tag flag's rising edge, by a bot callback burst, by the
+//     caller's own `bracket` (the native tag progress call) and by every native execution confirmation,
+//     so a build - or a player - whose tag flag never reads true still counts cumulative marks instead of
+//     mirroring the first marks.
 public sealed class ScanSession
 {
     private readonly ScanReveals _reveals;
@@ -42,24 +52,27 @@ public sealed class ScanSession
     public ScanSession(ScanReveals reveals) { _reveals = reveals ?? new ScanReveals(); }
 
     // The rising edge starts one sweep. A build whose flag is never readable still gets its first
-    // sweep counted below, from the reveals themselves.
-    public bool ObserveTagging(bool active, ImpactCounters counters)
+    // sweep counted below, from the reveals themselves. `bracket` is the caller's own attempt boundary -
+    // the native tag progress call - and is a fresh sweep window on its own, even while the flag reads
+    // false, because that is how a human scanner's confirmed tags really arrive.
+    public bool ObserveTagging(bool active, ImpactCounters counters, bool bracket = false)
     {
         bool started = active && !_tagging;
-        if (started) _sweepMarks.Clear();
+        if (started || bracket) _sweepMarks.Clear();
         _tagging = active;
         if (!active) { _countedThisSweep = false; return false; }
         if (started && counters != null) { counters.CreditScan(0); _countedThisSweep = true; }
         return started;
     }
 
-    // Each enemy contributes once to the current sweep, while the first-mark score still counts
-    // expedition-unique reveals. If the tag flag is unavailable, only a new reveal is evidence.
+    // Each enemy contributes once to the sweep window now under way, while the first-mark score still
+    // counts expedition-unique reveals. The cumulative mark therefore no longer depends on the tag flag
+    // being readable: the window is what bounds it, never the reveal.
     public ScanMark Observe(int identity, ImpactCounters counters, bool bot = false)
     {
         if (counters == null || identity == 0) return ScanMark.Rejected;
         bool first = _reveals.Reveal(identity);
-        if (_tagging ? _sweepMarks.Add(identity) : first) counters.CreditScanMark();
+        if (_sweepMarks.Add(identity)) counters.CreditScanMark();
         if (!first) return ScanMark.Repeat;
         if (!_countedThisSweep) { counters.CreditScan(0); _countedThisSweep = true; }
         counters.ScanFirstMarks++;
@@ -68,6 +81,14 @@ public sealed class ScanSession
 
     public ScanMark ObserveConfirmed(int identity, ImpactCounters counters, bool confirmed, bool bot = false)
         => confirmed ? Observe(identity, counters, bot) : ScanMark.Rejected;
+
+    // One native execution confirmation, one sweep window. A guest's scanner is never readable here - only
+    // the local human's `BeginHumanScan` runs, and the host has no scanner instance for a guest's row at all
+    // - so on the host that row kept a single window for the whole expedition and its cumulative figure could
+    // never leave the first-mark figure. Opening the window at every confirmation is what makes the
+    // confirmation itself the boundary, whoever the player is. Only the sweep window is cleared: the
+    // denominator flags are left exactly as they were, so a confirmation still cannot invent an attempt.
+    public void BeginConfirmWindow() => _sweepMarks.Clear();
 
     public void EndBotTag() => _tagging = false;
 

@@ -50,5 +50,22 @@ internal static partial class Program
         var unavailable = ImpactScoring.Evaluate(new[] { new ImpactInput { Name = "unknown" } }, ImpactScoring.DefaultWeights, 1, 1);
         Check(ImpactBoard.MetricFields(unavailable.Entries[0], ImpactMetric.TotalDamage, KillTier.Minor, false, true)[0] == "—",
             "unobserved settlement damage is unavailable, not a fabricated zero");
+        // The settlement cache keeps the glue triple as one block with the same test and the same monotonicity as
+        // its neighbours: the block that fired more shots wins, an equal one leaves what is already settled alone,
+        // and a late snapshot that fired nothing - or fired less - cannot shrink a figure this run already reported.
+        var glueCache = new SettlementRows();
+        var glueLive = new CombatPlayer(77);
+        glueLive.Impact.GlueShots = 9; glueLive.Impact.GlueHits = 6; glueLive.Impact.GluedEnemies = 3;
+        glueCache.Update(new[] { glueLive }, 1);
+        var glueSmaller = new CombatPlayer(77);
+        glueSmaller.Impact.GlueShots = 4; glueSmaller.Impact.GlueHits = 4; glueSmaller.Impact.GluedEnemies = 2;
+        ImpactCounters settledGlue = glueCache.Update(new[] { glueSmaller }, 1).Single().Impact;
+        Check(settledGlue.GlueShots == 9 && settledGlue.GlueHits == 6 && settledGlue.GluedEnemies == 3,
+            "a settlement snapshot that fired fewer glue shots cannot shrink a block the settlement already holds");
+        var glueHitOnlySettled = new CombatPlayer(77);
+        glueHitOnlySettled.Impact.GlueHits = 7;
+        ImpactCounters keptGlue = glueCache.Update(new[] { glueHitOnlySettled }, 1).Single().Impact;
+        Check(keptGlue.GlueShots == 9 && keptGlue.GlueHits == 6 && keptGlue.GluedEnemies == 3,
+            "a settlement snapshot that fired no glue cannot replace the settled triple, hits included");
     }
 }

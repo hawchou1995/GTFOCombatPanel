@@ -155,9 +155,19 @@ public static class CombatMerge
         impact.MinePickups = MergeCount(impact.MinePickups, snap.MinePickups);
         impact.MineTriggers = MergeCount(impact.MineTriggers, snap.MineTriggers);
         impact.MineDamage = float.IsFinite(snap.MineDamage) && snap.MineDamage > 0 ? snap.MineDamage : impact.MineDamage;
-        impact.GlueShots = MergeCount(impact.GlueShots, snap.GlueShots);
-        impact.GlueHits = MergeCount(impact.GlueHits, snap.GlueHits);
-        impact.GluedEnemies = MergeCount(impact.GluedEnemies, snap.GluedEnemies);
+        // The glue triple is one block, exactly as it is merged on the wire: shots are the test, because a
+        // machine that fired no glue has no usable sample at all. An enemy swinging at a glued door leaves
+        // hits without a launch, so a triple whose shots are zero is never taken - it would print
+        // "shot 0 / hit N" over a row that measured its glue - and a triple that did fire is taken whole,
+        // so one peer's shots are never assembled with another peer's hits. A snapshot about this machine's
+        // own row cannot carry this machine's counters back to it either: the sender built its copy from
+        // what this machine broadcast, so the block stays what this machine measured, byte for byte.
+        if (!own && snap.GlueShots > 0)
+        {
+            impact.GlueShots = snap.GlueShots;
+            impact.GlueHits = snap.GlueHits;
+            impact.GluedEnemies = snap.GluedEnemies;
+        }
         if (!own)
         {
             impact.ScanUses = MergeCount(impact.ScanUses, snap.ScanUses);

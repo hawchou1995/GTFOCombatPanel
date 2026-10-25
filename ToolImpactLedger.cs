@@ -37,6 +37,8 @@ public sealed class ToolImpactLedger
     private readonly HashSet<IntPtr> _triggeredMines = new HashSet<IntPtr>();
     private readonly HashSet<(IntPtr Turret, uint SearchId)> _sentryHits = new HashSet<(IntPtr, uint)>();
     private readonly HashSet<(ulong Owner, IntPtr Projectile)> _glueHits = new HashSet<(ulong, IntPtr)>();
+    // The glue shots this machine has counted and not yet seen land. A hit is credited only from here.
+    private readonly HashSet<(ulong Owner, IntPtr Projectile)> _glueFired = new HashSet<(ulong, IntPtr)>();
     private readonly HashSet<(ulong Owner, IntPtr Enemy)> _gluedEnemies = new HashSet<(ulong, IntPtr)>();
     private readonly Dictionary<IntPtr, ulong> _gluedDoors = new Dictionary<IntPtr, ulong>();
     private readonly HashSet<(IntPtr Door, IntPtr Projectile)> _glueDoorApplications = new HashSet<(IntPtr, IntPtr)>();
@@ -162,14 +164,23 @@ public sealed class ToolImpactLedger
     public bool TrySentryHit(IntPtr turret, uint damageSearchId)
         => turret != IntPtr.Zero && _sentryHits.Add((turret, damageSearchId));
 
-    public void BeginGlueProjectile(IntPtr projectile)
+    // A glue shot is registered when the gun itself fires and is then spent by the first contact that
+    // lands. A contact no counted shot owns - an enemy swinging at a door it glued long ago, a projectile
+    // this machine never fired, a second callback for a shot already spent - is not a hit, which is what
+    // makes "hits never exceed shots" true rather than hoped for.
+    public void BeginGlueProjectile(ulong owner, IntPtr projectile)
     {
+        if (owner == 0UL || projectile == IntPtr.Zero) return;
         _glueHits.RemoveWhere(hit => hit.Projectile == projectile);
         _glueDoorApplications.RemoveWhere(hit => hit.Projectile == projectile);
+        _glueFired.Add((owner, projectile));
     }
 
+    // True at most once per registered launch: the first contact consumes the shot and every later one
+    // reports false, so one fired projectile still contributes at most one shot-hit.
     public bool TryGlueHit(ulong owner, IntPtr projectile)
-        => owner != 0UL && projectile != IntPtr.Zero && _glueHits.Add((owner, projectile));
+        => owner != 0UL && projectile != IntPtr.Zero
+            && _glueFired.Remove((owner, projectile)) && _glueHits.Add((owner, projectile));
 
     public bool TryRegisterGlueDoor(IntPtr door, IntPtr projectile, ulong owner)
     {
@@ -206,6 +217,7 @@ public sealed class ToolImpactLedger
         _triggeredMines.Clear();
         _sentryHits.Clear();
         _glueHits.Clear();
+        _glueFired.Clear();
         _gluedEnemies.Clear();
         _gluedDoors.Clear();
         _glueDoorApplications.Clear();

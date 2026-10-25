@@ -583,9 +583,18 @@ public static class SyncProtocol
         result.MineDeployments = CombineCount(existing.MineDeployments, incoming.MineDeployments);
         result.MinePickups = CombineCount(existing.MinePickups, incoming.MinePickups);
         result.MineTriggers = CombineCount(existing.MineTriggers, incoming.MineTriggers);
-        result.GlueShots = CombineCount(existing.GlueShots, incoming.GlueShots);
-        result.GlueHits = CombineCount(existing.GlueHits, incoming.GlueHits);
-        result.GluedEnemies = CombineCount(existing.GluedEnemies, incoming.GluedEnemies);
+        // The glue triple is one block for the same reason the kill tiers above are: three zeros mean "this
+        // machine fired no glue", so the figures are taken whole from one side instead of pairing one
+        // machine's shots with another machine's hits. The test is `GlueShots`, the same test `CombatMerge`
+        // and the settlement handover use: a side whose shots are zero has no usable glue sample at all -
+        // an enemy swinging at a glued door used to leave hits behind without a launch - so its triple is
+        // never taken, even when its hits or glued enemies are not zero, and the block that was counted
+        // survives untouched.
+        bool takeIncomingGlue = incoming.GlueShots > 0;
+        SyncSnapshot glueSource = takeIncomingGlue ? incoming : existing;
+        result.GlueShots = glueSource.GlueShots;
+        result.GlueHits = glueSource.GlueHits;
+        result.GluedEnemies = glueSource.GluedEnemies;
         // v7: nothing is left to merge above - every state figure travelled with the block it belongs to,
         // so a sleeping or unreadable kill is never assembled from one machine's figure and printed on
         // another machine's total, and an unreadable one is never folded into an awake count.

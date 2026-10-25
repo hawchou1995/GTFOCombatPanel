@@ -103,8 +103,15 @@ internal static partial class Program
             && tools.TrySentryHit(turret, 1u) && !tools.TrySentryHit(turret, 1u),
             "zero and real sentry ids both deduplicate repeated contacts within the same shot window");
         IntPtr projectile = new IntPtr(301), secondProjectile = new IntPtr(302), enemyA = new IntPtr(401), enemyB = new IntPtr(402);
+        // A shot is registered when the glue gun fires, and a hit is only ever spent out of a registered shot.
+        // The two registrations here stand for the two launches `ToolStatsTracker.CreditGlueProjectile` counts.
+        tools.BeginGlueProjectile(11UL, projectile);
+        tools.BeginGlueProjectile(11UL, secondProjectile);
         Check(tools.TryGlueHit(11UL, projectile) && !tools.TryGlueHit(11UL, projectile)
             && tools.TryGlueHit(11UL, secondProjectile), "one fired glue projectile contributes at most one shot-hit despite repeated enemy contacts");
+        IntPtr unfiredProjectile = new IntPtr(303);
+        Check(!tools.TryGlueHit(11UL, unfiredProjectile) && tools.GlueHitIdentityCount == 2,
+            "a projectile this machine never counted as a shot cannot contribute a glue hit, so hits cannot exceed shots");
         Check(tools.TryGluedEnemy(11UL, enemyA) && !tools.TryGluedEnemy(11UL, enemyA)
             && tools.TryGluedEnemy(22UL, enemyA) && tools.TryGluedEnemy(11UL, enemyB),
             "glued enemies are unique per owning player and distinct enemy");
@@ -117,6 +124,13 @@ internal static partial class Program
             && !tools.TryGlueDoorHit(door, doorAttacker, 77u, 10)
             && tools.TryGlueDoorHit(door, doorAttacker, 78u, 10),
             "distinct enemy attacks on a foamed door count even when the door survives, while a repeated search callback is deduplicated");
+        // An enemy swinging at a foamed door is a melee exchange, not a shot landing: the glue gun fired nothing
+        // for that swing, so the swing record grows while the glue-hit column, which can only spend a counted
+        // shot, does not move. This is the 435-shot / 516-hit pair the archive showed.
+        int glueHitsBeforeDoorSwings = tools.GlueHitIdentityCount;
+        Check(tools.TryGlueDoorHit(door, doorAttacker, 79u, 10)
+            && tools.GlueDoorHitIdentityCount == 3 && tools.GlueHitIdentityCount == glueHitsBeforeDoorSwings,
+            "an enemy swinging at a foamed door grows the door-hit ledger without inventing a glue shot-hit");
         tools.ForgetGlueDoor(door);
         Check(!tools.TryGetGlueDoorOwner(door, out _) && tools.GluedDoorCount == 0 && tools.GlueDoorHitIdentityCount == 0,
             "clearing door foam removes its owner and hit identities");
@@ -291,6 +305,24 @@ internal static partial class Program
             && mergedTools.MineTriggers == 3 && mergedTools.GluedEnemies == 4 && mergedTools.ScanMarks == 50
             && Math.Abs(mergedTools.MeleeEnemyDamage - 31.5f) < 0.01f,
             "an empty peer snapshot cannot erase host kill, scan, melee or tool counters");
+        // The glue triple moves as one block on the wire, exactly as the kill tiers do: a machine that fired
+        // nothing reports three zeros and may not erase a block that was counted, and a machine that counted
+        // anything supplies all three figures at once - so shots from one peer are never paired with hits from
+        // another, and "hits never exceed shots" survives a merge.
+        var shotOnlyPeer = new SyncSnapshot { Owner = 0x771UL, GlueShots = 7 };
+        SyncSnapshot glueTakenWhole = SyncProtocol.Combine(toolSnapshot, true, shotOnlyPeer, false);
+        Check(glueTakenWhole.GlueShots == 7 && glueTakenWhole.GlueHits == 0 && glueTakenWhole.GluedEnemies == 0,
+            "a peer that counted glue supplies the whole triple, so one machine's shots are never printed with another machine's hits");
+        Check(mergedTools.GlueShots == 12 && mergedTools.GlueHits == 8 && mergedTools.GluedEnemies == 4,
+            "a peer that counted no glue cannot erase the glue block that was counted");
+        // The test is the shot count, and it is the same test in all three places the triple is taken from: a
+        // side whose shots are zero has no usable glue sample at all, so a triple that left hits behind without a
+        // counted launch - an enemy swinging at a glued door - may neither displace nor be spliced into a block
+        // that was measured. That is the shape that printed "shot 435 / hit 516" in the archive.
+        var hitOnlyPeer = new SyncSnapshot { Owner = 0x771UL, GlueHits = 6, GluedEnemies = 2 };
+        SyncSnapshot glueKeptFromShots = SyncProtocol.Combine(toolSnapshot, true, hitOnlyPeer, false);
+        Check(glueKeptFromShots.GlueShots == 12 && glueKeptFromShots.GlueHits == 8 && glueKeptFromShots.GluedEnemies == 4,
+            "a peer whose shots are zero supplies no glue sample, so a hits-only triple cannot displace the block that was counted");
         var toolProjection = new CombatPlayer(0x772UL);
         CombatMerge.ApplyRemote(toolProjection, decodedTools, 0, 1, 2, 3, 0x772UL);
         Check(toolProjection.Impact.FriendlyFireDeaths == 2 && toolProjection.Impact.MeleeKills == 4
@@ -298,6 +330,27 @@ internal static partial class Program
             && toolProjection.Impact.GlueShots == 12 && toolProjection.Impact.ScanMarks == 50
             && Math.Abs(toolProjection.FindWeapon(3, 444u).Counters.EnemyDamage - 31.5) < 0.01,
             "the client display projection receives scan totals, tool counters, kill counts and melee damage");
+
+        // The display projection takes the triple from the same side the wire merge would, and never from a
+        // snapshot about this machine's own row: that copy was built from what this machine broadcast, so it
+        // cannot be more precise than the block it was made from.
+        var glueDisplay = new CombatPlayer(0x772UL);
+        glueDisplay.Impact.GlueShots = 3; glueDisplay.Impact.GlueHits = 1; glueDisplay.Impact.GluedEnemies = 1;
+        CombatMerge.ApplyRemote(glueDisplay, new SyncSnapshot { Owner = 0x771UL, GlueShots = 12, GlueHits = 8, GluedEnemies = 4 },
+            0, 1, 2, 3, 0x772UL);
+        Check(glueDisplay.Impact.GlueShots == 12 && glueDisplay.Impact.GlueHits == 8 && glueDisplay.Impact.GluedEnemies == 4,
+            "a remote triple that fired glue supplies all three figures at once, so one machine's shots are never printed with another machine's hits");
+        var glueHitOnlyRow = new CombatPlayer(0x772UL);
+        glueHitOnlyRow.Impact.GlueShots = 5; glueHitOnlyRow.Impact.GlueHits = 4; glueHitOnlyRow.Impact.GluedEnemies = 2;
+        CombatMerge.ApplyRemote(glueHitOnlyRow, hitOnlyPeer, 0, 1, 2, 3, 0x772UL);
+        Check(glueHitOnlyRow.Impact.GlueShots == 5 && glueHitOnlyRow.Impact.GlueHits == 4 && glueHitOnlyRow.Impact.GluedEnemies == 2,
+            "a remote snapshot that fired no glue cannot rewrite the glue block this row measured");
+        var glueOwnRow = new CombatPlayer(0x771UL);
+        glueOwnRow.Impact.GlueShots = 2; glueOwnRow.Impact.GlueHits = 2; glueOwnRow.Impact.GluedEnemies = 1;
+        CombatMerge.ApplyRemote(glueOwnRow, new SyncSnapshot { Owner = 0x771UL, GlueShots = 9, GlueHits = 7, GluedEnemies = 3 },
+            0, 1, 2, 3, 0x771UL);
+        Check(glueOwnRow.Impact.GlueShots == 2 && glueOwnRow.Impact.GlueHits == 2 && glueOwnRow.Impact.GluedEnemies == 1,
+            "a snapshot about this machine's own row never overwrites the glue triple this machine measured itself");
         var reportInput = new ImpactInput { Name = "Runner", Counters = new ImpactCounters() };
         var report = ImpactScoring.Evaluate(new[] { reportInput }, ImpactScoring.DefaultWeights, 1, 1);
         var board = ImpactBoard.Build(report, true, true);

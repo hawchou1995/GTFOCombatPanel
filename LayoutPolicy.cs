@@ -734,6 +734,27 @@ public static class ResultsFontGrowth
     // player can read, and shrinking further would only trade text for room nobody can use.
     public const int MinimumReadablePixels = 6;
 
+    // The share of the button's own height that the settlement board's glyphs have to keep. The board is
+    // fitted into the strip between the page's completion section and the lobby button, and a strip that
+    // is short is what used to drag the glyph size down to the absolute minimum - a table the player has
+    // to press a button under, drawn at 6 to 12px. Deriving the floor from the control the player presses
+    // instead keeps the figures as large as the room in front of that control really allows.
+    public const float ButtonHeightShare = 0.15f;
+    // A sanity ceiling for that floor: the button's measured height is a hint, never a poster licence.
+    public const int MaximumReadabilityFloor = 32;
+
+    // The smallest glyph size the settlement board may be drawn at, given the measured height of the
+    // button it has to clear. An unmeasurable, zero or negative height keeps the old absolute minimum, so
+    // a page that hands nothing measurable behaves exactly as it did before this existed.
+    public static int ReadabilityFloor(float buttonHeight)
+    {
+        if (!float.IsFinite(buttonHeight) || buttonHeight <= 0f) return MinimumReadablePixels;
+        int floor = (int)Math.Round(buttonHeight * ButtonHeightShare);
+        if (floor < MinimumReadablePixels) floor = MinimumReadablePixels;
+        if (floor > MaximumReadabilityFloor) floor = MaximumReadabilityFloor;
+        return floor;
+    }
+
     // The glyph size to draw the settlement board at, when the seed itself is the wrong size.
     //
     // `FitResultFontSize` above is a climb: a board that already overruns its strip is returned unchanged,
@@ -787,6 +808,40 @@ public static class ResultsFontGrowth
         }
         return low;
     }
+
+    // The glyph size the settlement board is drawn at, when the readability floor is a preference rather
+    // than a licence to draw nothing.
+    //
+    // `FitIntoStrip` above answers with the seed when nothing between the floor and the ceiling fits, and
+    // `HudTable.BuildGrid` then honours that same floor and refuses to shrink below it: the grid it hands
+    // back is not merely taller than the strip, it is refused by the placement and the board is never drawn
+    // at all. The floor is what the board would like its figures to be, not what it may cost: a strip that
+    // cannot hold the table at the readable size is drawn at the absolute minimum instead, which is exactly
+    // the degradation this had before the floor existed. `usedFloor` reports which of the two produced the
+    // answer, and the caller has to build its grid with that one - a grid built with the floor that was
+    // refused is the overrun again.
+    //
+    // A measurement that reports nothing is not evidence that anything overruns, so the first pass stands as
+    // it is; a floor already at the absolute minimum leaves nothing lower to fall back to.
+    public static int FitBoardIntoStrip(int seedPixels, int floorPixels, int maximumPixels, float stripHeight,
+        float boardWidth, Func<int, ResultTableSize> measure, out int usedFloor)
+    {
+        int floor = floorPixels < MinimumReadablePixels ? MinimumReadablePixels : floorPixels;
+        usedFloor = floor;
+        int size = FitIntoStrip(seedPixels, floor, maximumPixels, stripHeight, boardWidth, measure);
+        if (measure == null) return size;
+        ResultTableSize table = Measured(measure, size);
+        if (!table.Usable || Inside(table, stripHeight, boardWidth)) return size;
+        if (floor <= MinimumReadablePixels) return size;
+        usedFloor = MinimumReadablePixels;
+        return FitIntoStrip(seedPixels, MinimumReadablePixels, maximumPixels, stripHeight, boardWidth, measure);
+    }
+
+    // The table the answer produces really lands in the box it was measured against. The height is the figure
+    // that decides whether the board is drawn at all, and the slack is the half pixel a ratio-based rebuild
+    // can leave behind - the same tolerance the fit above already allows.
+    private static bool Inside(ResultTableSize size, float stripHeight, float boardWidth)
+        => size.Height <= stripHeight + 0.5f && size.Width <= boardWidth + WidthSlack;
 
     // The table is inside the box it was given: tall enough to be the point of the page, short enough to
     // stay clear of the button, and never wider than the width the page offers.

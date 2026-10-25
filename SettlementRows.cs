@@ -61,8 +61,13 @@ internal sealed class SettlementRows
         a.SentryDamage = Math.Max(a.SentryDamage, b.SentryDamage);
         a.MineDeployments = Math.Max(a.MineDeployments, b.MineDeployments); a.MinePickups = Math.Max(a.MinePickups, b.MinePickups);
         a.MineTriggers = Math.Max(a.MineTriggers, b.MineTriggers); a.MineDamage = Math.Max(a.MineDamage, b.MineDamage);
-        a.GlueShots = Math.Max(a.GlueShots, b.GlueShots); a.GlueHits = Math.Max(a.GlueHits, b.GlueHits);
-        a.GluedEnemies = Math.Max(a.GluedEnemies, b.GluedEnemies);
+        // The glue triple moves as one block and its test is the shot count, the same test `CombatMerge.ApplyRemote`
+        // and `SyncProtocol.Combine` use: a row that fired no glue has no usable sample, so a hit-only triple
+        // - an enemy swinging at a glued door - can neither be spliced into the block nor replace it. Of two
+        // blocks that did fire, the larger count wins and an equal one leaves what is already settled alone,
+        // which is what keeps a late, smaller snapshot from shrinking a figure this run already reported.
+        if (b.GlueShots > 0 && b.GlueShots > a.GlueShots)
+        { a.GlueShots = b.GlueShots; a.GlueHits = b.GlueHits; a.GluedEnemies = b.GluedEnemies; }
     }
 
     private static bool Keep(double old, bool oldObserved, bool oldEstimated, double value, bool observed, bool estimated)

@@ -2,15 +2,15 @@
 
 源码：[hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)。当前功能、JSON 称号示例和多人协议要求以 `Thunderstore/README.md` 为准；下方旧版本记录仅作历史说明。
 
-**1.19.7 只改结算板版面（未发布、未在游戏内实机验证）**：
+**1.19.7 已于 2026-10-25 发布至 Thunderstore GTFO（`HawChow-CombatPanel`，Client Mods，NSFW=否）；尚未在游戏内实机验证**：
 
 - 结算板下边界锚定「送所有囚犯回大厅 / 返回大厅」按钮本身，失败页再与「重开检查点」按钮取更高者，板子压不住这两个已命名按钮中的任何一个；页面上更高但未命名的控件不再削减板子高度。
 - 字号与行高按该按钮上方的真实间隙搜索：最高到条带的 96%，到达条带的 92% 或撞到页面可用宽度即停止；测量不可用或连可读下限都装不下时保留原字号，由既有 fit 兜底。
 - 恢复结算板铺满页面可用宽度：`PanelGeometry.FillWidth` 重新作为最后一步，多余宽度只摊给右对齐的数值列，标签列宽度、行高、字号与表格高度都不变。
 
-本版同时包含未发布的 1.19.6 两项（客机伤害兜底、rundown 名称解析）。协议、伤害、同步、计分与存档逻辑未改。
+本版同时包含未发布的 1.19.6 两项（客机伤害兜底、rundown 名称解析），以及两项用户报告的缺陷修复：扫描「累计」不再与「首次」印成同一个数（累计改为每次原生标记确认记一次，面板只在两者不同时才打印该段），胶枪「命中」不再把敌人砸胶门的挥击计入、三格改为整组取源（此前归档里出现过「射击 435 / 命中 516」）。协议仍为 v8，伤害归因、计分权重与存档格式未改。发布包的 ZIP SHA-256 为 `EDF2D61B55273EE4B0DF0E2A3A18567488956AEF65D3EFC20C055E832858FA36`（336126 字节、6 成员），线上下载包与之逐字节一致，包内 DLL 与本地构建同为 `0F07793B070C969A5EA0F3E4999429B638A0B0C6352435A19A16157C98ECEEA6`。
 
-验证（2026-10-24）：`scripts/Verify.ps1` 输出 `VERIFY: PASS`，插件构建 0 警告 0 错误，`PASS: 1825 combat-panel assertions`。这只是编译与自动化（托管重放）验证，不是实机验证。
+验证（2026-10-25）：`scripts/Verify.ps1` 输出 `VERIFY: PASS`，插件构建 0 警告 0 错误，`PASS: 1857 combat-panel assertions`（另 9 配置监听 / 50 补给归属 / 38 扫描重放）。这只是编译与自动化（托管重放）验证，不是实机验证。
 
 1.19.6 修复“主机未装模组时客机自己那行永远没有伤害”：`BulletDamage` / `MeleeDamage` 两个肢体钩子的 finalizer 原本只把调用前后的肢体血量交给 `CombatTracker.NoteLocalOutgoing`，而这类对局里伤害由主机结算，本机同一次调用前后血量不变，`amount <= 0` 静默返回。现在把武器带入的原始 `dam`（护甲与精准倍率之前）一并传入，只在血量差读不到时作为兜底，并按肢体剩余血量封顶；能读到血损时仍以实际血损为准，估算标记 `~` 与显示不变。游戏方法自己抛异常时不再据 `dam` 估算，同一个异常原样返回；一次性诊断日志补 `healthBefore / healthAfter / dam / amount`，武器名读不到时写 `unknown weapon`。结算写出的 rundown key 补上本地档解析：`Local_<id>` 能读到本机已加载的 `RundownDataBlock.name` 就写该名字，读不到（无此 block、读取失败、名字为空）或本来不是这个形状的 key 一律原样保留。主机与“主机装模组”的客机仍不本地记账，协议 v8、显示布局、总量与占比公式均未改。验证（2026-10-24）：以 SDK 6.0.428 对本机 r2modman 的 Survival profile 里的真实 BepInEx / Interop 程序集重跑当前 `scripts/Verify.ps1`，得到 `VERIFY: PASS`：插件构建 0 警告 0 错误，`PASS: 1778 combat-panel assertions`（含本次新增的兜底规则与估算标记用例），文件监听 9 条、补给归属 50 条、扫描管线重放 38 条断言全部通过，EWC 可选桥接、显示投影、结算工具行投影与 GTFO TMP 字体等 wiring checks 亦为 PASS。这只是编译与自动化（托管重放）验证，不是实机验证：未进游戏复核 `Local_<id>` 到本机 `RundownDataBlock.name` 的实际解析，主机未装模组时客机的实际数值也仍待实测；未安装 profile、未发布。
 

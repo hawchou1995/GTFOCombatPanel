@@ -4,7 +4,10 @@
 - 结算板的下边界锚定「送所有囚犯回大厅 / 返回大厅」按钮本身（失败页 `m_btnGoToLobby`、成功页 `m_btnLeaveExpedition`），失败页再与「重开检查点」（`m_btnRestartCheckpoint`）取更高者：板子不压住这两个已命名按钮中的任何一个；只有两者都测不到时才回落到页面上所有已绘制按钮的最高上边缘（这条带本身就包含这两个按钮）。而页面上更高、本模组叫不出名字的控件不再削减板子高度。
 - 字号与行高按「该按钮上边缘 − 条带上边缘」这段真实间隙搜索：字号由这段间隙得到，最高到条带的 96%；到达条带的 92% 或撞到页面可用宽度即停止；测量不可用、或连可读下限都装不下时保留原字号，由既有 fit 兜底。1.19.5 那种「种子字号本身就超出条带、于是被静默缩到极小字号、按钮上方留一大片空白」的现象不再出现。
 - 恢复结算板铺满页面可用宽度：`PanelGeometry.FillWidth` 重新作为最后一步，多余宽度只摊给右对齐的数值列，标签列宽度、行高、字号与表格高度都不变。
-- 本版同时包含尚未发布的 1.19.6 两项（客机伤害兜底、rundown 名称解析），不是只有版面改动。未发布、未在游戏内实机验证：本轮只有编译与自动化断言（`scripts/Verify.ps1` 的 `VERIFY: PASS`：构建 0 警告 0 错误，`PASS: 1825 combat-panel assertions`）。协议、伤害、同步、计分与存档逻辑未改动。
+- 扫描「累计」不再由读不到的 `m_tagging` 垄断：`CreditExecutedScanTag` 在每次原生执行确认前开一个新窗口（`ScanSession.BeginConfirmWindow` 只清这一轮的已标记集合，不动 `_countedThisSweep`），因此本机的行与主机上客机玩家的行都按「每次确认记一次」累计（同一敌人被重复标记各计一次），而「首次」仍是全局唯一揭示数，「扫描次数」不受影响。面板只在「累计 ≠ 首次」时才打印第三段——此前两列恒等，是同一个事件源同一个去重键。
+- 胶枪「命中」现在必须对应一次已计数的发射：敌人近战砸已经胶住的门不再计入「命中」（此前它没有上限、也不对应任何发射，这正是归档里「射击 435 / 命中 516」的来源）；`SyncProtocol.Combine`、`CombatMerge.ApplyRemote`、`SettlementRows.Retain` 三处改为一律以来源侧的 `GlueShots > 0` 整组取源（射击为 0 表示这一侧没有可用的胶枪样本），不再把两台机器的数字拼在一行；本机自身那一行也不会被远端快照改写，结算缓存另加「射击更多的一组胜出、相等则保留现值」的单调规则。
+- 结算板的字号下限与单元格高度仍取「返回大厅」按钮的实测高度（0.15 × 按钮高度，限 6–32px）与该按钮上沿；按钮高度不可测、或条带连可读下限都装不下时，退回 6px 绝对下限重新算一次（`ResultsFontGrowth.FitBoardIntoStrip`），**绝不因为抬高下限而不画**：旧行为的下限就是 6px，兜底后不会比它更差（28 行 / 470px 条带 / 按钮 120px 这一例按 6px 下限算回约 10px 的表格，而不是整块消失）。
+- 本版同时包含尚未发布的 1.19.6 两项（客机伤害兜底、rundown 名称解析），不是只有版面改动。本版只有编译与自动化断言、未在游戏内实机验证（`scripts/Verify.ps1` 的 `VERIFY: PASS`：构建 0 警告 0 错误，`PASS: 1857 combat-panel assertions`，另 9 配置监听 / 50 补给归属 / 38 扫描重放断言）。协议版本（v8）、伤害归因、计分权重与存档格式未改动；本轮改动的是扫描窗口的计数边界、胶枪三元组的取源与单调规则，以及结算板装不下可读下限时的字号兜底。
 
 ## 1.19.6
 - A client whose host runs no panel of its own now keeps its own damage figure when the game applies the blow elsewhere. The bullet and melee limb hooks pass the weapon's carried damage into the local fallback, which is used only when the health across the call did not move, capped by the health the limb still had.
