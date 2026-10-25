@@ -291,20 +291,25 @@ internal static class ResultsDisplay
     // The glyph size the settlement board is drawn at, and the grid that size produces.
     //
     // The strip between the page's completion section and the lobby button is usually far taller than the table
-    // needs, so the board is grown into that height instead of sitting small in the middle of it.
-    // `ResultsFontGrowth` decides the size from real measurements of this very content - the table is built once
-    // per candidate size and its own extents handed back - and the grid is then used at exactly the width its
-    // own cells need: the four player columns already share one width, measured as the widest cell of any of
-    // them, so the board never carries padding the figures did not ask for. Neither step can push the board over
-    // the icons, the title or the button: the fit's own ceiling stays below the strip and inside the width the
-    // page offers. Both result screens come through here, so success and failure are laid out by one rule.
+    // needs, and it is occasionally shorter than the sharing size wants, so the size is searched rather than
+    // guessed: `ResultsFontGrowth.FitIntoStrip` measures the table at a candidate size and answers with the
+    // largest one that fits - down as well as up. Measuring and then squeezing the table into the box, which
+    // is what a climb that refuses to look downwards does, is how a board ended up drawn at ~9px with the top
+    // of its strip left empty.
+    //
+    // `NaturalSize` is the measurement and the box is what is being chosen here, so the table is measured
+    // with no box at all. The width the page offers then spreads the finished grid across the page through
+    // `PanelGeometry.FillWidth`, which hands the room the figures did not need to the right-aligned value
+    // columns and leaves the label column - and the grid's height, row height and glyph size - exactly where
+    // they were. Neither step can push the board over the icons, the title or the button: the fit's own
+    // ceiling stays below the strip and inside the width the page offers.
     private static PanelGrid FitBoard(TableContent content, float room, float boardWidth)
     {
         int seed = Mathf.Max(1, PanelBehaviour.FontSizeForSharing);
-        int fontSize = ResultsFontGrowth.FitResultFontSize(seed, seed, int.MaxValue, room, boardWidth,
+        int fontSize = ResultsFontGrowth.FitIntoStrip(seed, ResultsFontGrowth.MinimumReadablePixels, int.MaxValue, room, boardWidth,
             size => NaturalSize(content, size));
         PanelGrid grid = HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, room);
-        return grid;
+        return grid == null ? null : PanelGeometry.FillWidth(grid, boardWidth);
     }
 
     // The table's own extents at one glyph size, measured without a box to fit into: the box is what is being
@@ -599,10 +604,15 @@ internal static class ResultsDisplay
             completion = ResultsRegion.LowestBottom(Bottom(success.m_sectorIconSecond), completion);
             completion = ResultsRegion.LowestBottom(Bottom(success.m_sectorIconThird), completion);
             completion = ResultsRegion.LowestBottom(Bottom(success.m_sectorIconAllCompleted), completion);
-            // Only a button the player can really see bounds the strip; ButtonBand answers for every button
-            // the page has actually drawn, which includes the one this build does not know by name.
-            button = ResultsRegion.HighestTop(VisibleTop(success.m_btnLeaveExpedition), button);
-            button = ButtonBand(page, button);
+            // The strip's lower bound is the button that sends the squad home, and only that button: on the
+            // success page the controls the page has drawn include ones far above the footer, and clearing
+            // the highest of them cost the board a band of the page it then could not use. `ButtonBand`
+            // answers for every button that has actually been drawn - including the one this build does not
+            // know by name - and is kept as the fallback for a page whose own lobby button cannot be read.
+            float lobbyTop = VisibleTop(success.m_btnLeaveExpedition);
+            bool lobbyMeasured = float.IsFinite(lobbyTop);
+            float bandTop = ButtonBand(page, float.NaN);
+            button = ResultsRegion.LobbyEdge(lobbyMeasured, lobbyTop, bandTop, Screen.height);
         }
         catch (Exception error)
         {
@@ -760,11 +770,13 @@ internal static class ResultsDisplay
         if (row > 0 && row < dividers.Length) dividers[row] = true;
     }
 
-    // The strip of the failure page the board may use: below the page's own message and above the two
-    // buttons that send the squad back to the lobby or restart the checkpoint. Both edges are measured from
-    // the page itself, and this is the same rule the success screen uses (ResultsRegion.Resolve), so the
-    // board of either screen stands in the same safe strip instead of each having its own idea of "below
-    // the heading". Measurement failure degrades to a screen-space fallback that still clears the button
+    // The strip of the failure page the board may use: below the page's own message and above the higher
+    // of the two footer buttons this build knows by name - "send every prisoner back to the lobby" and
+    // "restart checkpoint". Both edges are measured from the page itself, and this is the same rule the
+    // success screen uses (ResultsRegion.Resolve), so the board of either screen stands in the same safe
+    // strip instead of each having its own idea of "below the heading". The edge that bounds it is chosen by
+    // `ResultsRegion.LobbyEdge` - that button when it can be measured, the band of everything the page drew
+    // when it cannot - and measurement failure degrades to a screen-space fallback that still clears that
     // band, never to permission to cover a button.
     //
     // The button's own top edge comes back with the strip: the button is the one edge a board that is
@@ -789,16 +801,27 @@ internal static class ResultsDisplay
             if (present && (!active || float.IsFinite(alpha) && alpha <= 0.001f)) return false;
             opacity = present && float.IsFinite(alpha) ? Mathf.Clamp01(alpha) : 1f;
 
-            // The buttons the board must never cover: the highest top edge of whichever the page has
-            // revealed is the one to clear, and the page's own buttons are read as a set rather than by the
-            // two vanilla field names this build happens to know - a host's fail page carries a different
-            // footer from a client's, and a page re-laid out by another mod moves them.
-            if (fail != null)
-            {
-                buttonTop = ResultsRegion.HighestTop(VisibleTop(fail.m_btnGoToLobby), buttonTop);
-                buttonTop = ResultsRegion.HighestTop(VisibleTop(fail.m_btnRestartCheckpoint), buttonTop);
-            }
-            buttonTop = ButtonBand(page, buttonTop);
+            // The buttons the board must never cover are the two this build knows by name: "send every
+            // prisoner back to the lobby", `m_btnGoToLobby`, and "restart checkpoint",
+            // `m_btnRestartCheckpoint`. The higher of the two - the smaller finite top edge - is the strip's
+            // lower bound, so a page that puts the restart button above the lobby button cannot be covered
+            // either. A result page also carries controls that are switched on and drawn yet sit far above
+            // the footer, and those are deliberately not part of this input: taking the highest of everything
+            // the page drew cost the board ~180px of the page and made it draw small with a band of empty
+            // screen above the button.
+            //
+            // The band of every button the page has drawn is only the fallback for a page whose named
+            // buttons cannot be read at all: a host's fail page carries a different footer from a client's,
+            // and a page re-laid out by another mod moves them, so a page whose own buttons cannot be read
+            // still keeps the board above whatever it did draw. That is the whole of the rule: while a named
+            // button is readable, a control the page shows but this build cannot name cannot cost the board
+            // its height, and when none of them is readable the band still clears every one of them.
+            float lobbyTop = fail != null
+                ? ResultsRegion.HighestTop(VisibleTop(fail.m_btnRestartCheckpoint), VisibleTop(fail.m_btnGoToLobby))
+                : float.NaN;
+            bool lobbyMeasured = float.IsFinite(lobbyTop);
+            float bandTop = ButtonBand(page, float.NaN);
+            buttonTop = ResultsRegion.LobbyEdge(lobbyMeasured, lobbyTop, bandTop, Screen.height);
             buttonMeasured = float.IsFinite(buttonTop);
             // The message is moved so its bottom edge is the line the success page's completion section
             // ended on, and the board starts the same gap under it - the very rule the success board uses.
@@ -846,18 +869,23 @@ internal static class ResultsDisplay
     }
 
     // The lobby button's own top edge, on its own: the one edge that still moves a board already in place.
+    //
+    // It is read by the same rule the strip is measured with - the higher of the two named buttons
+    // ("send every prisoner back to the lobby" and "restart checkpoint") when either can be measured, the
+    // band of everything the page drew when neither can - so the hold that keeps an already placed board
+    // off the footer can never pull it up against a control the strip itself was never asked to clear.
     private static bool LobbyButtonTop(Component page, out float top)
     {
         top = float.NaN;
         try
         {
             var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
-            if (fail != null)
-            {
-                top = ResultsRegion.HighestTop(VisibleTop(fail.m_btnGoToLobby), top);
-                top = ResultsRegion.HighestTop(VisibleTop(fail.m_btnRestartCheckpoint), top);
-            }
-            top = ButtonBand(page, top);
+            float lobbyTop = fail != null
+                ? ResultsRegion.HighestTop(VisibleTop(fail.m_btnRestartCheckpoint), VisibleTop(fail.m_btnGoToLobby))
+                : float.NaN;
+            bool lobbyMeasured = float.IsFinite(lobbyTop);
+            float bandTop = ButtonBand(page, float.NaN);
+            top = ResultsRegion.LobbyEdge(lobbyMeasured, lobbyTop, bandTop, Screen.height);
         }
         catch { return false; }
         return float.IsFinite(top);

@@ -510,23 +510,24 @@ internal static class CombatTracker
     // client in a lobby whose host runs no panel of its own used to show no damage of its own at all, and
     // with it no share and no kill of its own.
     //
-    // The amount is the health the enemy lost across the call, not the `dam` the weapon carried into it.
-    // The argument is pre-armour and pre-precision: the game multiplies it by the struck limb's resistance
-    // and by the hit's precision multiplier inside the call, so a precise shot into a weakspot was being
-    // recorded as a plain body shot. Subtracting the health afterwards is the damage that was actually
-    // applied - the same measurement the receive path takes from its packet - and it is what makes the
-    // fallback agree with a host that runs this mod instead of reading low against it.
+    // The amount is the health the enemy lost across the call whenever that loss is readable - the damage
+    // actually applied. The argument the weapon carried in (`dam`) is pre-armour and pre-precision: the
+    // game multiplies it by the struck limb's resistance and by the hit's precision multiplier inside the
+    // call, so a precise shot into a weakspot was being recorded as a plain body shot. Subtracting the
+    // health afterwards is the damage that was applied - the same measurement the receive path takes
+    // from its packet - and it is what makes the fallback agree with a host that runs this mod.
     //
-    // It is still an estimate rather than a measurement, so it goes out under the panel's estimate marker,
-    // and a host that does run this mod replaces it with the blow it applied, which outranks an estimate
-    // by construction.
+    // A client whose host applies the blow is never told the result inside the same call, so the two
+    // reads can come back as one number and that loss is zero. `dam` is then the only figure there is,
+    // capped by the health the limb still had; it is read as the estimate it is, and a host that does run
+    // this mod replaces it with the blow it applied, which outranks an estimate by construction.
     //
     // Nobody counts a blow here twice: the host never enters this path (it reads every blow through the
     // record path) and neither does a client whose host runs this mod (the host's record of that blow
     // reaches it). Only a client whose host runs nothing falls back to measuring its own blows locally,
     // which is the same split Dinorush's StatDisplay makes on MasterHasMod.
     internal static void NoteLocalOutgoing(Dam_EnemyDamageLimb limb, Agent source, float healthBefore,
-        DamageKind kind, uint gearCategoryId = 0)
+        DamageKind kind, uint gearCategoryId = 0, float dam = 0f)
     {
         try
         {
@@ -536,7 +537,7 @@ internal static class CombatTracker
             SNet_Player owner = agent == null ? null : agent.Owner;
             if (owner == null || !owner.IsLocal || !ShouldTrack(owner)) return;
             float healthAfter = Math.Max(0f, limb.m_base.Health);
-            float amount = Math.Max(0f, Math.Max(0f, healthBefore) - healthAfter);
+            float amount = (float)LocalOutgoingRule.Amount(healthBefore, healthAfter, dam);
             if (!float.IsFinite(amount) || amount <= 0f) return;
             var player = ObservePlayer(owner);
             InventorySlot slot = kind == DamageKind.Melee
@@ -545,15 +546,15 @@ internal static class CombatTracker
             var entry = ResolveWeapon(player, owner, slot);
             RememberAttacker(limb.m_base, owner.Lookup, kind);
             player.RecordDamage(CombatPlayer.MatchDamage(player, entry, gearCategoryId), amount, false, true);
-            // The Scout row reports the damage that went into Scouts, so the same applied figure is put
-            // there too when the enemy under this limb is one. It is an estimate for the same reason the
-            // row above is: this machine measured its own blow, and a host that runs the panel overrules it.
+            // The Scout row reports the damage that went into Scouts, so the same figure is put there too
+            // when the enemy under this limb is one. It is an estimate for the same reason the row above
+            // is: this machine measured its own blow, and a host that runs the panel overrules it.
             if (limb.m_base.Owner != null && limb.m_base.Owner.IsScout)
                 player.Impact.AddScoutDamage(amount, true);
             if (!_loggedOutgoing)
             {
                 _loggedOutgoing = true;
-                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client whose host runs no panel of its own, so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry.Name}, read as the health the enemy actually lost rather than the pre-armour figure the weapon carries - because the game never sends a machine its own damage back. The figure is marked as an estimate, and a host that does run this mod replaces it with the blow it applied.");
+                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client whose host runs no panel of its own, so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry?.Name ?? "unknown weapon"}, from healthBefore={healthBefore:0.0}, healthAfter={healthAfter:0.0}, dam={dam:0.0} - because the game never sends a machine its own damage back. The health the enemy lost across the call is used whenever it moved; when it did not, the figure the weapon carried in is used instead and capped by the health the limb had left. Either way the figure is marked as an estimate, and a host that does run this mod replaces it with the blow it applied.");
             }
         }
         catch (Exception error) { LogImpact("local outgoing damage", error); }

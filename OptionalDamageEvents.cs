@@ -53,6 +53,25 @@ internal static class DamageObservation
     }
 }
 
+// What a blow this machine dealt to an enemy limb is worth, for the one case the game leaves unread. On a
+// client whose host runs no panel of its own, the host applies the blow and this machine is told the result
+// later, so reading the limb's health before and after the call can return the same number twice. The figure
+// the weapon carried into the call is then all there is - but it is the pre-armour, pre-precision value, so
+// it is an estimate and is capped by the health the limb still had. When the health did move, that loss is
+// the applied damage and it wins outright, which is the 1.19.0 reading and stays exactly as it was.
+internal static class LocalOutgoingRule
+{
+    internal static double Amount(float healthBefore, float healthAfter, float dam)
+    {
+        if (!float.IsFinite(healthBefore) || !float.IsFinite(healthAfter)) return 0;
+        double delta = Math.Max(0f, Math.Max(0f, healthBefore) - Math.Max(0f, healthAfter));
+        if (delta > 0) return delta;
+        if (!float.IsFinite(dam)) return 0;
+        // A limb already at zero keeps it that way, and an overkill cannot credit more than the pool it emptied.
+        return Math.Max(0, Math.Min(dam, Math.Max(0f, healthBefore)));
+    }
+}
+
 internal sealed class DamageCreditLedger
 {
     private readonly Dictionary<IntPtr, Dictionary<ulong, double>> _credit = new();

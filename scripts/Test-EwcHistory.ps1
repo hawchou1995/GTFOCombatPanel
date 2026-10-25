@@ -1,6 +1,10 @@
-param([Parameter(Mandatory)][string[]]$Dlls)
+param([Parameter(Mandatory)][string[]]$Dlls, [string]$CecilPath)
 $ErrorActionPreference = 'Stop'
-Add-Type -Path 'E:\Games\R2ModMan\GTFO\profiles\Test\BepInEx\core\Mono.Cecil.dll'
+if ([string]::IsNullOrWhiteSpace($CecilPath)) {
+    if ([string]::IsNullOrWhiteSpace($env:GTFO_DIR)) { throw 'Pass -CecilPath, or set GTFO_DIR to a profile root, so BepInEx\core\Mono.Cecil.dll can be found.' }
+    $CecilPath = Join-Path $env:GTFO_DIR 'BepInEx\core\Mono.Cecil.dll'
+}
+Add-Type -Path (Resolve-Path -LiteralPath $CecilPath).Path
 foreach ($entry in $Dlls) {
     $name, $path = $entry -split '\|', 2
     $assembly = [Mono.Cecil.AssemblyDefinition]::ReadAssembly((Resolve-Path -LiteralPath $path).Path)

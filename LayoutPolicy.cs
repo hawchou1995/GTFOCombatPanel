@@ -462,6 +462,22 @@ public static class ResultsRegion
     // The highest top edge among the measured footer elements, by the same reasoning.
     public static float HighestTop(float candidate, float best)
         => float.IsFinite(candidate) && (!float.IsFinite(best) || candidate < best) ? candidate : best;
+    // The lower bound of a result board's strip: the top edge of the button that sends the squad home,
+    // and nothing else.
+    //
+    // `ButtonBand` answers for every button the page has drawn, which is what keeps a page this build has
+    // never seen from being covered - but a result page also carries controls that are switched on, drawn
+    // from the page's own animation and yet far above the button the player presses. Taking the highest of
+    // them cost the board some 180px of strip on a real success page, which is why the board sat small with
+    // a band of empty page above the footer. When the lobby button itself can be measured it is therefore
+    // the only wall; the band is the fallback for a page whose button could not be read at all.
+    //
+    // A measured edge that is not a screen coordinate (not a number, zero, negative, past the bottom of the
+    // window) is not evidence of anything and falls back to the band, so no NaN ever travels on from here.
+    public static float LobbyEdge(bool lobbyMeasured, float lobbyTop, float bandTop, float screenHeight)
+        => lobbyMeasured && float.IsFinite(lobbyTop) && lobbyTop > 0f && lobbyTop <= screenHeight
+            ? lobbyTop
+            : bandTop;
 }
 
 // Whether a control of a result page is really on the screen, and therefore whether the board has to keep
@@ -710,6 +726,64 @@ public static class ResultsFontGrowth
             low = middle;
             // The strip is used once the table is inside its band, which is where the climb was heading.
             if (Filled(probe, stripHeight, boardWidth)) break;
+        }
+        return low;
+    }
+
+    // The smallest glyph size `FitIntoStrip` will ever answer with. Below this a table is no longer a table a
+    // player can read, and shrinking further would only trade text for room nobody can use.
+    public const int MinimumReadablePixels = 6;
+
+    // The glyph size to draw the settlement board at, when the seed itself is the wrong size.
+    //
+    // `FitResultFontSize` above is a climb: a board that already overruns its strip is returned unchanged,
+    // because for the in-level table an overrun is the caller's to place. On a result page that is exactly
+    // the case that hurts - the sharing size can be taller than the strip between the completion section and
+    // the lobby button, the climb refuses to look downwards, and `HudTable.BuildGrid` then squeezes the
+    // table into the box it was given, which is how a board ended up drawn at ~9px with a band of empty page
+    // above the footer. This one looks in both directions and answers with the largest size that fits:
+    // downwards when the seed overruns, upwards when the strip has room to spare, and never past the
+    // `MaximumSeedMultiple` readability cap or the caller's own `maximumPixels`.
+    //
+    // `floorPixels` is the readability floor and is never taken below `MinimumReadablePixels`; it may be
+    // above the answer only when nothing between it and the ceiling fits at all, in which case the seed is
+    // returned and the caller's own shrink decides - the same degradation this had before. `measure`
+    // answers with the table's natural extents at a candidate size; a measure that is missing, throws or
+    // reports no extent, and a strip or width that could not be measured, all keep the seed.
+    public static int FitIntoStrip(int seedPixels, int floorPixels, int maximumPixels, float stripHeight,
+        float boardWidth, Func<int, ResultTableSize> measure)
+    {
+        int seed = seedPixels < 1 ? 1 : seedPixels;
+        if (measure == null) return seed;
+        if (!float.IsFinite(stripHeight) || stripHeight <= 0f) return seed;
+        if (!float.IsFinite(boardWidth) || boardWidth <= 0f) return seed;
+        int ceiling = Ceiling(seed, maximumPixels);
+        int floor = floorPixels < MinimumReadablePixels ? MinimumReadablePixels : floorPixels;
+        if (floor > ceiling) floor = ceiling;
+
+        ResultTableSize seedSize = Measured(measure, seed);
+        if (!seedSize.Usable) return seed;
+        if (ceiling > seed)
+        {
+            ResultTableSize top = Measured(measure, ceiling);
+            if (top.Usable && Fits(top, stripHeight, boardWidth)) return ceiling;
+        }
+        else if (Fits(seedSize, stripHeight, boardWidth)) return seed;
+
+        // The ceiling has been refused (or is the seed itself), so the answer - if there is one - lies
+        // between the readable floor and that refused size. A floor that does not fit either means the strip
+        // cannot hold the table at any size worth drawing, and the seed is kept.
+        int low = floor;
+        int high = ceiling;
+        ResultTableSize smallest = low == seed ? seedSize : Measured(measure, low);
+        if (!smallest.Usable || !Fits(smallest, stripHeight, boardWidth)) return seed;
+        int guard = 0;
+        while (high - low > 1 && guard++ < MaximumMeasurements)
+        {
+            int middle = low + (high - low) / 2;
+            ResultTableSize probe = Measured(measure, middle);
+            if (!probe.Usable || !Fits(probe, stripHeight, boardWidth)) { high = middle; continue; }
+            low = middle;
         }
         return low;
     }

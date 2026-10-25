@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.19.7
+- 结算板的下边界锚定「送所有囚犯回大厅 / 返回大厅」按钮本身（失败页 `m_btnGoToLobby`、成功页 `m_btnLeaveExpedition`），失败页再与「重开检查点」（`m_btnRestartCheckpoint`）取更高者：板子不压住这两个已命名按钮中的任何一个；只有两者都测不到时才回落到页面上所有已绘制按钮的最高上边缘（这条带本身就包含这两个按钮）。而页面上更高、本模组叫不出名字的控件不再削减板子高度。
+- 字号与行高按「该按钮上边缘 − 条带上边缘」这段真实间隙搜索：字号由这段间隙得到，最高到条带的 96%；到达条带的 92% 或撞到页面可用宽度即停止；测量不可用、或连可读下限都装不下时保留原字号，由既有 fit 兜底。1.19.5 那种「种子字号本身就超出条带、于是被静默缩到极小字号、按钮上方留一大片空白」的现象不再出现。
+- 恢复结算板铺满页面可用宽度：`PanelGeometry.FillWidth` 重新作为最后一步，多余宽度只摊给右对齐的数值列，标签列宽度、行高、字号与表格高度都不变。
+- 本版同时包含尚未发布的 1.19.6 两项（客机伤害兜底、rundown 名称解析），不是只有版面改动。未发布、未在游戏内实机验证：本轮只有编译与自动化断言（`scripts/Verify.ps1` 的 `VERIFY: PASS`：构建 0 警告 0 错误，`PASS: 1825 combat-panel assertions`）。协议、伤害、同步、计分与存档逻辑未改动。
+
+## 1.19.6
+- A client whose host runs no panel of its own now keeps its own damage figure when the game applies the blow elsewhere. The bullet and melee limb hooks pass the weapon's carried damage into the local fallback, which is used only when the health across the call did not move, capped by the health the limb still had.
+- A readable health loss still wins, so the 1.19.0 armour / precision reading is unchanged, and the fallback stays an estimate (`~`; layout, total and share formulas untouched). The one-shot diagnostic now prints `healthBefore`, `healthAfter`, `dam` and `amount`, which separates "the client is never told the blow" from "the limb was already empty".
+- The settlement rundown key resolves a local progressive rundown: the game exposes one only as the synthetic `Local_<id>`, so the archive now writes the name of the loaded `RundownDataBlock` when it can be read. Every other key, and a local id whose block cannot be read, is written exactly as the game gave it.
+- A limb blow whose game call throws is no longer estimated from the weapon's carried figure: the finalizer keeps the same exception and records nothing local for it.
+- The host guard is untouched: a host, and a client whose host runs this build, still record nothing locally, so an installed host cannot be double-counted. Protocol stays v8.
+- Verification (2026-10-24): the current `scripts/Verify.ps1` was re-run with SDK 6.0.428 against the real BepInEx / Interop assemblies of the local r2modman Survival profile and printed `VERIFY: PASS`: the plugin builds with 0 warnings / 0 errors, `PASS: 1778 combat-panel assertions` (including the new fallback-rule and estimate-marker cases), 9 config watcher, 50 supply attribution and 38 scan pipeline replay assertions pass, and the EWC-bridge, display-projection, settlement-tool and GTFO TMP font wiring checks pass. This is compile and automated (managed replay) verification, not an in-game run: nothing here confirms that a `Local_<id>` key resolves to the loaded `RundownDataBlock.name`, and the live figures on a client behind an unmodded host are still unverified. No profile install and no publication.
+
 ## 1.19.5
 - Observe actual native tag requests and ToolSyncManager.DoTagEnemy execution, rather than matching late tags against per-frame candidate lists. Host validation captures the original sender without requiring a remote first-person EnemyScanner instance.
 - Queue confirmation values for main-thread resolution and counting; reject exceptions, unowned, expired and old-run events. Client pairing is estimated because broadcasts carry no scanner identity; host fallback counts are also estimated without sweep IDs. Missing receive senders never fall back to a concurrently scanning host.

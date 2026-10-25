@@ -104,31 +104,40 @@ internal static class LocalBulletDamagePatch
 {
     private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(Dam_EnemyDamageLimb), "BulletDamage");
 
-    // What the blow is worth is read as the health the enemy actually lost, never from the `dam`
-    // argument. That argument is the figure the weapon carries before the game applies the armour of the
-    // limb that was struck and the precision multiplier of the hit, so a shot that landed on a weakspot
-    // was recorded as though every hit were the same - which is exactly why a precise primary could read
-    // lower than the same rifle fired into a body. The health before the call and after it is the applied
-    // damage, the same measurement the receive path above takes from its own packet.
+    // What the blow is worth is read as the health the enemy actually lost whenever that loss is
+    // readable. The `dam` argument is the figure the weapon carries before the game applies the armour of
+    // the limb that was struck and the precision multiplier of the hit, so a shot that landed on a
+    // weakspot was recorded as though every hit were the same - which is exactly why a precise primary
+    // could read lower than the same rifle fired into a body. The health before the call and after it is
+    // the applied damage, the same measurement the receive path above takes from its own packet.
     //
-    // A finalizer rather than a postfix, so the figure is read exactly once whether the call returns or
-    // throws, and a fault in this mod never replaces what the game was going to do.
+    // `dam` is handed over anyway, for the one case the two reads cannot differ: a client whose host
+    // applies the blow is told the result later, so its own call can return the health unchanged, and the
+    // weapon's carried figure is then all there is. `NoteLocalOutgoing` reads it only on that path, capped
+    // by the health the limb had left, and still marks the row as an estimate.
+    //
+    // A finalizer rather than a postfix, so the figure is read exactly once on the path that returns, and a
+    // fault in this mod never replaces what the game was going to do. A call that threw is not measured at
+    // all: its health readings say nothing about a blow that never landed, so the carried figure would be
+    // damage invented by a game-side exception.
     [HarmonyPrefix]
     private static void Prefix(Dam_EnemyDamageLimb __instance, out float __state)
         => __state = CombatTracker.LimbHealth(__instance);
 
     [HarmonyFinalizer]
     private static Exception Finalizer(Dam_EnemyDamageLimb __instance, Agent sourceAgent, uint gearCategoryId,
-        float __state, Exception __exception)
+        float dam, float __state, Exception __exception)
     {
-        CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, __state, DamageKind.Bullet, gearCategoryId);
+        if (__exception == null)
+            CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, __state, DamageKind.Bullet, gearCategoryId, dam);
         return __exception;
     }
 }
 
-// Melee travels its own method and carries the same two parameters that matter, so it gets its own hook.
+// Melee travels its own method and carries the same parameters that matter, so it gets its own hook.
 // The amount is read the same way: a backstab, a weakspot blow and a sleeper multiplier all live between
-// the argument and the health the enemy lost, so the argument is never the figure printed.
+// the argument and the health the enemy lost, so the argument is never the figure printed - it is only
+// the fallback for a call that moved no health here.
 [HarmonyPatch]
 internal static class LocalMeleeDamagePatch
 {
@@ -138,11 +147,13 @@ internal static class LocalMeleeDamagePatch
     private static void Prefix(Dam_EnemyDamageLimb __instance, out float __state)
         => __state = CombatTracker.LimbHealth(__instance);
 
+    // Same guard as the bullet hook: a game call that threw measured nothing and is left unrecorded.
     [HarmonyFinalizer]
     private static Exception Finalizer(Dam_EnemyDamageLimb __instance, Agent sourceAgent, uint gearCategoryId,
-        float __state, Exception __exception)
+        float dam, float __state, Exception __exception)
     {
-        CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, __state, DamageKind.Melee, gearCategoryId);
+        if (__exception == null)
+            CombatTracker.NoteLocalOutgoing(__instance, sourceAgent, __state, DamageKind.Melee, gearCategoryId, dam);
         return __exception;
     }
 }

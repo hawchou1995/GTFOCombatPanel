@@ -187,3 +187,4 @@ internal static class ScoutWitness
         Plugin.Logger?.LogWarning($"[DIAG] the Scout sleeping capture could not read {what}, so that witness is missing: {error.Message}");
     }
 }
+

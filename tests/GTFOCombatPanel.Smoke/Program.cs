@@ -27,6 +27,7 @@ internal static partial class Program
         SettlementHandoffScenarios();
         RunScoutSleepScenarios();
         RunEwcDamageScenarios();
+        RunLocalOutgoingScenarios();
         RunSquadTransportFramingScenarios();
         RunReviewFixScenarios();
         CaptureRevisionScenarios();
@@ -1671,6 +1672,7 @@ internal static partial class Program
         RunTransportScenarios();
         RunReviveAttributionScenarios();
         RunImpactFeatureScenarios();
+        RunRundownKeyScenarios();
         RunEwcProjectileScenarios();
         RunRowHeightScenarios();
         // ---- the settlement board's size: a search, not a guess --------------------------------

@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Reflection;
 using BepInEx;
+using GameData;
 using UnityEngine;
 
 namespace HawChow.GTFOCombatPanel;
@@ -98,10 +99,23 @@ internal static class ResultsSaver
         {
             var active = RundownManager.ActiveExpedition;
             var descriptive = active?.Descriptive;
-            return ExpeditionMetadata.Create(RundownManager.ActiveRundownKey,
-                descriptive?.Prefix, descriptive?.PublicName);
+            return ExpeditionMetadata.Create(RundownKey(), descriptive?.Prefix, descriptive?.PublicName);
         }
         catch { return default; }
+    }
+
+    // The game exposes a local progressive rundown only as the synthetic key RundownManager.GetLocalRundownKey
+    // builds ("Local_<id>"), and its readable name exists only on the RundownDataBlock the game actually
+    // loaded. That loaded block is the authority here, so the name is read from the running game instead of
+    // from a fixed table: a missing block, a failed read or an empty name keeps the key exactly as it was, and
+    // a non-local key never reaches the lookup at all.
+    private static string RundownKey()
+        => RundownKeyResolver.Resolve(RundownManager.ActiveRundownKey, LocalRundownName);
+
+    private static string LocalRundownName(uint id)
+    {
+        if (!RundownDataBlock.HasBlock(id)) return null;
+        return RundownDataBlock.GetBlockName(id);
     }
 
     private static void Warn(string message)

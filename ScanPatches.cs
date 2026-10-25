@@ -51,3 +51,4 @@ internal static class BotScanActionPatch
     private static System.Exception Finalizer(System.Exception __exception)
     { CombatTracker.EndBotScanAction(); return __exception; }
 }
+

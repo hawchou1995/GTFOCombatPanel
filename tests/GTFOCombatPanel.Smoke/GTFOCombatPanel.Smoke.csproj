@@ -21,6 +21,7 @@
     <Compile Include="..\..\ScanTagLedger.cs" Link="ScanTagLedger.cs" />
     <Compile Include="..\..\ToolImpactLedger.cs" Link="ToolImpactLedger.cs" />
     <Compile Include="..\..\ExpeditionMetadata.cs" Link="ExpeditionMetadata.cs" />
+    <Compile Include="..\..\RundownKeyResolver.cs" Link="RundownKeyResolver.cs" />
     <Compile Include="..\..\FriendlyFireAttributionLedger.cs" Link="FriendlyFireAttributionLedger.cs" />
     <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
     <Compile Include="..\..\ResultsLog.cs" Link="ResultsLog.cs" />
