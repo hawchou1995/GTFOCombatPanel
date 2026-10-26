@@ -1,6 +1,14 @@
- # CombatPanel 1.19.8
+# CombatPanel 1.19.9
 
 源码：[hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)。当前功能、JSON 称号示例和多人协议要求以 `Thunderstore/README.md` 为准；下方旧版本记录仅作历史说明。
+
+**1.19.9**：
+
+- 滚轮命中矩形改为每次重绘重新取得。`ResultsDisplay.Draw` 开头调用新的 `InvalidateHitForRepaint()`：先把上一帧那张矩形连同它的有效位与页面种类一起清掉，只有本帧真正画出板子时才重新写入。此前某一帧没画出板子（还没有网格、条带拒绝落位、页面被隐藏）时，上一帧的矩形还留着，指针停在板子曾经在的位置仍会被当成板子接收滚轮——即「鼠标停在旧位置还能缩放一个屏幕上并不存在的板子」。现在这种帧把滚轮让回游戏。
+- 同一次滚轮手势的帧内锁保留。`InvalidateHitForRepaint()` 故意不清 `_hitFrame`，`ResultsZoom` 的判定也改为先问帧锁、再问矩形：一个 notch 会写回配置，配置写回让布局缓存失效，同一帧后续的 notch 到达时矩形已经没了，它们仍由本模组消费，不会漏给下面的页面；帧锁本身也仍是「一次手势只被消费一次」。
+- F8 关闭、换页与离开结算页仍走完整清理（`ClearHit()`，连帧锁一起清），隐藏的板子不再是滚轮目标。
+- 本次只动上面这一处滚轮命中判定：协议、伤害归因、评分权重、同步、列宽与落位策略均未改。
+- 验证（2026-10-26）：以 SDK 6.0.428 对本机 r2modman Survival profile 的真实 BepInEx / Interop 程序集重跑 `scripts\Verify.ps1`，`VERIFY: PASS`：插件构建 0 警告 0 错误，`PASS: 1929 combat-panel assertions`（1.19.8 时为 1926；新增矩形失效与帧锁用例），另 9 配置监听 / 50 补给归属 / 38 扫描重放断言通过。这只是编译与自动化（托管重放）验证；运行时/实机的画面观感与滚轮手感**尚未**在游戏内复核。
 
 **1.19.8**：
 

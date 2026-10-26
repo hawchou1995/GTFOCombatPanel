@@ -292,6 +292,36 @@ internal static class ResultsPageScenarios
               && results.Contains("ResultAnchorRecovery.LatchFallback(_fallbackRecoveries")
               && policy.Contains("public const int MaximumRecoveries = 1;"),
             "the fallback recovery hangs off the refresh path and stays bounded to one attempt per page");
+
+        // The stale-hit residual, pinned by position rather than by wording: a repaint drops the cached rectangle
+        // before it can reach any of its early returns, and only a frame that really drew the board re-earns it. A
+        // pointer left where the board used to be therefore cannot keep scaling a board that is not on the screen.
+        int draw = results.IndexOf("internal static void Draw()", StringComparison.Ordinal);
+        int invalidateForRepaint = results.IndexOf("InvalidateHitForRepaint();", StringComparison.Ordinal);
+        int noGridReturn = results.IndexOf("if (_grid == null || _content == null || _page == null", StringComparison.Ordinal);
+        int boardDrawn = results.IndexOf("HudTable.Draw(_grid, _origin.X", StringComparison.Ordinal);
+        int hitEarned = results.IndexOf("_hitValid = true;", StringComparison.Ordinal);
+        check(draw >= 0 && invalidateForRepaint > draw && noGridReturn > invalidateForRepaint
+              && boardDrawn > noGridReturn && hitEarned > boardDrawn,
+            "every repaint drops the cached wheel rectangle before the no-grid/no-placement return, and only a board that was really drawn re-earns it");
+
+        // The gesture lock is asked before the rectangle is: the notch that changed the scale is the one that took the
+        // rectangle away, so the rest of that same gesture has to be answered by the frame it belongs to.
+        int zoomAt = results.IndexOf("internal static bool ZoomAt(", StringComparison.Ordinal);
+        int frameLock = results.IndexOf("if (_hitFrame == frame) return true;", StringComparison.Ordinal);
+        int rectangleGate = results.IndexOf("if (!_hitValid || _hitSucceeded != succeeded) return false;", StringComparison.Ordinal);
+        check(zoomAt >= 0 && frameLock > zoomAt && rectangleGate > frameLock,
+            "the same-frame gesture lock is asked before the rectangle's validity, so a rebuild cannot cut one wheel gesture in half");
+
+        // ...and dropping the stale rectangle must not drop the lock: only the full reset - F8, leaving the page, a
+        // different screen - resets the frame it belongs to.
+        int clearHit = results.IndexOf("private static void ClearHit()", StringComparison.Ordinal);
+        int invalidateDefinition = results.IndexOf("private static void InvalidateHitForRepaint()", StringComparison.Ordinal);
+        string clearBody = Between(results, clearHit, invalidateDefinition);
+        string invalidateBody = Between(results, invalidateDefinition, results.IndexOf("// Everything the board caches for one result page", StringComparison.Ordinal));
+        check(clearBody.Contains("_hitFrame = -1;") && !invalidateBody.Contains("_hitFrame")
+              && invalidateBody.Contains("_hitValid = false;"),
+            "the per-repaint invalidation keeps the gesture lock; only ClearHit resets the frame it belongs to");
     }
 
     private static string SourceRoot()
@@ -308,6 +338,11 @@ internal static class ResultsPageScenarios
         while ((index = text.IndexOf(needle, index, StringComparison.Ordinal)) >= 0) { total++; index += needle.Length; }
         return total;
     }
+
+    // The text between two source anchors, so one method's body can be asserted without pinning the file's line
+    // numbers; an anchor that is not found yields an empty slice, which every assertion here treats as a failure.
+    private static string Between(string text, int start, int end)
+        => start >= 0 && end > start ? text.Substring(start, end - start) : string.Empty;
 
     // The same stand-in the growth scenarios measure with: `rows` rows of `rowEm` ems, the whole table `emWidth`
     // ems wide, both growing with the glyph size exactly as `PanelGeometry.Build` does.

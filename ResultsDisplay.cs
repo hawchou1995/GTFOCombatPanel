@@ -148,6 +148,22 @@ internal static class ResultsDisplay
         _hitRect = default; _hitValid = false; _hitSucceeded = false; _hitFrame = -1;
     }
 
+    // The rectangle is re-earned on every repaint: it describes a board that is on the screen now, not one that was on
+    // the screen at some earlier frame. A frame in which the board could not be drawn at all - no grid yet, a
+    // placement the strip refused - leaves nothing for the wheel to aim at, so the stale rectangle is dropped before
+    // any of `Draw`'s early returns can skip past it.
+    //
+    // The gesture lock is deliberately *not* dropped: `_hitFrame` is the frame a notch of the wheel already matched
+    // the board in, and the rebuild that notch started is exactly what invalidates the layout a moment later. A
+    // later notch of that same frame must still be consumed, so only the rectangle and its validity are cleared
+    // here - the full reset, frame included, stays with `ClearHit` for F8 and for leaving or replacing the page.
+    private static void InvalidateHitForRepaint()
+    {
+        _hitRect = default;
+        _hitValid = false;
+        _hitSucceeded = false;
+    }
+
     // Everything the board caches for one result page: the place it was measured into, the strip that place
     // came from and the readiness its completion section has already earned. None of it is dropped by
     // `ResetPlacement`, and that is the whole point of it: F8 writes the configuration file, that write comes
@@ -199,6 +215,11 @@ internal static class ResultsDisplay
 
     internal static void Draw()
     {
+        // Every repaint starts from "no board to aim at": the rectangle below is only ever re-earned by a frame that
+        // really draws one. Nothing is carried over from the last frame, so a frame whose board was refused - no grid
+        // yet, a strip that would not hold it - leaves the wheel to the game instead of consuming it over a rectangle
+        // that is not on the screen. The same-frame gesture lock survives this; see `InvalidateHitForRepaint`.
+        InvalidateHitForRepaint();
         // F8 hides this mod's overlay on a result page exactly as it hides the table in a level, and the
         // influence-board switch holds it back on its own. The vanilla blocks go back on their own page, so
         // the screen is never left half-hidden.
@@ -348,20 +369,23 @@ internal static class ResultsDisplay
 
     // Where the wheel scales the settlement board.
     //
-    // The rectangle is the one the board was last *drawn* at, not the cache of it: `_hitRect` is written by `Draw`
-    // and survives the rebuild a notch causes, so the gesture that changed the scale keeps landing on the board it
-    // was aimed at even though the grid behind it has already been dropped. `frame` is the GUI frame the notch
-    // arrived in: the first notch of a sequence has to be inside that rectangle, and every further notch of the
-    // same frame is the same gesture and is answered the same way - one gesture is consumed once, in full, and
-    // nothing outside the board is ever claimed.
+    // The rectangle is the one the board was drawn at during the most recent repaint, and it is dropped again at the
+    // start of the next one: a frame that could not draw the board leaves nothing to aim at, so a pointer resting
+    // where the board used to be cannot keep scaling something nobody can see. `frame` is the GUI frame the notch
+    // arrived in, and the gesture lock is asked first: the notch that changed the scale saves the configuration,
+    // that save drops the layout, and the rectangle is gone by the time the rest of the same gesture arrives - which
+    // must still be consumed here rather than reaching the page underneath. Beyond that lock, the first notch of a
+    // sequence has to be inside the rectangle that is really on screen, and nothing outside it is ever claimed.
     internal static bool ZoomAt(Vector2 point, bool succeeded, int frame)
     {
-        if (!_hitValid || _hitSucceeded != succeeded) return false;
         if (!PanelBehaviour.ToggleState) return false;
         if (Plugin.ShowResults != null && !Plugin.ShowResults.Value) return false;
         if (Plugin.ShowResultOverlay != null && !Plugin.ShowResultOverlay.Value) return false;
         if (Plugin.ShowImpactBoard != null && !Plugin.ShowImpactBoard.Value) return false;
+        // The rest of a gesture that already landed on this page's board during this very frame. Asked before the
+        // rectangle, because the rectangle is exactly what the rebuild the first notch started has taken away.
         if (_hitFrame == frame) return true;
+        if (!_hitValid || _hitSucceeded != succeeded) return false;
         if (!float.IsFinite(point.x) || !float.IsFinite(point.y)) return false;
         if (!float.IsFinite(_hitRect.X) || !float.IsFinite(_hitRect.Y) || !(_hitRect.Width > 0f) || !(_hitRect.Height > 0f)) return false;
         if (point.x < _hitRect.X || point.x > _hitRect.X + _hitRect.Width) return false;

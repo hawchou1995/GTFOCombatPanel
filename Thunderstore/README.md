@@ -1,10 +1,17 @@
- # CombatPanel 1.19.8
+# CombatPanel 1.19.9
 
 独立 GTFO 战斗统计面板：局内查看战斗数据，成功或失败结算查看队伍贡献。仅依赖 **BepInEx-BepInExPack_GTFO-3.2.3**。
 
 **源码 / Source：[GitHub — hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)**
 
 反馈：[qingju.me](https://qingju.me) ｜ [小黑盒语音](https://chat.xiaoheihe.cn/in1wpsjd)
+
+## 1.19.9 更新
+
+- 滚轮命中矩形改为每次重绘重新取得：`ResultsDisplay.Draw` 开头调用 `InvalidateHitForRepaint()`，先清掉上一帧那张矩形（连同它的有效位与页面种类），只有本帧真的画出板子才重新写入。此前某一帧没画出板子时（还没有网格、条带拒绝落位、页面被隐藏），旧矩形仍在，鼠标停在板子曾经在的位置依然会被当成板子吃掉滚轮——缩放的是一个屏幕上并不存在的板子。这类帧现在把滚轮让回游戏。
+- 同一次滚轮手势的帧内锁保留：该失效不清 `_hitFrame`，判定改为先问帧锁、再问矩形。一个 notch 会写配置、配置写回会作废布局，同一帧后续 notch 到达时矩形已经没了，它们仍由本模组消费，不会漏给下面的页面。
+- F8 关闭、换页、离开结算页仍走完整清理（`ClearHit()`，含帧锁），隐藏的板子不是滚轮目标。本次只改这一处滚轮命中判定；协议、伤害归因、评分权重、同步、列宽与落位策略未改。
+- 验证（2026-10-26）：`VERIFY: PASS`，`PASS: 1929 combat-panel assertions`（1.19.8 时为 1926），构建 0 警告 0 错误，另 9 配置监听 / 50 补给归属 / 38 扫描重放断言通过。**尚未进游戏做实机与画面观感复核**（板子落点与滚轮手感还没有实机证据）。
 
 ## 1.19.8 更新
 
