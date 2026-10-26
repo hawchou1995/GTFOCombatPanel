@@ -275,46 +275,30 @@ public static class PanelGeometry
         return Build(metrics, 0f, fontPixels, rows, density, fontShrink, null, minimumRowEm);
     }
 
-    // Spreads a measured table across the width the page offers without touching its height, its glyph
-    // size or the width of any field.
+    // Column widths for one settlement board, from the width every column measured on its own.
     //
-    // The room the table does not need goes to the columns that hold figures, never to the row label: a
-    // label column that grew would push its text in from the plate's own left edge, because a column that
-    // is not right-aligned centres its group in whatever room it was given. Every figure column receives
-    // the same amount, so the player columns keep the one width they share, and the fields inside each of
-    // them keep their own slots. The result is never wider than the target: the share is a division, so
-    // the last figure column gives back whatever fraction of a pixel it overhangs by.
-    public static PanelGrid FillWidth(PanelGrid grid, float targetWidth)
+    // The row label is a column of its own: it keeps the width its content asked for, and never less than its
+    // floor, because a label that changed width would push its text in from the plate's own left edge, and a
+    // label that shared the figure width would move the figures with it. Every value column holds the same
+    // kind of figure, so they are all given one width - the widest of their own measurements. That one width
+    // is what makes `#1`..`#N` line up down the board, and it is a measurement of the figures rather than a
+    // share of the page, so a wide page leaves the board at its own size instead of stretching it across.
+    public static float[] SettlementColumnWidths(IReadOnlyList<PanelColumn> columns, IReadOnlyList<float> measuredWidths, float fontSizePixels)
     {
-        if (grid == null || grid.Columns == 0 || grid.CellWidths.Length != grid.Columns) return grid;
-        if (!float.IsFinite(targetWidth) || targetWidth <= 0f) return grid;
-        float extra = targetWidth - grid.Width;
-        if (!(extra > 0.01f)) return grid;
-        int columns = grid.Columns;
-        int sharing = 0;
-        for (int index = 0; index < columns; index++) if (grid.IsRightAligned(index)) sharing++;
-        // A table with no right-aligned figure column has nothing to spread a label against, and widening the
-        // label column itself would push its text in from the plate's own left edge, so the grid is left alone.
-        if (sharing == 0) return grid;
-        float share = extra / sharing;
-        var widths = new float[columns];
-        int last = -1;
-        for (int index = 0; index < columns; index++)
+        int count = columns != null ? columns.Count : 0;
+        var widths = new float[count];
+        float labelWidth = 0f, valueWidth = 0f;
+        for (int column = 0; column < count; column++)
         {
-            bool widens = grid.IsRightAligned(index);
-            widths[index] = widens ? Math.Max(0f, grid.CellWidths[index] + share) : grid.CellWidths[index];
-            if (widens) last = index;
+            float measured = measuredWidths != null && column < measuredWidths.Count ? measuredWidths[column] : 0f;
+            if (columns[column] == PanelColumn.ImpactLabel) labelWidth = Math.Max(labelWidth, measured);
+            else valueWidth = Math.Max(valueWidth, Math.Max(measured, MinimumWidth(columns[column], fontSizePixels)));
         }
-        PanelGrid filled = new PanelGrid(widths, grid.FieldWidths, grid.SeparatorWidth, grid.Gap, grid.RowHeight,
-            grid.FontPixels, grid.Rows, grid.Density, grid.RightAligned);
-        float overrun = filled.Width - targetWidth;
-        if (overrun > 0f && last >= 0)
-        {
-            widths[last] = Math.Max(0f, widths[last] - overrun);
-            filled = new PanelGrid(widths, grid.FieldWidths, grid.SeparatorWidth, grid.Gap, grid.RowHeight,
-                grid.FontPixels, grid.Rows, grid.Density, grid.RightAligned);
-        }
-        return filled;
+        for (int column = 0; column < count; column++)
+            widths[column] = columns[column] == PanelColumn.ImpactLabel
+                ? Math.Max(labelWidth, MinimumWidth(PanelColumn.ImpactLabel, fontSizePixels))
+                : valueWidth;
+        return widths;
     }
 
     // Fraction of an em that one glyph occupies. Digits and punctuation are the common case in
@@ -478,6 +462,67 @@ public static class ResultsRegion
         => lobbyMeasured && float.IsFinite(lobbyTop) && lobbyTop > 0f && lobbyTop <= screenHeight
             ? lobbyTop
             : bandTop;
+
+    // Which control a result board's lower bound came from, once the bound has been resolved.
+    //
+    // `Pressable` is the control the player can really press: the page drew it, switched it on and left it on
+    // the frame. `Layout` is that same control's own laid-out rectangle while the page is still revealing its
+    // footer from zero alpha - the button is where it will be pressed, it simply is not drawn yet, which is
+    // why `ResultsButtonPolicy.Visible` quite rightly refuses it. `Band` is the drawn buttons of a page whose
+    // own control could not be read by name, and `None` is a page that handed nothing measurable at all.
+    public enum LobbyEdgeSource { None = 0, Pressable = 1, Layout = 2, Band = 3 }
+
+    public readonly struct LobbyEdgeReading
+    {
+        public readonly float Top;
+        public readonly LobbyEdgeSource Source;
+        public LobbyEdgeReading(float top, LobbyEdgeSource source) { Top = top; Source = source; }
+        // A wall the board has to stay above exists.
+        public bool Measured { get { return Source != LobbyEdgeSource.None && float.IsFinite(Top); } }
+        // That wall is a control the player can press right now.
+        public bool Pressable { get { return Source == LobbyEdgeSource.Pressable; } }
+        // That wall is the button's own geometry - drawn, or merely laid out - rather than the fallback band of
+        // everything the page drew. This is the case a board may be measured against without waiting for the
+        // page's reveal to finish, and the one whose height the readability floor is taken from.
+        public bool FromButton { get { return Source == LobbyEdgeSource.Pressable || Source == LobbyEdgeSource.Layout; } }
+    }
+
+    // The lower bound of the strip, with the button's *pressability* and its *geometry* kept apart.
+    //
+    // The success page reveals its footer from zero alpha. During those frames the lobby button is already laid
+    // out exactly where the player will press it, while the visibility test says "not a bound", and treating the
+    // two answers as one is what cost the board 240px of a 1080-high page: the strip fell back to the historical
+    // fraction of the window even though the button's own top edge was known, and a 30-row table could only be
+    // drawn at 6px. Measuring a bound is therefore asked for in this order:
+    //
+    //   1. the control as the player can press it (the drawn rectangle), which is the tightest true edge;
+    //   2. the same control's laid-out rectangle, which is the same edge before the reveal finished;
+    //   3. the band of every button the page has drawn, for a page whose own control cannot be read by name;
+    //   4. nothing, which leaves the caller on its own historical fallback - never permission to cover a button.
+    //
+    // `active` is the one gate in front of the first two: a control the page has switched off is not part of this
+    // frame at all, and a rectangle it left behind is a stale guess rather than an edge - a page that re-lays its
+    // footer out can keep the old rect on a deactivated object, and letting that win would bound the board against
+    // a button nobody can press. Alpha is deliberately *not* part of the gate: a control that is laid out and still
+    // fading in is exactly the case this exists for.
+    //
+    // Every answer is a coordinate on the page, so an edge that is not a number, sits at or above zero, or lies
+    // past the bottom of the window is discarded rather than trusted.
+    public static LobbyEdgeReading ResolveLobbyEdge(bool active, bool pressable, float pressableTop, bool layoutRead,
+        float layoutTop, float bandTop, float screenHeight)
+    {
+        if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return new LobbyEdgeReading(float.NaN, LobbyEdgeSource.None);
+        if (active)
+        {
+            if (pressable && OnPage(pressableTop, screenHeight)) return new LobbyEdgeReading(pressableTop, LobbyEdgeSource.Pressable);
+            if (layoutRead && OnPage(layoutTop, screenHeight)) return new LobbyEdgeReading(layoutTop, LobbyEdgeSource.Layout);
+        }
+        if (OnPage(bandTop, screenHeight)) return new LobbyEdgeReading(bandTop, LobbyEdgeSource.Band);
+        return new LobbyEdgeReading(float.NaN, LobbyEdgeSource.None);
+    }
+
+    private static bool OnPage(float top, float screenHeight)
+        => float.IsFinite(top) && top > 0f && top <= screenHeight;
 }
 
 // Whether a control of a result page is really on the screen, and therefore whether the board has to keep

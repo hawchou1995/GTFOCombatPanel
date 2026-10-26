@@ -1,6 +1,14 @@
-# CombatPanel 1.19.7
+ # CombatPanel 1.19.8
 
 源码：[hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)。当前功能、JSON 称号示例和多人协议要求以 `Thunderstore/README.md` 为准；下方旧版本记录仅作历史说明。
+
+**1.19.8**：
+
+- 撤回 1.19.7 的「铺满页面可用宽度」：结算板按自身内容定宽——第 1 列（玩家名 / 行标签）用自己文字量出来的宽度，第 2–5 列统一取「各自自适应宽度里最宽的那个」，右边缘共线；页面可用宽度只作上限，多出来的宽度不再摊给任何一列。`PanelGeometry.FillWidth` 已从代码里删除，列宽规则回到 1.19.4 定下的那一份，现只由 `PanelGeometry.SettlementColumnWidths` 一处实现（`HudTable` 的结算板路用它，局内 HUD 表不受影响），1.19.7 那条「恢复铺满」的记录只在那一版成立。
+- 字号与行高仍由「返回大厅 / 送所有囚犯回大厅」按钮上沿到条带顶的这段真实间隙决定（上限到条带 96%，到 92% 即停，撞到页面可用宽度也停）；其中「撞到页面可用宽度」只是提前停止放大，不会把表格拉宽。成功页的下界不再因为页脚还在 0 alpha 淡入就被判成「没有按钮」：现在按「玩家真正能按的按钮矩形 → 同一按钮已排布但还没淡入出来的矩形（只要求 `activeInHierarchy`，不看 alpha）→ 页面已绘制按钮的最高上沿 → 历史窗口比例」的顺序取（`ResultsRegion.ResolveLobbyEdge` / `LobbyEdgeSource`），量到的是按钮自己的几何，而不是窗口比例。
+- 已按历史比例落位、当时量不到按钮的板子，在按钮矩形变可读时按 `ResultAnchorRecovery` 重测一次（每页 1 次预算，不是逐帧重测）；条带已经测得的板子永不被它移动。
+- 结算板字号可用鼠标滚轮缩放：`[Results] SuccessFontScale`（成功页）与 `FailureFontScale`（失败页）各存一份，默认 1.0，范围 0.5–2.0，一格 0.1。缩放只乘在「页面条带自己量出来的字号」上：往上不超过该字号本身（所以不可能盖住按钮），并按真实条带高度与页面宽度逐步回退到能画得下为止；往下不低于绝对可读下限（`ResultsZoom.ScaleSize`）。只有指针落在板内才吃滚轮，板子隐藏时滚轮归游戏；落盘走与 F8 同一条受控保存路径（`Config.Save()` + 自保存抑制），到边界不写盘、不重建。
+- 验证（2026-10-26）：以 SDK 6.0.428 对本机 r2modman Survival profile 的真实 BepInEx / Interop 程序集重跑 `scripts\Verify.ps1`，得到 `VERIFY: PASS`：插件构建 0 警告 0 错误，`PASS: 1926 combat-panel assertions`（1.19.7 时为 1857；本次新增列宽契约、按钮几何与一次重测、滚轮缩放的用例），另 9 配置监听 / 50 补给归属 / 38 扫描重放断言通过。这只是编译与自动化（托管重放）验证；运行时/实机的画面观感（成功页条带的实际高度、板子落点、滚轮手感）**尚未**在游戏内复核。
 
 **1.19.7 已于 2026-10-25 发布至 Thunderstore GTFO（`HawChow-CombatPanel`，Client Mods，NSFW=否）；尚未在游戏内实机验证**：
 
@@ -267,6 +275,8 @@ ShowResults = true
 ShowResultOverlay = true
 OffsetX = 0
 OffsetY = 0
+SuccessFontScale = 1
+FailureFontScale = 1
 ShowImpactBoard = true
 ShowSuccessArtifacts = false
 ShowSuccessPlayerReports = false
@@ -290,6 +300,7 @@ StaggerNeedsAttack = true
 - `FontSize`：1080p 基准字号，随窗口高度与紧凑度缩放。
 - `PanelOpacity`（默认 0.28）：**局内面板底板的浓淡**，0 = 完全透出游戏画面，1 = 实心板。底板本身是深色，为了在亮背景下也能看清数字；嫌它像块黑板就往下调。每一帧都重新读，所以改文件或热重载下一帧就生效。**结算影响板不受这个键影响**（保留它自己已确认的底板值）。1.17.1 之前局内底板是写死的 0.48。
 - `[Results] ShowResultOverlay`（默认 true）：关掉后结算页保持游戏原样，**不再回退旧统计表**。`ShowImpactBoard`（默认 true）：影响板整块开关。`ShowSuccessArtifacts`（默认 false = 隐藏成功页红晶体/神器栏、总结行、检查点消耗）、`ShowSuccessPlayerReports`（默认 false = 隐藏四张囚犯报告卡及其锚点）、`HideVanillaFailBlocks`（默认 true = 隐藏失败页红晶面板）：打开即精确还原；两条成功页开关的描述里都带提示「建议关闭显示以免影响观感」。
+- `[Results] SuccessFontScale` / `FailureFontScale`（默认 1.0，范围 0.5–2.0，一格 0.1）：结算板字号的滚轮缩放，成功页与失败页各存一份（两页条带高度不同，同一个倍率是两张不同大小的表）。1.0 = 页面条带自己量出来的字号；滚轮只在这个字号上做乘算，往上被夹回 1.0，往下到 0.5 为止，并且仍按真实条带与页面宽度回退到画得下、且不低于可读下限，所以任何倍率都不会盖住按钮。指针落在板内才吃滚轮；改文件或热重载同样下一帧生效。
 - `ToggleKey`（默认 F8）：局内与结算页同一个 overlay，按下后写回 `ShowPanel` + `ShowResultOverlay` 并 `Config.Save()`，即**永久保存到 `.cfg`**，下一帧生效。
 - `[Scoring] ScoringFile`（默认 true）：是否读取 `CombatPanel-config/scoring.json`；`Weights` 只是回退值（关闭或文件不可读时生效）。评分文件字段见下。
 - 以上全部支持热重载（`.cfg` 与 `scoring.json` 都在主线程重载）。位置不顺手就改 `PositionX/PositionY`，大小不合适就改 `FontSize`，保存即生效。

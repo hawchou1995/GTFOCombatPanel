@@ -44,6 +44,7 @@
     <Compile Include="..\..\ReviveAttributionLedger.cs" Link="ReviveAttributionLedger.cs" />
     <Compile Include="..\..\EnemyDeathLedger.cs" Link="EnemyDeathLedger.cs" />
     <Compile Include="..\..\HealthLossLedger.cs" Link="HealthLossLedger.cs" />
+    <Compile Include="..\..\ResultsPagePolicy.cs" Link="ResultsPagePolicy.cs" />
     <Compile Include="..\..\SentryShotLedger.cs" Link="SentryShotLedger.cs" />
   </ItemGroup>
 </Project>

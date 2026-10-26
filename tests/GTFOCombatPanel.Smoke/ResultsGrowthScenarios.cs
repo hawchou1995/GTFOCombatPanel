@@ -9,7 +9,7 @@ using HawChow.GTFOCombatPanel;
 // the table is measured at a candidate glyph size, the strip's height and the page's width say whether
 // that size uses the room, and the largest size that does is the one drawn.
 //
-// Everything asserted here runs against `ResultsFontGrowth.FitResultFontSize` and the width fill in
+// Everything asserted here runs against `ResultsFontGrowth.FitResultFontSize` and the column-width rule in
 // `PanelGeometry`, both of which are pure arithmetic - no Mathf, no Screen, no texture - so the whole of
 // the decision is pinned headlessly, on measurements this file makes itself. `Run()` counts its own
 // failures; `RunInto(Check)` feeds the same assertions to the smoke suite's own checker.
@@ -141,38 +141,36 @@ internal static class ResultsGrowthScenarios
         check(measurements <= ResultsFontGrowth.MaximumMeasurements + 2,
             $"and it is probed a bounded number of times ({measurements} probes, bound {ResultsFontGrowth.MaximumMeasurements + 2})");
 
-        // ---- the board's width: its own cells, then spread across the page ------------------------
+        // ---- the board's width: its own cells, one width for the value columns --------------------------
         //
-        // The font fit is bounded by the strip more often than by the width, so the board that comes out of
-        // it is narrower than the page. 1.19.5 stopped handing that leftover out as extra column width and
-        // drew the board at exactly the width its cells measured, which is what left a ~850px plate on a
-        // 2512px page; 1.19.7 spreads it across the page again. What the spread may never do is touch the
-        // row-label column or the table's height: the four player columns stay one width - the widest of
-        // them, which is the product requirement that makes `#1`..`#4` line up - and both keep it.
-        bool[] rightAligned = { false, true, true, true, true };
-        PanelGrid natural = PanelGeometry.Build(PlayerColumns(), 12f, 24, 12, PanelDensity.Compact, 1f, rightAligned);
+        // The font fit is bounded by the strip more often than by the width, so the board that comes out of it
+        // is narrower than the page. 1.19.5 drew it at exactly the width its cells measured and 1.19.7 stretched
+        // it across the page; that stretch is what this branch removes, so a wide page leaves the board its own
+        // size again. What survives is the rule behind the shared player columns - `#1`..`#N` line up because
+        // every value column is given the widest measurement of them - and a label column measured on its own.
+        // The fixture's value columns are deliberately unequal, so the one width they come out with is a
+        // measurement of them rather than a width the fixture handed in already equal.
+        float[] unequalPlayers = { 6.75f * 24f, 7.15f * 24f, 6.1f * 24f, 6.8f * 24f };
+        PanelGrid natural = Board(SettlementWidths(5.4f * 24f, unequalPlayers, 24), 24);
         float naturalWidth = natural.Width;
         bool equalPlayers = true;
         for (int column = 2; column < natural.Columns; column++)
             equalPlayers &= Math.Abs(natural.CellWidths[column] - natural.CellWidths[1]) <= 0.001f;
-        check(equalPlayers, $"the player columns print at one width, the widest of {natural.Columns - 1} columns");
+        check(equalPlayers,
+            $"the player columns print at one width, the widest of {natural.Columns - 1} unequal columns");
+        float padding = natural.CellWidths[0] - 5.4f * 24f;
+        bool measuredValues = true;
+        for (int column = 1; column < natural.Columns; column++)
+            measuredValues &= Math.Abs(natural.CellWidths[column] - (7.15f * 24f + padding)) <= 0.01f;
+        check(measuredValues,
+            $"every value column is drawn at the widest natural width, 7.15em plus one cell padding: {natural.CellWidths[1]:0.###}px");
         check(naturalWidth <= 2512f + 0.01f,
             $"the board's own width fits the page without being stretched: {naturalWidth:0.###}px <= 2512px");
-        // Nothing widens the measured board behind the layout's back: the width the board will be drawn at is
-        // the width it measured, and the row-label column keeps its own width so its text stays on the plate.
-        PanelGrid wider = PanelGeometry.Build(PlayerColumns(), 12f, 48f, 12, PanelDensity.Compact, 1f, rightAligned);
+        // A larger glyph widens the board through the cells it actually prints, and nothing widens it behind
+        // the layout's back: the width the board is drawn at is the width it measured.
+        PanelGrid wider = Board(SettlementWidths(5.4f * 48f, new[] { 6.75f * 48f, 7.15f * 48f, 6.1f * 48f, 6.8f * 48f }, 48), 48);
         check(wider.Width > naturalWidth,
             "a larger glyph widens the board only through the cells it actually prints, never through padding");
-
-        // The width-spreading helper is the settlement board's own last step again, and it keeps its bounds:
-        // it never overruns the width it is given, and it never enlarges the table it spreads.
-        PanelGrid filled = PanelGeometry.FillWidth(natural, 2512f);
-        check(filled.Width <= 2512f + 0.01f, $"a caller that does ask for it never overruns the width: {filled.Width:0.###}px <= 2512px");
-        check(Math.Abs(filled.Height - natural.Height) <= 0.001f && Math.Abs(filled.FontPixels - natural.FontPixels) <= 0.001f,
-            "and spreading columns is white space, not a bigger table");
-        check(ReferenceEquals(PanelGeometry.FillWidth(natural, float.NaN), natural)
-              && ReferenceEquals(PanelGeometry.FillWidth(null, 2512f), null),
-            "an unmeasured width is not a reason to rebuild anything");
 
         // ---- the two numbers the capture showed, end to end ---------------------------------
         //
@@ -313,38 +311,49 @@ internal static class ResultsGrowthScenarios
         check(!float.IsFinite(neither) && ResultsRegion.LobbyEdge(false, neither, 500f, 1440f) == 500f,
             "两个已命名按钮都不可测时，下边界交回页面按钮带 500，未命名控件照样被让开");
 
-        // ---- 1.19.7: the board is spread across the page's width again --------------------------
+        // ---- one width for the value columns, the label on its own, whatever N is ----------------------
         //
-        // 1.19.5 dropped the fill, so the board was drawn at its own measured width - about 850px on a
-        // 2512px page. `FillWidth` only ever hands the leftover room to the right-aligned figure columns:
-        // the label column keeps its own width, its text keeps its place on the plate, and nothing about the
-        // height, the row height or the glyph size changes.
-        bool[] fillAligned = { false, true, true };
-        PanelGrid fillSource = PanelGeometry.Build(new[]
+        // 1.19.5 drew the board at its own measured width - about 850px on a 2512px page - and 1.19.7 stretched
+        // it across the page; this branch takes the stretch back out. What is pinned here is the rule that
+        // survives it: the board is one label column and N value columns, and the width they share is the
+        // widest of the value columns' own measurements, never a share of the page. A full squad is four value
+        // columns and a squad that lost players has fewer, so the rule is exercised from one to seven of them
+        // instead of being pinned to the five columns of the capture.
+        for (int players = 1; players <= 7; players++)
         {
-            new PanelColumnMetrics(new[] { 120f }),
-            new PanelColumnMetrics(new[] { 240f }),
-            new PanelColumnMetrics(new[] { 240f })
-        }, 8f, 20f, 6, PanelDensity.Normal, 1f, fillAligned);
-        float fillTarget = fillSource.Width + 91f;
-        PanelGrid spread = PanelGeometry.FillWidth(fillSource, fillTarget);
-        check(Math.Abs(spread.Width - fillTarget) <= 1f,
-            $"铺满后表格宽度就是页面宽度 ±1：{spread.Width:0.###}px vs {fillTarget:0.###}px");
-        check(spread.Width > fillSource.Width, $"铺满确实变宽了：{fillSource.Width:0.###}px -> {spread.Width:0.###}px");
-        check(Math.Abs(spread.CellWidths[0] - fillSource.CellWidths[0]) <= 0.001f,
-            "标签列宽度一点没动，它的文字不会离开板子左边缘");
-        check(Math.Abs(spread.CellWidths[1] - fillSource.CellWidths[1] - 45.5f) <= 0.5f
-              && Math.Abs(spread.CellWidths[2] - fillSource.CellWidths[2] - 45.5f) <= 0.5f,
-            $"两个数值列均分了 91px 余量：各得 {(spread.CellWidths[1] - fillSource.CellWidths[1]):0.##}px / {(spread.CellWidths[2] - fillSource.CellWidths[2]):0.##}px");
-        check(Math.Abs(spread.CellWidths[1] - fillSource.CellWidths[1]) <= Math.Abs(spread.CellWidths[2] - fillSource.CellWidths[2]) + 1f
-              && Math.Abs(spread.CellWidths[2] - fillSource.CellWidths[2]) <= Math.Abs(spread.CellWidths[1] - fillSource.CellWidths[1]) + 1f,
-            "两个数值列得到的余量相等，玩家列仍然共用一个宽度");
-        check(Math.Abs(spread.RowHeight - fillSource.RowHeight) <= 0.001f
-              && Math.Abs(spread.FontPixels - fillSource.FontPixels) <= 0.001f
-              && Math.Abs(spread.Height - fillSource.Height) <= 0.001f,
-            "只摊宽不改高：行高、字号与表格总高都不变");
-        check(spread.Rows == fillSource.Rows && spread.Columns == fillSource.Columns,
-            "铺满不改变行数与列数");
+            var naturals = new float[players];
+            for (int index = 0; index < players; index++) naturals[index] = (5.4f + index * 0.35f) * 24f;
+            float widest = Math.Max(naturals[players - 1], 4f * 24f);
+            float[] widths = SettlementWidths(9.25f * 24f, naturals, 24);
+            bool shared = Math.Abs(widths[0] - 9.25f * 24f) <= 0.001f;
+            for (int column = 1; column < widths.Length; column++)
+                shared &= Math.Abs(widths[column] - widest) <= 0.001f;
+            check(shared,
+                $"{players} 个数值列全部等于其原始自适应宽度中的最大值 {widest:0.##}px（标签列保留自己的 {widths[0]:0.##}px）：{string.Join(" / ", widths)}");
+        }
+        // The shared width is a measurement, not a default: two value columns of different natural widths both
+        // come out at the wider one, so the narrower column's own width is not what gets drawn.
+        float[] twoValues = SettlementWidths(4.0f * 24f, new[] { 6.2f * 24f, 7.15f * 24f }, 24);
+        check(Math.Abs(twoValues[1] - 7.15f * 24f) <= 0.001f && Math.Abs(twoValues[2] - 7.15f * 24f) <= 0.001f,
+            $"窄的那一列被放宽到宽的那一列，而不是各按自己：{twoValues[1]:0.##}px / {twoValues[2]:0.##}px");
+
+        // The label column is the one column outside that rule: as wide as its own content, floored at 4 em, so
+        // a short label is not squeezed below its floor and a long one does not drag the figures wider with it.
+        float[] shortLabel = SettlementWidths(1.4f * 24f, new[] { 6.2f * 24f, 7.15f * 24f }, 24);
+        check(Math.Abs(shortLabel[0] - 4f * 24f) <= 0.001f,
+            $"标签列比 4em 下限还窄时按下限画，而不是跟着内容缩：{shortLabel[0]:0.##}px = {4f * 24f:0}px");
+        float[] longLabel = SettlementWidths(11.5f * 24f, new[] { 6.2f * 24f, 7.15f * 24f }, 24);
+        check(Math.Abs(longLabel[0] - 11.5f * 24f) <= 0.001f
+              && Math.Abs(longLabel[1] - 7.15f * 24f) <= 0.001f && Math.Abs(longLabel[2] - 7.15f * 24f) <= 0.001f,
+            $"标签列按自己的内容 {longLabel[0]:0.##}px 测量，数值列仍是它们的 {longLabel[1]:0.##}px，互不牵连");
+
+        // And nothing takes the page's width: the board built from the capture's fixture keeps the width its
+        // cells measured and stays well inside a 2512px page, which is the point of dropping the fill.
+        PanelGrid pageBoard = Board(SettlementWidths(5.4f * 24f, new[] { 6.75f * 24f, 7.15f * 24f, 6.1f * 24f, 6.8f * 24f }, 24), 24);
+        check(pageBoard.Width < 2512f - 1f,
+            $"结算板按自己的测量宽度 {pageBoard.Width:0.##}px 画，不再被拉满 2512px 的页面");
+        check(pageBoard.Rows == 12 && pageBoard.Columns == 5,
+            "列组成与行数没有被这一改动动过：1 个标签列 + 4 个数值列，12 行");
 
         // ---- 1.19.7: the readability floor comes from the button the player presses ---------------------
         //
@@ -403,17 +412,33 @@ internal static class ResultsGrowthScenarios
     private static ResultTableSize Measure(int rows, float rowEm, float emWidth, int fontSize)
         => Table(rows, rowEm, emWidth)(fontSize);
 
-    // A label column and four player columns, in the order and with the field widths the settlement board
-    // actually uses. The four player columns already carry the one width `HudTable.BuildGrid` gives them -
-    // the widest of them, which is what makes `#1`..`#4` line up - so filling the page is only ever asked
-    // to keep a width that was equal, not to invent one.
-    private static PanelColumnMetrics[] PlayerColumns()
-        => new[]
+    // The widths a settlement board is drawn with, given the width every column measured on its own: the
+    // board's own rule, headless. Column 0 is the row label; every column after it is a player's figures.
+    private static float[] SettlementWidths(float labelNatural, float[] valueNaturals, int fontSize)
+    {
+        var columns = new PanelColumn[valueNaturals.Length + 1];
+        var measured = new float[valueNaturals.Length + 1];
+        columns[0] = PanelColumn.ImpactLabel;
+        measured[0] = labelNatural;
+        for (int index = 0; index < valueNaturals.Length; index++)
         {
-            new PanelColumnMetrics(new[] { 5.4f * 24f }),
-            new PanelColumnMetrics(new[] { 6.8f * 24f }),
-            new PanelColumnMetrics(new[] { 6.8f * 24f }),
-            new PanelColumnMetrics(new[] { 6.8f * 24f }),
-            new PanelColumnMetrics(new[] { 6.8f * 24f })
-        };
+            columns[index + 1] = PanelColumn.ImpactValue;
+            measured[index + 1] = valueNaturals[index];
+        }
+        return PanelGeometry.SettlementColumnWidths(columns, measured, fontSize);
+    }
+
+    // The grid those widths produce, through the same `PanelGeometry.Build` the renderer calls: the label
+    // column reads from the left and every value column hugs its right edge.
+    private static PanelGrid Board(float[] widths, int fontSize, int rows = 12)
+    {
+        var metrics = new PanelColumnMetrics[widths.Length];
+        var aligned = new bool[widths.Length];
+        for (int index = 0; index < widths.Length; index++)
+        {
+            metrics[index] = new PanelColumnMetrics(new[] { widths[index] });
+            aligned[index] = index > 0;
+        }
+        return PanelGeometry.Build(metrics, 0f, fontSize, rows, PanelDensity.Compact, 1f, aligned);
+    }
 }

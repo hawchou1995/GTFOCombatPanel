@@ -23,6 +23,9 @@ public sealed class Plugin : BasePlugin
     internal static ConfigEntry<string> LanguageConfig, DensityConfig;
     internal static ConfigEntry<bool> ShowImpactBoard, SplitKillTiers, StaggerNeedsAttack, HideVanillaFailBlocks;
     internal static ConfigEntry<float> KillMinorMaxHealth, KillEliteMaxHealth, SupportRoleFirepowerBonus, SupportRoleUtilityBonus, MinorKillWeight, EliteKillWeight, BossKillWeight;
+    // The settlement board's own wheel-controlled glyph scale, one preference per result page: the two pages
+    // have strips of different heights, so the same scale means two different tables.
+    internal static ConfigEntry<float> SuccessFontScale, FailureFontScale;
     internal static ConfigEntry<string> WeightsConfig, SupportToolNames;
     // 1.16.0 additions: the result overlay's own switch, the two positive vanilla-block switches (off by
     // default, so the board owns the page), the two support-tool rules, and the user-editable scoring file.
@@ -62,6 +65,14 @@ public sealed class Plugin : BasePlugin
         ShowResultOverlay = Config.Bind("Results", "ShowResultOverlay", true, "Draw this mod's board over the result pages. Set false to leave the vanilla result screens exactly as the game drew them, with no board and no legacy table put in their place.");
         ResultsOffsetX = Config.Bind("Results", "OffsetX", 0f, "Pixel offset of the result table from its default place on the page; positive moves right.");
         ResultsOffsetY = Config.Bind("Results", "OffsetY", 0f, "Pixel offset of the result table from its default place on the page; positive moves down.");
+        // The wheel's two preferences. Readable keys, the same section as the rest of the result-page settings,
+        // and a range the wheel itself steps through - so a hand edit, a re-read and a scroll all agree.
+        SuccessFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.SuccessKey, ResultsZoom.Default,
+            new ConfigDescription("Glyph scale of the settlement board on the SUCCESS screen, changed with the mouse wheel over the board and remembered on its own. 1.0 is the size the page's own strip allows - the strip between the completion section and the button that sends the squad home. Below 1 draws a smaller board; above 1 is clamped back onto the strip's own size, so the wheel can never make the board cover that button. One notch is one step of 0.1.",
+                new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
+        FailureFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.FailureKey, ResultsZoom.Default,
+            new ConfigDescription("Glyph scale of the settlement board on the FAILURE screen, changed with the mouse wheel over the board and remembered on its own. 1.0 is the size the page's own strip allows - the strip between the mission-failed message and the buttons below it. Below 1 draws a smaller board; above 1 is clamped back onto the strip's own size, so the wheel can never make the board cover a button. One notch is one step of 0.1.",
+                new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
         // The influence board, and the thirteen metrics it scores.
         ShowImpactBoard = Config.Bind("Results", "ShowImpactBoard", true, "Draw the influence board (every player scored out of 100, ranked, with a sentence and thirteen metrics) on result screens. Set false and the result page is left exactly as the game drew it: there is no older statistics table to fall back to. The same key that toggles the HUD in a level (ToggleKey, F8 by default) toggles this board on a result screen and writes the new value back to this file.");
         ShowSuccessArtifacts = Config.Bind("Results", "ShowSuccessArtifacts", false, "Show the vanilla red crystal (artifact) block on the success screen: the artifact inventory, its summary line and the checkpoint usage. Off by default - 建议关闭显示以免影响观感 - so this mod's board owns the page; switch it on to see the game's own artifact figures beside the board. Every block is put back exactly where the game drew it the moment this is switched on, the page changes or the results screen is left.");
@@ -255,6 +266,53 @@ public sealed class Plugin : BasePlugin
         {
             if (file != null) file.SaveOnConfigSet = autoSave;
             _persistingToggle = false;
+        }
+    }
+
+    // The wheel scale in force for one result page. Read on every rebuild and never cached, so a hand edit of
+    // the file - or the hot reload that follows it - is on screen the next frame, and so a value that could not be
+    // read at all falls back to the published 1.0 rather than to something nobody asked for.
+    internal static float ResultFontScale(bool succeeded)
+        => ResultsZoom.Clamp(succeeded ? SuccessFontScale != null ? SuccessFontScale.Value : ResultsZoom.Default
+                                       : FailureFontScale != null ? FailureFontScale.Value : ResultsZoom.Default);
+
+    // The wheel's one write, on the same controlled path as F8: the file is saved once by hand and the watcher is
+    // told this save was ours, so the hot reload it would otherwise arm does not fire back at the frame that made
+    // the change. The setting's own `SettingChanged` handler is deliberately left running - that is what drops the
+    // cached board and rebuilds it at the new size - and only the file's automatic save is taken out of the way.
+    //
+    // A wheel that has reached a bound changes nothing, and nothing is what it does: no disk write, no watcher
+    // record, no cache invalidation and no "the scale is now" line. Only a value that really moved is persisted, so
+    // holding the wheel against the end of the range is a no-op rather than a stream of identical saves.
+    //
+    // Returns whether the stored scale really changed.
+    internal static bool PersistResultFontScale(ResultPageKind page, float scale)
+    {
+        ConfigEntry<float> entry = page == ResultPageKind.Success ? SuccessFontScale : FailureFontScale;
+        if (entry == null) return false;
+        float snapped = ResultsZoom.Snap(scale);
+        if (Math.Abs(entry.Value - snapped) <= 0.0005f) return false;
+        ConfigFile file = Instance?.Config;
+        bool autoSave = file != null && file.SaveOnConfigSet;
+        try
+        {
+            if (file != null) file.SaveOnConfigSet = false;
+            entry.Value = snapped;
+            if (file != null)
+            {
+                file.Save();
+                ConfigWatcher.RecordOwnSave();
+            }
+            return true;
+        }
+        catch (Exception error)
+        {
+            Logger?.LogWarning("the settlement board's wheel scale could not be written back to the config file: " + error.Message);
+            return false;
+        }
+        finally
+        {
+            if (file != null) file.SaveOnConfigSet = autoSave;
         }
     }
 

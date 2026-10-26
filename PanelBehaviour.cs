@@ -94,6 +94,11 @@ public sealed class PanelBehaviour : MonoBehaviour
 
     private void OnGUI()
     {
+        // The wheel is the settlement board's own control and IMGUI hands it over as an event of its own, so it is
+        // read here - before the Repaint gate every other event type is still refused by - and `Use()`d, so the page
+        // under the pointer does not scroll as well. Nothing about the Repaint path below changes: it draws exactly
+        // what it drew before, at whatever size the wheel has chosen for the page that is up.
+        if (ResultsZoomEvent()) return;
         if (Event.current == null || Event.current.type != EventType.Repaint) return;
         try
         {
@@ -121,6 +126,50 @@ public sealed class PanelBehaviour : MonoBehaviour
             ResultsDisplay.Draw();
         }
         catch (Exception error) { LogOnce(error); }
+    }
+
+    // The settlement board's wheel.
+    //
+    // A settlement page that is really showing, with the pointer inside the board's own rectangle, is the whole of
+    // the trigger: the in-level table keeps the glyph size its own settings give it, and every other page ignores
+    // the wheel exactly as it did before this existed. The page is decided from the same state the board itself
+    // reads, so the success board and the failure board can only ever move their own preference.
+    //
+    // Once a notch has landed on the board the event is consumed here - `Use()` and handled - whatever writing the
+    // new value does to the layout cache: `ResultsDisplay.ZoomAt` judges the gesture against the rectangle the
+    // board was last drawn at and locks the wheel sequence for this frame, so the rest of one gesture cannot leak
+    // to the page underneath while the board is being rebuilt at its new size.
+    [HideFromIl2Cpp]
+    private static bool ResultsZoomEvent()
+    {
+        Event current = Event.current;
+        if (current == null || current.type != EventType.ScrollWheel) return false;
+        try
+        {
+            var state = GameStateManager.CurrentStateName;
+            bool succeeded = state == eGameStateName.ExpeditionSuccess;
+            if (!succeeded && state != eGameStateName.ExpeditionFail) return false;
+            if (!ResultsZoom.Accepts(current.delta.y)) return false;
+            if (!ResultsDisplay.ZoomAt(current.mousePosition, succeeded, Time.frameCount)) return false;
+            ResultPageKind page = ResultsZoom.Page(succeeded);
+            float scale = ResultsZoom.Next(Plugin.ResultFontScale(succeeded), current.delta.y);
+            bool changed = Plugin.PersistResultFontScale(page, scale);
+            if (changed)
+                Plugin.Logger?.LogInfo($"[DIAG] settlement board wheel: the {page.ToString().ToLowerInvariant()} page's own font scale is now {scale:0.##}, and the board is rebuilt at that scale inside the strip this page measured - the button below it is never covered.");
+            current.Use();
+            return true;
+        }
+        catch (Exception error) { LogWheelOnce(error); return false; }
+    }
+
+    private static bool _loggedWheel;
+
+    [HideFromIl2Cpp]
+    private static void LogWheelOnce(Exception error)
+    {
+        if (_loggedWheel) return;
+        _loggedWheel = true;
+        Plugin.Logger?.LogWarning("[DIAG] the settlement board could not take the mouse wheel and keeps its size: " + error.Message);
     }
 
     [HideFromIl2Cpp]

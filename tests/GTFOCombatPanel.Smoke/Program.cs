@@ -1752,6 +1752,8 @@ internal static partial class Program
         RunRowHeightScenarios();
         // ---- the settlement board's size: a search, not a guess --------------------------------
         ResultsGrowthScenarios.RunInto(Check);
+        // ---- the settlement page's own two controls: its measured lower bound and the wheel -----------
+        ResultsPageScenarios.RunInto(Check);
         // ---- the explanation line under each title: a template a player may edit --------------
         ReasonTemplateScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------

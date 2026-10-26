@@ -241,26 +241,24 @@ internal static class HudTable
         var metrics = new PanelColumnMetrics[content.ColumnCount];
         if (content.FieldSeparator != null)
         {
-            // One measured right edge per player column, so the settlement cells share one width.
-            float labelWidth = 0f, valueWidth = 0f;
+            // One measured width per column, then the settlement board's own rule for turning them into the
+            // widths it draws with: the row label keeps its own width and every value column is given the
+            // widest of them, which is what lines `#1`..`#N` up down the board. Nothing here looks at the
+            // page the board is drawn on, so a wider page leaves the board at the width its figures measured.
+            var measured = new float[content.ColumnCount];
             for (int column = 0; column < content.ColumnCount; column++)
             {
-                bool label = content.Columns[column] == PanelColumn.ImpactLabel;
-                float width = PanelGeometry.MinimumWidth(content.Columns[column], fontSize);
+                float width = 0f;
                 for (int row = 0; row < content.Rows; row++)
                 {
                     string joined = string.Join(content.FieldSeparator, content.Cell(row, column));
                     width = Mathf.Max(width, Mathf.Max(PanelGeometry.EstimateTextWidth(joined, fontSize), Measure(joined, fontSize, true)));
                 }
-                if (label) labelWidth = Mathf.Max(labelWidth, width);
-                else valueWidth = Mathf.Max(valueWidth, width);
+                measured[column] = width;
             }
+            float[] widths = PanelGeometry.SettlementColumnWidths(content.Columns, measured, fontSize);
             for (int column = 0; column < content.ColumnCount; column++)
-            {
-                bool label = content.Columns[column] == PanelColumn.ImpactLabel;
-                float width = label ? Mathf.Max(labelWidth, PanelGeometry.MinimumWidth(PanelColumn.ImpactLabel, fontSize)) : valueWidth;
-                metrics[column] = new PanelColumnMetrics(new[] { width });
-            }
+                metrics[column] = new PanelColumnMetrics(new[] { widths[column] });
         }
         else
         {
