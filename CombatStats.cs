@@ -166,6 +166,57 @@ public sealed class WeaponCombatStats
     }
 }
 
+// Which row of one inventory slot a display should read.
+//
+// A player's rows are keyed by (slot, archetype id), so one slot can hold several of them: the game opens a
+// placeholder row for the equipped slot before anything names the weapon (`ArchetypeId = 0`, name
+// `GearClass`), and the real weapon - or the tool that really fired, a sentry among them - is a second row in
+// the same slot. Reading "the first row of this slot" therefore depended on dictionary order and could hand
+// the board the placeholder: a row with no real name and no figures, which is how one column showed data for
+// only part of the squad. The most specific real row wins instead, in this order:
+//
+//   * a row the game gave an archetype id of its own (`ArchetypeId != 0`) - a real weapon, not a placeholder;
+//   * a row whose name a real source set (`NameAuthoritative`), so `GearClass` loses to `Sentry`;
+//   * a row that has actually counted something.
+//
+// Ties keep the best row seen first, so a projection holding two equally good rows is answered with the same
+// one on every frame rather than with whichever the dictionary happened to yield.
+public static class WeaponRows
+{
+    public static WeaponCombatStats For(IEnumerable<WeaponCombatStats> rows, int slot)
+    {
+        WeaponCombatStats best = null;
+        int bestRank = int.MinValue;
+        if (rows == null) return null;
+        foreach (WeaponCombatStats row in rows)
+        {
+            if (row == null || row.Slot != slot) continue;
+            int rank = Rank(row);
+            if (best != null && rank <= bestRank) continue;
+            best = row; bestRank = rank;
+        }
+        return best;
+    }
+
+    // What a row of one slot is worth: whether it is a real weapon at all, whether something really named it,
+    // and whether it counted anything. A row that is both unnamed and without an archetype id is the
+    // placeholder its slot was opened with, and it never wins over a row that is either.
+    public static int Rank(WeaponCombatStats row)
+    {
+        if (row == null) return int.MinValue;
+        int rank = 0;
+        if (row.ArchetypeId != 0) rank += 4;
+        if (row.NameAuthoritative) rank += 2;
+        if (Counted(row)) rank += 1;
+        return rank;
+    }
+
+    private static bool Counted(WeaponCombatStats row)
+        => row.Counters != null
+           && (row.Counters.ShotsFired > 0 || row.Counters.Hits > 0 || row.Counters.EnemyDamage > 0
+               || row.Counters.FriendlyFireDamage > 0);
+}
+
 public sealed class CombatPlayer
 {
     private readonly Dictionary<(int, uint), WeaponCombatStats> _weapons = new Dictionary<(int, uint), WeaponCombatStats>();

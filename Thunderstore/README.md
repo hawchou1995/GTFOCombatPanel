@@ -1,10 +1,30 @@
-# CombatPanel 1.19.9
+# CombatPanel 1.19.11
 
 独立 GTFO 战斗统计面板：局内查看战斗数据，成功或失败结算查看队伍贡献。仅依赖 **BepInEx-BepInExPack_GTFO-3.2.3**。
 
 **源码 / Source：[GitHub — hawchou1995/GTFOCombatPanel](https://github.com/hawchou1995/GTFOCombatPanel)**
 
 反馈：[qingju.me](https://qingju.me) ｜ [小黑盒语音](https://chat.xiaoheihe.cn/in1wpsjd)
+
+## 1.19.11 更新
+
+- 修掉「结算板装不下时，整页既没有原版区块也没有本模组表格」的空页：`ResultsDisplay.Prepare` 此前在 `Fit(...)` 之后**无条件**写入 `_placed = true`，即使 fit 已经因为「完成区块下沿到返回大厅按钮上沿之间放不下这块板」直接返回（只写一行 `[DIAG] result board cannot fit`）。随后 `Refresh` 看到 `_placed` 便调用 `ApplyVanillaBlocks` 把原版结算区块隐藏，而 `Draw` 因 `_grid` / `_content` 为空立刻返回——这一帧就只剩空白。
+- 修复方式：`Fit` 现在返回「是否真的落位」（`TryPlace` 成功，或既有 `_holdValid` 保持分支），`Prepare` 再把结果交给新的无 Unity 策略 `ResultBoardLatch.Placed(fitConfirmed, gridReady, contentReady)`，只有它为真才写入 `_placed`；`Refresh` 的隐藏动作改走 `ResultBoardLatch.HidesVanilla(_placed)`。**Fit 失败时保留原版结算块并等待重试**：失败帧不隐藏任何原版内容，`NeedsAttach()` 仍为真，下一帧重新测量、重新落位。
+- 成功路径完全不变：`TryPlace` 落位与 `_holdValid` 保持两条分支、按完成区块上沿悬挂（`bottomAligned: false`）、行内容、评分、返回大厅按钮保护（`ButtonClearance`）与同步协议（v8）都未改动。
+- 与外部整合包 FX.0 关卡日志无关：该日志来自另一个 profile，未加载本模组，也没有任何本模组帧；本版**不**声称修复任何 FX.0 闪退。
+- 验证（2026-10-27）：`VERIFY: PASS`，`PASS: 2039 combat-panel assertions`（1.19.10 时为 2012），构建 0 警告 0 错误，另 9 配置监听 / 50 补给归属 / 38 扫描重放断言通过，EWC 契约与 Scout hook 安全检查通过，协议仍为 v8。**尚未进游戏做实机复核**：本次只证明策略与接线正确，结算页在真实窗口尺寸下的观感没有新证据。
+
+## 1.19.10 更新
+
+- 成功页「远征中生还 / 分区」与表格之间那条大留白修掉了：完成区块不再用「字段固定 + renderer.enabled」估，而是按当帧**真实可见的像素**量——分区白框、分区标题与四个已清区图标各自读成一份可见边界，被关掉的图标、alpha 为 0 的图标与空字段一律不参与，padding 容器 rect 只在部件真的没画出东西时兜底，最后取最深可见者作为上界。
+- 表格改成从这条上界往下挂：顶缘落在「完成区块底 + 间隙」上，多出来的空白留在返回大厅按钮正上方，而不是标题与表格之间。按钮仍是严格下限，装不下就不画、已上板只上抬，绝不覆盖。字号、行高、列宽、行序、指标内容与评分都没动。
+- 上界的测量路径也修了：世界坐标的分区图标与其文字现在直接按 `Renderer.bounds` 的八个角投影成屏幕矩形来量，不再因为「没有 RectTransform」被判成测不到；UI 元素才走 `RectTransform` 回退，两条路用同一套合理性规则。万一这一帧连一个可见完成元素都量不出来，成功页不会再把表格放到 0.16×窗口高度那个会压住图标与文字的位置上，而是本帧不画（原版页面保持原样）并下一帧重试。
+- 失败页的标题与表格间距改由**原生失败标题**自己界定：优先用当帧实测的 `m_missionFailed_text` 底边，标题不再被搬动；记下的成功页完成线只在标题还测不到时兜底，标题淡入的等待有上限，不会再永久拖到历史比例上。
+- 结算板的 `[DIAG]` 行补 `anchorSource` 与真实空白像素数（`blankAbove` / `blankBelow`），只记几何与计数，不含玩家标识。
+- 炮台列只有部分玩家有数据（展示侧）：工具详情先看真实记录（哨戒炮的射击 / 命中 / 伤害等），工具名只作次级提示，中文名、空名、占位名不再把已记录的数据吞掉；结算读同 slot 的多行时优先真实武器行（有 archetype id / 有实名 / 有计数），不再撞上 `GearClass` 占位行。采集侧的主机门禁、协议与同步未改。
+- EX.B「Survival rundown / 关卡布局 4444」闪退的**缓解**（不是已复现的修复）：`ReceiveParasiteDamage` 这一个玩家伤害方法不再被本模组挂 detour，其余 `Receive*` 与结算用到的观察点全部照旧。依据是同机两次（主机、客机各一次）同签名 `DMD<ReceiveParasiteDamage> ↔ IL2CPP runtime invoke` 栈与本插件 detour 的相关性——日志里没有本插件的 callback 帧，因果未严格证明，也没有 EX.B 实机 A/B。代价是寄生虫那一类伤害的「失血」采样不再直接覆盖（游戏真实伤害不变，但「失血」可能长期少记，而不是「迟一帧补记」：治疗 / 复活 / 生命上限变化若先于下一次观察到达，水位线向上重设，这段伤害就永久不计入）。本版没有加无效的 re-entry guard，也没有改数据包门或网络链。
+- 结算期同一帧里「hello 先被旧 roster 拒绝、roster 之后才加入对方」的竞态：被拒的 hello 现在会短时间暂存并在刷新 roster 后立刻用同一策略重判，不再白等对方 2 秒重发。身份校验强度、包格式与重试语义未变，不在当前 squad 的包仍然拒收；新远征开始时这批暂存的 hello 会一并清空，上一局的包不会在新一局的 roster 上被重判。
+- 验证（2026-10-27）：`VERIFY: PASS`，`PASS: 2012 combat-panel assertions`（1.19.9 时为 1929），构建 0 警告 0 错误，另 9 配置监听 / 50 补给归属 / 38 扫描重放断言通过，协议仍为 v8。**尚未进游戏做实机与画面观感复核**：上界与失败页间距的观感、炮台列的实机数值、EX.B 是否不再闪退都还没有实机证据。
 
 ## 1.19.9 更新
 

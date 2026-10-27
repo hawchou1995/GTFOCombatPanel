@@ -112,6 +112,58 @@ internal sealed class SquadExchange
     // rather than once per frame.
     private int _withheldPeers = -1;
 
+    // A hello that arrived before the roster knew the player who sent it.
+    //
+    // The receive queue is drained on the main thread at the start of a tick and the roster is rebuilt from the
+    // game's own slot list later in the same tick, so a player who joins and greets in one frame is judged
+    // against the roster of the previous frame and refused as "not in this squad's roster" - the peer answers
+    // on its own two-second cadence instead, and the row the pair would have exchanged in between is lost. The
+    // packet is kept here for a bounded moment and re-judged by the caller right after it refreshes the roster:
+    // the same policy, the same refusal for a sender that is still not in the squad, and no packet accepted
+    // outside the roster this machine trusts.
+    private struct DeferredHello { public ulong Sender; public uint Generation; public float ReceivedAt; }
+    public const int MaxDeferredHellos = 8;
+    // How long one of those hellos stays worth re-judging. It is the same order as the peer's own retry cadence,
+    // so a hello that is kept longer would only duplicate what the peer already sends again.
+    public const float DeferredHelloSeconds = 3f;
+    private readonly List<DeferredHello> _deferred = new List<DeferredHello>();
+
+    // How many hellos are waiting to be re-judged. Read by the headless suite and by the diagnostic line.
+    public int DeferredHellos { get { return _deferred.Count; } }
+
+    // Keeps one hello for the bounded retry above. A repeated hello from the same peer for the same run replaces
+    // the timestamp instead of adding an entry, so a peer that keeps greeting cannot grow the list.
+    internal void DeferHello(ulong sender, uint generation, float now)
+    {
+        if (sender == 0UL || sender == _local) return;
+        for (int index = 0; index < _deferred.Count; index++)
+        {
+            if (_deferred[index].Sender != sender || _deferred[index].Generation != generation) continue;
+            DeferredHello repeated = _deferred[index];
+            repeated.ReceivedAt = now;
+            _deferred[index] = repeated;
+            return;
+        }
+        if (_deferred.Count >= MaxDeferredHellos) _deferred.RemoveAt(0);
+        _deferred.Add(new DeferredHello { Sender = sender, Generation = generation, ReceivedAt = now });
+    }
+
+    // The oldest hello still worth re-judging, removed from the list. False once nothing is left or everything
+    // left is older than `DeferredHelloSeconds`.
+    internal bool TryTakeDeferredHello(float now, out ulong sender, out uint generation)
+    {
+        sender = 0UL; generation = 0U;
+        while (_deferred.Count > 0)
+        {
+            DeferredHello next = _deferred[0];
+            _deferred.RemoveAt(0);
+            if (now - next.ReceivedAt > DeferredHelloSeconds) continue;
+            sender = next.Sender; generation = next.Generation;
+            return true;
+        }
+        return false;
+    }
+
     // Every accepted and refused packet is published here. The runtime points it at the BepInEx logger; the
     // headless suite records it and asserts on the exact fields.
     public Action<string> Report = _ => { };
@@ -170,6 +222,10 @@ internal sealed class SquadExchange
         Cache.Clear();
         _squadTotal = null; _squadTotalPartial = false;
         Handshake.Reset();
+        // A hello that was waiting to be re-judged describes the run that just ended: the roster is rebuilt for the
+        // new one, so a packet kept from before it must never be re-judged against that new roster - the peer may not
+        // even be in this expedition, and a hello is answered only for the session that received it.
+        _deferred.Clear();
         unchecked { _generation++; }
         if (_generation == 0) _generation = 1;
         Report("[DIAG] squad sync run counter: this machine's run is now generation=" + _generation
@@ -189,6 +245,8 @@ internal sealed class SquadExchange
         // it names machines, not a lobby.
         Discovery.ResetEvidence();
         _withheldPeers = -1;
+        // A hello waiting for the roster is about the lobby that just ended, so it goes with it.
+        _deferred.Clear();
         Report("[DIAG] squad sync peers cleared: the lobby, the session or this machine's role in it changed, so every peer is fresh again.");
     }
 
@@ -399,13 +457,20 @@ internal sealed class SquadExchange
 
     // A peer offering the protocol. Accepting it is what puts the pair in touch; the answer is a hello back,
     // and it is re-sent on a cadence, because the first answer is exactly the packet a busy lobby drops.
-    internal SquadDecision OnHello(ulong sender, uint generation, float now, out bool answer)
+    internal SquadDecision OnHello(ulong sender, uint generation, float now, out bool answer, bool deferrable = true)
     {
         answer = false;
         if (sender == 0UL || sender == _local)
             return Refuse("hello", "a hello from nobody, or an echo of this machine's own packet", sender, generation);
         if (!TryPeer(sender, out _))
+        {
+            // Arriving a frame before the roster knew this player is not the same as not being in the squad: the
+            // packet is kept for the bounded retry the caller runs right after it refreshes the roster, and it is
+            // re-judged there by this very method. The refusal stands for now, and a sender that is still outside
+            // the roster when it is re-judged is refused again and dropped.
+            if (deferrable) DeferHello(sender, generation, now);
             return Refuse("hello", "the sender is not in this squad's roster", sender, generation);
+        }
         // This packet is itself the evidence: only a machine running this build can produce one, and nothing
         // was sent to this peer to find that out. It is recorded before the run counter is judged, because a
         // stale generation still proves what the sender is, and it is what lets this machine answer at all.

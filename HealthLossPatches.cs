@@ -33,13 +33,10 @@ internal static class HealthLossPatches
         {
             if (method.IsAbstract || method.ContainsGenericParameters) continue;
             if (!ReturnsVoid(method)) continue;
-            string name = method.Name;
-            if (name.StartsWith("Receive", StringComparison.Ordinal)
-                || name == "OnApplyDamageOverTimeModifier"
-                || name == "OnRevive"
-                || name == "OnKilledByTankTentacle"
-                || name == "Setup")
-                yield return method;
+            // One shared rule decides what is observed, so the single exclusion this release adds cannot drift
+            // away from the `Receive*` coverage the ledger depends on (see `HealthLossTargets`).
+            if (!HealthLossTargets.Accepts(method.Name)) continue;
+            yield return method;
         }
     }
 

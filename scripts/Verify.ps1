@@ -111,6 +111,58 @@ try {
         throw 'Settlement tool rows must carry the equipped GearClass identity into ImpactInput.'
     }
     Write-Host 'SETTLEMENT_TOOL_PROJECTION: PASS'
+    # The settlement board's upper bound: the completion section is measured as the visible pixels it draws, and
+    # the table hangs from that edge instead of being bottom-aligned against the lobby button. Both are
+    # behavioural properties the headless suite cannot reach (they need the real page), so the wiring is checked
+    # here and the policy itself is asserted in tests/GTFOCombatPanel.Smoke.
+    $usesVisibleCompletion = $resultsSource.Contains('CompletionBounds.Deepest(')
+    $anchorsOnUpperEdge = $resultsSource.Contains('bottomAligned: false') -and -not $resultsSource.Contains('bottomAligned: true')
+    $namesTheAnchor = $resultsSource.Contains('FailureAlignment.Source(') -and $resultsSource.Contains('anchorSource=')
+    $boundsTheTitleWait = $resultsSource.Contains('FailureAlignment.WaitForTitle(')
+    # A world-space renderer is measured from its own bounds, so the projection must go through `ScreenBounds` and
+    # must not sit behind a RectTransform any more; and a success page whose completion section could not be measured
+    # is deferred (`ResultsUpperBound.Decide`) instead of being placed at the historical fraction of the window,
+    # which sits above the icons and captions. The smoke suite asserts both policies; these two lines assert that the
+    # runtime actually calls them.
+    $measuresRendererBounds = $resultsSource.Contains('ScreenBounds.TryFromCorners(') -and $resultsSource.Contains('renderer.bounds')
+    $defersWithoutMeasuredSection = $resultsSource.Contains('ResultsUpperBound.Decide(') -and -not $resultsSource.Contains('ResultsRegion.Resolve(false')
+    $upperBoundBroken = (-not $usesVisibleCompletion) -or (-not $anchorsOnUpperEdge) -or (-not $namesTheAnchor) -or (-not $boundsTheTitleWait) -or (-not $measuresRendererBounds) -or (-not $defersWithoutMeasuredSection)
+    if ($upperBoundBroken) {
+        throw 'The result board must measure the completion section by its visible pixels (renderer bounds projected through ScreenBounds, never behind a RectTransform), hang the table from that edge, defer instead of guessing when that edge is unmeasurable, name its anchor and bound the wait for the failure title.'
+    }
+    Write-Host 'RESULT_BOARD_UPPER_BOUND: PASS'
+    # The tool cell is chosen from the recorded figures first (the name is only a hint), and a slot is read from
+    # its most specific real row rather than from the first entry the dictionary happens to yield.
+    $toolDetailFromData = (Get-Content (Join-Path $projectRoot 'ImpactBoard.cs') -Raw).Contains('ToolDetailOf(counters, name)')
+    $slotRowPolicy = $resultsSource.Contains('WeaponRows.For(player.Weapons, (int)slot)')
+    if (-not $toolDetailFromData -or -not $slotRowPolicy) {
+        throw 'The tool cell and the tool slot row must both be decided by recorded figures and the most specific real row.'
+    }
+    Write-Host 'SETTLEMENT_TOOL_DATA_FIRST: PASS'
+    # The parasite-damage crash mitigation is one exclusion and nothing else: the target set is decided by
+    # `HealthLossTargets`, the patch class adds no prefix and no re-entry guard, and the host gate on the sentry
+    # ledger is untouched.
+    $healthSource = Get-Content (Join-Path $projectRoot 'HealthLossPatches.cs') -Raw
+    $targetsSource = Get-Content (Join-Path $projectRoot 'HealthLossLedger.cs') -Raw
+    $usesTargetPolicy = $healthSource.Contains('HealthLossTargets.Accepts(') -and -not $healthSource.Contains('[HarmonyPrefix')
+    $oneExclusion = ([regex]::Matches($targetsSource, '"Receive[A-Za-z]+"')).Count -eq 1 -and $targetsSource.Contains('"ReceiveParasiteDamage"')
+    $sentryHostGate = (Get-Content (Join-Path $projectRoot 'ToolStatsTracker.cs') -Raw).Contains('!SNet.IsMaster')
+    if (-not $usesTargetPolicy -or -not $oneExclusion -or -not $sentryHostGate) {
+        throw 'The blood-loss observation must exclude exactly ReceiveParasiteDamage, add no prefix, and leave the sentry host gate in place.'
+    }
+    Write-Host 'HEALTH_LOSS_TARGET_WIRING: PASS'
+    # A hello that arrives before the roster holds its sender is kept and re-judged, never accepted early.
+    $syncSource = Get-Content (Join-Path $projectRoot 'CombatSync.cs') -Raw
+    $exchangeSource = Get-Content (Join-Path $projectRoot 'SquadExchange.cs') -Raw
+    $defersHellos = $exchangeSource.Contains('DeferHello(') -and $exchangeSource.Contains('TryTakeDeferredHello(')
+    $rejudgesAfterRoster = $syncSource.Contains('RetryDeferredHellos();') -and $syncSource.Contains('Exchange.SetRoster(')
+    # A hello kept from one run must not be re-judged against the next run's roster: the explicit expedition reset is
+    # wired from `CombatSync.ResetExpedition`, and the smoke suite asserts that it actually empties the list.
+    $dropsHellosOnReset = $syncSource.Contains('Exchange.ResetForExpedition();')
+    if (-not $defersHellos -or -not $rejudgesAfterRoster -or -not $dropsHellosOnReset) {
+        throw 'A hello refused for an older roster must be re-judged against the refreshed roster instead of being dropped, and the kept hellos must be dropped on the expedition reset.'
+    }
+    Write-Host 'SQUAD_HELLO_ROSTER_RACE: PASS'
     $fontSource = Get-Content (Join-Path $projectRoot 'HudTable.cs') -Raw
     $hasTmpDefault = $fontSource.Contains('TMP_Settings.defaultFontAsset')
     $reusesTmpSourceFont = $fontSource.Contains('sourceFontFile')

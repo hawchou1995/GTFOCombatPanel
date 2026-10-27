@@ -1754,6 +1754,10 @@ internal static partial class Program
         ResultsGrowthScenarios.RunInto(Check);
         // ---- the settlement page's own two controls: its measured lower bound and the wheel -----------
         ResultsPageScenarios.RunInto(Check);
+        // ---- 1.19.10: the board's upper bound, the tool cell, the blood-loss detour and the roster race ------
+        Release11910Scenarios.RunInto(Check);
+        // ---- 1.19.11: a result page whose board the strip refused keeps the game's own settlement blocks --
+        Release11911Scenarios.RunInto(Check);
         // ---- the explanation line under each title: a template a player may edit --------------
         ReasonTemplateScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------

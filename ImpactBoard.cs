@@ -392,6 +392,48 @@ public static class ImpactBoard
         if (counters == null) return CombatStrings.Placeholder;
         return Count(counters.KillCount(tier)) + CombatStrings.KillTierLabel(tier);
     }
+    // Which detail block a tool's counters describe - decided from the data first, with the tool's name only
+    // as a hint.
+    //
+    // The name a row carries is whatever the game (or a localization mod) gave the equipped GearClass, and it
+    // arrives empty, in Chinese, or as the slot's own placeholder often enough that a display keyed on
+    // `name.Contains("Sentry")` left a whole column empty: the sentry had really shot, hit and dealt damage,
+    // and the cell printed nothing because the row was called `哨戒炮` or nothing at all. The ledger knows what
+    // it recorded, so the figures decide - the name only decides between kinds that reported together, or
+    // when nothing has been counted yet.
+    public enum ToolDetailKind { None = 0, Sentry = 1, Mine = 2, Glue = 3 }
+
+    public static ToolDetailKind ToolDetailOf(ImpactCounters counters, string name)
+    {
+        bool sentry = counters != null
+            && (counters.SentryShots > 0 || counters.SentryHits > 0 || counters.SentryDamage > 0);
+        bool mine = counters != null
+            && (counters.MineDeployments > 0 || counters.MinePickups > 0 || counters.MineTriggers > 0 || counters.MineDamage > 0);
+        bool glue = counters != null
+            && (counters.GlueShots > 0 || counters.GlueHits > 0 || counters.GluedEnemies > 0);
+        int kinds = (sentry ? 1 : 0) + (mine ? 1 : 0) + (glue ? 1 : 0);
+        // Exactly one kind of record means that kind, whatever the row is called: a Chinese or empty tool name
+        // is a missing hint, not a licence to hide the figures the ledger really recorded.
+        if (kinds == 1) return sentry ? ToolDetailKind.Sentry : mine ? ToolDetailKind.Mine : ToolDetailKind.Glue;
+        ToolDetailKind named = NamedDetail(name);
+        if (named != ToolDetailKind.None) return named;
+        if (kinds == 0) return ToolDetailKind.None;
+        // Several kinds in one merged row and no name to choose between them: the order this board has always
+        // printed its blocks in.
+        return sentry ? ToolDetailKind.Sentry : mine ? ToolDetailKind.Mine : ToolDetailKind.Glue;
+    }
+
+    private static ToolDetailKind NamedDetail(string name)
+    {
+        if (Contains(name, "Sentry") || Contains(name, "哨戒") || Contains(name, "炮台") || Contains(name, "Turret"))
+            return ToolDetailKind.Sentry;
+        if (Contains(name, "Tripmine") || Contains(name, "Mine") || Contains(name, "绊雷") || Contains(name, "地雷"))
+            return ToolDetailKind.Mine;
+        if (Contains(name, "Glue") || Contains(name, "C-Foam") || Contains(name, "胶") || Contains(name, "泡沫"))
+            return ToolDetailKind.Glue;
+        return ToolDetailKind.None;
+    }
+
     // The scan pair remains the score source; the second segment only reports the equipped tool's use.
     public static string ToolEfficiencyText(ImpactEntry entry)
     {
@@ -403,13 +445,22 @@ public static class ImpactBoard
                 ? CombatStrings.ToolScan(counters.ScanEstimated, Count(counters.ScanUses), Count(counters.ScanFirstMarks), Count(counters.ScanMarks))
                 : CombatStrings.ToolScanUnavailable
             : string.Empty;
-        string details = string.Empty;
-        if (Contains(name, "Sentry") || Contains(name, "哨戒"))
-            details = CombatStrings.ToolSentry(Count(counters.SentryShots), Count(counters.SentryHits), CombatStatsFormatter.FormatDamage(counters.SentryDamage));
-        else if (Contains(name, "Tripmine") || Contains(name, "Mine") || Contains(name, "绊雷") || Contains(name, "地雷"))
-            details = CombatStrings.ToolMine(Count(Math.Max(0, counters.MineDeployments - counters.MinePickups)), Count(counters.MineTriggers), CombatStatsFormatter.FormatDamage(counters.MineDamage));
-        else if (Contains(name, "Glue") || Contains(name, "C-Foam") || Contains(name, "胶") || Contains(name, "泡沫"))
-            details = CombatStrings.ToolGlue(Count(counters.GlueShots), Count(counters.GlueHits), Count(counters.GluedEnemies));
+        string details;
+        switch (ToolDetailOf(counters, name))
+        {
+            case ToolDetailKind.Sentry:
+                details = CombatStrings.ToolSentry(Count(counters.SentryShots), Count(counters.SentryHits), CombatStatsFormatter.FormatDamage(counters.SentryDamage));
+                break;
+            case ToolDetailKind.Mine:
+                details = CombatStrings.ToolMine(Count(Math.Max(0, counters.MineDeployments - counters.MinePickups)), Count(counters.MineTriggers), CombatStatsFormatter.FormatDamage(counters.MineDamage));
+                break;
+            case ToolDetailKind.Glue:
+                details = CombatStrings.ToolGlue(Count(counters.GlueShots), Count(counters.GlueHits), Count(counters.GluedEnemies));
+                break;
+            default:
+                details = string.Empty;
+                break;
+        }
         if (scan.Length == 0) return details.Length == 0 ? CombatStrings.Placeholder : details;
         // One separator for the whole board: a tool that both scans and holds a placeable would otherwise print
         // two different joints inside one cell. The halves are one cell, so they are joined like every field.

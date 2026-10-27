@@ -22,6 +22,10 @@ namespace HawChow.GTFOCombatPanel;
 //                            because the pages animate their own buttons and a button's own bounds move a
 //                            pixel or two while it is hovered. The lobby button stays a wall throughout:
 //                            a held board that really would reach it is lifted off it, never dropped.
+//   ResultBoardLatch         whether the board may stand in for the game's own result blocks. Those blocks are
+//                            only ever put away for a board that was really fitted, has the grid and content it
+//                            will draw, and is therefore about to be drawn; a frame whose placement was refused
+//                            hides nothing, leaves the page exactly as the game drew it and is asked again.
 // ---------------------------------------------------------------------------------------------------
 
 // A placement, a measured strip and an earned readiness all belong to one result page. A different page
@@ -41,6 +45,29 @@ public static class ResultVisibility
         => current != IntPtr.Zero && cached == current;
 
     public static bool PageChanged(IntPtr cached, IntPtr current) => cached != current;
+}
+
+// The one latch that decides whether the board stands in for the game's own result blocks.
+//
+// `Fit` may refuse a board outright - the strip the page measured came back shorter than the table - and it used to
+// answer its caller with silence: the refresh path then recorded the placement anyway, `ApplyVanillaBlocks` put the
+// game's own blocks away for a board `Draw` would never paint (it returns the moment the grid or the content is
+// missing), and the settlement page was left with neither. A refusal is a refusal here: the frame hides nothing, the
+// page stays exactly as the game drew it, and it is asked again on the next one.
+public static class ResultBoardLatch
+{
+    // A placement counts only when the fit confirmed it and the grid and the content it will draw are the ones it
+    // fitted. A frame that fitted nothing has nothing to draw and therefore nothing to stand in for.
+    public static bool Placed(bool fitConfirmed, bool gridReady, bool contentReady)
+        => fitConfirmed && gridReady && contentReady;
+
+    // The game's own blocks make way only for a board that is really there.
+    public static bool HidesVanilla(bool placed) => placed;
+
+    // Whether the page still has to be attached. A board that was never really placed is retried on the next frame
+    // instead of being recorded as done, which is the half of the rule that makes a transient refusal cost one frame
+    // rather than the rest of the page.
+    public static bool NeedsAttach(bool placed, bool succeededMatches) => !placed || !succeededMatches;
 }
 
 // One frame of evidence about the success page's completion section, taken from the page's own objects:

@@ -304,6 +304,13 @@ internal static class CombatSync
             if (local == 0UL) return;
             Exchange.Configure(local, PrimarySlot, SpecialSlot, ClassSlot, MeleeSlot);
             Exchange.SetRoster(Roster(local), master);
+            // The roster this tick now trusts is the one the deferred hellos are judged against. A hello can reach
+            // this machine in the same frame the player who sent it was slotted, and it was refused a moment ago by
+            // the roster of the previous frame ("the sender is not in this squad's roster"); it is re-judged here,
+            // before anything is sent, so the peer is answered on this tick instead of on its next two-second
+            // cadence. `SquadExchange.OnHello` is the same policy as the arriving path: a sender that is still not
+            // in this squad is refused again, and a hello older than the retry window is dropped.
+            RetryDeferredHellos();
             // A lookup or a switch changed in the file while the game runs takes effect here, without a restart.
             ApplyShareMode(false);
             ApplyAllowlist(false);
@@ -378,16 +385,44 @@ internal static class CombatSync
                 Plugin.Logger.LogWarning($"[DIAG] squad sync hello: refused; peer={sender}; claimedOwner={owner}; reason=hello identity does not match transport sender;");
                 return;
             }
-            SquadDecision decision = Exchange.OnHello(sender, generation, Now, out bool answer);
-            if (decision.Accepted) Note(sender);
-            if (!answer) return;
-            if (!TryPlayer(sender, out SNet_Player peer) || peer == null) return;
-            SquadNet.SendHello(peer, OwnLookup(), Exchange.Generation);
-            SentTo.Add(sender);
+            AnswerHello(sender, generation, true);
         }
         catch (Exception error)
         {
             Plugin.Logger.LogWarning("squad sync hello could not be answered: " + error.Message);
+        }
+    }
+
+    // One hello, judged against the exchange's own roster and answered when its policy says so. It is the same
+    // call for the packet as it arrives and for the one that is re-judged after the roster was refreshed; the
+    // only difference is `deferrable`, which is false on the retry so a second refusal ends the matter instead of
+    // parking the packet again.
+    private static void AnswerHello(ulong sender, uint generation, bool deferrable)
+    {
+        SquadDecision decision = Exchange.OnHello(sender, generation, Now, out bool answer, deferrable);
+        if (decision.Accepted) Note(sender);
+        if (!answer) return;
+        if (!TryPlayer(sender, out SNet_Player peer) || peer == null) return;
+        SquadNet.SendHello(peer, OwnLookup(), Exchange.Generation);
+        SentTo.Add(sender);
+    }
+
+    // The hellos that arrived a frame before the roster held their sender, re-judged against the roster this tick
+    // refreshed. Bounded by the exchange's own list and by its retry window, so this can never become a second
+    // packet path: every one of them goes through the same `OnHello` the arriving packet uses.
+    private static void RetryDeferredHellos()
+    {
+        try
+        {
+            for (int attempt = 0; attempt < SquadExchange.MaxDeferredHellos; attempt++)
+            {
+                if (!Exchange.TryTakeDeferredHello(Now, out ulong sender, out uint generation)) return;
+                AnswerHello(sender, generation, false);
+            }
+        }
+        catch (Exception error)
+        {
+            Plugin.Logger?.LogWarning("a hello waiting for the roster could not be re-judged: " + error.Message);
         }
     }
 

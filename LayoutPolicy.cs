@@ -409,8 +409,11 @@ public readonly struct ResultsSafeArea
 
 public static class ResultsRegion
 {
-    // Used when the completion section cannot be measured: the fraction the success board used before
-    // the region was measured, which sits below the page's heading band in the captured layouts.
+    // The fraction of the window a strip starts at when the completion section could not be measured. It is no
+    // longer a placement of its own: the success page refuses to place a board it cannot prove sits below that
+    // section (`ResultsUpperBound`), because on the captured pages this fraction lies *above* the cleared-sector
+    // icons and their captions. It stays here as the documented floor of this arithmetic and for the callers that
+    // ask `Resolve` for a region without a measured edge.
     public const float FallbackTopFraction = 0.16f;
     // Where the strip stops when the page's buttons could not be read at all. It is deliberately a fraction
     // of the window rather than "the bottom minus a margin": a button this build failed to measure is
@@ -525,6 +528,132 @@ public static class ResultsRegion
         => float.IsFinite(top) && top > 0f && top <= screenHeight;
 }
 
+// ---------------------------------------------------------------------------------------------------
+// The completion section's own pixels: the upper bound of the success board.
+// ---------------------------------------------------------------------------------------------------
+
+// One element of a result page's completion section - the sector box, its header, one of the cleared sector
+// icons - read as the pixels the player can actually see.
+//
+// `OwnBottom` is the element's own container rectangle, and it is exactly the figure that may not be trusted
+// on its own: a padded container is laid out to hold its children and can end tens of pixels below the last
+// thing it draws, which is how the board came to be pushed away from a section that had already ended higher
+// up. `VisualBottom` is the deepest renderer that is really drawing under the element, its captions included,
+// and it is the figure the strip is built from whenever the element draws anything measurable.
+public readonly struct CompletionPart
+{
+    public readonly bool Present, Active;
+    public readonly float Alpha;
+    public readonly float OwnBottom;
+    public readonly float VisualBottom;
+
+    public CompletionPart(bool present, bool active, float alpha, float ownBottom, float visualBottom)
+    {
+        Present = present; Active = active; Alpha = alpha;
+        OwnBottom = ownBottom; VisualBottom = visualBottom;
+    }
+
+    // An element this build does not have on the page at all.
+    public static CompletionPart Missing { get { return new CompletionPart(false, false, float.NaN, float.NaN, float.NaN); } }
+}
+
+// The deepest edge the completion section really draws.
+//
+// The success board starts under this edge plus the page's own gap, so everything that is not on the screen
+// has to be kept out of the measurement: a sector icon the page switched off for a sector the squad never
+// reached, a part whose canvas group is still at zero alpha, a part that hands over a padded rectangle but
+// draws nothing inside it. Each of those used to add height to the "completion section" and pushed the table
+// away from the section the player is looking at - the empty band reported under the sector name and icons.
+public static class CompletionBounds
+{
+    // The same floor `ResultsButtonPolicy` uses: what the page has faded to nothing is not part of the frame
+    // the player is looking at, and an alpha nobody could read is kept rather than dropped.
+    public const float VisibleAlpha = 0.02f;
+
+    // The bottom edge of one part, or NaN when that part is not on the page at all: switched off, faded out,
+    // or drawing nothing that could be measured. A part that draws something is measured from what it draws;
+    // only a part whose renderers cannot be read at all falls back to its own container rectangle.
+    public static float PartBottom(in CompletionPart part)
+    {
+        if (!part.Present || !part.Active) return float.NaN;
+        if (float.IsFinite(part.Alpha) && part.Alpha <= VisibleAlpha) return float.NaN;
+        if (float.IsFinite(part.VisualBottom)) return part.VisualBottom;
+        return float.IsFinite(part.OwnBottom) ? part.OwnBottom : float.NaN;
+    }
+
+    // The deepest bottom edge among the parts the player can really see, and which of them produced it.
+    // `deepest` is -1 when nothing on the page could be measured, which leaves the caller on its fallback.
+    public static float Deepest(IReadOnlyList<CompletionPart> parts, out int deepest)
+    {
+        deepest = -1;
+        float bottom = float.NaN;
+        if (parts == null) return bottom;
+        for (int index = 0; index < parts.Count; index++)
+        {
+            float candidate = PartBottom(parts[index]);
+            if (!float.IsFinite(candidate)) continue;
+            if (float.IsFinite(bottom) && candidate <= bottom) continue;
+            bottom = candidate;
+            deepest = index;
+        }
+        return bottom;
+    }
+
+    public static float Deepest(params CompletionPart[] parts) { return Deepest(parts, out int _); }
+}
+
+// The screen rectangle a set of already-projected corners spans, with the sanity rules every measurement of a
+// result page goes through.
+//
+// It exists so that a Renderer measured from its own world bounds and a UI element measured from its RectTransform
+// are judged by exactly one set of rules, and so that those rules can be asserted headlessly: the projection itself
+// needs Unity, the judgement does not. A corner that could not be projected (not a number) makes the whole box
+// unusable - half a box is not a box - and a rectangle a pixel tall, entirely off the frame, or the whole window is
+// not a measurement of anything either. Everything is in window pixels with y counted from the top.
+public static class ScreenBounds
+{
+    public static bool TryFromCorners(IReadOnlyList<float> xs, IReadOnlyList<float> ys,
+        float screenWidth, float screenHeight, out LayoutRect rect)
+    {
+        rect = default;
+        if (xs == null || ys == null || xs.Count == 0 || xs.Count != ys.Count) return false;
+        if (!float.IsFinite(screenWidth) || !float.IsFinite(screenHeight) || screenWidth <= 0f || screenHeight <= 0f) return false;
+        float x0 = float.MaxValue, y0 = float.MaxValue, x1 = float.MinValue, y1 = float.MinValue;
+        for (int corner = 0; corner < xs.Count; corner++)
+        {
+            float x = xs[corner], y = ys[corner];
+            if (!float.IsFinite(x) || !float.IsFinite(y)) return false;
+            x0 = Math.Min(x0, x); x1 = Math.Max(x1, x);
+            y0 = Math.Min(y0, y); y1 = Math.Max(y1, y);
+        }
+        float width = x1 - x0, height = y1 - y0;
+        if (!(width > 1f) || !(height > 1f)) return false;
+        if (x1 <= 0f || x0 >= screenWidth || y1 <= 0f || y0 >= screenHeight) return false;
+        if (width >= screenWidth && height >= screenHeight) return false;
+        rect = new LayoutRect(x0, y0, width, height);
+        return true;
+    }
+}
+
+// Whether the success board may be placed from what this frame measured.
+//
+// The success page's upper bound is the completion section's own visible pixels. When none of that section can be
+// read there is nothing on the page this build can prove the table stays below, and the historical fraction of the
+// window is not such a proof: on the captured pages it sits *above* the cleared-sector icons and their captions, so
+// a board placed there is drawn over the very section it is meant to stand under. The board is therefore deferred -
+// not drawn at all this frame, the vanilla page left exactly as the game drew it - and asked for again on the next
+// frame, exactly like a page whose completion section is still arriving. A strip that was measured but cannot hold
+// the table is deferred for the same reason: it is refused rather than squeezed over the completion section or the
+// button. The button stays the strict lower bound either way.
+public static class ResultsUpperBound
+{
+    public enum Decision { Deferred = 0, Placed = 1 }
+
+    // `completionMeasured` is what `CompletionBounds.Deepest` answered for the section's visible pixels, and
+    // `stripFits` is `ResultsRegion.Resolve`'s answer for the strip between that edge and the lobby button.
+    public static Decision Decide(bool completionMeasured, bool stripFits)
+        => completionMeasured && stripFits ? Decision.Placed : Decision.Deferred;
+}
 // Whether a control of a result page is really on the screen, and therefore whether the board has to keep
 // out of its way. Three kinds of object live in these pages without being part of them: a control the page
 // switched off for this state (the host's own lobby button on a client's fail page), a control whose canvas
@@ -621,13 +750,15 @@ public static class PanelAppearance
     }
 }
 
-// Where the failure page's own message has to end and where the board under it begins, so the two
-// result screens carry their board in one and the same strip. The success page's completion section is
-// measured while it is up and remembered here - the failure page has no such section, so its own
-// message is moved until its bottom edge is that same line, and the board then starts the same gap
-// under it: identical arithmetic to the success side, which is what "the same place" means. The
-// remembered line is only ever reused at the window size it was measured at, and a page whose line was
-// never seen keeps the message exactly where the game put it.
+// Where the failure page's board begins: under the page's own message.
+//
+// The message is the element the player is looking at, so its measured bottom edge plus the page's gap is what
+// decides where the board starts - the spacing between the failure title (and the sector icons over it) and the
+// table is the native composition's, not a remembered line from another screen. The line the success page's
+// completion section ended on is kept as the fallback for a frame in which the message has faded in but cannot
+// be measured yet, so a page that never hands over its title still gets a board in the same strip both screens
+// share instead of one hanging from the historical fraction of the window. The remembered line is only ever
+// reused at the window size it was measured at.
 public static class FailureAlignment
 {
     private static float _completionBottom = float.NaN;
@@ -650,19 +781,22 @@ public static class FailureAlignment
 
     public static void Forget() { _completionBottom = float.NaN; _completionScreenHeight = float.NaN; }
 
-    // The line the failure page's message must end on, and the strip its board may use - produced by the
-    // very same rule the success page uses, so the two boards stand in the same place. The message is
-    // never pushed off the top of the page and never pushed down onto the buttons: a line that would do
-    // either is refused and the message stays where the game put it.
+    // The line the failure page's board starts under. The native message wins whenever it could be measured:
+    // it is the element the player sees, and the gap under it is the whole of the spacing rule. A message that
+    // has not arrived yet - the page fades it in - falls back to the line the success page's completion section
+    // remembered for this window size, and only a session that never measured either keeps the historical
+    // fraction. Nothing here moves the message: it is read where the game put it.
     public static bool Resolve(bool messageMeasured, float messageBottom, float screenHeight, float offsetY, float gap,
         bool buttonMeasured, float buttonTop, out float alignedBottom, out ResultsSafeArea strip)
     {
         alignedBottom = float.NaN; strip = default;
         if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
         if (!float.IsFinite(gap) || gap < 0f) gap = 0f;
+        bool measured = messageMeasured && float.IsFinite(messageBottom)
+            && messageBottom >= 0f && messageBottom < screenHeight - 8f;
         bool anchored = AnchorKnown(screenHeight) && _completionBottom < screenHeight - 8f && _completionBottom >= screenHeight * 0.05f;
-        if (anchored) alignedBottom = _completionBottom;
-        else if (messageMeasured && float.IsFinite(messageBottom) && messageBottom >= 0f && messageBottom < screenHeight - 8f) alignedBottom = messageBottom;
+        if (measured) alignedBottom = messageBottom;
+        else if (anchored) alignedBottom = _completionBottom;
         else alignedBottom = screenHeight * ResultsHeading.FallbackBottomFraction;
         strip = ResultsRegion.Resolve(true, alignedBottom, buttonMeasured, buttonTop, screenHeight, gap);
         if (!strip.Fits) return false;
@@ -670,6 +804,21 @@ public static class FailureAlignment
         strip = new ResultsSafeArea(top, strip.Bottom);
         return strip.Fits;
     }
+
+    // Which of the three produced the line, for the one diagnostic line the failure page writes: the native
+    // message, the completion line an earlier success page remembered, or the historical fraction.
+    public static string Source(bool messageMeasured, float messageBottom, float screenHeight)
+    {
+        bool measured = messageMeasured && float.IsFinite(messageBottom)
+            && messageBottom >= 0f && messageBottom < screenHeight - 8f;
+        if (measured) return "mission-failed-text";
+        return AnchorKnown(screenHeight) ? "remembered-completion" : "window-fraction";
+    }
+
+    // Whether the page's own message is still worth waiting for. The wait is bounded, so a title that never
+    // becomes readable costs the page a fixed number of frames and no more: after that the strip is measured
+    // from the fallback above and the board is drawn.
+    public static bool WaitForTitle(int misses, int attempts) => attempts > 0 && misses < attempts;
 }
 
 // ---------------------------------------------------------------------------------------------------

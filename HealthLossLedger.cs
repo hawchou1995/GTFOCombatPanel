@@ -82,3 +82,41 @@ internal sealed class HealthLossLedger
         unchecked { return pointer * 397L ^ (long)owner; }
     }
 }
+
+// Which of a player's damage-base methods this mod observes for blood loss.
+//
+// Everything that reports a figure is observed, because the watermark ledger only credits a real decrease and
+// therefore needs no exclusion list to stay correct. There is exactly one exception, and it is a crash
+// mitigation rather than a change of policy: `ReceiveParasiteDamage` is left unpatched so the game's own
+// method carries no detour of this mod at all. Two sessions on one machine - one host, one client, the same
+// rundown layout - ended in the same `Stack overflow; Repeat 1526 times; DMD<ReceiveParasiteDamage> <->
+// IL2CPP runtime invoke` signature, and this mod's only detour anywhere near that call is the postfix below,
+// which observes every `Receive*` of `Dam_PlayerDamageBase`. The link is a correlation and not a proof: no
+// callback frame of this mod appears in those stacks. Leaving that single method alone is the smallest change
+// that removes the correlation. The game's damage is untouched and every other `Receive*` still reports, but the
+// cost is real and it is not merely a delay: the ledger only credits a decrease it *observes*, so a drop caused by
+// a parasite tick that no other observed event reports is not sampled at all. Whether the next observation recovers
+// it depends on what that observation is - a later decrease (any other `Receive*`, `Setup`, `OnRevive`,
+// `OnApplyDamageOverTimeModifier`, `OnKilledByTankTentacle`) credits the accumulated difference, but a heal, a revive
+// or a maximum-health change lands first often enough, and its watermark re-bases upward, after which the parasite
+// damage is gone from `HealthLost` for good. The metric is therefore allowed to under-count for that one damage kind;
+// no line anywhere may promise that the next observation recovers it.
+//
+// Nothing else may be added here: a re-entry guard was considered and rejected, because the reported stack
+// never returns to this postfix - the loop lives inside the IL2CPP bridge, where no postfix gets a frame.
+public static class HealthLossTargets
+{
+    // The one method this mod deliberately does not detour.
+    public const string ParasiteDamage = "ReceiveParasiteDamage";
+
+    // Every `Receive*` of the damage base is observed, except that one, and the named events below are
+    // observed for the reasons the ledger documents (a heal, a revive, a tentacle kill and the spawn seed).
+    public static bool Accepts(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        if (name == ParasiteDamage) return false;
+        if (name.StartsWith("Receive", StringComparison.Ordinal)) return true;
+        return name == "OnApplyDamageOverTimeModifier" || name == "OnRevive"
+            || name == "OnKilledByTankTentacle" || name == "Setup";
+    }
+}
