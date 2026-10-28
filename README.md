@@ -2,7 +2,7 @@
 
 独立 GTFO 战斗统计面板：局内看战斗数据，成功或失败结算看队伍贡献。表格由 IMGUI 画在窗口像素里，不写入任何原版文字对象。
 
-- **当前状态**：`1.19.12` 为本地候选版本（源码与包内文案已更新，`scripts\Verify.ps1` 本地通过，正式 ZIP 已在本地打出：`artifacts\GTFOCombatPanel-1.19.12.zip`；**未**上传、未发布）。逐版变更、未验证项与验证记录只写在 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；Thunderstore 详情页与包内 `Thunderstore/README.md` 只保留常青的功能/配置/安装文档，不列更新日志。
+- **当前状态**：`1.19.12` **已发布到 Thunderstore**（per-version `HawChow-CombatPanel-1.19.12`，`is_active=true`；package latest = `1.19.12`；listing 仍为唯一 GTFO / Client Mods / NSFW=false）。线上包与本地成品逐 byte 一致：`GTFOCombatPanel-1.19.12.zip` **348774** 字节、SHA-256 `29E2320C53469DAE5E2463640693DBC9BC14D1EDBEC4055C654EEF0B3FD9941C`；包内 `GTFOCombatPanel.dll` **377856** 字节、SHA-256 `9CA9399CC850F37625754A4276555AA934D51E5CB12F472A19D78A1A6D4631CC`。源码已同步到 GitHub（代码提交 `96a31ea1d23071230fb4c133ffa420e440307b2f`）。逐版变更、未验证项与验证记录只写在 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；Thunderstore 详情页与包内 `Thunderstore/README.md` 只保留常青的功能/配置/安装文档，不列更新日志。
 - **安装**：r2modman / Thunderstore Mod Manager 搜索 `CombatPanel`（自动带上 BepInEx 依赖）；或手动把包内 `BepInEx/plugins/GTFOCombatPanel/` 整个目录放进 GTFO 目录下的同一路径。`CombatPanel-config/scoring.json` 只在缺失时创建一次，手改过的配置不会被覆盖。已有 `.cfg` 在升级时保留，新配置项下次加载自动补齐。
 - **兼容**：仅依赖 **BepInEx-BepInExPack_GTFO-3.2.3**；EWC（ExtraWeaponCustomization）是可选集成，公共 DLL 不带它的程序集引用。多人快照协议为 **v8**，与旧协议不兼容（旧协议包会被明确拒收）。需要共享统计的每台机器装同一版本。
 - **反馈**：<https://qingju.me>；开黑语音频道（小黑盒语音）<https://chat.xiaoheihe.cn/in1wpsjd>。
