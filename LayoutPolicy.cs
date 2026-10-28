@@ -815,10 +815,11 @@ public static class FailureAlignment
         return AnchorKnown(screenHeight) ? "remembered-completion" : "window-fraction";
     }
 
-    // Whether the page's own message is still worth waiting for. The wait is bounded, so a title that never
-    // becomes readable costs the page a fixed number of frames and no more: after that the strip is measured
-    // from the fallback above and the board is drawn.
-    public static bool WaitForTitle(int misses, int attempts) => attempts > 0 && misses < attempts;
+    // There is deliberately no "wait for the title, then place anyway" rule here. The wait for a settled title is
+    // owned by `ResultTitleGate` (full opacity over an edge that has stopped moving) and it has no timeout that turns
+    // into a placement: a page whose own message never arrives keeps the game's own screen, and the placement is
+    // retried at the bounded cadence `ResultRetryCadence` keeps. A fraction of the window is not a substitute for the
+    // page's own title - on the captured pages it sits above the title and would put the board on top of it.
 }
 
 // ---------------------------------------------------------------------------------------------------

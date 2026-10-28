@@ -93,17 +93,30 @@ internal static class ResultsDisplay
             if (_page != null) RestoreHidden();
             ResetPlacement();
             ClearHit();
+            // Turning the board off and on again is a fresh attempt: the settle state is kept (a page that has already
+            // been measured stays measured) but the retry cadence starts over, so the board comes back on the next
+            // frame rather than up to half a second later.
+            Retry.Forget();
             return;
         }
         // The placed board keeps its position and size while current cells fit its measured grid.
-        // Polls refresh the text and archive; geometry is remeasured only when updated data outgrows it.
-        // The one exception is the second look below: a board that was placed against a guess because the
-        // lobby button handed it no geometry is re-measured once, the moment that geometry appears.
+        // Polls refresh the text and archive; geometry is remeasured only when updated data outgrows it, or when
+        // `FallbackRecoveryDue` says the strip this board was measured into no longer describes this page: a
+        // placement that had to fall back before one of the page's own edges was readable, or a page that has
+        // moved since (another mod's footer, a resolution change, a section that finished drawing later). Both
+        // are budgeted per page, so a settled board is never rebuilt for a frame of the page's own animation.
         if (_placed && _placedSucceeded == succeeded && _grid != null && _content != null &&
             _page != null && _page.gameObject.activeInHierarchy)
         {
             if (!FallbackRecoveryDue(succeeded, _page) && RefreshBoardData(_page, succeeded)) return;
         }
+        // A page whose own anchors have not arrived yet is measured every frame while its reveal runs, then at a
+        // bounded cadence: measuring a page walks its renderers and every button it drew, and a page that never hands
+        // an anchor over would pay for that on every frame for the rest of the expedition while the vanilla page is on
+        // the screen anyway. A skipped frame draws nothing and hides nothing - the caches are already empty, so the
+        // game's own page stays exactly as it drew it.
+        if (!Retry.Due(Time.frameCount)) return;
+
         Component previous = _page;
         ResetPlacement();
         if (previous != null) RestoreHidden();
@@ -175,26 +188,30 @@ internal static class ResultsDisplay
     private static bool _holdValid;
     private static LayoutRect _holdBoard;
     private static float _holdOpacity;
-    // The page animates its footer in. A button measured mid-animation sits higher than the one the player
-    // ends up pressing, and the board built against that edge is permanently too short - `TryHold` never
-    // enlarges a board, by design, so a first measurement taken too early is never corrected. These wait
-    // for the edge to stop moving before the one and only measurement is taken; after that the board is
-    // fixed for the life of the page, which is what keeps a redraw or a hover from resizing it.
-    private static float _seedButtonTop = float.NaN;
-    private static int _seedSettleFrames, _seedAttempts, _seedButtonMisses;
-    // The board standing now was laid out against the historical fraction of the window because the lobby
-    // button handed it no geometry at all, and the one second look that case is allowed: a page whose button
-    // becomes readable a moment later is re-measured once, not every frame. See `ResultAnchorRecovery`.
+    // The page animates its footer in. A button measured mid-animation sits higher than the one the player ends up
+    // pressing, and the board built against that edge is permanently too short - `TryHold` never enlarges a board, by
+    // design, so a first measurement taken too early is never corrected. `Footer` follows that edge across frames and
+    // answers "settled" only for an edge it really read at the same value twice; a button the page never hands over
+    // stays unanswered, and the vanilla page is kept rather than a board drawn from a fraction of the window. The
+    // failure page's own title is followed by `Title` (full opacity *and* a still edge) and the success page's
+    // completion section by `Completion`.
+    private static readonly ResultEdgeGate Footer = new ResultEdgeGate();
+    private static readonly ResultTitleGate Title = new ResultTitleGate();
+    private static readonly ResultEdgeGate Completion = new ResultEdgeGate();
+    // A page whose own anchors have not arrived is measured every frame while its reveal runs, then at a bounded
+    // cadence: waiting for an anchor must not cost a full walk of the page's renderers and buttons on every frame for
+    // the rest of the expedition, and it must not buy an approximate board either.
+    private static readonly ResultRetryCadence Retry = new ResultRetryCadence();
+    // The board standing now was laid out against a guess - the lobby button handed it no geometry - and the one second
+    // look that case is allowed: a page whose own edges become readable a moment later is re-measured once, not every
+    // frame. See `ResultAnchorRecovery`.
     private static bool _placedOnFallback;
     private static int _fallbackRecoveries;
-    private const int ButtonSettleFrames = 2;
-    private const int ButtonSettleAttempts = 120;
-    // How many frames the failure page's own message is waited for before the strip is measured without it. The
-    // page fades that title in, and a board placed before it arrives is seen on its own and then jumps; a title
-    // that never becomes measurable must not cost the page its board, so the wait is bounded and the strip then
-    // falls back to the line an earlier success page remembered (never to a permanent fraction of the window).
-    private const int TitleSettleAttempts = 120;
-    private static int _seedTitleMisses;
+    // The strip the board standing now was really measured into, and the comparison that notices the page has
+    // moved away from it. Both live as long as the page does: a re-measure is a bounded answer to a real move,
+    // never a per-frame rebuild, and it is what makes an F8 toggle unnecessary.
+    private static BoardStrip _holdStrip;
+    private static readonly ResultAnchorDrift Drift = new ResultAnchorDrift();
     private static readonly CompletionReadiness Readiness = new CompletionReadiness();
 
     private static void ForgetPage()
@@ -203,7 +220,12 @@ internal static class ResultsDisplay
         _holdValid = false;
         _holdBoard = default;
         _holdOpacity = 0f;
-        _seedButtonTop = float.NaN; _seedSettleFrames = 0; _seedAttempts = 0; _seedButtonMisses = 0; _seedTitleMisses = 0;
+        // A different screen has a different footer, title and completion section: every settle state, the retry
+        // cadence and the recorded strip are dropped here and nowhere else.
+        Footer.Forget(); Title.Forget(); Completion.Forget();
+        Retry.Forget();
+        _holdStrip = default;
+        Drift.Forget();
         _placedOnFallback = false; _fallbackRecoveries = 0;
         // A different screen has a different board, and the wheel is only ever aimed at the one on the page now.
         ClearHit();
@@ -215,9 +237,10 @@ internal static class ResultsDisplay
     }
 
     // A configuration change (weights, thresholds, columns, the vanilla-block flags) may move the board or
-    // the blocks it stands in for, so the caches are dropped and the next poll remeasures. Called on the
-    // main thread from Plugin.ApplyConfig.
-    internal static void Invalidate() => ResetPlacement();
+    // the blocks it stands in for, so the caches are dropped and the next poll remeasures. The retry cadence is
+    // dropped too: a change the player just made is measured on the next frame, not on the next cadence tick.
+    // Called on the main thread from Plugin.ApplyConfig.
+    internal static void Invalidate() { ResetPlacement(); Retry.Forget(); }
 
     internal static void Draw()
     {
@@ -267,7 +290,7 @@ internal static class ResultsDisplay
                 // A first placement still has to fit the strip the page measured: below the page's own message
                 // and above the buttons the player has to press. A board that cannot fit is not drawn rather
                 // than drawn over a button.
-                if (!FailureStrip(_page, ref _seedTitleMisses, out float top, out float bottom, out opacity, out bool buttonMeasured, out float buttonTop, out float buttonHeight)) return;
+                if (!FailureStrip(_page, out float top, out float bottom, out opacity, out bool buttonMeasured, out float buttonTop, out float buttonHeight, out _)) return;
                 if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight), _grid.Width, _grid.Height,
                     Plugin.ResultsOffsetX.Value, out LayoutRect fitted, BoardSlack))
                 {
@@ -325,24 +348,128 @@ internal static class ResultsDisplay
         return _page == null || _grid == null || ResultBoardLatch.NeedsAttach(_placed, _placedSucceeded == succeeded);
     }
 
-    // The one second look at a board that was laid out without the lobby button's geometry.
+    // Whether the board standing now should be measured again instead of merely refreshed.
     //
-    // `1.19.8` measured the success page's button before its footer had finished revealing, was told there was
-    // no button, and placed the board against the historical fraction of the window - then kept that placement,
-    // and the glyph size it forced, for the life of the page: `_placed` and `_holdValid` are latched precisely so
-    // a settled board never jumps. The latch is right, the one-off mistake is not, so a board placed against a
-    // guess is re-measured exactly once when the button's own rectangle becomes readable. `ResultAnchorRecovery`
-    // owns the budget: one retry per page, never a per-frame re-measure, and a board whose strip was measured is
-    // not touched at all.
+    // Two things answer yes, and both are budgeted per page:
+    //
+    //   the second look   the board was laid out against a guess - the lobby button handed no geometry, or the
+    //                     anchor above it had not settled - and the page's own edges are readable now. That is
+    //                     the difference between a first measurement taken before the footer had revealed and a
+    //                     table that stays small for the rest of the expedition, and it is what
+    //                     `ResultAnchorRecovery` budgets: one retry per page, never a per-frame re-measure.
+    //                     `1.19.8` only ever took it on the success page; both pages take it now, because the
+    //                     failure page's title and footer animate in exactly the same way.
+    //   the page moved    the strip the board was really measured into no longer describes this page: another
+    //                     mod re-laid the footer out, the resolution changed, the completion section's optional
+    //                     parts appeared after the native Blink finished. `ResultAnchorDrift` compares the
+    //                     recorded strip against a fresh measurement, with a threshold and two samples of
+    //                     hysteresis, and spends at most two re-measures per page.
+    //
+    // A board whose strip was measured and whose page has not moved is touched by neither, which is what keeps a
+    // settled table from jumping.
     private static bool FallbackRecoveryDue(bool succeeded, Component page)
     {
-        if (!succeeded || page == null || !_placedOnFallback) return false;
-        if (!ResultAnchorRecovery.ShouldRetry(_fallbackRecoveries, true, SuccessButtonReadable(page))) return false;
-        _fallbackRecoveries = ResultAnchorRecovery.Record(_fallbackRecoveries);
-        _placedOnFallback = false;
-        if (HeadingReports.Add("success-region-recovered"))
-            Plugin.Logger?.LogInfo("[DIAG] success region re-measured: the lobby button's own rectangle became readable after the board had been laid out on the historical fraction of the window, so this page is measured again once - and only once - and the board is re-placed against the button instead of the guess.");
+        if (page == null || !_placed) return false;
+        if (_placedOnFallback && AnchorReadable(page, succeeded)
+            && ResultAnchorRecovery.ShouldRetry(_fallbackRecoveries, true, true))
+        {
+            _fallbackRecoveries = ResultAnchorRecovery.Record(_fallbackRecoveries);
+            _placedOnFallback = false;
+            if (HeadingReports.Add(succeeded ? "success-region-recovered" : "failure-region-recovered"))
+                Plugin.Logger?.LogInfo($"[DIAG] {(succeeded ? "success" : "failure")} region re-measured: both of this page's own edges - the anchor the board hangs from and the button it has to clear - are readable now, and the board standing here was laid out before one of them was, so this page is measured again once - and only once - and the board is re-placed against the real strip instead of the guess.");
+            RearmSettle();
+            return true;
+        }
+        return AnchorDriftDue(page, succeeded);
+    }
+
+    // Whether the page's own two edges can both be measured now: the anchor the board hangs from and the button
+    // it may not reach. That is the whole of "the second look is worth taking" - re-measuring before the footer
+    // hands over its geometry would only reproduce the guess that was placed in the first place.
+    private static bool AnchorReadable(Component page, bool succeeded)
+        => succeeded ? SuccessButtonReadable(page) : FailureEdgesReadable(page);
+
+    // The failure page's own two edges: the native title, anywhere on the frame, and one of the two footer
+    // buttons the strip is bounded by. Alpha is deliberately not part of it - the reveal is exactly the case the
+    // second look exists for - and neither is whether the title has finished settling: the strip only has to be
+    // readable.
+    private static bool FailureEdgesReadable(Component page)
+    {
+        try
+        {
+            var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
+            if (fail == null) return false;
+            var heading = fail.m_missionFailed_text;
+            if (heading == null || !heading.gameObject.activeInHierarchy) return false;
+            LayoutRect title = default;
+            if (!TryScreenRect(heading, out title) || !float.IsFinite(title.Bottom)) return false;
+            return float.IsFinite(VisibleTop(fail.m_btnRestartCheckpoint))
+                || float.IsFinite(VisibleTop(fail.m_btnGoToLobby));
+        }
+        catch { return false; }
+    }
+
+    // The page moved away from the strip the board was measured into. The sample is the same measurement the
+    // placement uses, taken without any of its gates and without touching a counter, a hold or a log line of the
+    // placement itself: a frame that cannot read the page's own edges is not evidence that they moved.
+    private static bool AnchorDriftDue(Component page, bool succeeded)
+    {
+        if (!Drift.Armed) return false;
+        if (!AnchorSample(page, succeeded, out float top, out float bottom)) return false;
+        if (!Drift.Due(top, bottom - top)) return false;
+        Drift.Spent();
+        if (HeadingReports.Add(succeeded ? "success-region-moved" : "failure-region-moved"))
+            Plugin.Logger?.LogInfo($"[DIAG] result board re-measured: the {(succeeded ? "success" : "failure")} page's own edges have moved since this board was placed - the strip it was measured into was ({_holdStrip.Top:0}..{_holdStrip.Bottom:0}) and it is ({top:0}..{bottom:0}) now - so the board is fitted again against what the page really offers, once, instead of staying at the size of a page that is no longer there. {Drift.Recoveries}/{ResultAnchorDrift.MaximumRecoveries} re-measures of this page have been spent; no F8 toggle is needed for this.");
+        RearmSettle();
         return true;
+    }
+
+    // The strip this page offers now, measured for the drift test only: no gates, no counters, no log lines, and
+    // no effect on what is drawn this frame.
+    private static bool AnchorSample(Component page, bool succeeded, out float top, out float bottom)
+    {
+        top = float.NaN; bottom = float.NaN;
+        try
+        {
+            if (page == null) return false;
+            if (succeeded)
+            {
+                // Exactly the edges `Placement` places from, so the comparison is against the same measurement.
+                if (!SuccessRegion(page, out ResultsSafeArea area, out _, out _, out _) || !area.Fits) return false;
+                top = Math.Max(0f, area.Top) + Mathf.Max(0f, Plugin.ResultsOffsetY.Value);
+                bottom = Math.Min(area.Bottom, Screen.height - 8f);
+                return float.IsFinite(top) && float.IsFinite(bottom) && bottom > top;
+            }
+            var fail = page.TryCast<CM_PageExpeditionFail>();
+            if (fail == null) return false;
+            var heading = fail.m_missionFailed_text;
+            if (heading == null || !heading.gameObject.activeInHierarchy) return false;
+            if (!TryScreenRect(heading, out LayoutRect title)) return false;
+            LayoutRect restart = default, go = default;
+            float restartTop = VisibleRect(fail.m_btnRestartCheckpoint, out restart) ? restart.Y : float.NaN;
+            float goTop = VisibleRect(fail.m_btnGoToLobby, out go) ? go.Y : float.NaN;
+            float lobbyTop = ResultsRegion.HighestTop(restartTop, goTop);
+            float buttonTop = ResultsRegion.LobbyEdge(float.IsFinite(lobbyTop), lobbyTop, ButtonBand(page, float.NaN), Screen.height);
+            bool buttonMeasured = float.IsFinite(buttonTop);
+            if (!FailureAlignment.Resolve(true, title.Bottom, Screen.height, Plugin.ResultsOffsetY.Value, MessageGap,
+                buttonMeasured, buttonTop, out _, out ResultsSafeArea strip)) return false;
+            top = strip.Top;
+            bottom = Math.Min(strip.Bottom, Screen.height - 8f);
+            return float.IsFinite(top) && float.IsFinite(bottom) && bottom > top;
+        }
+        catch { return false; }
+    }
+
+    // A re-measure is a first measurement: the settle state of the page's own edges and the retry cadence are re-armed
+    // so the second look is exactly as strict as the first one was, and it happens on the next frame rather than on the
+    // next cadence tick. Left alone, a state spent while the page was still arriving would let the second placement
+    // through on a single frame's reading - the weaker gate the F8 toggle has always had.
+    private static void RearmSettle()
+    {
+        Footer.Forget();
+        Title.Forget();
+        Completion.Forget();
+        Retry.Forget();
     }
 
     // Whether the success page's lobby button now hands over its own geometry, by either of the two questions
@@ -432,10 +559,15 @@ internal static class ResultsDisplay
         // again next frame, instead of hiding its own blocks and drawing nothing over the gap.
         if (!ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded), _grid != null, _content != null)) return;
         _placed = true; _placedSucceeded = succeeded;
-        // A strip that was measured - through the button itself or through its own layout rectangle - is not a
-        // guess, and the board is never re-measured away from it. One that fell back to the historical fraction
-        // of the window is, and it keeps the right to exactly one second look.
-        _placedOnFallback = ResultAnchorRecovery.LatchFallback(_fallbackRecoveries, strip.ButtonMeasured);
+        // A strip whose three facts were all measured is not a guess and the board is never re-measured away from it:
+        // the anchor it hangs from in its settled state, the button's own top edge, and that button's height - which is
+        // the one figure the readability floor is taken from and which only exists when the bound came from a named
+        // control rather than from the drawn band of everything the page put at its bottom. A strip built from the band
+        // is therefore the case that keeps the right to exactly one second look, taken when that control's own
+        // rectangle becomes readable. With the strict gates above, a strip is only ever placed from measured edges, so
+        // this is now a precision backstop rather than the normal path.
+        _placedOnFallback = ResultAnchorRecovery.LatchFallback(_fallbackRecoveries,
+            strip.ButtonMeasured && strip.AnchorMeasured && float.IsFinite(strip.ButtonHeight));
     }
 
     // The glyph size the settlement board is drawn at, and the grid that size produces.
@@ -651,6 +783,12 @@ internal static class ResultsDisplay
             // reload that follows it and the page's own button animation all come back through here, and none of
             // them may cost the board the strip it was already given.
             _holdValid = true; _holdBoard = origin; _holdOpacity = 0f;
+            // The strip itself is kept next to the place, because a page that later offers a different one is a
+            // page this board no longer fits: `ResultAnchorDrift` compares the strip's upper edge and the room it
+            // gave against what the page measures from now on, and asks for one bounded re-measure when they have
+            // really moved.
+            _holdStrip = strip;
+            Drift.Record(strip.Top, strip.Bottom - strip.Top);
             float x = origin.X, y = origin.Y;
             if (!_loggedDraw)
             {
@@ -669,9 +807,21 @@ internal static class ResultsDisplay
         // own bounds move by a pixel or two while it is hovered, so a board measured against one frame can be
         // refused by the next - which is exactly how the failure board disappeared and only came back while the
         // player happened to hover the page. A board that is already up on this page keeps the place it was
-        // measured into; `Draw` holds it there and lifts it off the button if the button really did move onto it.
+        // measured into.
+        //
+        // What it does *not* do is keep that place for a grid that no longer clears it. A later settlement
+        // snapshot can ask for a taller table, and the failure page's `Draw` lifts such a board off the button
+        // every frame while the success page has no per-frame wall at all - so the grid is checked against the
+        // strip this board was really measured into and against this frame's button, and a grid that reaches
+        // either keeps the grid that is already up instead of growing over the control the player has to press.
         if (_holdValid && _page != null && ResultVisibility.SamePage(_holdPage, _page.Pointer))
         {
+            if (!ResultBoardHold.HeldGridFits(_holdStrip, strip, _holdBoard, grid.Height, Screen.height, BoardSlack))
+            {
+                if (HeadingReports.Add("board-growth-refused"))
+                    Plugin.Logger?.LogInfo($"[DIAG] result board kept at its measured size: a refreshed {grid.Width:0}x{grid.Height:0} board would come within the lobby button's clearance line (button top {(float.IsFinite(strip.ButtonTop) ? strip.ButtonTop.ToString("0") : "unmeasurable")}) or run past the strip it was measured into ({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), so the grid already on the page is kept and the next snapshot asks again.");
+                return true;
+            }
             _origin = _holdBoard;
             _content = content; _grid = grid;
             if (HeadingReports.Add("board-held"))
@@ -684,28 +834,35 @@ internal static class ResultsDisplay
 
     // Where the board's top edge goes and how much room it has, together with the strip that produced it and
     // the lobby button that bounds it, so that place can be held afterwards. On the failure screen the board
-    // waits for the page's own message to be measurable and then sits under it: a board that landed before the
-    // message would be seen on its own and jump as the message faded in, which is the flicker that was
-    // reported. On the success screen the board measures the strip between the expedition's completion section
-    // and the button that sends the squad home, and the table scales its font and row spacing to that strip, so
-    // all four players fit without covering either element.
+    // before that is seen on its own, jumps as the message fades in, and keeps the shorter strip it was measured
+    // into for the whole page. On the success screen the board measures the strip between the expedition's
+    // completion section and the button that sends the squad home, and the table scales its font and row spacing
+    // to that strip, so all four players fit without covering either element. Neither page places anything before
+    // both of its own edges - the anchor above and the button below - have been measured in their settled state.
     private static bool Placement(Component page, bool succeeded, out float top, out float room, out BoardStrip strip)
     {
         top = 0f; room = 0f; strip = default;
         if (!succeeded)
         {
-            // The page fades its own message in, so the strip is measured against a message that is already on the
-            // screen. `FailureStrip` waits for it for a bounded number of frames and then measures without it -
-            // against the line an earlier success page remembered, or the historical fraction - so a page whose
-            // message never becomes measurable still gets its board instead of waiting for ever.
-            if (!FailureStrip(page, ref _seedTitleMisses, out top, out float bottom, out _, out bool buttonMeasured, out float buttonTop, out float buttonHeight)) return false;
-            // The footer animates in, and a button measured mid-animation sits higher than the one the
-            // player ends up pressing. A held board is never enlarged, so a first measurement taken too early
-            // fixes the table permanently below the room the settled page actually offers. Wait for the edge
-            // to stop moving (bounded, in case a hover keeps nudging it), then measure once and fix it for
-            // the life of the page - which is also why nothing here ever enlarges it afterwards.
-            if (!ButtonSettled(buttonMeasured, buttonTop)) return false;
-            strip = new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight);
+            // The page fades its own message in and moves it as it lands, so the strip is measured against a title
+            // that has reached full opacity over an edge that has stopped moving - `FailureStrip` owns that rule and
+            // returns false until both hold. There is no bounded give-up here: a page whose own title never becomes
+            // readable keeps the game's own screen, and the attempt is repeated at the cadence `Retry` keeps.
+            if (!FailureStrip(page, out top, out float bottom, out _, out bool buttonMeasured, out float buttonTop, out float buttonHeight, out bool titleSettled)) return false;
+            // The footer animates in, and a button measured mid-animation sits higher than the one the player ends up
+            // pressing. A held board is never enlarged, so a first measurement taken too early fixes the table
+            // permanently below the room the settled page actually offers. `ButtonSettled` is true only for an edge it
+            // really read twice at the same value; a button the page never hands over keeps the vanilla screen instead
+            // of the shorter strip the historical fraction would allow.
+            if (!ButtonSettled(buttonMeasured, buttonTop))
+            {
+                // Once per page, and only when the page has really run out of readings: this is the case that must never
+                // turn into a board measured against a fraction of the window.
+                if (Footer.Exhausted && HeadingReports.Add("failure-footer-unsettled"))
+                    Plugin.Logger?.LogInfo($"[DIAG] failure board held back: {Footer.Misses} readings without a measurable footer button ({(buttonMeasured ? "an edge that never held still" : "no edge at all")}) and the title above it is settled, so no strip can be built; the vanilla failure page is left exactly as the game drew it and this page is retried at a bounded cadence - a board is never drawn from a fraction of the window.");
+                return false;
+            }
+            strip = new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight, titleSettled);
             room = Math.Min(bottom, Screen.height - 8f) - top;
             return room > 0f;
         }
@@ -730,40 +887,36 @@ internal static class ResultsDisplay
                     : "[DIAG] success board deferred: not one visible part of the completion section could be measured this frame, and the historical fraction of the window would sit above those icons and captions - so nothing is drawn over them and this page is asked again next frame (the vanilla page is left exactly as the game drew it).");
             return false;
         }
-        // The success page animates its footer in too, so its one measurement is taken against a settled
-        // button edge as well. A strip read mid-reveal would be permanently shorter than the page really
-        // offers, and the board is measured once and then kept for the life of the page.
-        // The footer is revealed from zero alpha, and a control nobody can see is deliberately not a bound - so
-        // the first frames of a freshly opened page offer no edge at all. Waiting for the reveal is what buys
-        // the board the height that is really there above the button; the wait is bounded, so a page whose
-        // button never becomes acceptable is still laid out against the completion section with the button's own
-        // historical lower bound, which can never lift the table over that section because the top is measured.
-        if (!measuredButton)
+        // The native reveal has finished, but the pixels of the completion section can still move for a frame or two
+        // while the page lays its own layout out - and this board is measured once and then kept for the life of the
+        // page. `Completion` follows that upper edge until it has been read at the same value twice; a section that
+        // keeps moving is not an anchor, nothing is drawn from it, and the attempt is repeated at the cadence `Retry`
+        // keeps.
+        bool completionSettled = Completion.Observe(true, area.Top);
+        if (!completionSettled) return false;
+        // The footer is revealed from zero alpha, and a control nobody can see is deliberately not a bound - so the
+        // first frames of a freshly opened page offer no edge at all. That is a wait, not a licence: a button the page
+        // never hands over keeps the game's own screen, because a strip stopped at a fraction of the window is a board
+        // at a size nobody can read. The same call answers for a footer that has arrived but is still moving.
+        if (!ButtonSettled(measuredButton, measuredTop))
         {
-            if (++_seedButtonMisses < ButtonSettleAttempts) return false;
+            if (Footer.Exhausted && HeadingReports.Add("success-footer-unsettled"))
+                Plugin.Logger?.LogInfo($"[DIAG] success board held back: {Footer.Misses} readings without a measurable lobby button ({(measuredButton ? "an edge that never held still" : "no edge at all")}), so no strip can be built under the completion section; the vanilla success page is left exactly as the game drew it and this page is retried at a bounded cadence - a board is never drawn against a fraction of the window.");
+            return false;
         }
-        else if (!ButtonSettled(measuredButton, measuredTop)) return false;
         top = Math.Max(0f, area.Top) + Mathf.Max(0f, Plugin.ResultsOffsetY.Value);
         room = Math.Min(area.Bottom, Screen.height - 8f) - top;
-        // The measured button travels with the strip: it is the edge the board may never reach, on either page.
-        // The measured button travels with the strip: it is the edge the board may never reach, on either
-        // page, and its own height is the size the board's readability floor is measured against.
-        strip = new BoardStrip(top, top + room, measuredButton, measuredTop, measuredHeight);
+        // The measured button travels with the strip: it is the edge the board may never reach, on either page, and its
+        // own height is the size the board's readability floor is measured against. The upper edge counts as measured
+        // because `ResultsUpperBound` refused to get here without it and `Completion` only settles a real reading.
+        strip = new BoardStrip(top, top + room, measuredButton, measuredTop, measuredHeight, completionSettled);
         return room > 0f;
     }
-
-    // The footer of a result page animates in, so the button's own top edge is only trusted once it has
-    // stopped moving. A page whose button could not be measured has nothing to wait for, and the wait is
-    // bounded so a hover that keeps nudging the edge cannot hold the board back for ever.
-    private static bool ButtonSettled(bool measured, float top)
-    {
-        if (!measured || !float.IsFinite(top)) return true;
-        bool steady = float.IsFinite(_seedButtonTop) && Math.Abs(top - _seedButtonTop) <= 1f;
-        _seedSettleFrames = steady ? _seedSettleFrames + 1 : 0;
-        _seedButtonTop = top;
-        _seedAttempts++;
-        return _seedSettleFrames >= ButtonSettleFrames || _seedAttempts >= ButtonSettleAttempts;
-    }
+    // The footer of a result page animates in, so the button's own top edge is only trusted once it has stopped moving -
+    // and a button the page has not drawn yet is not a licence to use a fraction of the window instead. `Footer` answers
+    // true only for an edge it really read at the same value twice; a button that never arrives leaves the vanilla page
+    // in place, and the page is retried at the bounded cadence `Retry` keeps.
+    private static bool ButtonSettled(bool measured, float top) => Footer.Observe(measured, top);
 
     private static string _completionState;
 
@@ -776,6 +929,20 @@ internal static class ResultsDisplay
         _completionState = null;
         Success = page;
         CompletionTargets.BeginPage();
+    }
+
+    // A new visit to the failure page is a new screen: its title starts fading in from zero again, its footer is
+    // revealed again, and none of the settle budgets the previous visit spent may be inherited. The game keeps
+    // both result pages alive for the whole session and raises them for every expedition, so without this the
+    // second expedition's failure page would be measured with a budget already used up - the same "already
+    // waited once, so place on whatever is readable now" shortcut that F8 used to inherit.
+    internal static void BeginFailurePage(CM_PageExpeditionFail page)
+    {
+        RestoreHidden();
+        ResetPlacement();
+        ForgetPage();
+        HeadingReports.Clear();
+        Fail = page;
     }
 
     // Blink completion is native state, not an inferred alpha or a camera culling flag.
@@ -1078,13 +1245,21 @@ internal static class ResultsDisplay
     // success screen uses (ResultsRegion.Resolve), so the board of either screen stands in the same safe
     // strip instead of each having its own idea of "below the heading". The edge that bounds it is chosen by
     // `ResultsRegion.LobbyEdge` - that button when it can be measured, the band of everything the page drew
-    // when it cannot - and measurement failure degrades to a screen-space fallback that still clears that
-    // band, never to permission to cover a button.
+    // when it cannot. When neither answers - no named button, and nothing drawn that could be one - there is
+    // no bound at all, and `buttonMeasured` comes back false: the caller then places nothing and leaves the
+    // vanilla failure page exactly as the game drew it, instead of inventing a bound out of a fraction of the
+    // window.
     //
     // The button's own top edge comes back with the strip: the button is the one edge a board that is
     // already up is still held to, so the draw path can keep that promise without re-measuring the whole
     // strip it was placed in.
-    private static bool FailureStrip(Component page, ref int misses, out float top, out float bottom, out float opacity, out bool buttonMeasured, out float buttonTop, out float buttonHeight)
+    // `anchorSettled` answers whether the upper edge was measured in its settled state: the title fully drawn -
+    // its alpha at full opacity, not a rectangle that merely stopped moving - over a bottom edge that had held
+    // still for two readings. This function hands back a strip only when it did: a false answer returns false
+    // below, so the caller places nothing, hides nothing, and asks again at the bounded cadence
+    // `ResultRetryCadence` keeps. There is no guessed upper bound to be re-measured later, because no guessed
+    // strip is ever placed.
+    private static bool FailureStrip(Component page, out float top, out float bottom, out float opacity, out bool buttonMeasured, out float buttonTop, out float buttonHeight, out bool anchorSettled)
     {
         top = Screen.height * 0.34f;
         bottom = Screen.height - 8f;
@@ -1092,29 +1267,48 @@ internal static class ResultsDisplay
         buttonMeasured = false;
         buttonTop = float.NaN;
         buttonHeight = float.NaN;
+        anchorSettled = false;
         try
         {
             var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
             var heading = fail?.m_missionFailed_text;
             bool present = heading != null;
             bool active = present && heading.gameObject.activeInHierarchy;
-            float alpha = present ? heading.alpha : float.NaN;
+            float alpha = present ? HeadingAlpha(heading) : float.NaN;
             LayoutRect rect = default;
             opacity = present && float.IsFinite(alpha) ? Mathf.Clamp01(alpha) : 1f;
 
-            // The page fades its own message in. A message that is present but not yet drawn is the one thing this
-            // wait exists for: a board placed before it arrives is seen on its own and then jumps as the title
-            // lands. The wait is bounded (`TitleSettleAttempts`), so a page whose title never becomes readable is
-            // still laid out - from the completion line an earlier success page remembered, or from the historical
-            // fraction when this session measured none - instead of waiting for ever.
-            const float TitleVisibleAlpha = 0.001f;
+            // The page fades its own message in, and it moves the title as it lands. Both halves matter: a board placed
+            // on the first frame on which the alpha left zero is seen on its own and then jumps, and - because its strip
+            // was measured from where that title happened to be at the time - it also keeps a shorter strip, and
+            // therefore a smaller table, for the whole page. `ResultTitleGate` therefore requires both things at once:
+            // the title as the player really sees it (its own text alpha multiplied by every canvas group above it) has
+            // reached full opacity, *and* its measured bottom edge has held still for two readings. A rectangle that has
+            // stopped moving while the text is still fading in is not a settled title - that is the report this rule
+            // exists for, and geometry alone must never be enough.
+            //
+            // There is no "wait a while, then place anyway". A page whose own title never becomes opaque keeps the
+            // game's own failure screen, and this is asked again at the bounded cadence `Retry` keeps - never with a
+            // fraction of the window standing in for the title it cannot read.
+            const float TitleVisibleAlpha = ResultTitleGate.VisibleAlpha;
             bool drawn = active && !(float.IsFinite(alpha) && alpha <= TitleVisibleAlpha);
-            if (present && !drawn && FailureAlignment.WaitForTitle(misses, TitleSettleAttempts)) { misses++; return false; }
             // The message is measured on the path this project already proved for a world-space TMP: its own
             // transform casts to a RectTransform even though nothing above it is a canvas, `TryScreenRect` resolves
             // the page's camera (`CM_PageBase.Camera`) first, the Renderer's own bounds are the pixels the player
             // sees, and the text box is only the fallback for a build that hands the renderer no extent.
             bool measured = drawn && TryScreenRect(heading, out rect);
+            anchorSettled = Title.Observe(active, alpha, measured, measured ? rect.Bottom : float.NaN);
+            if (!anchorSettled)
+            {
+                // One line per page, only once the wait is long enough to be worth reporting: the failure page is left
+                // exactly as the game drew it, and the caller retries at the bounded cadence.
+                if (Title.Misses == ResultRetryCadence.EveryFrameFrames && HeadingReports.Add("failure-title-unsettled"))
+                    Plugin.Logger?.LogInfo($"[DIAG] failure board held back: after {Title.Misses} readings the page's own title is still not fully drawn (alpha {(float.IsFinite(alpha) ? alpha.ToString("0.00") : "unreadable")} over {Title.OpaqueFrames} opaque readings) or its edge has not held still, so the vanilla failure page stays exactly as the game drew it; this page is retried at a bounded cadence and the board appears the moment the title really is on the screen.");
+                return false;
+            }
+            float titleBottom = float.IsFinite(Title.Edge) ? Title.Edge : rect.Bottom;
+            bool titleKnown = float.IsFinite(titleBottom);
+            if (!titleKnown) return false;
 
             // The buttons the board must never cover are the two this build knows by name: "send every
             // prisoner back to the lobby", `m_btnGoToLobby`, and "restart checkpoint",
@@ -1145,11 +1339,13 @@ internal static class ResultsDisplay
             buttonHeight = lobbyTop == restartTop ? restartRect.Height
                 : lobbyTop == goTop ? goRect.Height
                 : float.NaN;
-            // The board starts the gap under the message's own measured bottom edge - the native composition's
-            // spacing between the title, the sector icons over it and the table. Nothing is moved: the message stays
-            // exactly where the game put it, which is what makes the gap the game's rather than this mod's.
+            // The board starts the gap under the message's own bottom edge - the native composition's spacing
+            // between the title, the sector icons over it and the table. Nothing is moved: the message stays
+            // exactly where the game put it, which is what makes the gap the game's rather than this mod's. The
+            // edge is the one `titleKnown` describes: this frame's reading, or the last real reading of this very
+            // title, and only a page that never handed one over falls through to `FailureAlignment`'s own lines.
             float aligned;
-            if (!FailureAlignment.Resolve(measured, measured ? rect.Bottom : float.NaN, Screen.height, Plugin.ResultsOffsetY.Value,
+            if (!FailureAlignment.Resolve(titleKnown, titleKnown ? titleBottom : float.NaN, Screen.height, Plugin.ResultsOffsetY.Value,
                 MessageGap, buttonMeasured, buttonTop, out aligned, out ResultsSafeArea strip)) return false;
             top = strip.Top;
             bottom = Math.Min(strip.Bottom, Screen.height - 8f);
@@ -1166,21 +1362,46 @@ internal static class ResultsDisplay
             // The blank bands the strip leaves in pixels, above the board and under it: the first is the gap
             // between the page's own message and the table, the second the room left above the button. Neither
             // figure says anything about a player.
-            float anchorBottom = measured ? rect.Bottom : aligned;
+            float anchorBottom = titleKnown ? titleBottom : aligned;
             float blankAbove = Math.Max(0f, board.Y - anchorBottom);
             float blankBelow = Math.Max(0f, (float.IsFinite(buttonTop) ? buttonTop : board.Bottom) - board.Bottom);
             if (HeadingReports.Add("failure-strip"))
-                Plugin.Logger?.LogInfo($"[DIAG] failure strip: anchorSource={FailureAlignment.Source(measured, measured ? rect.Bottom : float.NaN, Screen.height)}, messageBottom={(measured ? rect.Bottom.ToString("0") : "unmeasurable")}, boardTop=({board.Y:0}..{board.Bottom:0}), blankAbove={blankAbove:0}px, blankBelow={blankBelow:0}px, lobbyButtonTop={(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")}, completionAnchor={(FailureAlignment.AnchorKnown(Screen.height) ? FailureAlignment.Anchor.ToString("0") : "unseen")}, screen={Screen.width}x{Screen.height}, lobby={DescribeButton(fail?.m_btnGoToLobby)}, restart={DescribeButton(fail?.m_btnRestartCheckpoint)}, boardOverlapsLobbyButton={overlapsLobby.ToString().ToLowerInvariant()}.");
+                Plugin.Logger?.LogInfo($"[DIAG] failure strip: anchorSource={FailureAlignment.Source(titleKnown, titleKnown ? titleBottom : float.NaN, Screen.height)}, messageBottom={(titleKnown ? titleBottom.ToString("0") : "unmeasurable")}, title={(float.IsFinite(alpha) ? alpha.ToString("0.00") : "unreadable")} alpha over {Title.OpaqueFrames} opaque readings, messageEdge={(measured ? "measured-this-frame" : $"last-real-edge-{Title.EdgeAge}f-ago")}, boardTop=({board.Y:0}..{board.Bottom:0}), blankAbove={blankAbove:0}px, blankBelow={blankBelow:0}px, lobbyButtonTop={(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")}, completionAnchor={(FailureAlignment.AnchorKnown(Screen.height) ? FailureAlignment.Anchor.ToString("0") : "unseen")}, screen={Screen.width}x{Screen.height}, lobby={DescribeButton(fail?.m_btnGoToLobby)}, restart={DescribeButton(fail?.m_btnRestartCheckpoint)}, boardOverlapsLobbyButton={overlapsLobby.ToString().ToLowerInvariant()}.");
             return true;
         }
         catch (Exception error)
         {
-            if (HeadingReports.Add("title-read-error")) Plugin.Logger?.LogWarning("[DIAG] failure strip read failed; using visible screen-space fallback: " + error.Message);
+            if (HeadingReports.Add("title-read-error")) Plugin.Logger?.LogWarning("[DIAG] failure strip measurement failed; keeping the vanilla results page and waiting to retry with stable anchors: " + error.Message);
             buttonMeasured = false;
             buttonTop = float.NaN;
             buttonHeight = float.NaN;
             return true;
         }
+    }
+
+    // The failure page's own message, exactly as the player sees it: the TMP text's own fade - its `alpha`,
+    // which is the value the page animates and which is *not* its colour alpha - multiplied by every canvas
+    // group above it. Both are read because either is how a result page can fade a block in, and a title is not
+    // settled by one of the two having arrived. An alpha nobody could read is not evidence of transparency and
+    // counts as drawn, which is the rule this file has always used for a control it cannot measure.
+    private static float HeadingAlpha(TextMeshPro heading)
+    {
+        if (heading == null) return float.NaN;
+        float text = 1f, group = 1f;
+        try { if (float.IsFinite(heading.alpha)) text = Mathf.Clamp01(heading.alpha); } catch { return float.NaN; }
+        try
+        {
+            Transform node = heading.transform;
+            int guard = 0;
+            while (node != null && guard++ < 32)
+            {
+                var canvasGroup = node.TryCast<CanvasGroup>();
+                if (canvasGroup != null && float.IsFinite(canvasGroup.alpha)) group *= Mathf.Clamp01(canvasGroup.alpha);
+                node = node.parent;
+            }
+        }
+        catch { }
+        return Mathf.Clamp01(text * group);
     }
 
     // The failure page's own message alpha: the figure the board has always been drawn with, so the two
@@ -1330,7 +1551,7 @@ internal static class ResultsDisplay
             if (!_loggedMeasure)
             {
                 _loggedMeasure = true;
-                Plugin.Logger?.LogWarning("[DIAG] failure heading measurement failed; using screen-space fallback: " + error.Message);
+                Plugin.Logger?.LogWarning("[DIAG] failure heading screen projection failed; the rectangle is unmeasurable this frame, so nothing is placed from it: " + error.Message);
             }
             return false;
         }
@@ -1467,6 +1688,12 @@ internal static class SuccessResultsPatch
 [HarmonyPatch(typeof(CM_PageExpeditionFail), "OnEnable")]
 internal static class FailureResultsPatch
 {
+    // The prefix only drops what belonged to the previous visit to this page: the page object is reused for
+    // every failed expedition in a session, so its title starts fading in from zero again and none of the settle
+    // budgets the last visit spent - or the smaller board it was measured into - may be inherited by this one.
+    [HarmonyPrefix, HarmonyPriority(Priority.First)]
+    private static void Prefix(CM_PageExpeditionFail __instance) => ResultsDisplay.BeginFailurePage(__instance);
+
     [HarmonyPostfix]
     private static void Postfix(CM_PageExpeditionFail __instance) => ResultsDisplay.Fail = __instance;
 }

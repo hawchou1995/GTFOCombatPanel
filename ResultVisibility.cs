@@ -155,16 +155,24 @@ public static class CompletionDrawing
 // `ButtonHeight` is that same button's own measured height, and it is the one figure that says how large a
 // control the player is being asked to press. The settlement board derives its readability floor from it,
 // so a page that offers no measurable height keeps the absolute minimum and behaves exactly as before.
+//
+// `AnchorMeasured` is whether the strip's *upper* edge - the failure title's own bottom, the success
+// completion section's - was measured in its settled state, rather than taken from a remembered line or a
+// frame in which the page was still landing. A strip whose button or whose anchor was a guess is the one case
+// that may be measured a second time; see `ResultAnchorRecovery` and `ResultAnchorDrift`.
 public readonly struct BoardStrip
 {
     public readonly float Top, Bottom;
     public readonly bool ButtonMeasured;
     public readonly float ButtonTop;
     public readonly float ButtonHeight;
+    public readonly bool AnchorMeasured;
 
-    public BoardStrip(float top, float bottom, bool buttonMeasured, float buttonTop, float buttonHeight = float.NaN)
+    public BoardStrip(float top, float bottom, bool buttonMeasured, float buttonTop, float buttonHeight = float.NaN,
+        bool anchorMeasured = true)
     {
         Top = top; Bottom = bottom; ButtonMeasured = buttonMeasured; ButtonTop = buttonTop; ButtonHeight = buttonHeight;
+        AnchorMeasured = anchorMeasured;
     }
 }
 
@@ -217,5 +225,33 @@ public static class ResultBoardHold
         if (placed.Bottom <= wall) return true;
         rect = new LayoutRect(placed.X, Math.Max(0f, wall - placed.Height), placed.Width, placed.Height);
         return true;
+    }
+
+    // Whether a grid that arrived *after* the board was placed may be drawn in the rectangle the board keeps.
+    //
+    // A settlement snapshot keeps arriving while the page is up, and updated data can ask for a bigger table. A board
+    // that is already up keeps the rectangle it was measured into - that is what stops a settled board from jumping -
+    // and `Fit` replaces the grid it draws there. On the failure page `Draw` then lifts that board off the button every
+    // frame (`TryHold`), so a taller grid is still held to the control the player presses. The success page has no such
+    // per-frame wall: it places once and draws that placement, so a grid that grew after the fact would be drawn over
+    // the button nobody re-checks. This is that missing check, and it is deliberately the same rule the first placement
+    // uses: the grid's lower edge may not run past the strip the board was really measured into (`measured` - not this
+    // frame's strip, which is exactly the one that refused it) and may not reach the button's clearance line whenever
+    // this frame knows where that button is. A grid that does not clear either keeps the grid that is already up.
+    public static bool HeldGridFits(BoardStrip measured, BoardStrip current, LayoutRect held, float height,
+        float screenHeight, float slack = 0f)
+    {
+        if (!float.IsFinite(held.Y) || !float.IsFinite(height) || !(height > 0f)) return false;
+        if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
+        if (!float.IsFinite(slack) || slack < 0f) slack = 0f;
+        float bottom = held.Y + height;
+        float limit = screenHeight - 8f;
+        // The strip the board was measured into, with the same tolerance the first placement allows: that strip is the
+        // contract the board's place was accepted under.
+        if (float.IsFinite(measured.Bottom) && measured.Bottom > 0f) limit = Math.Min(limit, measured.Bottom + slack);
+        // ...and the control the player has to press, whenever this frame can see it.
+        if (current.ButtonMeasured && float.IsFinite(current.ButtonTop))
+            limit = Math.Min(limit, current.ButtonTop - ButtonClearance + slack);
+        return bottom <= limit;
     }
 }

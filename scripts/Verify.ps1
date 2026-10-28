@@ -118,7 +118,9 @@ try {
     $usesVisibleCompletion = $resultsSource.Contains('CompletionBounds.Deepest(')
     $anchorsOnUpperEdge = $resultsSource.Contains('bottomAligned: false') -and -not $resultsSource.Contains('bottomAligned: true')
     $namesTheAnchor = $resultsSource.Contains('FailureAlignment.Source(') -and $resultsSource.Contains('anchorSource=')
-    $boundsTheTitleWait = $resultsSource.Contains('FailureAlignment.WaitForTitle(')
+    # The failure page's own title is now gated by `ResultTitleGate` (full opacity over a still edge) and there is no
+    # bounded give-up that ends in a placement: the strip is refused until the gate answers settled.
+    $refusesUnsettledTitle = $resultsSource.Contains('anchorSettled = Title.Observe(active, alpha, measured') -and $resultsSource.Contains('if (!anchorSettled)')
     # A world-space renderer is measured from its own bounds, so the projection must go through `ScreenBounds` and
     # must not sit behind a RectTransform any more; and a success page whose completion section could not be measured
     # is deferred (`ResultsUpperBound.Decide`) instead of being placed at the historical fraction of the window,
@@ -126,11 +128,29 @@ try {
     # runtime actually calls them.
     $measuresRendererBounds = $resultsSource.Contains('ScreenBounds.TryFromCorners(') -and $resultsSource.Contains('renderer.bounds')
     $defersWithoutMeasuredSection = $resultsSource.Contains('ResultsUpperBound.Decide(') -and -not $resultsSource.Contains('ResultsRegion.Resolve(false')
-    $upperBoundBroken = (-not $usesVisibleCompletion) -or (-not $anchorsOnUpperEdge) -or (-not $namesTheAnchor) -or (-not $boundsTheTitleWait) -or (-not $measuresRendererBounds) -or (-not $defersWithoutMeasuredSection)
+    $upperBoundBroken = (-not $usesVisibleCompletion) -or (-not $anchorsOnUpperEdge) -or (-not $namesTheAnchor) -or (-not $refusesUnsettledTitle) -or (-not $measuresRendererBounds) -or (-not $defersWithoutMeasuredSection)
     if ($upperBoundBroken) {
-        throw 'The result board must measure the completion section by its visible pixels (renderer bounds projected through ScreenBounds, never behind a RectTransform), hang the table from that edge, defer instead of guessing when that edge is unmeasurable, name its anchor and bound the wait for the failure title.'
+        throw 'The result board must measure the completion section by its visible pixels (renderer bounds projected through ScreenBounds, never behind a RectTransform), hang the table from that edge, defer instead of guessing when that edge is unmeasurable, name its anchor and refuse the failure strip until its title gate is settled.'
     }
     Write-Host 'RESULT_BOARD_UPPER_BOUND: PASS'
+    # Neither settlement page may be measured before its own anchors are real, and no number of frames may turn a
+    # missing anchor into a placement: the gates only answer for an edge that was really read twice, the title only for
+    # full opacity over a still edge, and a page that never hands one over keeps the vanilla screen and is retried at the
+    # bounded cadence. A page that moves after the board was placed is fitted again without an F8 toggle. The policies
+    # themselves are asserted in tests/GTFOCombatPanel.Smoke/Release11912Scenarios.cs; these lines assert the runtime
+    # calls them.
+    $waitsForSettledTitle = $resultsSource.Contains('anchorSettled = Title.Observe(active, alpha, measured') -and $resultsSource.Contains('if (!anchorSettled)')
+    $waitsForSettledFooter = $resultsSource.Contains('Footer.Observe(measured, top)')
+    $waitsForSettledUpperBound = $resultsSource.Contains('Completion.Observe(true, area.Top)')
+    $boundedRetry = $resultsSource.Contains('if (!Retry.Due(Time.frameCount)) return;')
+    $noTimeoutReady = -not (Get-Content (Join-Path $projectRoot 'ResultsPagePolicy.cs') -Raw).Contains('|| _attempts >= SettleAttempts')
+    $anchorLatchedAsGuess = $resultsSource.Contains('strip.ButtonMeasured && strip.AnchorMeasured && float.IsFinite(strip.ButtonHeight)')
+    $remeasuresMovedPage = $resultsSource.Contains('Drift.Record(strip.Top, strip.Bottom - strip.Top)') -and $resultsSource.Contains('AnchorDriftDue(page, succeeded)')
+    $settleBroken = (-not $waitsForSettledTitle) -or (-not $waitsForSettledFooter) -or (-not $waitsForSettledUpperBound) -or (-not $boundedRetry) -or (-not $noTimeoutReady) -or (-not $anchorLatchedAsGuess) -or (-not $remeasuresMovedPage)
+    if ($settleBroken) {
+        throw 'Both settlement pages must place only from a real settled anchor, retry a page that has none at a bounded cadence (never turning a missing anchor into a placement), latch a strip whose anchor was a guess, and re-fit a page that moved afterwards instead of needing an F8 toggle.'
+    }
+    Write-Host 'RESULT_PAGE_SETTLE: PASS'
     # The tool cell is chosen from the recorded figures first (the name is only a hint), and a slot is read from
     # its most specific real row rather than from the first entry the dictionary happens to yield.
     $toolDetailFromData = (Get-Content (Join-Path $projectRoot 'ImpactBoard.cs') -Raw).Contains('ToolDetailOf(counters, name)')

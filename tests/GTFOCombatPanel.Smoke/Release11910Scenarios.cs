@@ -131,12 +131,10 @@ internal static class Release11910Scenarios
             "a remembered line belongs to the window it was measured in, and another window size does not inherit it");
         FailureAlignment.Forget();
 
-        // The wait for that title is bounded: a page whose message never becomes readable is laid out from the
-        // fallback after a fixed number of frames instead of waiting for ever.
-        check(FailureAlignment.WaitForTitle(0, 120) && FailureAlignment.WaitForTitle(119, 120),
-            "the failure title is still waited for while the budget lasts");
-        check(!FailureAlignment.WaitForTitle(120, 120) && !FailureAlignment.WaitForTitle(500, 120),
-            "and is given up on once the budget is spent, so the page still gets its board");
+        // The wait for that title is no longer a bounded give-up that ends in a placement: `ResultTitleGate` owns it
+        // (full opacity over an edge that has stopped moving) and a page whose title never arrives keeps the game's own
+        // screen. That rule is asserted in `Release11912Scenarios.FailureTitleNeedsFullOpacityOverASettledEdge`, and the
+        // `WaitForTitle` helper this file used to pin is gone with it.
     }
 
     // ------------------------------------------- A4: the projected corners of a renderer, judged by one rule set

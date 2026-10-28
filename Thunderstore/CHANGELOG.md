@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.19.12
+- 修掉两个结算页「板子出现得太早、字号/尺寸被缓存，只有 F8 关开一次才正常」的时序缺陷。失败页过去只要 `m_missionFailed_text` 的 alpha 大于 `0.001`（淡入第一帧）就当作标题已到，当帧直接 Fit；同一帧页脚按钮的可测门槛是 `alpha > 0.02`，量不到按钮时条带下沿退回窗口高度的 `0.66`、字号可读下限退回绝对 `6px`，而 `ButtonSettled(未测到)` 立即返回真。Fit 成功即把 `_holdValid`/`_holdBoard` 连同这个偏小的尺寸锁住，`Draw` 之后只重读按钮上沿、`TryHold` 只会上抬不会放大，失败页也没有任何二次测量，所以尺寸一直不会自愈；F8 关开会经 `ResetPlacement` 强制在页面稳定后重测，看起来才「治好」。
+- **标题的就绪条件只有一条**：`ResultTitleGate`（`ResultsPagePolicy.cs`）要求原生 `任务失败` 标题的文字**已经完整显示**——玩家实际看到的 alpha（TMP 自身 alpha × 上层所有 CanvasGroup）达到 `OpaqueAlpha = 0.99`——**并且**实测底边连续两次读数一致。几何稳定不再能替代文字渲染完成：矩形早已停在最终位置、文字仍在淡入（alpha 0.1 / 0.5）时**永远不算就绪**，面板不会出现。alpha 不可读也不算完成；alpha 恰好 0.99 算，0.98 不算。
+- `ResultEdgeGate`（页脚按钮 / 成功页完成区上界）只对「真的被读到两次一致值」的边回答就绪。**预算不再是许可**：`SettleAttempts = 120` 只报告 `Exhausted`，让调用方改走有界节流；一条从未交出真实几何的边，跑多少帧都不会变成 ready，因此不会再出现「120 帧后拿 `0.66H` 猜条带」这条回到约 11px 小板并锁死的路径。
+- 失败页：`FailureStrip` 在标题门未通过时直接返回 false；页脚门由 `ButtonSettled → Footer.Observe` 统一。两者任一未就绪即**不落位、不隐藏原版结算区块**（`ResultBoardLatch.HidesVanilla(_placed)` 保持），原版失败页原样留在屏幕上；一旦真实锚点稳定可测就落位，**不需要 F8**。
+- `ResultRetryCadence`（`ResultsPagePolicy.cs`）：等待期间前 120 次读数逐帧测量（页面自己的 reveal 就在这段里），之后每 30 帧复测一次，避免每帧遍历页面 renderer 与按钮；`Forget()` 在换页、F8 重新打开、配置变更与每次自动重测时重置。节流只决定「要不要再看一眼」，绝不回答「就绪」。
+- 成功页：保留原生 `BlinkIn` 就绪（`CompletionReadiness`，无超时旁路）、`ResultsUpperBound.Decide` 的延迟落位、`bottomAligned: false` 的上界下悬挂与 1.19.11 的 Fit 拒绝闩锁；新增的只是「完成区上界连续两次读数一致」与同一套页脚门——任一锚点未就绪时不显示任何临时尺寸，原版页面保留。
+- 落位后页面明显变化（别的模组重排页脚、分辨率变化、完成区可选部件晚到）时自动失效并重新 `Fit`：以落位时真正用到的条带上沿与可用高度为基准，超过 max(12px, 8%) 且连续两次采样才触发，每页最多 2 次，因此不会每帧抖动、也不会持续全布局重建，**不需要 F8**。
+- `BoardStrip` 增加 `AnchorMeasured`；「一次二次测量」（`ResultAnchorRecovery`）的判据改为「按钮是否实测 + 上界是否已稳定 + 该按钮自己的高度是否可读」。由于严格门下不会再从不完整条带落位，实际可触发的只剩「下界来自页面已绘制按钮带、拿不到具名按钮高度」这一种精度问题；其余情况它退化为精度兜底，而不再是主力路径。
+- 失败页新增 `OnEnable` 前缀 `ResultsDisplay.BeginFailurePage`：游戏在整个会话里复用同一个结算页对象，没有它第二次远征的失败页会继承上一局已经花完的 settle 状态与节流计数。F8 只清 placement（`ResetPlacement` + 节流重置），不清 settle 状态，因此**按钮缺失时 F8 也无法绕过门**直接画出小板。
+- 回归用例 `tests/GTFOCombatPanel.Smoke/Release11912Scenarios.cs`：直接驱动生产 `ResultTitleGate`（矩形稳定 + alpha 0.1/0.5/0.98 多帧 → 永不就绪；alpha 0.99 + 同一边两次 → 就绪；alpha 不可读、矩形读不到 → 不就绪）、`ResultEdgeGate`（120+ 帧缺失 / 一直抖动 → 永不 ready 且 `Exhausted`；恢复稳定读数 → 就绪）、`ResultRetryCadence`（逐帧窗口、每 30 帧、`Forget`、帧计数重启）、失败页逐帧重放（第 42 次读数、标题满不透明且按钮稳定后才落位，字号 15px；首测只会得到 11px）以及「无真实锚点 → `ResultBoardLatch.HidesVanilla` 恒为 false / 原版保留」。文件末尾的 `WIRING: RESULT_PAGE_SETTLE` 是静态接线检查，明确不是运行时证明。
+- 与 FX.0 无关：用户提供的 FX.0 日志来自另一个 profile、没有本模组加载记录与任何本模组帧，本版不声称修复任何 FX.0 闪退，FX0 结论未改动。
+- 验证（2026-10-29）：`scripts/Verify.ps1` 对本机 r2modman Survival profile 的真实 BepInEx / Interop 程序集运行，`VERIFY: PASS`：构建 0 警告 / 0 错误，`PASS: 2136 combat-panel assertions`（1.19.11 时为 2039），另 9 配置监听 / 50 补给归属 / 38 扫描重放断言，`SCOUT_HOOK_SAFETY`、`EWC_API_CONTRACT`、各 wiring 检查（含 `RESULT_PAGE_SETTLE`，其中新增「超时不得变成 ready」与节流接线断言）全 PASS；构建出的 `GTFOCombatPanel.dll` 为 377856 字节，SHA-256 `9CA9399CC850F37625754A4276555AA934D51E5CB12F472A19D78A1A6D4631CC`。只有编译与托管重放验证：两个结算页在真实分辨率下的观感**没有**实机证据。
+
+
 ## 1.19.11
 - 修掉结算板的**空页缺陷**：`ResultsDisplay.Prepare` 在 `Fit(...)` 之后无条件写入 `_placed = true; _placedSucceeded = succeeded;`，即使 fit 已经因为「条带装不下这块板」走 `fit-failed` 分支直接返回（`ResultsDisplay.Fit`）。`Refresh` 随后看到 `_placed` 就调用 `ApplyVanillaBlocks` 隐藏原版结算区块，而 `Draw` 在 `_grid == null || _content == null` 时立刻返回——那一帧既没有原版结算块，也没有本模组的板子。
 - `Fit` 现在返回「是否真的落位」（只有 `ResultBoardHold.TryPlace` 成功、或既有的 `_holdValid` 保持分支为真），`Prepare` 再把该结果连同「网格与内容是否就绪」交给新的无 Unity 策略 `ResultBoardLatch.Placed(fitConfirmed, gridReady, contentReady)`，只有它为真才写入 `_placed`。`Refresh` 的隐藏动作改经 `ResultBoardLatch.HidesVanilla(_placed)`：**Fit 失败时保留原版结算块并等待重试**，失败帧不隐藏任何原版内容。
