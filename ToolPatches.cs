@@ -35,6 +35,14 @@ internal static class GlueShotPatch
     private static void Postfix(GlueGunProjectile __instance, PlayerAgent owner) => ToolStatsTracker.CreditGlueProjectile(__instance, owner);
 }
 
+// SyncDestroy is the native projectile end-of-life callback; erase only this projectile's provenance and per-shot identities.
+[HarmonyPatch(typeof(GlueGunProjectile), "SyncDestroy")]
+internal static class GlueProjectileDestroyPatch
+{
+    [HarmonyPostfix]
+    private static void Postfix(GlueGunProjectile __instance) => ToolStatsTracker.ForgetGlueProjectile(__instance);
+}
+
 // This enemy-only callback ignores walls and counts one successful projectile only once.
 // Multiple enemies can still be counted individually by the glued-enemy metric.
 [HarmonyPatch(typeof(Dam_EnemyDamageBase), "AddToTotalGlueVolume")]

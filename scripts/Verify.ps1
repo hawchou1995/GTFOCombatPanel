@@ -117,10 +117,13 @@ try {
     # here and the policy itself is asserted in tests/GTFOCombatPanel.Smoke.
     $usesVisibleCompletion = $resultsSource.Contains('CompletionBounds.Deepest(')
     $anchorsOnUpperEdge = $resultsSource.Contains('bottomAligned: false') -and -not $resultsSource.Contains('bottomAligned: true')
-    $namesTheAnchor = $resultsSource.Contains('FailureAlignment.Source(') -and $resultsSource.Contains('anchorSource=')
+    # The failure strip names which native fact produced its upper bound through `titleSource`, the same way the
+    # success page names its completion part, so the log line alone can tell a measured title from a
+    # post-sequence layout; the anchor name is still printed as `anchorSource=`.
+    $namesTheAnchor = $resultsSource.Contains('titleSource={titleSource}') -and $resultsSource.Contains('anchorSource=')
     # The failure page's own title is now gated by `ResultTitleGate` (full opacity over a still edge) and there is no
     # bounded give-up that ends in a placement: the strip is refused until the gate answers settled.
-    $refusesUnsettledTitle = $resultsSource.Contains('anchorSettled = Title.Observe(active, alpha, measured') -and $resultsSource.Contains('if (!anchorSettled)')
+    $refusesUnsettledTitle = $resultsSource.Contains('anchorSettled = Title.Observe(Time.frameCount, active, alpha, measured') -and $resultsSource.Contains('if (!anchorSettled)')
     # A world-space renderer is measured from its own bounds, so the projection must go through `ScreenBounds` and
     # must not sit behind a RectTransform any more; and a success page whose completion section could not be measured
     # is deferred (`ResultsUpperBound.Decide`) instead of being placed at the historical fraction of the window,
@@ -139,18 +142,31 @@ try {
     # bounded cadence. A page that moves after the board was placed is fitted again without an F8 toggle. The policies
     # themselves are asserted in tests/GTFOCombatPanel.Smoke/Release11912Scenarios.cs; these lines assert the runtime
     # calls them.
-    $waitsForSettledTitle = $resultsSource.Contains('anchorSettled = Title.Observe(active, alpha, measured') -and $resultsSource.Contains('if (!anchorSettled)')
-    $waitsForSettledFooter = $resultsSource.Contains('Footer.Observe(measured, top)')
-    $waitsForSettledUpperBound = $resultsSource.Contains('Completion.Observe(true, area.Top)')
+    $waitsForSettledTitle = $resultsSource.Contains('anchorSettled = Title.Observe(Time.frameCount, active, alpha, measured') -and $resultsSource.Contains('if (!anchorSettled)')
+    $waitsForSettledFooter = $resultsSource.Contains('Footer.Observe(Time.frameCount, measured, top)')
+    $waitsForSettledUpperBound = $resultsSource.Contains('Completion.Observe(Time.frameCount, true, area.Top)')
     $boundedRetry = $resultsSource.Contains('if (!Retry.Due(Time.frameCount)) return;')
     $noTimeoutReady = -not (Get-Content (Join-Path $projectRoot 'ResultsPagePolicy.cs') -Raw).Contains('|| _attempts >= SettleAttempts')
     $anchorLatchedAsGuess = $resultsSource.Contains('strip.ButtonMeasured && strip.AnchorMeasured && float.IsFinite(strip.ButtonHeight)')
-    $remeasuresMovedPage = $resultsSource.Contains('Drift.Record(strip.Top, strip.Bottom - strip.Top)') -and $resultsSource.Contains('AnchorDriftDue(page, succeeded)')
+    $remeasuresMovedPage = $resultsSource.Contains('Drift.Record(Time.frameCount, strip.Top, strip.Bottom - strip.Top);') -and $resultsSource.Contains('AnchorDriftDue(page, succeeded)')
     $settleBroken = (-not $waitsForSettledTitle) -or (-not $waitsForSettledFooter) -or (-not $waitsForSettledUpperBound) -or (-not $boundedRetry) -or (-not $noTimeoutReady) -or (-not $anchorLatchedAsGuess) -or (-not $remeasuresMovedPage)
     if ($settleBroken) {
-        throw 'Both settlement pages must place only from a real settled anchor, retry a page that has none at a bounded cadence (never turning a missing anchor into a placement), latch a strip whose anchor was a guess, and re-fit a page that moved afterwards instead of needing an F8 toggle.'
+        throw 'Both settlement pages must place only from a real settled anchor, sample each Unity frame once, retry missing anchors at a bounded cadence, and re-fit a moved page without an F8 toggle.'
     }
     Write-Host 'RESULT_PAGE_SETTLE: PASS'
+    $policySource = Get-Content (Join-Path $projectRoot 'ResultsPagePolicy.cs') -Raw
+    $failureAnchorPolicy = $policySource.Contains('public static class FailureTitleAnchorPolicy') -and $policySource.Contains('bool missionActive, bool missionTextPresent, bool missionGeometryMeasured, bool failureSequenceFinished)') -and $policySource.Contains('FailureTitleAnchorKind.MissionTitleLayoutAfterSequence') -and $resultsSource.Contains('FailureTitleAnchorPolicy.Select(client, nativeFooterVisible') -and $resultsSource.Contains('TextMeshPro heading = missionTitle;') -and $resultsSource.Contains('protectWaitingStatus ? guestStatus : null') -and $resultsSource.Contains('FailureSequenceStartedPatch') -and $resultsSource.Contains('FailureSequenceFinishedPatch') -and $resultsSource.Contains('failureSequenceFinished={sequenceFinished.ToString().ToLowerInvariant()}') -and $resultsSource.Contains('titleSource={titleSource}') -and $resultsSource.Contains('sameFrameInvalidations={Title.SameFrameInvalidations}') -and $resultsSource.Contains('geometryMeasured={measured.ToString().ToLowerInvariant()}') -and $resultsSource.Contains('rawTextAlpha={(float.IsFinite(rawTextAlpha)') -and $resultsSource.Contains('if (!float.IsFinite(text)) return float.NaN;') -and $resultsSource.Contains('if (!float.IsFinite(groupAlpha)) return float.NaN;') -and -not $resultsSource.Contains('FailureTitleAnchorKind.GuestWaitingStatus')
+    if (-not $failureAnchorPolicy) { throw 'Failure title placement must use a full-opacity native title or a measured mission-title layout after native sequence completion; waiting status is lower protection only.' }
+    Write-Host 'RESULT_FAILURE_TITLE_ANCHOR: PASS'
+    $siblingParentCoverage = $resultsSource.Contains('Transform parent = source.transform.parent;') -and $resultsSource.Contains('parent.GetComponentsInChildren<CM_Item>(true)') -and $resultsSource.Contains('parentCoverageComplete')
+    $nativeControlsMeasured = $resultsSource.Contains('menuPage.m_allItems') -and $resultsSource.Contains('GetComponentsInChildren<CM_Item>(true)') -and $siblingParentCoverage
+    $noFooterNeedsProof = $policySource.Contains('public sealed class ResultNoFooterGate') -and $resultsSource.Contains('ResultNoFooterSafeArea.TryResolve') -and $resultsSource.Contains('controls.FooterTop')
+    $pageNativeFlags = $resultsSource.Contains('success.m_lobbyButtonVisible') -and $resultsSource.Contains('nativeFooterVisible = fail.m_lobbyButtonVisible')
+    $measuredSafeAreaSource = $resultsSource.Contains('ResultFooterSource.ClientNoFooterSafeArea') -and $resultsSource.Contains('if (!BoardStillSafe())') -and $resultsSource.Contains('ResultInteractionStripPolicy.OverlapsBoard(') -and $resultsSource.Contains('DeferBoardForInteraction();')
+    if (-not $nativeControlsMeasured -or -not $noFooterNeedsProof -or -not $pageNativeFlags -or -not $measuredSafeAreaSource) {
+        throw 'Guest safe-area placement requires page registrations/tree, local action-parent scans, page visibility flags, a bounded proof gate and per-draw collision rejection.'
+    }
+    Write-Host 'RESULT_CLIENT_NO_FOOTER_SAFE_AREA: PASS'
     # The tool cell is chosen from the recorded figures first (the name is only a hint), and a slot is read from
     # its most specific real row rather than from the first entry the dictionary happens to yield.
     $toolDetailFromData = (Get-Content (Join-Path $projectRoot 'ImpactBoard.cs') -Raw).Contains('ToolDetailOf(counters, name)')

@@ -53,8 +53,12 @@ internal static class Release11912Scenarios
         AFallenBackStripIsMeasuredAgain(check);
         APageThatMovedIsFittedAgainWithoutF8(check);
         SuccessPageWaitsForSettledEdges(check);
+        GuestFailureTitleAnchorIsRenderedAndGeometric(check);
+        RepeatedRepaintSamplesAreFrameIdempotent(check);
+        GuestWithoutFooterUsesOnlyTheProvenSafeArea(check);
         RefusedFitStillKeepsTheVanillaPage(check);
         AGrownBoardCannotCoverTheLobbyButton(check);
+        ReviewerBlockRegressions(check);
         Wiring(check);
     }
 
@@ -274,20 +278,17 @@ internal static class Release11912Scenarios
             $"the anchor follows the title again once it can be read: {gate.Edge:0} at age {gate.EdgeAge}");
         check(gate.Observe(true, 1f, true, 624f), "and settles on the next reading at that same value");
 
-        // Why the fraction of the window is not a substitute for that edge, through the real arithmetic: with no
-        // completion line remembered in this window it sits *above* the title and would put the board on top of it.
-        FailureAlignment.Forget();
-        bool fractionWay = FailureAlignment.Resolve(false, float.NaN, 1440f, 0f, 16f, true, 1200f,
-            out float fractionLine, out ResultsSafeArea fractionStrip);
-        check(fractionWay && fractionLine < 612f,
-            $"the historical fraction sits above this page's title ({fractionLine:0} against a title ending at 612)");
+        // Neither a remembered success edge nor a viewport fraction is a failure-title proof.
+        bool missingTitle = FailureAlignment.Resolve(false, float.NaN, 1440f, 0f, 16f, true, 1200f,
+            out _, out ResultsSafeArea missingStrip);
+        check(!missingTitle && !missingStrip.Fits,
+            "an unreadable failure title stays deferred instead of guessing a window-fraction upper edge");
         bool measuredWay = FailureAlignment.Resolve(true, gate.Edge, 1440f, 0f, 16f, true, 1200f,
             out float titleLine, out ResultsSafeArea measuredStrip);
         check(measuredWay && Math.Abs(titleLine - 624f) <= 0.01f,
             $"the edge the title really gave is the line the strip starts under: {titleLine:0}");
-        check(measuredStrip.Top >= titleLine + 16f - 0.01f && measuredStrip.Top > fractionStrip.Top,
-            $"so the board starts below the title and below where the fraction would have started it: {measuredStrip.Top:0} vs {fractionStrip.Top:0}");
-        FailureAlignment.Forget();
+        check(measuredStrip.Top >= titleLine + 16f - 0.01f,
+            $"the board starts below the measured title edge: {measuredStrip.Top:0} vs {titleLine:0}");
     }
 
     // ------------------------------------------------------- the one second look at a strip that was a guess
@@ -453,6 +454,304 @@ internal static class Release11912Scenarios
     //
     // A static source check only: it says the runtime asks the policies above, in the order that matters. It is not a
     // runtime behaviour test and does not pretend to be one.
+
+    private static void GuestFailureTitleAnchorIsRenderedAndGeometric(Action<bool, string> check)
+    {
+        check(FailureTitleAnchorPolicy.Select(true, false, true, true, true, true, false)
+                == FailureTitleAnchorKind.MissionFailed,
+            "a nonempty active mission-failed title is the only immediate native title candidate");
+        check(FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, true)
+                == FailureTitleAnchorKind.MissionTitleLayoutAfterSequence,
+            "an inactive client mission-title layout is eligible only after the native failure sequence completes");
+        check(FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, false)
+                == FailureTitleAnchorKind.None
+            && FailureTitleAnchorPolicy.Select(true, false, true, false, true, false, true)
+                == FailureTitleAnchorKind.None
+            && FailureTitleAnchorPolicy.Select(false, false, true, false, true, true, true)
+                == FailureTitleAnchorKind.None
+            && FailureTitleAnchorPolicy.Select(true, true, true, false, true, true, true)
+                == FailureTitleAnchorKind.None
+            && FailureTitleAnchorPolicy.Select(true, false, true, false, false, true, true)
+                == FailureTitleAnchorKind.None,
+            "a guest waiting-status alone, an incomplete layout/sequence, a host, or visible lobby state cannot supply an upper anchor");
+
+        var inactiveTitle = new ResultTitleGate();
+        check(!inactiveTitle.Observe(41, false, 1f, true, 580f)
+                && inactiveTitle.OpaqueFrames == 0 && !float.IsFinite(inactiveTitle.Edge),
+            "alpha 1.0 on an inactive title is not a completed rendered title and contributes zero opaque frames");
+        var gate = new ResultTitleGate();
+
+        gate.Forget();
+        check(!gate.Observe(50, true, 1f, false, float.NaN)
+                && gate.OpaqueFrames == 1
+                && !gate.Observe(50, true, 1f, false, float.NaN)
+                && gate.OpaqueFrames == 0 && gate.SameFrameInvalidations == 1,
+            "an active alpha-1 title with unreadable geometry is invalidated by a repeated same-frame repaint, explaining zero opaque readings");
+        check(!gate.Observe(51, true, 1f, true, 580f)
+                && gate.Observe(52, true, 1f, true, 580f),
+            "a real measured title edge becomes ready across frames, never by bypassing alpha or geometry");
+    }
+
+    private static void RepeatedRepaintSamplesAreFrameIdempotent(Action<bool, string> check)
+    {
+        var title = new ResultTitleGate();
+        check(!title.Observe(100, true, 1f, true, 600f) && !title.Observe(100, true, 1f, true, 600f)
+            && title.OpaqueFrames == 1,
+            "two Repaint callbacks in one Unity frame remain one title observation");
+        check(title.Observe(101, true, 1f, true, 600f),
+            "the title settles on the next distinct frame with the same fully drawn edge");
+
+        var edge = new ResultEdgeGate();
+        check(!edge.Observe(200, true, 1200f) && !edge.Observe(200, true, 1200f) && edge.Attempts == 1,
+            "a duplicate footer/completion sample in one frame cannot spend the second stable reading");
+        check(edge.Observe(201, true, 1200f) && edge.Attempts == 2,
+            "the same edge becomes ready across two distinct frames");
+
+        var retry = new ResultRetryCadence();
+        check(retry.Due(300) && retry.Due(300) && retry.Waits == 1,
+            "same-frame Repaint callbacks keep the cadence decision without burning its frame budget");
+
+        var drift = new ResultAnchorDrift();
+        drift.Record(400, 500f, 600f);
+        check(!drift.Due(401, 560f, 600f) && !drift.Due(401, 560f, 600f),
+            "same-frame page movement is one drift sample, not a two-sample re-fit trigger");
+        check(drift.Due(402, 560f, 600f), "a changed strip re-fits after the next distinct stable frame");
+    }
+
+    private static void GuestWithoutFooterUsesOnlyTheProvenSafeArea(Action<bool, string> check)
+    {
+        var guestSuccess = new ResultNoFooterGate();
+        check(!guestSuccess.Observe(10, true, true, true, false, true, 0)
+            && !guestSuccess.Observe(10, true, true, true, false, true, 0)
+            && guestSuccess.Samples == 1,
+            "a success guest's absent footer is not proved by repeated Repaints in one frame");
+        check(!guestSuccess.Observe(11, true, true, true, false, true, 0)
+            && guestSuccess.Observe(12, true, true, true, false, true, 0),
+            "the success safe-area proof requires three distinct, settled, complete empty scans");
+
+        var guestFailure = new ResultNoFooterGate();
+        bool failureReady = false;
+        for (int frame = 20; frame < 20 + ResultNoFooterGate.RequiredSamples; frame++)
+            failureReady = guestFailure.Observe(frame, true, true, true, false, true, 0);
+        check(failureReady, "the failure guest reaches the same bounded proof through the production policy");
+        check(!guestFailure.Observe(23, false, true, true, false, true, 0) && !guestFailure.Ready,
+            "a host never receives the guest-only unbounded footer policy");
+        check(!guestFailure.Observe(24, true, true, false, false, true, 0)
+            && !guestFailure.Observe(25, true, true, true, true, true, 0)
+            && !guestFailure.Observe(26, true, true, true, false, false, 0)
+            && !guestFailure.Observe(27, true, true, true, false, true, 1),
+            "unknown native state, a visible footer, an incomplete probe or any control cancels the safe-area proof");
+
+        check(ResultNoFooterSafeArea.TryResolve(476f, 1440f, out ResultsSafeArea safe)
+            && Math.Abs(safe.Top - 476f) < 0.01f && Math.Abs(safe.Bottom - 1432f) < 0.01f,
+            "the client safe area starts below the measured page anchor and ends at the viewport margin");
+        var strip = new BoardStrip(safe.Top, safe.Bottom, false, float.NaN, float.NaN, true,
+            ResultFooterSource.ClientNoFooterSafeArea);
+        check(strip.FooterSource == ResultFooterSource.ClientNoFooterSafeArea
+            && ResultBoardHold.TryPlace(1920f, 1440f, strip, 900f, 675f, 0f, out LayoutRect board)
+            && board.Y >= 476f && board.Bottom <= 1432f,
+            "the explicitly sourced safe strip auto-fits a readable board without covering title or controls");
+        check(!ResultNoFooterSafeArea.TryResolve(float.NaN, 1440f, out _)
+            && !ResultNoFooterSafeArea.TryResolve(1435f, 1440f, out _),
+            "an unreadable anchor or a non-fitting viewport never creates a safe area");
+    }
+    private static void ReviewerBlockRegressions(Action<bool, string> check)
+    {
+        var controls = new System.Collections.Generic.List<ResultActionBounds>
+        {
+            new ResultActionBounds(new LayoutRect(100f, 80f, 300f, 40f)), // unrelated action above the trusted title
+            new ResultActionBounds(new LayoutRect(100f, 900f, 300f, 80f)) // actual lower footer
+        };
+        check(ResultInteractionStripPolicy.TryResolve(400f, 16f, controls, out ResultInteractionStrip strip)
+            && Math.Abs(strip.BoardTop - 416f) < 0.01f && Math.Abs(strip.FooterTop - 900f) < 0.01f
+            && strip.FooterActionCount == 1,
+            "an upper-page button does not compress the strip, while the real footer remains its lower wall");
+
+        controls.Add(new ResultActionBounds(new LayoutRect(100f, 500f, 300f, 60f)));
+        check(ResultInteractionStripPolicy.TryResolve(400f, 16f, controls, out strip)
+            && Math.Abs(strip.BoardTop - 416f) < 0.01f && Math.Abs(strip.FooterTop - 500f) < 0.01f
+            && strip.FooterActionCount == 2,
+            "an action actually occupying the board strip becomes the measured lower wall");
+
+        var crossing = new System.Collections.Generic.List<ResultActionBounds>
+        {
+            new ResultActionBounds(new LayoutRect(100f, 405f, 300f, 45f)),
+            new ResultActionBounds(new LayoutRect(100f, 500f, 300f, 60f))
+        };
+        check(ResultInteractionStripPolicy.TryResolve(400f, 16f, crossing, out strip)
+            && Math.Abs(strip.BoardTop - 466f) < 0.01f && Math.Abs(strip.FooterTop - 500f) < 0.01f,
+            "a control crossing the title gap moves the board below its bottom rather than being ignored");
+
+        var bottomStatus = new System.Collections.Generic.List<ResultActionBounds>
+        {
+            new ResultActionBounds(new LayoutRect(100f, 1320f, 500f, 60f), protectedPageText: true)
+        };
+        check(ResultInteractionStripPolicy.TryResolve(500f, 16f, bottomStatus, out strip)
+            && Math.Abs(strip.BoardTop - 516f) < 0.01f && Math.Abs(strip.FooterTop - 1320f) < 0.01f
+            && strip.FooterActionCount == 0
+            && ResultNoFooterSafeArea.TryResolve(strip.BoardTop, 1440f, out ResultsSafeArea safe,
+                strip.FooterTop, 16f)
+            && Math.Abs(safe.Bottom - 1304f) < 0.01f,
+            "near-screen-bottom waiting status is only a protected lower wall, not an upper title anchor");
+
+        var title = new ResultTitleGate();
+        check(!title.Observe(40, true, 1f, false, float.NaN)
+            && !title.Observe(40, true, 1f, false, float.NaN)
+            && title.OpaqueFrames == 0 && title.SameFrameInvalidations == 1,
+            "alpha 1 with unreadable geometry and a duplicate repaint keeps zero opaque readings and cannot place");
+
+        var readiness = new FailureSequenceReadiness();
+        IntPtr page = new IntPtr(11), sequence = new IntPtr(21);
+        readiness.BeginPage(page);
+        check(FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, readiness.IsFinished(page))
+                == FailureTitleAnchorKind.None
+            && !readiness.BindSequence(new IntPtr(12), sequence)
+            && readiness.BindSequence(page, sequence)
+            && !readiness.MarkFinished(page, new IntPtr(22)) && !readiness.IsFinished(page),
+            "a late native sequence, stale page or wrong iterator cannot make the inactive mission-title layout ready");
+        check(readiness.MarkFinished(page, sequence)
+            && FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, readiness.IsFinished(page))
+                == FailureTitleAnchorKind.MissionTitleLayoutAfterSequence,
+            "only the bound native failure iterator's terminal completion enables the measured mission-title layout path");
+        var layoutEdge = new ResultEdgeGate();
+        check(!layoutEdge.Observe(51, true, 600f) && layoutEdge.Observe(52, true, 600f),
+            "the post-sequence title layout still needs two distinct stable geometry samples");
+        readiness.BeginPage(new IntPtr(12));
+        check(!readiness.IsFinished(page), "a subsequent failure page cannot inherit the prior sequence completion");
+
+        Func<int, ResultTableSize> table = size => new ResultTableSize(60f * size, 45f * size);
+        int readable = ResultsFontGrowth.FitBoardIntoStrip(17, ResultsFontGrowth.MinimumReadablePixels,
+            int.MaxValue, 511f, 1872f, table, out int usedFloor);
+        check(readable >= ResultsFontGrowth.MinimumReadablePixels && table(readable).Height <= 511f + 0.5f
+                && usedFloor == ResultsFontGrowth.MinimumReadablePixels,
+            "the smallest readable-table policy still finds a fitting size when the measured strip has room");
+        var shortStrip = new BoardStrip(500f, 740f, false, float.NaN, float.NaN);
+        check(!ResultBoardHold.TryPlace(1920f, 1440f, shortStrip, table(6).Width, table(6).Height,
+                0f, out _, 0f),
+            "when even the six-pixel minimum exceeds the measured strip, placement is reasonably refused");
+
+        // P1-B: a title that is still fading in is a title that has not been seen, whatever its geometry says.
+        var fading = new ResultTitleGate();
+        check(!fading.Observe(60, true, 0.5f, true, 620f) && !fading.Observe(61, true, 0.5f, true, 620f)
+            && fading.OpaqueFrames == 0,
+            "a title still fading in never places the board early, even with two identical measured edges");
+        check(fading.Observe(62, true, 1f, true, 620f) && fading.Observe(63, true, 1f, true, 620f),
+            "the same title places as soon as it is fully drawn over the same settled edge, without an F8 toggle");
+
+        // P1-B: the near-bottom waiting status can only ever shorten the strip, and a strip it leaves no room
+        // for is refused rather than turned into a fraction of the window.
+        check(!ResultNoFooterSafeArea.TryResolve(500f, 1440f, out _, 510f, 16f),
+            "a protected waiting-status wall that leaves no room refuses the client safe-area placement");
+        LayoutRect statusRect = new LayoutRect(100f, 1320f, 500f, 60f);
+        check(ResultInteractionStripPolicy.OverlapsBoard(statusRect, new LayoutRect(100f, 1200f, 500f, 200f), 6f),
+            "the waiting status overlapping the board triggers this frame's vanilla restore and wheel release");
+
+        // P2-C: ReturnToLobbyAnyway clones the page's own CM_Item under that button's parent, which is exactly
+        // the subtree the scan covers; the clone is measured as a lower wall, and any control keeps the
+        // no-footer safe area refused.
+        var clone = new System.Collections.Generic.List<ResultActionBounds>
+        {
+            new ResultActionBounds(new LayoutRect(700f, 1180f, 400f, 70f)) // the cloned guest return button
+        };
+        check(ResultInteractionStripPolicy.TryResolve(500f, 16f, clone, out ResultInteractionStrip cloned)
+            && Math.Abs(cloned.BoardTop - 516f) < 0.01f && Math.Abs(cloned.FooterTop - 1180f) < 0.01f
+            && cloned.FooterActionCount == 1,
+            "an interactable control cloned under the page's return-button parent becomes the measured lower wall");
+        var cloneGate = new ResultNoFooterGate();
+        bool cloneEverReady = false;
+        for (int frame = 70; frame < 70 + ResultNoFooterGate.RequiredSamples + 2; frame++)
+            cloneEverReady |= cloneGate.Observe(frame, true, true, true, false, true, 1);
+        check(!cloneEverReady && !cloneGate.Ready,
+            "any control the scan found - a hidden or cloned guest action included - keeps the no-footer safe area refused");
+
+        // P1-A: a control that ends exactly at the trusted edge is above it and must not move the strip.
+        var touching = new System.Collections.Generic.List<ResultActionBounds>
+        {
+            new ResultActionBounds(new LayoutRect(100f, 360f, 300f, 40f)) // bottom == anchorBottom
+        };
+        check(ResultInteractionStripPolicy.TryResolve(400f, 16f, touching, out ResultInteractionStrip edgeTouch)
+            && Math.Abs(edgeTouch.BoardTop - 416f) < 0.01f && !float.IsFinite(edgeTouch.FooterTop),
+            "a control whose bottom only touches the trusted completion/title edge is not a footer and cannot compress the strip");
+
+        LayoutRect board = new LayoutRect(100f, 600f, 500f, 270f);
+        check(ResultInteractionStripPolicy.OverlapsBoard(new LayoutRect(150f, 620f, 180f, 60f), board, 6f)
+            && !ResultInteractionStripPolicy.OverlapsBoard(new LayoutRect(150f, 900f, 180f, 60f), board, 6f),
+            "a late/moving action entering the cached board triggers overlap rejection, but a clear lower wall does not");
+
+        // Review BLOCK (this round): a control the game switched off cannot take the pointer, so it must neither
+        // forbid the board nor stand in the way of the guest safe-area proof; a control that comes back on and
+        // reaches the board still takes the vanilla page back on that frame.
+        var hiddenOnly = new ResultNoFooterGate();
+        bool hiddenOnlyReady = false;
+        for (int frame = 80; frame < 80 + ResultNoFooterGate.RequiredSamples; frame++)
+            hiddenOnlyReady = hiddenOnly.Observe(frame, true, true, true, false, true, 0);
+        check(hiddenOnlyReady,
+            "a result page whose only interactions are switched off still proves the guest safe area: a hidden control is not an interaction");
+
+        var lateControl = new System.Collections.Generic.List<ResultActionBounds>
+        {
+            new ResultActionBounds(new LayoutRect(120f, 1180f, 320f, 60f))
+        };
+        check(ResultInteractionStripPolicy.TryResolve(500f, 16f, lateControl, out ResultInteractionStrip late)
+            && Math.Abs(late.FooterTop - 1180f) < 0.01f
+            && !ResultBoardHold.TryPlace(1920f, 1440f, new BoardStrip(516f, 1180f - 16f, true, 1180f, 60f),
+                900f, 700f, 0f, out _, 0f),
+            "a control that comes back on inside the strip becomes the lower wall and refuses a board that reached the old bottom");
+        check(ResultInteractionStripPolicy.OverlapsBoard(lateControl[0].Bounds, new LayoutRect(120f, 900f, 900f, 300f),
+                ResultBoardHold.ButtonClearance),
+            "and the same control reaching the placed board is what restores vanilla on that frame");
+
+        // Degenerate geometry is its own answer, never the same thing as "the game switched it off": a one-pixel,
+        // whole-window or off-screen rectangle is not a measurement, and the scan keeps itself incomplete for it.
+        check(!ScreenBounds.TryFromCorners(new[] { 300f, 301f }, new[] { 700f, 700f }, 1920f, 1440f, out _)
+            && !ScreenBounds.TryFromCorners(new[] { 0f, 1920f }, new[] { 0f, 1440f }, 1920f, 1440f, out _)
+            && !ScreenBounds.TryFromCorners(new[] { 4000f, 4300f }, new[] { 4000f, 4050f }, 1920f, 1440f, out _)
+            && ScreenBounds.TryFromCorners(new[] { 100f, 400f }, new[] { 700f, 760f }, 1920f, 1440f, out _),
+            "a 1px, whole-window or off-screen rectangle is not a measurement, while a real rectangle still is");
+
+        // Review BLOCK (this round): the title gate's own anchor does not outlive the title that measured it.
+        var reused = new ResultTitleGate();
+        check(!reused.Observe(120, true, 1f, true, 600f) && reused.Observe(121, true, 1f, true, 600f)
+                && Math.Abs(reused.Edge - 600f) < 0.01f && reused.EdgeAge == 0,
+            "a settled title hands over the edge it really measured");
+        check(!reused.Observe(122, false, float.NaN, false, float.NaN) && !float.IsFinite(reused.Edge)
+                && reused.EdgeAge == -1,
+            "the same page object raised again with its title switched off drops that edge instead of reusing it");
+
+        string root = SourceRoot();
+        check(root != null, "review-block regression locates production source");
+        if (root == null) return;
+        string results = File.ReadAllText(Path.Combine(root, "ResultsDisplay.cs"));
+        int scan = results.IndexOf("private static FooterControls ScanFooterControls(", StringComparison.Ordinal);
+        int scanEnd = results.IndexOf("private static bool IsKnownClientHiddenLobbyAction(", scan, StringComparison.Ordinal);
+        string scanner = scan >= 0 && scanEnd > scan ? results.Substring(scan, scanEnd - scan) : string.Empty;
+        check(scanner.Contains("menuPage.m_allItems")
+            && scanner.Contains("page.GetComponentsInChildren<CM_Item>(true)")
+            && scanner.Contains("Transform parent = source.transform.parent;")
+            && scanner.Contains("parent.GetComponentsInChildren<CM_Item>(true)")
+            && scanner.Contains("parentCoverageComplete")
+            && !scanner.Contains("FindObjectsOfType"),
+            "interaction scan includes page registrations/tree plus only the named source-parent subtree, and fails closed if that coverage is unavailable");
+        check(scanner.Contains("hidden++") && scanner.Contains("hiddenPageActions++")
+            && !scanner.Contains("if (client && IsKnownClientHiddenLobbyAction(page, control)) return;")
+            && scanner.Contains("active-control-unmeasurable")
+            && results.Contains("ProvenEmpty => Complete && ParentCoverageComplete && Count == 0"),
+            "the interaction scan treats a control the page switched off as hidden rather than as a broken scan, and keeps itself incomplete only for an active control it cannot measure");
+        check(results.Contains("ReportIncompleteScan(\"failure\"") && results.Contains("ReportIncompleteScan(\"success\"")
+            && results.Contains("ReportBoardOverlap(\"failure\"") && results.Contains("ReportBoardOverlap(\"success\"")
+            && results.Contains("scanComplete={controls.Complete")
+            && results.Contains("parentCoverage={controls.ParentCoverageComplete")
+            && results.Contains("reason={(string.IsNullOrEmpty(controls.Reason)"),
+            "a held-back board says why the scan could not finish, once per page visit, with counts and geometry only and no player identity");
+        int safety = results.IndexOf("if (!BoardStillSafe())", StringComparison.Ordinal);
+        int defer = results.IndexOf("DeferBoardForInteraction();", safety, StringComparison.Ordinal);
+        int draw = results.IndexOf("HudTable.Draw(_grid", safety, StringComparison.Ordinal);
+        check(safety >= 0 && defer > safety && draw > defer
+            && results.Contains("_holdValid = false; _holdBoard = default;")
+            && results.Contains("ClearHit();"),
+            "a newly overlapping/unreadable control restores vanilla and clears the stale wheel target before drawing");
+    }
+
     private static void Wiring(Action<bool, string> check)
     {
         string root = SourceRoot();
@@ -470,7 +769,7 @@ internal static class Release11912Scenarios
             "the four settle policies exist as Unity-free code this file drives");
 
         // Full opacity is the only way in: no "alpha stopped moving" shortcut, and no timeout that turns into ready.
-        check(policy.Contains("bool opaque = float.IsFinite(visible) && visible >= OpaqueAlpha;")
+        check(policy.Contains("bool opaque = drawn && visible >= OpaqueAlpha;")
               && !policy.Contains("AlphaFrames")
               && !policy.Contains("|| _attempts >= SettleAttempts"),
             "the title gate requires full opacity, and the edge gate never answers ready on a timeout");
@@ -482,13 +781,15 @@ internal static class Release11912Scenarios
             "the runtime holds one gate per edge and one retry cadence");
 
         int stripDefinition = results.IndexOf("private static bool FailureStrip(", StringComparison.Ordinal);
-        int titleGate = results.IndexOf("anchorSettled = Title.Observe(active, alpha, measured", StringComparison.Ordinal);
+        int titleGate = results.IndexOf("anchorSettled = Title.Observe(Time.frameCount, active, alpha, measured", StringComparison.Ordinal);
+        int layoutGate = results.IndexOf("anchorSettled = FailureLayoutTitle.Observe(Time.frameCount, measured", StringComparison.Ordinal);
         int titleRefusal = results.IndexOf("if (!anchorSettled)", StringComparison.Ordinal);
-        int titleEdge = results.IndexOf("float titleBottom = float.IsFinite(Title.Edge) ? Title.Edge : rect.Bottom;", StringComparison.Ordinal);
-        check(stripDefinition >= 0 && titleGate > stripDefinition && titleRefusal > titleGate && titleEdge > titleRefusal,
-            "`FailureStrip` places nothing until the title gate is settled, and then starts the strip at that same edge");
+        int titleEdge = results.IndexOf("bool titleKnown = float.IsFinite(titleBottom);", StringComparison.Ordinal);
+        check(stripDefinition >= 0 && titleGate > stripDefinition && layoutGate > titleGate
+              && titleRefusal > layoutGate && titleEdge > titleRefusal,
+            "FailureStrip requires either a full-opacity active title or a stable measured mission-title layout after native sequence completion");
 
-        check(results.Contains("private static bool ButtonSettled(bool measured, float top) => Footer.Observe(measured, top);"),
+        check(results.Contains("private static bool ButtonSettled(bool measured, float top) => Footer.Observe(Time.frameCount, measured, top);"),
             "the footer is asked through one call on both pages, so a missing button can never be papered over");
 
         int refresh = results.IndexOf("internal static void Refresh(eGameStateName state)", StringComparison.Ordinal);
@@ -504,21 +805,34 @@ internal static class Release11912Scenarios
         check(recovery >= 0 && recoveryAsk > recovery && driftAsk > recoveryAsk && rearm > 0,
             "the refresh path asks both halves - the second look and the page that moved - and re-arms the cadence");
 
-        check(!results.Contains("WaitForTitle") && !layout.Contains("WaitForTitle"),
-            "no bounded give-up on the title survives anywhere: the wait cannot become a placement");
+        check(!results.Contains("WaitForTitle") && !layout.Contains("WaitForTitle"), "no bounded give-up on the title survives anywhere: the wait cannot become a placement");
+        check(policy.Contains("public static class FailureTitleAnchorPolicy")
+              && policy.Contains("if (missionPresent && missionActive && missionTextPresent) return FailureTitleAnchorKind.MissionFailed;")
+              && results.Contains("FailureTitleAnchorPolicy.Select(client, nativeFooterVisible")
+              && results.Contains("failureSequenceFinished={sequenceFinished.ToString().ToLowerInvariant()}")
+              && results.Contains("anchorActive={active.ToString().ToLowerInvariant()}")
+              && results.Contains("sameFrameInvalidations={Title.SameFrameInvalidations}")
+              && results.Contains("rawTextAlpha={(float.IsFinite(rawTextAlpha)")
+              && results.Contains("FailureSequenceStartedPatch")
+              && results.Contains("FailureSequenceFinishedPatch")
+              && !results.Contains("FailureAlignment.AnchorKnown")
+              && !results.Contains("FailureAlignment.RememberCompletion")
+              && !results.Contains("FailureTitleAnchorKind.GuestWaitingStatus"),
+            "failure upper anchoring uses only a fully drawn title or a native-sequence-complete measured mission-title layout; waiting status never anchors the board");
 
-        check(results.Contains("_placedOnFallback = ResultAnchorRecovery.LatchFallback(_fallbackRecoveries,")
+        check(results.Contains("_placedOnFallback = strip.FooterSource != ResultFooterSource.ClientNoFooterSafeArea")
+              && results.Contains("&& ResultAnchorRecovery.LatchFallback(_fallbackRecoveries,")
               && results.Contains("strip.ButtonMeasured && strip.AnchorMeasured && float.IsFinite(strip.ButtonHeight));"),
-            "a strip whose button height came from the drawn band is latched as one that may be measured once more");
+            "a measured guest no-footer strip is never mislabeled as a guessed footer fallback");
 
         int fit = results.IndexOf("private static bool Fit(BoardStrip strip", StringComparison.Ordinal);
-        int record = results.IndexOf("Drift.Record(strip.Top, strip.Bottom - strip.Top);", StringComparison.Ordinal);
+        int record = results.IndexOf("Drift.Record(Time.frameCount, strip.Top, strip.Bottom - strip.Top);", StringComparison.Ordinal);
         int hold = results.IndexOf("_holdStrip = strip;", StringComparison.Ordinal);
         check(fit >= 0 && record > fit && hold > fit,
             "the strip a placed board was measured into is recorded in the one place that really places a board");
 
         check(visibility.Contains("public readonly bool AnchorMeasured;")
-              && visibility.Contains("bool anchorMeasured = true)"),
+              && visibility.Contains("bool anchorMeasured = true, ResultFooterSource footerSource = ResultFooterSource.None)"),
             "the strip carries whether its upper edge was measured in its settled state, defaulting to the old answer");
 
         check(results.Contains("internal static void BeginFailurePage(CM_PageExpeditionFail page)")
@@ -538,6 +852,17 @@ internal static class Release11912Scenarios
         check(heldCheck > fit && heldKeep > heldCheck && visibility.Contains("public static bool HeldGridFits("),
             "the hold branch refuses a grid that would reach the button or run past the strip it was measured into");
 
+        check(policy.Contains("public sealed class ResultNoFooterGate")
+              && policy.Contains("public static class ResultNoFooterSafeArea")
+              && results.Contains("menuPage.m_allItems")
+              && results.Contains("GetComponentsInChildren<CM_Item>(true)")
+              && results.Contains("success.m_lobbyButtonVisible")
+              && results.Contains("nativeFooterVisible = fail.m_lobbyButtonVisible")
+              && results.Contains("ResultNoFooterSafeArea.TryResolve")
+              && results.Contains("ResultFooterSource.ClientNoFooterSafeArea")
+              && results.Contains("if (!BoardStillSafe())"),
+            "guest safe-area placement is wired only after page state, native CM_Item registry and Unity interaction scans prove no footer, with per-draw overlap protection");
+        Console.WriteLine("WIRING: CLIENT_NO_FOOTER_SAFE_AREA (static source check; not a runtime behaviour test)");
         Console.WriteLine("WIRING: RESULT_PAGE_SETTLE (static source check; not a runtime behaviour test)");
     }
 

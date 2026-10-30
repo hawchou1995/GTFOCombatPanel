@@ -97,6 +97,7 @@ internal static class EnemySpawnLedgerPatch
     private static void Postfix(EnemyAgent __instance)
     {
         CombatTracker.ObserveEnemySpawn(__instance);
+        ToolStatsTracker.ForgetGluedEnemy(__instance);
         // A pooled enemy is set up again here, and a Scout that screamed in its previous life must not
         // hand that latch to this one.
         ScoutWitness.Spawn(__instance);

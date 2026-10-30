@@ -209,80 +209,135 @@ public static class ResultAnchorRecovery
 //                      never touched.
 // ---------------------------------------------------------------------------------------------------
 
-// The failure page's own title, followed across frames.
+// The failure page's upper anchor is always its own mission-failed text. A client whose mission title is inactive
+// may use only that title's measured layout after the native ExpeditionFailedSequence has finished; waiting-status
+// text is never an upper anchor, because it can sit at the bottom of the page. The active-title path still requires
+// full opacity and stable geometry through ResultTitleGate; the inactive-layout path requires native sequence
+// completion plus a separately stable measured mission-title edge.
 //
-// The page fades `m_missionFailed_text` in, and it can move as it lands. `alpha` is the title as the player sees it -
-// its own text alpha multiplied by every canvas group above it. Two things are required together, and neither one
-// substitutes for the other:
-//
-//   * the text has really been drawn: its alpha has arrived at `OpaqueAlpha`. A title at 10% or 50% over a rectangle
-//     that has already stopped moving is still a title the player cannot read, and the board must not appear before
-//     the page's own headline is on the screen - that is exactly the report this rule exists for, because a stable
-//     rectangle is not evidence that the text has finished rendering. An alpha nobody could read is not evidence of
-//     completion either.
-//   * its measured bottom edge has held still: this reading and the one before it are the same value within
-//     `EdgeTolerance`, `EdgeFrames` readings in a row.
-//
-// `Edge` is the last bottom edge this title really handed over, and it survives the frames in which the renderer
-// cannot be read at all - that is what a later real measurement (the drift test, a re-measure, a diagnostic line)
-// starts from, and it is why a title whose renderer blinks out is not turned into "no geometry at all". `EdgeAge`
-// says how many frames ago it was read. Neither answers "complete" on its own: `Observe` returns true only on a
-// frame where both conditions above hold.
+// FailureSequenceReadiness binds one native coroutine instance to one page visit. Only that iterator's terminal
+// MoveNext(false) observation can mark the sequence finished; a stale page, a different sequence, a timeout, or an
+// unreadable title cannot produce readiness.
+public sealed class FailureSequenceReadiness
+{
+    private IntPtr _page, _sequence;
+    private bool _finished;
+
+    public IntPtr Page { get { return _page; } }
+    public IntPtr Sequence { get { return _sequence; } }
+    public bool Finished { get { return _finished; } }
+
+    public void BeginPage(IntPtr page)
+    {
+        _page = page;
+        _sequence = IntPtr.Zero;
+        _finished = false;
+    }
+
+    public bool BindSequence(IntPtr page, IntPtr sequence)
+    {
+        if (page == IntPtr.Zero || page != _page || sequence == IntPtr.Zero) return false;
+        _sequence = sequence;
+        _finished = false;
+        return true;
+    }
+
+    public bool MarkFinished(IntPtr page, IntPtr sequence)
+    {
+        if (page == IntPtr.Zero || page != _page || sequence == IntPtr.Zero || sequence != _sequence) return false;
+        _finished = true;
+        return true;
+    }
+
+    public bool IsFinished(IntPtr page) => page != IntPtr.Zero && page == _page && _sequence != IntPtr.Zero && _finished;
+
+    public void Forget() { _page = _sequence = IntPtr.Zero; _finished = false; }
+}
+
+public enum FailureTitleAnchorKind { None = 0, MissionFailed = 1, MissionTitleLayoutAfterSequence = 2 }
+
+public static class FailureTitleAnchorPolicy
+{
+    public static FailureTitleAnchorKind Select(bool client, bool nativeLobbyVisible, bool missionPresent,
+        bool missionActive, bool missionTextPresent, bool missionGeometryMeasured, bool failureSequenceFinished)
+    {
+        if (missionPresent && missionActive && missionTextPresent) return FailureTitleAnchorKind.MissionFailed;
+        if (client && !nativeLobbyVisible && !missionActive && missionPresent && missionTextPresent
+            && missionGeometryMeasured && failureSequenceFinished)
+            return FailureTitleAnchorKind.MissionTitleLayoutAfterSequence;
+        return FailureTitleAnchorKind.None;
+    }
+}
+
 public sealed class ResultTitleGate
 {
-    // Full opacity: what the page draws once the title's fade is over. There is deliberately no second way to arrive
-    // here - geometry that has stopped moving is not text that has finished rendering.
     public const float OpaqueAlpha = 0.99f;
-    // At or below this the page is still revealing the title and it is not on the screen at all.
     public const float VisibleAlpha = 0.02f;
-    // The measured bottom edge has to hold still: one frame of a title that is still landing is not an anchor.
     public const float EdgeTolerance = 1f;
     public const int EdgeFrames = 2;
 
     private float _reading = float.NaN, _anchor = float.NaN;
     private int _edgeSteady, _misses, _anchorAge = -1, _opaque;
-
-    // Readings this title has been observed without being settled. Reported, never a bound on anything: a title that
-    // never becomes opaque keeps the vanilla page, and no number of missed readings turns that into a placement.
+    private int _lastFrame = int.MinValue, _syntheticFrame;
+    private bool _settled;
+    private int _sameFrameInvalidations;
     public int Misses { get { return _misses; } }
-    // Consecutive readings at or above `OpaqueAlpha`, for the diagnostic line that says why the board is still not up.
     public int OpaqueFrames { get { return _opaque; } }
-    // The last bottom edge this title really handed over; NaN until it has been measured once.
     public float Edge { get { return _anchor; } }
-    // Frames since that edge was measured (0 on the frame it was), or -1 when it never was.
     public int EdgeAge { get { return _anchorAge; } }
+    public int SameFrameInvalidations { get { return _sameFrameInvalidations; } }
 
-    // One frame of evidence. `active` is whether the page has the title switched on at all; `measured` and `edge`
-    // are this frame's rectangle of it.
-    //
-    // Two different edges live here and they are not the same thing: `_reading` is the previous frame's reading,
-    // which is what "has this edge stopped moving" is asked against and which a frame without a reading clears;
-    // `_anchor` is the last reading that really existed, which survives those frames so a re-measure still starts
-    // from this page's own geometry.
+    // Compatibility for managed callers that represent one call as one frame. Runtime callers pass Unity's frame id.
     public bool Observe(bool active, float alpha, bool measured, float edge)
+        => Observe(_syntheticFrame++, active, alpha, measured, edge);
+
+    public bool Observe(int frame, bool active, float alpha, bool measured, float edge)
     {
+        float visible = float.IsFinite(alpha) ? Math.Min(1f, Math.Max(0f, alpha)) : float.NaN;
+        bool drawn = active && float.IsFinite(visible) && visible > VisibleAlpha;
+        bool opaque = drawn && visible >= OpaqueAlpha;
+        bool readable = drawn && measured && float.IsFinite(edge);
+
+        // IMGUI can ask the same page more than once during one Unity frame. Such a repaint is not a second
+        // observation; a conflicting reading only invalidates stability and must be confirmed on a later frame.
+        if (frame == _lastFrame)
+        {
+            if (!opaque || !readable || float.IsFinite(_reading) && Math.Abs(edge - _reading) > EdgeTolerance)
+            {
+                if (_sameFrameInvalidations < int.MaxValue) _sameFrameInvalidations++;
+                _reading = float.NaN; _edgeSteady = 0; _opaque = 0; _settled = false;
+            }
+            return _settled;
+        }
+        if (_lastFrame != int.MinValue && frame < _lastFrame) Forget();
+        _lastFrame = frame;
+
         if (!active)
         {
-            _reading = float.NaN; _edgeSteady = 0; _opaque = 0;
-            if (_anchorAge >= 0) _anchorAge++;
+            // A title the page has switched off owns no edge: the same page object is raised again for the next
+            // expedition, and reusing the rectangle the title occupied on the previous screen would place a board
+            // from an anchor nothing is drawn at. The reading and the anchor go together, and `EdgeAge` reports
+            // "no anchor" (-1) instead of ageing a value that no longer exists.
+            _reading = _anchor = float.NaN; _edgeSteady = 0; _opaque = 0; _settled = false; _anchorAge = -1;
             _misses++;
             return false;
         }
-        float visible = float.IsFinite(alpha) ? Math.Min(1f, Math.Max(0f, alpha)) : float.NaN;
-        bool drawn = float.IsFinite(visible) && visible > VisibleAlpha;
-        bool opaque = float.IsFinite(visible) && visible >= OpaqueAlpha;
         _opaque = opaque ? _opaque + 1 : 0;
-        bool readable = drawn && measured && float.IsFinite(edge);
         bool edgeSteady = readable && float.IsFinite(_reading) && Math.Abs(edge - _reading) <= EdgeTolerance;
         _edgeSteady = readable ? (edgeSteady ? _edgeSteady + 1 : 0) : 0;
         if (readable) { _reading = edge; _anchor = edge; _anchorAge = 0; }
         else { _reading = float.NaN; if (_anchorAge >= 0) _anchorAge++; }
-        bool settled = opaque && readable && _edgeSteady + 1 >= EdgeFrames;
-        _misses = settled ? 0 : _misses + 1;
-        return settled;
+        _settled = opaque && readable && _edgeSteady + 1 >= EdgeFrames;
+        _misses = _settled ? 0 : _misses + 1;
+        return _settled;
     }
 
-    public void Forget() { _reading = _anchor = float.NaN; _edgeSteady = 0; _misses = 0; _anchorAge = -1; _opaque = 0; }
+    public void Forget()
+    {
+        _reading = _anchor = float.NaN; _edgeSteady = 0; _misses = 0; _anchorAge = -1; _opaque = 0;
+        _lastFrame = int.MinValue; _syntheticFrame = 0; _settled = false;
+        _sameFrameInvalidations = 0;
+    }
 }
 
 // One measured edge of a result page, followed across frames.
@@ -296,32 +351,38 @@ public sealed class ResultTitleGate
 // a page whose own geometry is unavailable is better served by the game's own screen than by this mod's guess.
 public sealed class ResultEdgeGate
 {
-    // An edge is settled once its own value has been read `SettleFrames` times in a row within `Tolerance`.
     public const float Tolerance = 1f;
     public const int SettleFrames = 2;
-    // Readings after which the caller should stop measuring every frame and retry at a bounded cadence. A report, not
-    // a licence: `Exhausted` never makes `Observe` answer true.
     public const int SettleAttempts = 120;
 
     private float _edge = float.NaN;
     private int _steady, _attempts, _misses;
+    private int _lastFrame = int.MinValue, _syntheticFrame;
+    private bool _settled;
 
-    // The last real reading of this edge; NaN until it has been read once. Cleared by a frame without a reading, because
-    // a stale edge is not evidence that the edge is still where it was.
     public float Edge { get { return _edge; } }
-    // Readings in which this edge was not handed over at all.
     public int Misses { get { return _misses; } }
-    // Readings in which it was handed over.
     public int Attempts { get { return _attempts; } }
-    // Enough readings have gone by that the caller should retry at a bounded cadence instead of every frame.
     public bool Exhausted { get { return _misses + _attempts >= SettleAttempts; } }
 
-    // One frame of evidence: true only for an edge that was really read at the same value twice in a row.
-    public bool Observe(bool measured, float edge)
+    public bool Observe(bool measured, float edge) => Observe(_syntheticFrame++, measured, edge);
+
+    public bool Observe(int frame, bool measured, float edge)
     {
-        if (!measured || !float.IsFinite(edge))
+        bool readable = measured && float.IsFinite(edge);
+        if (frame == _lastFrame)
         {
-            _steady = 0; _edge = float.NaN;
+            if (!readable || float.IsFinite(_edge) && Math.Abs(edge - _edge) > Tolerance)
+            {
+                _steady = 0; _edge = float.NaN; _settled = false;
+            }
+            return _settled;
+        }
+        if (_lastFrame != int.MinValue && frame < _lastFrame) Forget();
+        _lastFrame = frame;
+        if (!readable)
+        {
+            _steady = 0; _edge = float.NaN; _settled = false;
             if (_misses < int.MaxValue) _misses++;
             return false;
         }
@@ -330,46 +391,106 @@ public sealed class ResultEdgeGate
         bool steady = float.IsFinite(_edge) && Math.Abs(edge - _edge) <= Tolerance;
         _steady = steady ? _steady + 1 : 0;
         _edge = edge;
-        return _steady + 1 >= SettleFrames;
+        _settled = _steady + 1 >= SettleFrames;
+        return _settled;
     }
 
-    public void Forget() { _edge = float.NaN; _steady = 0; _attempts = 0; _misses = 0; }
+    public void Forget()
+    {
+        _edge = float.NaN; _steady = 0; _attempts = 0; _misses = 0;
+        _lastFrame = int.MinValue; _syntheticFrame = 0; _settled = false;
+    }
 }
 
-// How often a settlement page that has not handed an anchor over yet is measured again.
-//
-// Measuring a page walks every renderer of its completion section and every button it drew, so a page whose title never
-// becomes opaque, or whose footer button is never drawn, must not pay for that walk on every frame for the rest of the
-// expedition - and it must not be given an approximate board either. The page is therefore measured on every frame
-// while its reveal is still running (that is where a real page settles), and after `EveryFrameFrames` readings it is
-// re-measured every `RetryEveryFrames` frames until a real anchor appears. Nothing here answers "ready": it answers
-// "look again", and `ResultTitleGate` / `ResultEdgeGate` answer whether what was found is real.
-public sealed class ResultRetryCadence
+// A client may use the remainder of a result page only after the page itself confirms that it has no footer
+// and a complete scan finds no native or Unity interaction item. Unknown/unreadable controls never qualify.
+public sealed class ResultNoFooterGate
 {
-    // Readings taken on every frame: the page's own reveal, plus a wide margin for a slow one.
-    public const int EveryFrameFrames = 120;
-    // After that, one reading every this many frames (~0.5s at 60 fps).
-    public const int RetryEveryFrames = 30;
+    public const int RequiredSamples = 3;
+    private int _samples, _lastFrame = int.MinValue;
 
-    private int _waits, _lastFrame = int.MinValue;
+    public int Samples { get { return _samples; } }
+    public bool Ready { get { return _samples >= RequiredSamples; } }
 
-    // Readings asked for so far on this page.
-    public int Waits { get { return _waits; } }
-    // Whether the every-frame window is spent and the page is on the bounded cadence.
-    public bool Throttled { get { return _waits >= EveryFrameFrames; } }
-
-    // Whether the page should be measured on this frame. `frame` is the engine's own frame counter, which only has to
-    // be monotone; a counter that restarts (a reload) is treated as "due" rather than as a reason to skip for ever.
-    public bool Due(int frame)
+    public bool Observe(int frame, bool client, bool anchorSettled, bool nativeStateKnown,
+        bool nativeFooterVisible, bool interactionScanComplete, int interactionCount)
     {
-        _waits++;
-        if (_waits <= EveryFrameFrames) { _lastFrame = frame; return true; }
-        if (_lastFrame != int.MinValue && frame >= _lastFrame && frame - _lastFrame < RetryEveryFrames) return false;
+        bool absent = client && anchorSettled && nativeStateKnown && !nativeFooterVisible
+            && interactionScanComplete && interactionCount == 0;
+        if (!absent)
+        {
+            Forget();
+            _lastFrame = frame;
+            return false;
+        }
+        if (frame == _lastFrame) return Ready;
+        if (_lastFrame != int.MinValue && frame < _lastFrame) Forget();
         _lastFrame = frame;
-        return true;
+        if (_samples < RequiredSamples) _samples++;
+        return Ready;
     }
 
-    public void Forget() { _waits = 0; _lastFrame = int.MinValue; }
+    public void Forget() { _samples = 0; _lastFrame = int.MinValue; }
+}
+
+// An explicitly sourced viewport strip for a client page whose native footer is absent. A measured protected
+// lower wall (for example, the native host-wait status text) shortens the strip; it is never an upper anchor.
+// Placement still requires ResultNoFooterGate.Ready from page state and a complete control/tree scan.
+public static class ResultNoFooterSafeArea
+{
+    public static bool TryResolve(float measuredTop, float screenHeight, out ResultsSafeArea area,
+        float lowerWallTop = float.NaN, float gap = 0f)
+    {
+        area = default;
+        if (!float.IsFinite(measuredTop) || !float.IsFinite(screenHeight) || screenHeight <= 8f) return false;
+        if (!float.IsNaN(lowerWallTop) && (!float.IsFinite(lowerWallTop) || !float.IsFinite(gap) || gap < 0f)) return false;
+        float top = Math.Max(0f, measuredTop);
+        float bottom = screenHeight - 8f;
+        if (float.IsFinite(lowerWallTop)) bottom = Math.Min(bottom, lowerWallTop - gap);
+        if (!(bottom > top)) return false;
+        area = new ResultsSafeArea(top, bottom);
+        return true;
+    }
+}
+
+public sealed class ResultRetryCadence
+{
+    public const int EveryFrameFrames = 120;
+    public const int RetryEveryFrames = 30;
+
+    private int _waits, _lastSampleFrame = int.MinValue, _lastObservedFrame = int.MinValue;
+    private bool _lastDecision;
+
+    public int Waits { get { return _waits; } }
+    public bool Throttled { get { return _waits >= EveryFrameFrames; } }
+
+    public bool Due(int frame)
+    {
+        if (frame == _lastObservedFrame) return _lastDecision;
+        if (_lastObservedFrame != int.MinValue && frame < _lastObservedFrame)
+        {
+            _waits = 0;
+            _lastSampleFrame = int.MinValue;
+        }
+        _lastObservedFrame = frame;
+        if (_waits < EveryFrameFrames)
+        {
+            _waits++;
+            _lastSampleFrame = frame;
+            return _lastDecision = true;
+        }
+        if (_lastSampleFrame != int.MinValue && frame >= _lastSampleFrame
+            && frame - _lastSampleFrame < RetryEveryFrames)
+            return _lastDecision = false;
+        if (_waits < int.MaxValue) _waits++;
+        _lastSampleFrame = frame;
+        return _lastDecision = true;
+    }
+
+    public void Forget()
+    {
+        _waits = 0; _lastSampleFrame = int.MinValue; _lastObservedFrame = int.MinValue; _lastDecision = false;
+    }
 }
 
 // The page moved after the board was placed.
@@ -384,44 +505,43 @@ public sealed class ResultRetryCadence
 // not a move, and every re-measure is budgeted, so this can never become a per-frame rebuild.
 public sealed class ResultAnchorDrift
 {
-    // A real move: more than this many pixels, and more than this share of the figure that moved. The share is
-    // what keeps a couple of pixels of the page's own animation from reading as a new layout, while a footer
-    // that lands a tenth of the strip lower - the case that fixes a small board - does read as one.
     public const float MinimumPixels = 12f;
     public const float Share = 0.08f;
-    // Two samples in a row, so one frame of the page's own animation cannot rebuild anything.
     public const int Frames = 2;
-    // How many times one page may be re-measured because it moved. A page that keeps moving is left alone
-    // after this rather than rebuilt for ever.
     public const int MaximumRecoveries = 2;
 
     private float _top = float.NaN, _room = float.NaN;
-    private int _frames, _recoveries;
+    private int _frames, _recoveries, _lastFrame = int.MinValue, _syntheticFrame;
 
-    // A board is only compared against a strip that was really recorded.
     public bool Armed { get { return float.IsFinite(_top) && float.IsFinite(_room); } }
     public int Recoveries { get { return _recoveries; } }
     public bool Exhausted { get { return _recoveries >= MaximumRecoveries; } }
 
-    // The strip the board standing now was measured into: its upper edge and the room it gave. Called from the one
-    // place that really places a board, so the comparison is always against a real measurement.
-    public void Record(float top, float room)
+    public void Record(float top, float room) => Record(_syntheticFrame++, top, room);
+
+    public void Record(int frame, float top, float room)
     {
         if (!float.IsFinite(top) || !float.IsFinite(room) || !(room > 0f)) return;
-        _top = top; _room = room; _frames = 0;
+        _top = top; _room = room; _frames = 0; _lastFrame = frame;
     }
 
-    public void Forget() { _top = _room = float.NaN; _frames = 0; _recoveries = 0; }
-
-    // Whether the page has really moved away from the strip the board was measured into. Does not spend the
-    // budget: the caller spends it with `Spent` once it has started the re-measure, so a sample that could not be
-    // acted on costs nothing.
-    public bool Due(float top, float room)
+    public void Forget()
     {
+        _top = _room = float.NaN; _frames = 0; _recoveries = 0;
+        _lastFrame = int.MinValue; _syntheticFrame = 0;
+    }
+
+    public bool Due(float top, float room) => Due(_syntheticFrame++, top, room);
+
+    public bool Due(int frame, float top, float room)
+    {
+        if (frame == _lastFrame) return false;
+        if (_lastFrame != int.MinValue && frame < _lastFrame) Forget();
+        _lastFrame = frame;
         if (!Armed) return false;
         if (!Moved(top, _top) && !Moved(room, _room)) { _frames = 0; return false; }
-        if (++_frames < Frames) return false;
-        return !Exhausted;
+        if (_frames < Frames) _frames++;
+        return _frames >= Frames && !Exhausted;
     }
 
     public void Spent()
@@ -430,7 +550,6 @@ public sealed class ResultAnchorDrift
         _frames = 0;
     }
 
-    // Whether an edge has moved by more than this rule allows.
     public static bool Moved(float now, float recorded)
         => float.IsFinite(now) && float.IsFinite(recorded)
            && Math.Abs(now - recorded) > Math.Max(MinimumPixels, Math.Abs(recorded) * Share);

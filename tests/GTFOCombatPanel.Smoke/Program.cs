@@ -1184,16 +1184,20 @@ internal static partial class Program
         sharedReveals.Clear();
         Check(sharedReveals.Count == 0 && new ScanSession(sharedReveals).Observe(41, new ImpactCounters(), true) == ScanMark.First, "a cleared ledger is a fresh expedition");
         if (args.Length == 2 && args[0] == "--preview") BoardPreview.Write(args[1], BoardPreview.Sample());
-        Check(ResultsHeading.Resolve(true, true, 1f, false, 0, 1440, 0, out var fallbackTop, out var fallbackAlpha) && near(fallbackTop, 505.6f) && fallbackAlpha == 1f, "a visible title with unavailable measurement still produces a visible board");
+        // The failure strip no longer has a fraction-of-the-window fallback: a title that cannot be measured is
+        // answered by the game's own page until its edge is really readable, and one that is still fading in is
+        // not a title the player has seen. These assertions pin that contract on the policy itself.
+        Check(!ResultsHeading.Resolve(true, true, 1f, false, 0, 1440, 0, out _, out _),
+            "a visible title whose edge cannot be measured keeps the vanilla page instead of a window fraction");
         Check(ResultsHeading.Resolve(true, true, 1f, true, 450f, 1440, 0, out var measuredTop, out _) && measuredTop == 466f, "a readable title uses its real lower edge");
         Check(!ResultsHeading.Resolve(true, true, 0f, false, 0, 1440, 0, out _, out _), "a known transparent title still delays the board");
         Check(!ResultsHeading.Resolve(true, false, 1f, false, 0, 1440, 0, out _, out _), "an inactive title delays the board");
-        Check(ResultsHeading.Resolve(false, false, 0f, false, 0, 1440, 0, out _, out var missingAlpha) && missingAlpha == 1f, "an unavailable title component degrades instead of permanently hiding statistics");
-        Check(ResultsHeading.Resolve(true, true, float.NaN, false, 0, 1440, 0, out _, out var unknownAlpha) && unknownAlpha == 1f, "unreadable alpha does not fabricate invisibility");
-        Check(ResultsHeading.Resolve(true, true, 1f, true, float.NaN, 1440, 0, out var invalidTop, out _) && near(invalidTop, fallbackTop), "invalid measured geometry uses the same fallback");
-        Check(ResultsHeading.Resolve(true, true, 1f, false, 0, 1440, -500, out var negativeTop, out _) && near(negativeTop, fallbackTop), "negative offsets cannot lift the fallback over the captured title");
+        Check(!ResultsHeading.Resolve(false, false, 0f, false, 0, 1440, 0, out _, out _), "an absent title component no longer degrades into a placement");
+        Check(!ResultsHeading.Resolve(true, true, float.NaN, false, 0, 1440, 0, out _, out _), "unreadable alpha is not evidence of a drawn title");
+        Check(!ResultsHeading.Resolve(true, true, 1f, true, float.NaN, 1440, 0, out _, out _), "invalid measured geometry is refused rather than replaced by a window fraction");
+        Check(!ResultsHeading.Resolve(true, true, 1f, true, 1435f, 1440, 0, out _, out _), "a title whose own bottom sits in the viewport margin cannot supply an edge");
         Check(!ResultsHeading.Resolve(true, true, 1f, false, 0, 0, 0, out _, out _), "an invalid viewport rejects placement");
-        Check(ResultsHeading.Resolve(true, true, 0.5f, false, 0, 1440, 0, out _, out var fadingAlpha) && fadingAlpha == 0.5f, "the fallback board still follows known heading fade");
+        Check(!ResultsHeading.Resolve(true, true, 0.5f, true, 450f, 1440, 0, out _, out _), "a title still fading in cannot place the board early");
         var fullSupply = new ImpactCounters();
         fullSupply.RecordSupply(0.2, 0.2); fullSupply.RecordSupply(0.35, 0.35);
         Check(fullSupply.SupplyUses == 2 && fullSupply.SupplyEfficiency == 1, "two non-overflowing ammo uses average to one, not two percent");
@@ -1541,23 +1545,20 @@ internal static partial class Program
         Check(OverlayPolicy.HidesArtifacts(false) && OverlayPolicy.HidesReports(false), "the artifact block and the report cards are put away while their switches are off");
         Check(!OverlayPolicy.HidesArtifacts(true) && !OverlayPolicy.HidesReports(true), "switching either block on brings it back");
 
-        // The line the failure page's message must end on is the one the success completion section ended
-        // on, remembered per window size and refused outright when it would cover a button.
-        FailureAlignment.Forget();
-        Check(!FailureAlignment.AnchorKnown(1440f), "a line nobody measured is not claimed");
-        FailureAlignment.RememberCompletion(600f, 1440f);
-        Check(FailureAlignment.AnchorKnown(1440f), "the completion line is remembered at the window it was measured in");
-        Check(!FailureAlignment.AnchorKnown(1080f), "the remembered line is not reused at another window size");
-        Check(FailureAlignment.Resolve(false, float.NaN, 1440f, 0f, 16f, true, 1300f, out float alignedBottom, out ResultsSafeArea alignedStrip)
+        // Failure placement accepts only a real mission-title edge and a real measured lower wall.
+        Check(!FailureAlignment.Resolve(false, float.NaN, 1440f, 0f, 16f, true, 1300f,
+                out _, out ResultsSafeArea missingTitleStrip) && !missingTitleStrip.Fits,
+            "a missing failure title cannot borrow a success-page remnant or a viewport fraction");
+        Check(FailureAlignment.Resolve(true, 600f, 1440f, 0f, 16f, true, 1300f,
+                out float alignedBottom, out ResultsSafeArea alignedStrip)
             && near(alignedBottom, 600f) && near(alignedStrip.Top, 616f) && near(alignedStrip.Bottom, 1284f),
-            "the failure message is moved onto the remembered completion line and the board starts the same gap under it");
-        Check(!FailureAlignment.Resolve(false, float.NaN, 1440f, 0f, 16f, true, 620f, out _, out ResultsSafeArea tightStrip) && !tightStrip.Fits,
-            "a button right under the line yields no strip and the board is not drawn rather than covering it");
+            "a measured native title and measured interaction wall define the failure strip");
+        Check(!FailureAlignment.Resolve(true, 600f, 1440f, 0f, 16f, false, float.NaN, out _, out _),
+            "a measured title without a lower wall cannot silently use a window-fraction footer");
         var lobbyButton = new LayoutRect(0f, alignedStrip.Bottom + 16f, 1920f, 100f);
         Check(ResultsPlacement.TryFitBetween(1920f, 1440f, alignedStrip.Top, alignedStrip.Bottom, 800f, 500f, 0f, out LayoutRect placedBoard)
             && !placedBoard.Overlaps(lobbyButton),
-            "the failure board placed in the shared strip clears the lobby button");
-        FailureAlignment.Forget();
+            "the failure board placed in the measured strip clears the lobby button");
 
         // ---- the settlement board's own visibility policy ------------------------------------------
         // Readiness of the success page's completion section. The board is not allowed over the page until the

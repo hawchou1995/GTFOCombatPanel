@@ -107,29 +107,22 @@ internal static class Release11910Scenarios
     // ---------------------------------------------------------------- A3: the failure page's own title
     private static void FailureTitleBound(Action<bool, string> check)
     {
-        FailureAlignment.Forget();
         check(FailureAlignment.Source(true, 380f, 1440f) == "mission-failed-text",
-            "the native failure title is the source of the board's upper bound when it could be measured");
-        check(FailureAlignment.Source(false, float.NaN, 1440f) == "window-fraction",
-            "a session that measured neither a title nor a completion section says so rather than claiming an anchor");
+            "the native failure title is the only upper-bound source when it could be measured");
+        check(FailureAlignment.Source(false, float.NaN, 1440f) == "none",
+            "a failure page that has not measured its own title has no upper-anchor fallback");
 
-        // The native message wins over a completion line remembered from an earlier success page in this window:
-        // the gap between the game's own title, the sector icons over it and the table is the game's.
-        FailureAlignment.RememberCompletion(410f, 1440f);
-        check(FailureAlignment.Source(false, float.NaN, 1440f) == "remembered-completion",
-            "with no readable title the remembered completion line is the fallback");
+        bool missingTitle = FailureAlignment.Resolve(false, float.NaN, 1440f, 0f, 16f, true, 953f,
+            out _, out ResultsSafeArea missingStrip);
+        check(!missingTitle && !missingStrip.Fits,
+            "a title that cannot be measured is refused instead of borrowing a success edge or window fraction");
+        bool missingFooter = FailureAlignment.Resolve(true, 380f, 1440f, 0f, 16f, false, float.NaN,
+            out _, out _);
+        check(!missingFooter, "a missing interaction lower wall cannot become a guessed footer bound");
         bool resolved = FailureAlignment.Resolve(true, 380f, 1440f, 0f, 16f, true, 953f,
             out float aligned, out ResultsSafeArea measuredStrip);
         check(resolved && Near(aligned, 380f) && Near(measuredStrip.Top, 396f),
             $"the measured title's own bottom edge plus the page gap starts the board: aligned={aligned:0}, top={measuredStrip.Top:0}");
-        bool fallback = FailureAlignment.Resolve(false, float.NaN, 1440f, 0f, 16f, true, 953f,
-            out float fallbackAligned, out _);
-        check(fallback && Near(fallbackAligned, 410f),
-            $"a title that could not be read falls back to the remembered line, never to the historical fraction: {fallbackAligned:0}");
-        bool otherWindow = FailureAlignment.Resolve(false, float.NaN, 1080f, 0f, 16f, true, 953f, out float other, out _);
-        check(otherWindow && Near(other, 1080f * ResultsHeading.FallbackBottomFraction),
-            "a remembered line belongs to the window it was measured in, and another window size does not inherit it");
-        FailureAlignment.Forget();
 
         // The wait for that title is no longer a bounded give-up that ends in a placement: `ResultTitleGate` owns it
         // (full opacity over an edge that has stopped moving) and a page whose title never arrives keeps the game's own

@@ -102,20 +102,49 @@ internal static partial class Program
         Check(tools.TrySentryHit(turret, 0u) && !tools.TrySentryHit(turret, 0u)
             && tools.TrySentryHit(turret, 1u) && !tools.TrySentryHit(turret, 1u),
             "zero and real sentry ids both deduplicate repeated contacts within the same shot window");
-        IntPtr projectile = new IntPtr(301), secondProjectile = new IntPtr(302), enemyA = new IntPtr(401), enemyB = new IntPtr(402);
-        // A shot is registered when the glue gun fires, and a hit is only ever spent out of a registered shot.
-        // The two registrations here stand for the two launches `ToolStatsTracker.CreditGlueProjectile` counts.
-        tools.BeginGlueProjectile(11UL, projectile);
-        tools.BeginGlueProjectile(11UL, secondProjectile);
-        Check(tools.TryGlueHit(11UL, projectile) && !tools.TryGlueHit(11UL, projectile)
-            && tools.TryGlueHit(11UL, secondProjectile), "one fired glue projectile contributes at most one shot-hit despite repeated enemy contacts");
-        IntPtr unfiredProjectile = new IntPtr(303);
-        Check(!tools.TryGlueHit(11UL, unfiredProjectile) && tools.GlueHitIdentityCount == 2,
-            "a projectile this machine never counted as a shot cannot contribute a glue hit, so hits cannot exceed shots");
-        Check(tools.TryGluedEnemy(11UL, enemyA) && !tools.TryGluedEnemy(11UL, enemyA)
-            && tools.TryGluedEnemy(22UL, enemyA) && tools.TryGluedEnemy(11UL, enemyB),
-            "glued enemies are unique per owning player and distinct enemy");
-        IntPtr door = new IntPtr(501), doorProjectile = new IntPtr(502), doorAttacker = new IntPtr(601);
+        IntPtr projectile = new IntPtr(301), secondProjectile = new IntPtr(302), enemyA = new IntPtr(401), enemyB = new IntPtr(402), enemyC = new IntPtr(403);
+        IntPtr wildProjectile = new IntPtr(303), door = new IntPtr(501), doorProjectile = new IntPtr(502), doorAttacker = new IntPtr(601);
+        var glueEvents = new ImpactCounters();
+        tools.BeginGlueProjectile(11UL, projectile); glueEvents.CreditGlueShot();
+        tools.BeginGlueProjectile(11UL, secondProjectile); glueEvents.CreditGlueShot();
+        GlueContactCredit sprayFirst = tools.RecordGlueContact(11UL, projectile, enemyA);
+        if (sprayFirst.Hit) glueEvents.CreditGlueHit(); if (sprayFirst.NewEnemy) glueEvents.CreditGluedEnemy();
+        GlueContactCredit sprayDuplicate = tools.RecordGlueContact(11UL, projectile, enemyA);
+        if (sprayDuplicate.Hit) glueEvents.CreditGlueHit(); if (sprayDuplicate.NewEnemy) glueEvents.CreditGluedEnemy();
+        GlueContactCredit spraySecondEnemy = tools.RecordGlueContact(11UL, projectile, enemyB);
+        if (spraySecondEnemy.Hit) glueEvents.CreditGlueHit(); if (spraySecondEnemy.NewEnemy) glueEvents.CreditGluedEnemy();
+        GlueContactCredit secondShot = tools.RecordGlueContact(11UL, secondProjectile, enemyC);
+        if (secondShot.Hit) glueEvents.CreditGlueHit(); if (secondShot.NewEnemy) glueEvents.CreditGluedEnemy();
+        GlueContactCredit wild = tools.RecordGlueContact(11UL, wildProjectile, new IntPtr(404));
+        GlueContactCredit wrongOwner = tools.RecordGlueContact(22UL, projectile, new IntPtr(405));
+        GlueContactCredit noOwner = tools.RecordGlueContact(0UL, secondProjectile, new IntPtr(406));
+        var bioCounters = new ImpactCounters { ScanUses = 2, ScanFirstMarks = 7, ScanMarks = 9 };
+        if (wild.Hit) bioCounters.CreditGlueHit(); if (wild.NewEnemy) bioCounters.CreditGluedEnemy();
+        var bioEntry = new ImpactEntry(new ImpactInput { ToolName = "Bio Tracker", Counters = bioCounters }, null, null,
+            50, 1, ImpactRating.Scan, (int)ImpactMetric.ToolEfficiency);
+        Check(bioCounters.ScanFirstMarks == 7 && bioCounters.GluedEnemies == 0
+            && ImpactBoard.ToolEfficiencyText(bioEntry) == "扫描 2 次 / 首次 7 只 / 累计 9 只",
+            "an unregistered wild glue callback leaves Bio Tracker scan figures and ToolEfficiency source unchanged");
+        Check(sprayFirst.Hit && sprayFirst.NewEnemy && !sprayDuplicate.Hit && !sprayDuplicate.NewEnemy
+            && !spraySecondEnemy.Hit && spraySecondEnemy.NewEnemy && secondShot.Hit && secondShot.NewEnemy,
+            "a registered spray spends one shot-hit but attributes multiple distinct enemies; repeated callbacks deduplicate");
+        Check(!wild.Hit && !wild.NewEnemy && !wrongOwner.Hit && !wrongOwner.NewEnemy && !noOwner.Hit && !noOwner.NewEnemy,
+            "unregistered wild foam, cross-owner contacts and ownerless contacts cannot create glue figures");
+        Check(glueEvents.GlueShots == 2 && glueEvents.GlueHits == 2 && glueEvents.GluedEnemies == 3,
+            "only the two accepted GlueGun launches produce two hits and three glued enemies");
+        tools.ForgetGlueProjectile(projectile);
+        Check(!tools.HasGlueProjectile(11UL, projectile) && tools.GlueHitIdentityCount == 1
+            && !tools.RecordGlueContact(11UL, projectile, new IntPtr(407)).NewEnemy,
+            "projectile destruction removes its owner, hit and contact provenance");
+        tools.BeginGlueProjectile(22UL, projectile);
+        GlueContactCredit oldOwnerReuse = tools.RecordGlueContact(11UL, projectile, new IntPtr(408));
+        GlueContactCredit newOwnerReuse = tools.RecordGlueContact(22UL, projectile, new IntPtr(408));
+        Check(!oldOwnerReuse.Hit && !oldOwnerReuse.NewEnemy && newOwnerReuse.Hit && newOwnerReuse.NewEnemy,
+            "a pooled pointer reused by another owner starts a fresh provenance lifetime");
+        tools.ForgetGluedEnemy(enemyA);
+        GlueContactCredit reusedEnemy = tools.RecordGlueContact(11UL, secondProjectile, enemyA);
+        Check(reusedEnemy.NewEnemy, "EnemyAgent.Setup clears the old occupant's dedupe identity when an enemy pointer is reused");
+        tools.BeginGlueProjectile(11UL, doorProjectile);
         Check(tools.TryRegisterGlueDoor(door, doorProjectile, 11UL)
             && !tools.TryRegisterGlueDoor(door, doorProjectile, 11UL)
             && tools.TryGetGlueDoorOwner(door, out ulong doorOwner) && doorOwner == 11UL,
@@ -136,7 +165,8 @@ internal static partial class Program
             "clearing door foam removes its owner and hit identities");
         tools.Clear();
         Check(tools.DeployedMineCount == 0 && tools.SentryHitIdentityCount == 0
-            && tools.GlueHitIdentityCount == 0 && tools.GluedEnemyCount == 0 && tools.GluedDoorCount == 0,
+            && tools.GlueHitIdentityCount == 0 && tools.GluedEnemyCount == 0 && tools.GluedDoorCount == 0
+            && !tools.HasGlueProjectile(22UL, projectile),
             "tool event identities clear at expedition reset");
 
         var friendlyFire = new FriendlyFireAttributionLedger();

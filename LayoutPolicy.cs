@@ -406,7 +406,81 @@ public readonly struct ResultsSafeArea
     public float Height { get { return Bottom > Top ? Bottom - Top : 0f; } }
     public bool Fits { get { return Height > 0f; } }
 }
+public readonly struct ResultActionBounds
+{
+    public readonly LayoutRect Bounds;
+    public readonly bool IsProtectedPageText;
 
+    public ResultActionBounds(LayoutRect bounds, bool protectedPageText = false)
+    { Bounds = bounds; IsProtectedPageText = protectedPageText; }
+}
+
+public readonly struct ResultInteractionStrip
+{
+    public readonly float BoardTop;
+    public readonly float FooterTop;
+    public readonly int FooterActionCount;
+    public bool HasFooter { get { return float.IsFinite(FooterTop); } }
+
+    public ResultInteractionStrip(float boardTop, float footerTop, int footerActionCount)
+    { BoardTop = boardTop; FooterTop = footerTop; FooterActionCount = footerActionCount; }
+}
+
+// The trusted title/completion edge divides unrelated controls from the strip the board may use. Controls
+// entirely above it do not become footer candidates; a control crossing the proposed start moves that start
+// below its actual bottom, and controls in or below the resulting strip form its lower wall. The complete
+// interaction scan still feeds OverlapsBoard independently before every draw.
+public static class ResultInteractionStripPolicy
+{
+    public static bool TryResolve(float anchorBottom, float gap, IReadOnlyList<ResultActionBounds> controls,
+        out ResultInteractionStrip strip)
+    {
+        strip = default;
+        if (!float.IsFinite(anchorBottom) || anchorBottom < 0f || !float.IsFinite(gap) || gap < 0f || controls == null)
+            return false;
+
+        float top = anchorBottom + gap;
+        for (int pass = 0; pass <= controls.Count; pass++)
+        {
+            bool raised = false;
+            for (int index = 0; index < controls.Count; index++)
+            {
+                LayoutRect rect = controls[index].Bounds;
+                if (!Valid(rect)) return false;
+                if (rect.Bottom <= anchorBottom || rect.Y >= top) continue;
+                float nextTop = rect.Bottom + gap;
+                if (nextTop > top + 0.5f) { top = nextTop; raised = true; }
+            }
+            if (!raised) break;
+        }
+
+        float footerTop = float.NaN;
+        int footerActionCount = 0;
+        for (int index = 0; index < controls.Count; index++)
+        {
+            ResultActionBounds action = controls[index];
+            LayoutRect rect = action.Bounds;
+            if (rect.Y < top - 0.5f || rect.Bottom <= top) continue;
+            footerTop = ResultsRegion.HighestTop(rect.Y, footerTop);
+            if (!action.IsProtectedPageText) footerActionCount++;
+        }
+        strip = new ResultInteractionStrip(top, footerTop, footerActionCount);
+        return float.IsFinite(top);
+    }
+
+    // A newly shown or moved control that enters the board rectangle/clearance band invalidates the cached draw.
+    public static bool OverlapsBoard(LayoutRect control, LayoutRect board, float clearance)
+    {
+        if (!Valid(control) || !Valid(board)) return true;
+        float gap = float.IsFinite(clearance) && clearance > 0f ? clearance : 0f;
+        return control.Right > board.X && board.Right > control.X
+            && control.Bottom > board.Y && board.Bottom > control.Y - gap;
+    }
+
+    private static bool Valid(LayoutRect rect)
+        => float.IsFinite(rect.X) && float.IsFinite(rect.Y) && float.IsFinite(rect.Width) && float.IsFinite(rect.Height)
+           && rect.Width > 0f && rect.Height > 0f;
+}
 public static class ResultsRegion
 {
     // The fraction of the window a strip starts at when the completion section could not be measured. It is no
@@ -686,24 +760,21 @@ public static class ResultsButtonPolicy
             && (!float.IsFinite(best) || top < best) ? top : best;
 }
 
-// Native title visibility is independent of whether its screen-space rectangle can be read.
+// Whether the failure page has a real, drawable title edge. No viewport fraction substitutes for missing
+// geometry; an inactive client title is handled separately only after native failure-sequence completion.
 public static class ResultsHeading
 {
+    public const float OpaqueAlpha = 0.99f;
 
-    // The fraction of the window the vanilla failure composition puts the bottom of its own message at,
-    // used only when nothing at all could be measured.
-    public const float FallbackBottomFraction = 0.34f;
     public static bool Resolve(bool present, bool active, float alpha, bool measured, float bottom,
         float screenHeight, float offsetY, out float top, out float opacity)
     {
         top = 0f; opacity = 0f;
-        if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
-        if (present && (!active || float.IsFinite(alpha) && alpha <= 0.001f)) return false;
-        opacity = present && float.IsFinite(alpha) ? Math.Min(1f, Math.Max(0f, alpha)) : 1f;
-        bool sane = measured && float.IsFinite(bottom) && bottom >= 0f && bottom < screenHeight - 8f;
-        // Explicit fallback for the vanilla failure composition; logged by the runtime, not claimed
-        // to be a measured title edge. It lies below the title in the supplied 2560x1440 capture.
-        top = ResultsPlacement.Top(sane ? bottom : screenHeight * FallbackBottomFraction, offsetY);
+        if (!present || !active || !float.IsFinite(alpha) || alpha < OpaqueAlpha
+            || !float.IsFinite(screenHeight) || screenHeight <= 0f
+            || !measured || !float.IsFinite(bottom) || bottom < 0f || bottom >= screenHeight - 8f) return false;
+        opacity = Math.Min(1f, Math.Max(0f, alpha));
+        top = ResultsPlacement.Top(bottom, offsetY);
         return true;
     }
 }
@@ -750,76 +821,30 @@ public static class PanelAppearance
     }
 }
 
-// Where the failure page's board begins: under the page's own message.
-//
-// The message is the element the player is looking at, so its measured bottom edge plus the page's gap is what
-// decides where the board starts - the spacing between the failure title (and the sector icons over it) and the
-// table is the native composition's, not a remembered line from another screen. The line the success page's
-// completion section ended on is kept as the fallback for a frame in which the message has faded in but cannot
-// be measured yet, so a page that never hands over its title still gets a board in the same strip both screens
-// share instead of one hanging from the historical fraction of the window. The remembered line is only ever
-// reused at the window size it was measured at.
+// The failure board starts below a real native mission-title edge and above a real measured interaction wall.
+// Missing title or footer geometry is not replaced with a success-page remnant or a window fraction.
 public static class FailureAlignment
 {
-    private static float _completionBottom = float.NaN;
-    private static float _completionScreenHeight = float.NaN;
-
-    public static bool AnchorKnown(float screenHeight)
-        => float.IsFinite(_completionBottom) && float.IsFinite(_completionScreenHeight)
-           && float.IsFinite(screenHeight) && screenHeight > 0f
-           && Math.Abs(_completionScreenHeight - screenHeight) <= 1f;
-
-    public static float Anchor { get { return _completionBottom; } }
-
-    // Called by the success path with every completion-section measurement it makes.
-    public static void RememberCompletion(float bottom, float screenHeight)
-    {
-        if (!float.IsFinite(bottom) || bottom < 0f || !float.IsFinite(screenHeight) || screenHeight <= 0f) return;
-        _completionBottom = bottom;
-        _completionScreenHeight = screenHeight;
-    }
-
-    public static void Forget() { _completionBottom = float.NaN; _completionScreenHeight = float.NaN; }
-
-    // The line the failure page's board starts under. The native message wins whenever it could be measured:
-    // it is the element the player sees, and the gap under it is the whole of the spacing rule. A message that
-    // has not arrived yet - the page fades it in - falls back to the line the success page's completion section
-    // remembered for this window size, and only a session that never measured either keeps the historical
-    // fraction. Nothing here moves the message: it is read where the game put it.
     public static bool Resolve(bool messageMeasured, float messageBottom, float screenHeight, float offsetY, float gap,
         bool buttonMeasured, float buttonTop, out float alignedBottom, out ResultsSafeArea strip)
     {
-        alignedBottom = float.NaN; strip = default;
-        if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
-        if (!float.IsFinite(gap) || gap < 0f) gap = 0f;
-        bool measured = messageMeasured && float.IsFinite(messageBottom)
-            && messageBottom >= 0f && messageBottom < screenHeight - 8f;
-        bool anchored = AnchorKnown(screenHeight) && _completionBottom < screenHeight - 8f && _completionBottom >= screenHeight * 0.05f;
-        if (measured) alignedBottom = messageBottom;
-        else if (anchored) alignedBottom = _completionBottom;
-        else alignedBottom = screenHeight * ResultsHeading.FallbackBottomFraction;
-        strip = ResultsRegion.Resolve(true, alignedBottom, buttonMeasured, buttonTop, screenHeight, gap);
+        alignedBottom = float.NaN;
+        strip = default;
+        if (!float.IsFinite(screenHeight) || screenHeight <= 0f || !float.IsFinite(gap) || gap < 0f
+            || !messageMeasured || !float.IsFinite(messageBottom) || messageBottom < 0f || messageBottom >= screenHeight - 8f
+            || !buttonMeasured || !float.IsFinite(buttonTop) || buttonTop <= 0f || buttonTop > screenHeight) return false;
+
+        alignedBottom = messageBottom;
+        strip = ResultsRegion.Resolve(true, messageBottom, true, buttonTop, screenHeight, gap);
         if (!strip.Fits) return false;
-        float top = ResultsPlacement.Top(alignedBottom, offsetY, gap);
+        float top = ResultsPlacement.Top(messageBottom, offsetY, gap);
         strip = new ResultsSafeArea(top, strip.Bottom);
         return strip.Fits;
     }
 
-    // Which of the three produced the line, for the one diagnostic line the failure page writes: the native
-    // message, the completion line an earlier success page remembered, or the historical fraction.
     public static string Source(bool messageMeasured, float messageBottom, float screenHeight)
-    {
-        bool measured = messageMeasured && float.IsFinite(messageBottom)
-            && messageBottom >= 0f && messageBottom < screenHeight - 8f;
-        if (measured) return "mission-failed-text";
-        return AnchorKnown(screenHeight) ? "remembered-completion" : "window-fraction";
-    }
-
-    // There is deliberately no "wait for the title, then place anyway" rule here. The wait for a settled title is
-    // owned by `ResultTitleGate` (full opacity over an edge that has stopped moving) and it has no timeout that turns
-    // into a placement: a page whose own message never arrives keeps the game's own screen, and the placement is
-    // retried at the bounded cadence `ResultRetryCadence` keeps. A fraction of the window is not a substitute for the
-    // page's own title - on the captured pages it sits above the title and would put the board on top of it.
+        => messageMeasured && float.IsFinite(messageBottom) && float.IsFinite(screenHeight)
+            && messageBottom >= 0f && messageBottom < screenHeight - 8f ? "mission-failed-text" : "none";
 }
 
 // ---------------------------------------------------------------------------------------------------

@@ -196,9 +196,11 @@ internal static class ToolStatsTracker
             if (enemy?.Owner == null || projectile?.m_owner?.Owner == null) return;
             SNet_Player owner = projectile.m_owner.Owner;
             if (!CombatTracker.ShouldTrack(owner)) return;
+            GlueContactCredit credit = Ledger.RecordGlueContact(owner.Lookup, projectile.Pointer, enemy.Owner.Pointer);
+            if (!credit.Hit && !credit.NewEnemy) return;
             CombatPlayer player = CombatTracker.ObservePlayer(owner);
-            if (Ledger.TryGlueHit(owner.Lookup, projectile.Pointer)) player.Impact.CreditGlueHit();
-            if (Ledger.TryGluedEnemy(owner.Lookup, enemy.Owner.Pointer)) player.Impact.CreditGluedEnemy();
+            if (credit.Hit) player.Impact.CreditGlueHit();
+            if (credit.NewEnemy) player.Impact.CreditGluedEnemy();
         }
         catch (Exception error) { CombatTracker.LogToolError("glue contact", error); }
     }
@@ -220,6 +222,18 @@ internal static class ToolStatsTracker
     {
         try { Ledger.ForgetGlueDoor(blade?.Pointer ?? IntPtr.Zero); }
         catch (Exception error) { CombatTracker.LogToolError("glue door clear", error); }
+    }
+
+    internal static void ForgetGlueProjectile(GlueGunProjectile projectile)
+    {
+        try { Ledger.ForgetGlueProjectile(projectile?.Pointer ?? IntPtr.Zero); }
+        catch (Exception error) { CombatTracker.LogToolError("glue projectile cleanup", error); }
+    }
+
+    internal static void ForgetGluedEnemy(EnemyAgent enemy)
+    {
+        try { Ledger.ForgetGluedEnemy(enemy?.Pointer ?? IntPtr.Zero); }
+        catch (Exception error) { CombatTracker.LogToolError("glued enemy pointer reuse", error); }
     }
 
     internal static GlueDoorHitSample CaptureGlueDoorHit(LG_WeakDoorBladeDamage blade, Agent source)

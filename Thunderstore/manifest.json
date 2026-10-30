@@ -1,6 +1,6 @@
 {
   "name": "CombatPanel",
-  "version_number": "1.19.12",
+  "version_number": "1.19.13",
   "website_url": "https://github.com/hawchou1995/GTFOCombatPanel",
   "description": "GTFO 战斗统计面板：局内 HUD 与结算板显示队伍伤害占比、命中率、武器与工具明细、睡眠击杀、个人补给使用与失血。JSON 可配置称号、评分权重与字号。仅需 BepInEx，可选 EWC 集成。",
   "dependencies": [

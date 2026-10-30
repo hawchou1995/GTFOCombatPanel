@@ -24,6 +24,13 @@ public readonly struct MineBlastAttribution
     }
 }
 
+public readonly struct GlueContactCredit
+{
+    public readonly bool Hit;
+    public readonly bool NewEnemy;
+    public GlueContactCredit(bool hit, bool newEnemy) { Hit = hit; NewEnemy = newEnemy; }
+}
+
 // Per-expedition identity guards for tool events. A mine is registered by its spawned item pointer and,
 // when available, its detonation core pointer; those can be distinct IL2CPP objects for the same mine.
 // Both tool and carried-in mines retain placer identity; only tool mines contribute tool counts.
@@ -37,7 +44,8 @@ public sealed class ToolImpactLedger
     private readonly HashSet<IntPtr> _triggeredMines = new HashSet<IntPtr>();
     private readonly HashSet<(IntPtr Turret, uint SearchId)> _sentryHits = new HashSet<(IntPtr, uint)>();
     private readonly HashSet<(ulong Owner, IntPtr Projectile)> _glueHits = new HashSet<(ulong, IntPtr)>();
-    // The glue shots this machine has counted and not yet seen land. A hit is credited only from here.
+    // Active provenance survives the first contact so a single shot may glue several distinct enemies.
+    private readonly Dictionary<IntPtr, ulong> _glueProjectileOwners = new Dictionary<IntPtr, ulong>();
     private readonly HashSet<(ulong Owner, IntPtr Projectile)> _glueFired = new HashSet<(ulong, IntPtr)>();
     private readonly HashSet<(ulong Owner, IntPtr Enemy)> _gluedEnemies = new HashSet<(ulong, IntPtr)>();
     private readonly Dictionary<IntPtr, ulong> _gluedDoors = new Dictionary<IntPtr, ulong>();
@@ -164,27 +172,47 @@ public sealed class ToolImpactLedger
     public bool TrySentryHit(IntPtr turret, uint damageSearchId)
         => turret != IntPtr.Zero && _sentryHits.Add((turret, damageSearchId));
 
-    // A glue shot is registered when the gun itself fires and is then spent by the first contact that
-    // lands. A contact no counted shot owns - an enemy swinging at a door it glued long ago, a projectile
-    // this machine never fired, a second callback for a shot already spent - is not a hit, which is what
-    // makes "hits never exceed shots" true rather than hoped for.
+    // A Fire accepted from a tracked owner's equipped GlueGun opens provenance for this projectile pointer.
+    // Re-firing a pooled object starts a new lifetime and cannot inherit its former owner's identities.
     public void BeginGlueProjectile(ulong owner, IntPtr projectile)
     {
         if (owner == 0UL || projectile == IntPtr.Zero) return;
-        _glueHits.RemoveWhere(hit => hit.Projectile == projectile);
-        _glueDoorApplications.RemoveWhere(hit => hit.Projectile == projectile);
+        ForgetGlueProjectile(projectile);
+        _glueProjectileOwners[projectile] = owner;
         _glueFired.Add((owner, projectile));
     }
 
-    // True at most once per registered launch: the first contact consumes the shot and every later one
-    // reports false, so one fired projectile still contributes at most one shot-hit.
-    public bool TryGlueHit(ulong owner, IntPtr projectile)
+    public bool HasGlueProjectile(ulong owner, IntPtr projectile)
         => owner != 0UL && projectile != IntPtr.Zero
+            && _glueProjectileOwners.TryGetValue(projectile, out ulong firedBy) && firedBy == owner;
+
+    // The shot-hit is spent once, but provenance remains until projectile cleanup so the same spray can glue
+    // multiple enemies. Enemy identities are still deduplicated once per owner for the expedition.
+    public GlueContactCredit RecordGlueContact(ulong owner, IntPtr projectile, IntPtr enemy)
+    {
+        if (enemy == IntPtr.Zero || !HasGlueProjectile(owner, projectile)) return default;
+        bool hit = TryGlueHit(owner, projectile);
+        bool newEnemy = _gluedEnemies.Add((owner, enemy));
+        return new GlueContactCredit(hit, newEnemy);
+    }
+
+    public bool TryGlueHit(ulong owner, IntPtr projectile)
+        => HasGlueProjectile(owner, projectile)
             && _glueFired.Remove((owner, projectile)) && _glueHits.Add((owner, projectile));
+
+    // Called on native SyncDestroy and before a pooled pointer is registered for another Fire.
+    public void ForgetGlueProjectile(IntPtr projectile)
+    {
+        if (projectile == IntPtr.Zero) return;
+        _glueProjectileOwners.Remove(projectile);
+        _glueHits.RemoveWhere(hit => hit.Projectile == projectile);
+        _glueFired.RemoveWhere(hit => hit.Projectile == projectile);
+        _glueDoorApplications.RemoveWhere(hit => hit.Projectile == projectile);
+    }
 
     public bool TryRegisterGlueDoor(IntPtr door, IntPtr projectile, ulong owner)
     {
-        if (door == IntPtr.Zero || projectile == IntPtr.Zero || owner == 0UL
+        if (door == IntPtr.Zero || !HasGlueProjectile(owner, projectile)
             || !_glueDoorApplications.Add((door, projectile))) return false;
         _gluedDoors[door] = owner;
         return true;
@@ -217,6 +245,7 @@ public sealed class ToolImpactLedger
         _triggeredMines.Clear();
         _sentryHits.Clear();
         _glueHits.Clear();
+        _glueProjectileOwners.Clear();
         _glueFired.Clear();
         _gluedEnemies.Clear();
         _gluedDoors.Clear();
@@ -224,6 +253,9 @@ public sealed class ToolImpactLedger
         _glueDoorHits.Clear();
     }
 
-    public bool TryGluedEnemy(ulong owner, IntPtr enemy)
-        => owner != 0UL && enemy != IntPtr.Zero && _gluedEnemies.Add((owner, enemy));
+    // EnemyAgent.Setup marks a new occupant when the game reuses a native enemy pointer.
+    public void ForgetGluedEnemy(IntPtr enemy)
+    {
+        if (enemy != IntPtr.Zero) _gluedEnemies.RemoveWhere(identity => identity.Enemy == enemy);
+    }
 }

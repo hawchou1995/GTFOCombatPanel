@@ -148,18 +148,11 @@ public static class CompletionDrawing
 
 }
 
-// The strip of a result page the board may use, together with the button it may never reach. `ButtonTop`
-// is the lobby button's own measured top edge and is only meaningful when `ButtonMeasured` is set: a page
-// whose button could not be measured has nothing to protect and nothing to guess at.
-//
-// `ButtonHeight` is that same button's own measured height, and it is the one figure that says how large a
-// control the player is being asked to press. The settlement board derives its readability floor from it,
-// so a page that offers no measurable height keeps the absolute minimum and behaves exactly as before.
-//
-// `AnchorMeasured` is whether the strip's *upper* edge - the failure title's own bottom, the success
-// completion section's - was measured in its settled state, rather than taken from a remembered line or a
-// frame in which the page was still landing. A strip whose button or whose anchor was a guess is the one case
-// that may be measured a second time; see `ResultAnchorRecovery` and `ResultAnchorDrift`.
+// The lower bound's provenance is retained in the placement so an explicitly proven client safe area cannot be
+// mistaken for an unmeasured-button guess during later recovery or diagnostics.
+public enum ResultFooterSource { None = 0, NamedControl = 1, InteractiveBand = 2, ClientNoFooterSafeArea = 3 }
+
+// The strip of a result page the board may use, together with the footer bound and its measured provenance.
 public readonly struct BoardStrip
 {
     public readonly float Top, Bottom;
@@ -167,12 +160,13 @@ public readonly struct BoardStrip
     public readonly float ButtonTop;
     public readonly float ButtonHeight;
     public readonly bool AnchorMeasured;
+    public readonly ResultFooterSource FooterSource;
 
     public BoardStrip(float top, float bottom, bool buttonMeasured, float buttonTop, float buttonHeight = float.NaN,
-        bool anchorMeasured = true)
+        bool anchorMeasured = true, ResultFooterSource footerSource = ResultFooterSource.None)
     {
         Top = top; Bottom = bottom; ButtonMeasured = buttonMeasured; ButtonTop = buttonTop; ButtonHeight = buttonHeight;
-        AnchorMeasured = anchorMeasured;
+        AnchorMeasured = anchorMeasured; FooterSource = footerSource;
     }
 }
 
@@ -229,15 +223,10 @@ public static class ResultBoardHold
 
     // Whether a grid that arrived *after* the board was placed may be drawn in the rectangle the board keeps.
     //
-    // A settlement snapshot keeps arriving while the page is up, and updated data can ask for a bigger table. A board
-    // that is already up keeps the rectangle it was measured into - that is what stops a settled board from jumping -
-    // and `Fit` replaces the grid it draws there. On the failure page `Draw` then lifts that board off the button every
-    // frame (`TryHold`), so a taller grid is still held to the control the player presses. The success page has no such
-    // per-frame wall: it places once and draws that placement, so a grid that grew after the fact would be drawn over
-    // the button nobody re-checks. This is that missing check, and it is deliberately the same rule the first placement
-    // uses: the grid's lower edge may not run past the strip the board was really measured into (`measured` - not this
-    // frame's strip, which is exactly the one that refused it) and may not reach the button's clearance line whenever
-    // this frame knows where that button is. A grid that does not clear either keeps the grid that is already up.
+    // Settlement snapshots can ask for a larger table. The board keeps the rectangle it was fitted into so ordinary
+    // updates do not jump; a refreshed grid must still clear that strip and the current measured action wall.
+    // Both the growth-fit path and ResultsDisplay.BoardStillSafe use this contract. A late/unreadable control is
+    // handled by deferring the overlay before drawing, never by covering its old bounds.
     public static bool HeldGridFits(BoardStrip measured, BoardStrip current, LayoutRect held, float height,
         float screenHeight, float slack = 0f)
     {
