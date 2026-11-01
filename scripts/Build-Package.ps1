@@ -77,7 +77,7 @@ try {
     $manifestEntry = $check.GetEntry('manifest.json')
     $reader = [IO.StreamReader]::new($manifestEntry.Open())
     try { $archiveManifest = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
-    if ($archiveManifest.dependencies.Count -ne 1 -or $archiveManifest.dependencies[0] -ne 'BepInEx-BepInExPack_GTFO-3.2.3') {
+    if ($archiveManifest.dependencies.Count -ne 1 -or $archiveManifest.dependencies[0] -ne 'BepInEx-BepInExPack_GTFO-3.2.4') {
         throw 'Archived manifest contains an unexpected dependency.'
     }
     $dllEntries = @($check.Entries | Where-Object { $_.FullName -match '\.dll$' })

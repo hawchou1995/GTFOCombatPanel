@@ -732,11 +732,11 @@ internal static class Release11912Scenarios
             && scanner.Contains("parentCoverageComplete")
             && !scanner.Contains("FindObjectsOfType"),
             "interaction scan includes page registrations/tree plus only the named source-parent subtree, and fails closed if that coverage is unavailable");
-        check(scanner.Contains("hidden++") && scanner.Contains("hiddenPageActions++")
+        check(scanner.Contains("tally.HiddenControl(client && IsKnownClientHiddenLobbyAction(page, control))")
             && !scanner.Contains("if (client && IsKnownClientHiddenLobbyAction(page, control)) return;")
-            && scanner.Contains("active-control-unmeasurable")
-            && results.Contains("ProvenEmpty => Complete && ParentCoverageComplete && Count == 0"),
-            "the interaction scan treats a control the page switched off as hidden rather than as a broken scan, and keeps itself incomplete only for an active control it cannot measure");
+            && !scanner.Contains("\"active-control-unmeasurable\"")
+            && results.Contains("ResultInteractionScanPolicy.ProvenEmpty(Complete, ParentCoverageComplete, Tally)"),
+            "the interaction scan treats a control the page switched off as hidden rather than as a broken scan, and an active control it cannot measure is counted as unmeasurable rather than as a reason the scan did not finish");
         check(results.Contains("ReportIncompleteScan(\"failure\"") && results.Contains("ReportIncompleteScan(\"success\"")
             && results.Contains("ReportBoardOverlap(\"failure\"") && results.Contains("ReportBoardOverlap(\"success\"")
             && results.Contains("scanComplete={controls.Complete")

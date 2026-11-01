@@ -4,7 +4,7 @@
 
 - **当前状态**：**`1.19.13` 已在 Thunderstore 正式发布**——上架分类 `GTFO / Client Mods`、Team `HawChow`、NSFW=false；UI 回执成功表格只有这一行，`community_listings` 也仍只有 1 条（gtfo / Client Mods / nsfw=false）。per-version 端点 200：`HawChow-CombatPanel-1.19.13`，`is_active=true`；包级 latest = `1.19.13` active；旧版 `1.19.12` 仍 active，未被覆盖。线上包与本地成品逐 byte 一致：**357967** 字节、SHA-256 `45CBF22DA1C9C32C2560E62EC3A2EEF93FB1A662A09A1120FAC8CE12FE9ABB76`，包内 6 个成员，其中 `GTFOCombatPanel.dll` **394752** 字节、SHA-256 `337B49DD09FFAEB01E01429D3EF1F3CAAC5498B8F9E7E1B48BF26EEA870D63C7`。源码已同步到 GitHub（`1.19.13` 代码提交 `1beb8d45ad4e4786313c89d4508cc33b3a788312`）。发布前的构建与托管重放验证在隔离临时目录内完成（`scripts/Verify.ps1` → `VERIFY: PASS`，assembly `1.19.13.0`，该次产物 DLL 同为 394752 字节、SHA-256 `1F22BB8ABEAE657A80CDB3E8C9CAEC2265E92FB8F5164B257549774C750A3284`）——本工程构建非确定性，跨输出目录同源会得到同尺寸不同 hash，一致性只能用「同一目录原地重编 hash 与字节均不变」证明。逐版变更、未验证项与验证记录只写在 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；Thunderstore 详情页与包内 `Thunderstore/README.md` 只保留常青的功能/配置/安装文档，不列更新日志。
 - **安装**：r2modman / Thunderstore Mod Manager 搜索 `CombatPanel`（自动带上 BepInEx 依赖）；或手动把包内 `BepInEx/plugins/GTFOCombatPanel/` 整个目录放进 GTFO 目录下的同一路径。`CombatPanel-config/scoring.json` 只在缺失时创建一次，手改过的配置不会被覆盖。已有 `.cfg` 在升级时保留，新配置项下次加载自动补齐。
-- **兼容**：仅依赖 **BepInEx-BepInExPack_GTFO-3.2.3**；EWC（ExtraWeaponCustomization）是可选集成，公共 DLL 不带它的程序集引用。多人快照协议为 **v8**，与旧协议不兼容（旧协议包会被明确拒收）。需要共享统计的每台机器装同一版本。
+- **兼容**：仅依赖 **BepInEx-BepInExPack_GTFO-3.2.4**；EWC（ExtraWeaponCustomization）是可选集成，公共 DLL 不带它的程序集引用。多人快照协议为 **v8**，与旧协议不兼容（旧协议包会被明确拒收）。需要共享统计的每台机器装同一版本。
 - **反馈**：<https://qingju.me>；开黑语音频道（小黑盒语音）<https://chat.xiaoheihe.cn/in1wpsjd>。
 
 ## HUD

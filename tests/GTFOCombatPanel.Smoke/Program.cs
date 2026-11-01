@@ -1762,6 +1762,8 @@ internal static partial class Program
         // ---- 1.19.12: neither settlement page is measured before its own anchors have settled, and a page
         //      that changes afterwards is fitted again without an F8 toggle -------------------------------
         Release11912Scenarios.RunInto(Check);
+        // ---- 1.19.14: an active control whose rectangle cannot be read no longer refuses the page -----------
+        Release11914Scenarios.RunInto(Check);
         // ---- the explanation line under each title: a template a player may edit --------------
         ReasonTemplateScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------

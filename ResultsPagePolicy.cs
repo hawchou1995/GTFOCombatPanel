@@ -412,11 +412,17 @@ public sealed class ResultNoFooterGate
     public int Samples { get { return _samples; } }
     public bool Ready { get { return _samples >= RequiredSamples; } }
 
+    // `interactionCount` is the number of *active* interactions the page had switched on - whether or not their
+    // rectangle could be read - and `unmeasurableCount` the number of those whose rectangle could not be. Both
+    // have to be zero for the footer to count as absent: an interaction nobody could place is still an
+    // interaction, and this gate is the only thing that releases the unbounded guest strip, so it may never be
+    // released for a page that has anything on it that the scan could not prove empty. The defaults keep the
+    // seven-argument call sites (the tests that drive this gate with a plain count) on the same rule.
     public bool Observe(int frame, bool client, bool anchorSettled, bool nativeStateKnown,
-        bool nativeFooterVisible, bool interactionScanComplete, int interactionCount)
+        bool nativeFooterVisible, bool interactionScanComplete, int interactionCount, int unmeasurableCount = 0)
     {
         bool absent = client && anchorSettled && nativeStateKnown && !nativeFooterVisible
-            && interactionScanComplete && interactionCount == 0;
+            && interactionScanComplete && interactionCount == 0 && unmeasurableCount == 0;
         if (!absent)
         {
             Forget();

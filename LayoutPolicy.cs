@@ -481,6 +481,64 @@ public static class ResultInteractionStripPolicy
         => float.IsFinite(rect.X) && float.IsFinite(rect.Y) && float.IsFinite(rect.Width) && float.IsFinite(rect.Height)
            && rect.Width > 0f && rect.Height > 0f;
 }
+
+// The tally one result page's interaction scan builds up, and the decisions that are read off it.
+//
+// A scan has to answer two questions that are not the same question, and confusing them is what kept a real
+// success page from ever showing the board. The first is "could this scan see everything it had to see", which
+// is a fact about the page's structure: an unreadable item registry, a parent node that cannot be reached, a
+// type conversion that fails. Nothing the page draws later can repair that, so a scan that cannot answer it must
+// keep the vanilla screen up. The second is "was every control's rectangle readable right now", which is a fact
+// about one frame of one control: another mod clones a button and its collider exists only after the clone has
+// been laid out, so for a frame or two there is an active, pressable control whose rectangle is the zero box.
+//
+// An unmeasurable rectangle is therefore counted and skipped instead of condemning the page. The control still
+// counts as an interaction - a player could really press it - which is what keeps the "the page has no footer at
+// all" answer unavailable while it is around, and `BoardStillSafe` re-runs this whole scan on every repaint, so
+// the moment the rectangle becomes readable it takes its place in the collision set like any other control.
+public readonly struct ResultInteractionTally
+{
+    public readonly int Active, Hidden, HiddenPageActions, Unmeasurable;
+
+    public ResultInteractionTally(int active, int hidden, int hiddenPageActions, int unmeasurable)
+    {
+        Active = active; Hidden = hidden; HiddenPageActions = hiddenPageActions; Unmeasurable = unmeasurable;
+    }
+
+    // The count grows for every control the page has switched on, before its geometry is even asked for, because
+    // existence and measurability are two separate readings of the same control.
+    public ResultInteractionTally ActiveControl() => new ResultInteractionTally(Active + 1, Hidden, HiddenPageActions, Unmeasurable);
+
+    public ResultInteractionTally HiddenControl(bool pageAction)
+        => new ResultInteractionTally(Active, Hidden + 1, HiddenPageActions + (pageAction ? 1 : 0), Unmeasurable);
+
+    public ResultInteractionTally UnmeasurableControl()
+        => new ResultInteractionTally(Active, Hidden, HiddenPageActions, Unmeasurable + 1);
+}
+
+public static class ResultInteractionScanPolicy
+{
+    // Whether a scan that found nothing the player can touch proves the page has no footer. A control whose
+    // rectangle could not be read is one the player may well be able to press, so it keeps this answer false:
+    // the guest safe area is only ever granted for a page where the scan really saw an empty result.
+    //
+    // The invariant this answer exists to keep: *while any active control is on the page - measurable or not -
+    // the page may not be called footerless.* Both counts are therefore required to be zero, not either one
+    // alone. `Active` already holds every control the page had switched on, an unmeasurable one included; the
+    // separate `Unmeasurable == 0` is the guard against a tally nobody built that way, because the count alone
+    // is only as true as the caller that filled it in: 1.19.14 shipped a scan that handed this decision the
+    // number of rectangles its strip could place instead of the number of interactions it found, and a page
+    // whose every active control was unmeasurable then read as empty. A tally carrying unmeasurable controls can
+    // never answer this question, whatever its active count says.
+    public static bool ProvenEmpty(bool complete, bool parentCoverageComplete, ResultInteractionTally tally)
+        => complete && parentCoverageComplete && tally.Active == 0 && tally.Unmeasurable == 0;
+
+    // Whether the one-off line about a downgraded control has to be written for this scan: it is about a scan
+    // that would have been refused before the downgrade existed - one that is otherwise complete and whose only
+    // finding is the unreadable geometry - and never about an ordinary frame.
+    public static bool DowngradeIsWhy(bool complete, bool parentCoverageComplete, ResultInteractionTally tally)
+        => complete && parentCoverageComplete && tally.Unmeasurable > 0;
+}
 public static class ResultsRegion
 {
     // The fraction of the window a strip starts at when the completion section could not be measured. It is no

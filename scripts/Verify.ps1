@@ -89,7 +89,7 @@ try {
     if ($manifest.name -ne 'CombatPanel' -or $manifest.version_number -ne $pluginVersion) {
         throw "Thunderstore package name/version mismatch: the manifest says '$($manifest.version_number)', the plugin says '$pluginVersion'."
     }
-    if ($manifest.dependencies.Count -ne 1 -or $manifest.dependencies[0] -ne 'BepInEx-BepInExPack_GTFO-3.2.3') {
+    if ($manifest.dependencies.Count -ne 1 -or $manifest.dependencies[0] -ne 'BepInEx-BepInExPack_GTFO-3.2.4') {
         throw 'Package must depend on the BepInEx GTFO pack only.'
     }
     if ($manifest.description.Length -gt 256) {

@@ -52,27 +52,44 @@ internal static class ResultsDisplay
     private readonly struct FooterControls
     {
         public readonly float FooterTop, BoardTop;
-        // `Count` is the number of controls the player can touch *this frame*; `Hidden` is the number the game
-        // switched off, of which `HiddenPageActions` are this page's own result actions (the client case, where
-        // the game hides the lobby button and another mod may clone a replacement). `ScannedCount` is everything
-        // the scan visited, so a log line can tell "nothing there" from "something there that cannot take input".
-        public readonly int Count, ScannedCount, Hidden, HiddenPageActions;
+        // `Count` is the number of interactions the scan found on the page this frame: everything the game left
+        // switched on, whether or not its rectangle could be read. `Hidden` is the number the game switched off, of
+        // which `HiddenPageActions` are this page's own result actions (the client case, where the game hides the
+        // lobby button and another mod may clone a replacement). `Unmeasurable` is the number of active controls
+        // whose rectangle was the zero box this frame, counted separately from `Hidden` because the two need
+        // different answers: a hidden control cannot take the pointer, an unmeasurable one very well can.
+        // `Count` is the only count the two decisions that matter read - `ProvenEmpty` and `ResultNoFooterGate` -
+        // so it is filled from the scan's own tally and never from the number of rectangles its strip could place
+        // (`strip.FooterActionCount`, which describes the strip alone). `ScannedCount` is everything the scan
+        // visited, switched on or off, so a log line can tell "nothing there" from "something there that cannot
+        // take input".
+        public readonly int Count, ScannedCount, Hidden, HiddenPageActions, Unmeasurable;
         public readonly bool Complete, ParentCoverageComplete, OverlapsBoard;
-        // Why a scan that is not `Complete` could not finish, in the few words a live log can afford: an
-        // interaction the scan saw is active and its geometry could not be read, or a coverage edge (page
-        // registry, tree, named action parent) was unavailable. A control the page switched off is *not* one of
-        // these - it cannot take the pointer, so it neither forms a lower wall nor makes the scan incomplete.
+        // Why a scan that is not `Complete` could not finish, in the few words a live log can afford: a coverage
+        // edge (page registry, tree, named action parent, client state) was unavailable, so the scan cannot claim
+        // it saw the page. A control the page switched off is *not* one of these - it cannot take the pointer, so
+        // it neither forms a lower wall nor makes the scan incomplete - and neither is an active control whose
+        // rectangle could not be read this frame: that one is counted in `Unmeasurable` and takes part in the
+        // collision set as soon as its geometry is readable.
         public readonly string Reason;
         // Nothing the player can touch was found, on a scan that could see everything it had to see. Hidden
         // controls do not stand in the way of this answer; a control that comes back on is caught by the
-        // per-repaint rescan (`BoardStillSafe`) instead.
-        public bool ProvenEmpty => Complete && ParentCoverageComplete && Count == 0;
+        // per-repaint rescan (`BoardStillSafe`) instead. An unmeasurable control does stand in the way, because
+        // it is a real interaction the scan could not place, which is why the count - not the measured set -
+        // decides this answer. The invariant behind it is the whole point of this struct: while any active
+        // control is on the page, measurable or not, nothing may claim the page has no footer - not this answer,
+        // not `ResultNoFooterGate`, and not the full-height guest safe area either of them releases.
+        public readonly ResultInteractionTally Tally;
+        public bool ProvenEmpty => ResultInteractionScanPolicy.ProvenEmpty(Complete, ParentCoverageComplete, Tally);
         public FooterControls(float footerTop, float boardTop, int count, int scannedCount, bool complete,
-            bool parentCoverageComplete, bool overlapsBoard, int hidden = 0, int hiddenPageActions = 0, string reason = "")
+            bool parentCoverageComplete, bool overlapsBoard, int hidden = 0, int hiddenPageActions = 0, string reason = "",
+            int unmeasurable = 0)
         {
             FooterTop = footerTop; BoardTop = boardTop; Count = count; ScannedCount = scannedCount;
             Complete = complete; ParentCoverageComplete = parentCoverageComplete; OverlapsBoard = overlapsBoard;
             Hidden = hidden; HiddenPageActions = hiddenPageActions; Reason = reason ?? string.Empty;
+            Unmeasurable = unmeasurable;
+            Tally = new ResultInteractionTally(count, hidden, hiddenPageActions, unmeasurable);
         }
     }
 
@@ -971,7 +988,7 @@ internal static class ResultsDisplay
             {
                 ButtonSettled(false, float.NaN);
                 bool failureNoFooterReady = FailureNoFooter.Observe(Time.frameCount, !SNet.IsMaster, failureTitleSettled,
-                    page != null, failureNativeFooterVisible, failureControls.Complete, failureControls.Count);
+                    page != null, failureNativeFooterVisible, failureControls.Complete, failureControls.Count, failureControls.Unmeasurable);
                 if (!failureNoFooterReady)
                 {
                     if (Footer.Exhausted && HeadingReports.Add("failure-footer-unsettled"))
@@ -1015,7 +1032,7 @@ internal static class ResultsDisplay
         {
             ButtonSettled(false, float.NaN);
             bool successNoFooterReady = SuccessNoFooter.Observe(Time.frameCount, !SNet.IsMaster, completionSettled,
-                page != null, successNativeFooterVisible, successControls.Complete, successControls.Count);
+                page != null, successNativeFooterVisible, successControls.Complete, successControls.Count, successControls.Unmeasurable);
             if (!successNoFooterReady)
             {
                 if (Footer.Exhausted && HeadingReports.Add("success-footer-unsettled"))
@@ -1045,14 +1062,30 @@ internal static class ResultsDisplay
     // in place, and the page is retried at the bounded cadence `Retry` keeps.
     private static bool ButtonSettled(bool measured, float top) => Footer.Observe(Time.frameCount, measured, top);
 
-    // One bounded line per page visit for the case the review found: a scan that could not finish used to hold the
-    // board back in total silence - indistinguishable in a live log from "the page has nothing to show yet" - and a
-    // control the game had merely switched off used to be able to make that state permanent. Geometry and counts
-    // only, never a player's identity.
+    // One bounded line per page visit for a scan that could not finish for a structural reason: the client flag,
+    // a control's own pointer, a control's active state, the named action's parent node, the page's item registry
+    // or a registry entry's type, the page's own type, or the strip arithmetic. Those are the cases in which the
+    // page could not be read, and geometry and counts are all a log line needs to say which one it was. A control
+    // its rectangle could not be read for is *not* one of them and is reported by `ReportDowngradedControls`
+    // instead, because that control does not stop the board from being drawn. Never a player's identity.
     private static void ReportIncompleteScan(string where, FooterControls controls, float top, float room, ResultFooterSource source)
     {
         if (!HeadingReports.Add("scan-incomplete-" + where)) return;
-        Plugin.Logger?.LogInfo($"[DIAG] {where} board held back: the interaction scan could not finish (scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},reason={(string.IsNullOrEmpty(controls.Reason) ? "none" : controls.Reason)},count={controls.Count},hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},scanned={controls.ScannedCount},footerSource={source},top={top:0},room={room:0}); vanilla is retained and the page is measured again.");
+        Plugin.Logger?.LogInfo($"[DIAG] {where} board held back: the interaction scan could not finish (scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},reason={(string.IsNullOrEmpty(controls.Reason) ? "none" : controls.Reason)},count={controls.Count},hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},unmeasurable={controls.Unmeasurable},scanned={controls.ScannedCount},footerSource={source},top={top:0},room={room:0}); vanilla is retained and the page is measured again.");
+    }
+
+    // One bounded line per page visit for the page that used to be refused for ever.
+    //
+    // An active control whose rectangle could not be read is not a hole in the scan, so the scan no longer says
+    // the page cannot be measured because of one - but a silent change of verdict is exactly what makes a live log
+    // useless, so the first scan that is allowed through *only* because of such a control says so once. The line
+    // names the count and nothing else: the control's own identity belongs to whatever mod created it, and the
+    // per-repaint rescan is what takes over, which is what the sentence at the end of the line promises.
+    private static void ReportDowngradedControls(string where, FooterControls controls, float top, float room, ResultFooterSource source)
+    {
+        if (!ResultInteractionScanPolicy.DowngradeIsWhy(controls.Complete, controls.ParentCoverageComplete, controls.Tally)) return;
+        if (!HeadingReports.Add("control-downgraded-" + where)) return;
+        Plugin.Logger?.LogInfo($"[DIAG] {where} board allowed past an unmeasurable interaction: count={controls.Count},unmeasurable={controls.Unmeasurable},hidden={controls.Hidden},scanned={controls.ScannedCount},footerSource={source},top={top:0},room={room:0}; the control is active but its geometry could not be read, so its collision was ignored and the board is drawn as usual. The per-repaint scan re-reads it and takes the vanilla page back the moment it has a rectangle that reaches the board.");
     }
 
     private static void ReportBoardOverlap(string where, FooterControls controls, float top, float room, ResultFooterSource source)
@@ -1216,6 +1249,7 @@ internal static class ResultsDisplay
         // board that starts too low is indistinguishable from a board that starts too high without it.
         if (HeadingReports.Add("success-region"))
             Plugin.Logger?.LogInfo($"[DIAG] success region: anchorSource={completionSource}, completion={(completionMeasured ? completion.ToString("0") : "unmeasurable")} (deepest visible part of the completion section, gap={MessageGap:0}px), lobbyButton={(buttonMeasured ? buttonTop.ToString("0") : "unmeasurable")}, lobbyEdge={DescribeLobbyEdge(wall)}, boardTop={area.Top:0}, room={area.Height:0} of a {Screen.height} window; the strip runs from the completion section to the button's own upper edge - drawn, or laid out and still revealing - not to a hidden, transparent or off-page control, and all four players scale into it rather than being trimmed to it.");
+        ReportDowngradedControls("success", controls, area.Top, area.Height, footerSource);
         // What the caller may act on is whether the *section* was measured: the strip's own fit is asked separately
         // through `ResultsUpperBound.Decide`, so a section that could not be read and a strip that cannot hold the
         // table stay two different answers instead of one false.
@@ -1522,7 +1556,8 @@ internal static class ResultsDisplay
             float blankAbove = Math.Max(0f, candidateBoard.Y - titleBottom);
             float blankBelow = Math.Max(0f, (float.IsFinite(buttonTop) ? buttonTop : candidateBoard.Bottom) - candidateBoard.Bottom);
             if (HeadingReports.Add("failure-strip"))
-                Plugin.Logger?.LogInfo($"[DIAG] failure strip: anchorSource={titleSource},messageBottom={titleBottom:0},titleAlpha={(float.IsFinite(alpha) ? alpha.ToString("0.00") : "unreadable")},opaqueReadings={Title.OpaqueFrames},sequenceFinished={sequenceFinished.ToString().ToLowerInvariant()},messageEdge={(measured ? "measured-this-frame" : "stable-mission-title-layout")},boardTop=({candidateBoard.Y:0}..{candidateBoard.Bottom:0}),blankAbove={blankAbove:0}px,blankBelow={blankBelow:0}px,footerTop={(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")},waitingStatusProtected={protectWaitingStatus.ToString().ToLowerInvariant()},scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},boardOverlapsControl={overlapsLobby.ToString().ToLowerInvariant()},screen={Screen.width}x{Screen.height}.");
+                Plugin.Logger?.LogInfo($"[DIAG] failure strip: anchorSource={titleSource},messageBottom={titleBottom:0},titleAlpha={(float.IsFinite(alpha) ? alpha.ToString("0.00") : "unreadable")},opaqueReadings={Title.OpaqueFrames},sequenceFinished={sequenceFinished.ToString().ToLowerInvariant()},messageEdge={(measured ? "measured-this-frame" : "stable-mission-title-layout")},boardTop=({candidateBoard.Y:0}..{candidateBoard.Bottom:0}),blankAbove={blankAbove:0}px,blankBelow={blankBelow:0}px,footerTop={(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")},waitingStatusProtected={protectWaitingStatus.ToString().ToLowerInvariant()},scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},unmeasurable={controls.Unmeasurable},boardOverlapsControl={overlapsLobby.ToString().ToLowerInvariant()},screen={Screen.width}x{Screen.height}.");
+            ReportDowngradedControls("failure", controls, top, Math.Max(0f, bottom - top), footerSource);
             return true;
         }
         catch (Exception error)
@@ -1604,9 +1639,14 @@ internal static class ResultsDisplay
         var actions = new List<ResultActionBounds>();
         var seen = new HashSet<IntPtr>();
         var parentSeen = new HashSet<IntPtr>();
-        int count = 0, hidden = 0, hiddenPageActions = 0;
+        // Every control the scan sees is added to this tally, and the three answers it can give are kept apart on
+        // purpose: one for the control the page switched on, one for the control it switched off, and one for the
+        // control that is on but whose rectangle this frame could not be read.
+        var tally = new ResultInteractionTally(0, 0, 0, 0);
         string reason = string.Empty;
         bool complete = true, overlaps = false, client = false, parentCoverageComplete = true;
+        // The client flag decides which result action the page is expected to have hidden, so an unreadable one is
+        // a coverage edge of the scan itself and keeps the vanilla page up rather than being guessed at.
         try { client = !SNet.IsMaster; } catch { complete = false; reason = "client-state-unreadable"; }
 
         // Two different questions, deliberately kept apart:
@@ -1616,8 +1656,10 @@ internal static class ResultsDisplay
         //     prefab or another mod's clone parked with `SetActive(false)` therefore no longer condemns the
         //     board to never appear. When one of them comes back on, the per-repaint rescan in `BoardStillSafe`
         //     reads it as a real interaction and restores the vanilla page on that frame if it reaches the board.
-        //   * could this scan see everything it had to see - that is the only thing `complete` answers, and an
-        //     active interaction whose rectangle cannot be read is the case that keeps it false.
+        //   * could this scan see everything it had to see - that is the only thing `complete` answers, and the
+        //     cases that keep it false are the ones about the page's *structure*: an unreadable item registry, a
+        //     parent node that cannot be reached, a type conversion that fails, a client flag nobody could read.
+        //     None of those is repaired by waiting, so a scan that hits one must leave the board alone.
         void AddControl(Component control)
         {
             if (control == null) return;
@@ -1627,18 +1669,30 @@ internal static class ResultsDisplay
             if (pointer != IntPtr.Zero && !seen.Add(pointer)) return;
             bool active;
             try { active = control.gameObject.activeInHierarchy; }
-            catch { count++; complete = false; if (reason.Length == 0) reason = "active-state-unreadable"; return; }
+            catch
+            {
+                // The scan cannot tell whether this control can take the pointer at all, which is again a fact
+                // about the page rather than about one rectangle, so the count grows and the page is refused.
+                tally = tally.ActiveControl();
+                complete = false; if (reason.Length == 0) reason = "active-state-unreadable"; return;
+            }
             if (!active)
             {
-                if (client && IsKnownClientHiddenLobbyAction(page, control)) hiddenPageActions++;
-                hidden++;
+                tally = tally.HiddenControl(client && IsKnownClientHiddenLobbyAction(page, control));
                 return;
             }
-            count++;
+            tally = tally.ActiveControl();
             if (!TryScreenRect(control, out LayoutRect rect))
             {
-                complete = false;
-                if (reason.Length == 0) reason = "active-control-unmeasurable";
+                // Active but with a rectangle nobody could read: this is one frame of one control, not a hole in
+                // the scan. Another mod clones the lobby button and its collider exists only once the clone has
+                // been laid out, so for a frame or two there is an active, pressable control whose rectangle is
+                // the zero box; treating that as an unfinished scan kept the board off a page that was in every
+                // other respect safe, and re-measuring could never clear it because the same clone was there on
+                // the next repaint too. The control keeps its place in `Count`, so the page cannot claim to have
+                // no footer, and `BoardStillSafe` re-runs this scan every repaint: once the rectangle reads, the
+                // control joins the collision set and restores the vanilla page if it reaches the board.
+                tally = tally.UnmeasurableControl();
                 return;
             }
             actions.Add(new ResultActionBounds(rect));
@@ -1648,7 +1702,18 @@ internal static class ResultsDisplay
 
         void ScanSiblingParent(Component source, bool required)
         {
-            if (source == null) { if (required) parentCoverageComplete = false; return; }
+            if (source == null)
+            {
+                // The page's own result action - the button whose parent this scan exists to cover - is not there
+                // at all. Nothing below can visit the sibling clones that would live beside it, so the scan cannot
+                // claim the page is covered and must say so rather than pass an unvisited subtree off as empty.
+                // The failure page's checkpoint-restart button is optional, so its absence alone changes nothing.
+                if (!required) return;
+                parentCoverageComplete = false;
+                complete = false;
+                if (reason.Length == 0) reason = "action-source-missing";
+                return;
+            }
             try
             {
                 Transform parent = source.transform.parent;
@@ -1678,7 +1743,13 @@ internal static class ResultsDisplay
                         var item = registered[index];
                         if (item == null) continue;
                         CM_Item native = item.TryCast<CM_Item>();
-                        if (native == null) { count++; complete = false; if (reason.Length == 0) reason = "registry-entry-unreadable"; continue; }
+                        if (native == null)
+                        {
+                            // A registered interaction that is not a CM_Item is a hole in the page's structure as
+                            // this scan understands it, so it is counted and the scan stays incomplete.
+                            tally = tally.ActiveControl();
+                            complete = false; if (reason.Length == 0) reason = "registry-entry-unreadable"; continue;
+                        }
                         AddControl(native);
                     }
                 }
@@ -1705,6 +1776,18 @@ internal static class ResultsDisplay
         // The waiting-status line is a lower wall, never an upper anchor. A frame in which the page has switched
         // it off is a frame without that wall rather than an unreadable page: it cannot take the pointer either,
         // and the next repaint re-reads it through the same scan.
+        //
+        // It is not one of the page's interactions, so the rectangle it *does* hand over only becomes a lower wall
+        // and never moves `Count`. A line whose geometry nobody can read is the one case that has to move it: a
+        // wall that is there but could not be measured this frame leaves the safe area without any lower bound at
+        // all, and the board is then free to stand on the very text that must stay readable. It is therefore
+        // counted as an interaction that is on the page and was not measured - two readings of the same element,
+        // exactly like an active control with an unreadable rectangle - which keeps `ProvenEmpty` false and keeps
+        // `ResultNoFooterGate` off its zero here. `Unmeasurable` is deliberately left alone: it is the count the
+        // one-off downgrade line reads, and that line's sentence is "the board is drawn as usual", which is not
+        // true of an element that stops the guest safe area outright. A line whose own *state* cannot be read is
+        // still the structural case and keeps the scan incomplete, because there is no telling whether it is on
+        // the screen at all.
         if (protectedPageText != null)
         {
             try
@@ -1713,8 +1796,7 @@ internal static class ResultsDisplay
                 if (!protectedActive) { }
                 else if (!TryScreenRect(protectedPageText, out LayoutRect rect))
                 {
-                    complete = false;
-                    if (reason.Length == 0) reason = "protected-text-unmeasurable";
+                    tally = tally.ActiveControl();
                 }
                 else
                 {
@@ -1726,11 +1808,24 @@ internal static class ResultsDisplay
             catch { complete = false; if (reason.Length == 0) reason = "protected-text-unreadable"; }
         }
 
+        // A control that is on but had no rectangle is a real interaction the collision set could not place, which
+        // is a verdict about this one frame rather than about the page. The scan therefore no longer refuses the
+        // page for it: the strip is resolved from the rectangles that could be read, and `BoardStillSafe` asks
+        // again on the next repaint.
         if (!ResultInteractionStripPolicy.TryResolve(anchorBottom, gap, actions, out ResultInteractionStrip strip))
         { complete = false; strip = default; if (reason.Length == 0) reason = "strip-unresolved"; }
         if (!parentCoverageComplete) complete = false;
-        return new FooterControls(strip.FooterTop, strip.BoardTop, strip.FooterActionCount, count, complete, parentCoverageComplete, overlaps,
-            hidden, hiddenPageActions, reason);
+        // A scan that refused the page for a structural reason and also saw an unmeasurable control states the
+        // structural reason only; the log line reports both counts under their own names either way.
+        if (!complete && reason.Length == 0) reason = "structural-coverage-unreadable";
+        // `Count` is the number of interactions the page had switched on - the ones whose rectangle could be read
+        // and the ones it could not - and never the number of rectangles the strip managed to place: the latter is
+        // `strip.FooterActionCount`, a diagnostic of the strip alone. `Count` is what `Tally`, `ProvenEmpty`,
+        // `BoardStillSafe` and `ResultNoFooterGate.Observe` all read, so taking it from the strip is exactly how a
+        // page whose every active control was unmeasurable came to claim it had no footer and hand the guest safe
+        // area the whole screen. `ScannedCount` is everything the scan visited, switched on or off.
+        return new FooterControls(strip.FooterTop, strip.BoardTop, tally.Active, tally.Hidden + tally.Active, complete, parentCoverageComplete, overlaps,
+            tally.Hidden, tally.HiddenPageActions, reason, tally.Unmeasurable);
     }
 
     private static bool IsKnownClientHiddenLobbyAction(Component page, Component control)
