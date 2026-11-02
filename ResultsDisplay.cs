@@ -114,6 +114,9 @@ internal static class ResultsDisplay
     private static bool _appliedSuccessBlocks, _appliedPrisonerReports, _appliedFailBlocks, _appliedAny;
     // Clearance between the failure screen's own message and the board that stands under it.
     private const float MessageGap = 16f;
+    // 客机固定几何下允许尝试落板的最小可用条带高度。装不下就明确不落板（原版页面保留），
+    // 而不是把板子压成一条看不见的缝；真正的字号适配仍由 FitBoard 决定。
+    private const float MinimumGuestStripHeight = 96f;
     // Tolerance for the page's own elements drifting a pixel or two between the measurement and the draw,
     // well inside the 16 px gap the strip leaves above the buttons.
     internal const float BoardSlack = 2f;
@@ -388,6 +391,12 @@ internal static class ResultsDisplay
             Plugin.Logger?.LogInfo($"[DIAG] failure board placed: board=({_origin.X:0},{_origin.Y:0},{_grid.Width:0}x{_grid.Height:0}), failureTitleEdge={(float.IsFinite(Title.Edge) ? Title.Edge.ToString("0") : float.IsFinite(FailureLayoutTitle.Edge) ? FailureLayoutTitle.Edge.ToString("0") : "unseen")}, titleSource=mission-title-only; this page's native title/layout and interaction lower wall were measured before drawing.");
     }
 
+    // 客机结算页没有「返回大厅」按钮，只有一行等待状态文字；本模组的落板不依赖任何原生控件。
+    private static bool GuestClient()
+    {
+        try { return !SNet.IsMaster; } catch { return false; }
+    }
+
     // Before drawing cached settlement geometry, revalidate the page's measured anchor and every native/Unity action.
     // If a late control overlaps the board or cannot be read, restore vanilla and attach again from the new strip.
     private static bool BoardStillSafe()
@@ -400,7 +409,9 @@ internal static class ResultsDisplay
                 || !SuccessRegion(_page, out ResultsSafeArea successArea, out bool successButtonMeasured, out float successButtonTop,
                     out float successButtonHeight, out FooterControls successControls, out bool successNativeFooterVisible,
                     out ResultFooterSource successFooterSource, board, true)) return false;
-            if (!successControls.Complete)
+            // 客机页固定存在等待状态文字，任何交互扫描都不可能证明本页为空，所以放行只看锚点渲染完成
+            // + 固定页面几何；「完整交互扫描」与 no-footer 证明只约束主机。
+            if (!GuestClient() && !successControls.Complete)
             {
                 ReportIncompleteScan("success", successControls, successArea.Top, successArea.Height, successFooterSource);
                 return false;
@@ -415,7 +426,8 @@ internal static class ResultsDisplay
             float bottom = Math.Min(successArea.Bottom, Screen.height - 8f);
             if (board.Y < safeTop - BoardSlack || board.Bottom > bottom + BoardSlack) return false;
             if (successButtonMeasured && board.Bottom > successButtonTop - ResultBoardHold.ButtonClearance + BoardSlack) return false;
-            if (!successButtonMeasured && (!SuccessNoFooter.Ready || !successControls.ProvenEmpty || successNativeFooterVisible)) return false;
+            // 客机：没有本页可用的 no-footer 证明（等待状态文字本身就是 active 控件），此门槛只属于主机。
+            if (!GuestClient() && !successButtonMeasured && (!SuccessNoFooter.Ready || !successControls.ProvenEmpty || successNativeFooterVisible)) return false;
             float room = bottom - safeTop;
             var current = new BoardStrip(safeTop, safeTop + room, successButtonMeasured, successButtonTop, successButtonHeight,
                 true, successFooterSource);
@@ -425,7 +437,8 @@ internal static class ResultsDisplay
         if (!FailureStrip(_page, out float failureTop, out float failureBottom, out _, out bool failureFooterMeasured,
             out float failureFooterTop, out float failureFooterHeight, out bool failureTitleSettled, out FooterControls failureControls,
             out bool failureNativeFooterVisible, out ResultFooterSource failureFooterSource, board, true)) return false;
-        if (!failureControls.Complete)
+        // 客机：同上——完整扫描证明只约束主机，客机放行只看锚点渲染完成 + 固定页面几何。
+        if (!GuestClient() && !failureControls.Complete)
         {
             ReportIncompleteScan("failure", failureControls, failureTop, Math.Min(failureBottom, Screen.height - 8f) - failureTop, failureFooterSource);
             return false;
@@ -438,7 +451,8 @@ internal static class ResultsDisplay
         }
         if (board.Y < failureTop - BoardSlack || board.Bottom > Math.Min(failureBottom, Screen.height - 8f) + BoardSlack) return false;
         if (failureFooterMeasured && board.Bottom > failureFooterTop - ResultBoardHold.ButtonClearance + BoardSlack) return false;
-        if (!failureFooterMeasured && (!FailureNoFooter.Ready || !failureControls.ProvenEmpty || failureNativeFooterVisible)) return false;
+        // 客机：量到的控件只用于事后重叠保护，不构成放行前提。
+        if (!GuestClient() && !failureFooterMeasured && (!FailureNoFooter.Ready || !failureControls.ProvenEmpty || failureNativeFooterVisible)) return false;
         var failureStrip = new BoardStrip(failureTop, failureBottom, failureFooterMeasured, failureFooterTop, failureFooterHeight,
             failureTitleSettled, failureFooterSource);
         return ResultBoardHold.HeldGridFits(_holdStrip, failureStrip, board, _grid.Height, Screen.height, BoardSlack);
@@ -559,7 +573,12 @@ internal static class ResultsDisplay
                 if (!SuccessRegion(page, out ResultsSafeArea successArea, out bool successButtonMeasured, out _, out _, out FooterControls successControls, out bool successNativeFooterVisible, out _)) return false;
                 if (!successButtonMeasured)
                 {
-                    if (!SuccessNoFooter.Ready || !successControls.ProvenEmpty || successNativeFooterVisible
+                    if (GuestClient())
+                    {
+                        // 客机条带已由 SuccessRegion 的客机分支按固定页面几何算好（锚点 = 完成区实测上界），
+                        // 这里直接比对同一组边界，不再二次缩放、也不问 no-footer。
+                    }
+                    else if (!SuccessNoFooter.Ready || !successControls.ProvenEmpty || successNativeFooterVisible
                         || !ResultNoFooterSafeArea.TryResolve(successArea.Top, Screen.height, out successArea,
                             successControls.FooterTop, MessageGap)) return false;
                 }
@@ -570,8 +589,12 @@ internal static class ResultsDisplay
             }
             if (!FailureStrip(page, out top, out bottom, out _, out bool failureButtonMeasured, out _, out _,
                 out bool failureTitleSettled, out FooterControls failureControls, out bool failureNativeFooterVisible, out _)
-                || !failureTitleSettled || !failureControls.Complete) return false;
-            if (!failureButtonMeasured && (!FailureNoFooter.Ready || !failureControls.ProvenEmpty || failureNativeFooterVisible)) return false;
+                || !failureTitleSettled || (!GuestClient() && !failureControls.Complete)) return false;
+            if (GuestClient())
+            {
+                // 客机条带已由 FailureStrip 的客机分支算成固定几何，与 Placement 完全同源，直接比对。
+            }
+            else if (!failureButtonMeasured && (!FailureNoFooter.Ready || !failureControls.ProvenEmpty || failureNativeFooterVisible)) return false;
             bottom = Math.Min(bottom, Screen.height - 8f);
             return float.IsFinite(top) && float.IsFinite(bottom) && bottom > top;
         }
@@ -970,12 +993,18 @@ internal static class ResultsDisplay
             if (!FailureStrip(page, out top, out float failureBottom, out _, out bool failureButtonMeasured, out float failureButtonTop,
                 out float failureButtonHeight, out bool failureTitleSettled, out FooterControls failureControls, out bool failureNativeFooterVisible,
                 out ResultFooterSource failureFooterSource)) return false;
-            if (!failureControls.Complete)
+            // 客机：完整扫描证明只约束主机；客机放行只看锚点渲染完成 + 固定页面几何。
+            if (!GuestClient() && !failureControls.Complete)
             {
                 ReportIncompleteScan("failure", failureControls, top, Math.Min(failureBottom, Screen.height - 8f) - top, failureFooterSource);
                 return false;
             }
-            if (failureButtonMeasured)
+            if (GuestClient())
+            {
+                // 客机：锚点（任务失败标题）渲染完成即落板；条带已由 FailureStrip 的客机分支算成固定几何。
+                ButtonSettled(false, float.NaN);
+            }
+            else if (failureButtonMeasured)
             {
                 if (!ButtonSettled(true, failureButtonTop))
                 {
@@ -986,6 +1015,8 @@ internal static class ResultsDisplay
             }
             else
             {
+                // 1.19.14 原样：没有实测按钮时先清掉按钮 settle 状态，否则 Footer 的稳定计数会跨未测帧残留，
+                // A→B→A 的输入会让 ButtonSettled 在单帧读数上就放行，且 Footer.Exhausted 永不成立、诊断日志不打印。
                 ButtonSettled(false, float.NaN);
                 bool failureNoFooterReady = FailureNoFooter.Observe(Time.frameCount, !SNet.IsMaster, failureTitleSettled,
                     page != null, failureNativeFooterVisible, failureControls.Complete, failureControls.Count, failureControls.Unmeasurable);
@@ -1002,7 +1033,8 @@ internal static class ResultsDisplay
                 if (HeadingReports.Add("failure-client-safe-area"))
                     Plugin.Logger?.LogInfo($"[DIAG] failure footerSource=client-no-native-footer-safe-area: native lobbyVisible=false, complete interaction scan empty for {FailureNoFooter.Samples} distinct frames, title settled; safe strip=({top:0}..{failureBottom:0}).");
             }
-            strip = new BoardStrip(top, failureBottom, failureButtonMeasured, failureButtonTop, failureButtonHeight, failureTitleSettled, failureFooterSource);
+            // 客机没有原生页脚按钮，条带不得标成「按钮已实测」，否则 ResultBoardHold 会按按钮高度算可读性下限。
+            strip = new BoardStrip(top, failureBottom, GuestClient() ? false : failureButtonMeasured, failureButtonTop, failureButtonHeight, failureTitleSettled, failureFooterSource);
             room = Math.Min(failureBottom, Screen.height - 8f) - top;
             return room > 0f;
         }
@@ -1013,13 +1045,19 @@ internal static class ResultsDisplay
             out bool successNativeFooterVisible, out ResultFooterSource footerSource);
         if (!completionMeasured) return false;
         bool completionSettled = Completion.Observe(Time.frameCount, true, area.Top);
-        if (!successControls.Complete)
+        // 客机：同上——完整扫描证明只约束主机；客机放行只看锚点渲染完成 + 固定页面几何。
+        if (!GuestClient() && !successControls.Complete)
         {
             ReportIncompleteScan("success", successControls, area.Top, area.Height, footerSource);
             return false;
         }
         if (!completionSettled) return false;
-        if (measuredButton)
+        if (GuestClient())
+        {
+            // 客机：条带已由 SuccessRegion 的客机分支按固定几何算好；完成区上界稳定即落板。
+            ButtonSettled(false, float.NaN);
+        }
+        else if (measuredButton)
         {
             if (!ButtonSettled(true, measuredTop))
             {
@@ -1030,6 +1068,8 @@ internal static class ResultsDisplay
         }
         else
         {
+            // 1.19.14 原样：没有实测按钮时先清掉按钮 settle 状态，否则 Footer 的稳定计数会跨未测帧残留，
+            // A→B→A 的输入会让 ButtonSettled 在单帧读数上就放行，且 Footer.Exhausted 永不成立、诊断日志不打印。
             ButtonSettled(false, float.NaN);
             bool successNoFooterReady = SuccessNoFooter.Observe(Time.frameCount, !SNet.IsMaster, completionSettled,
                 page != null, successNativeFooterVisible, successControls.Complete, successControls.Count, successControls.Unmeasurable);
@@ -1051,9 +1091,20 @@ internal static class ResultsDisplay
                 Plugin.Logger?.LogWarning($"[DIAG] success board deferred: the measured completion section leaves no usable strip ({area.Top:0}..{area.Bottom:0} of {Screen.height}); vanilla is retained.");
             return false;
         }
-        top = Math.Max(0f, area.Top) + Mathf.Max(0f, Plugin.ResultsOffsetY.Value);
+        // 客机：玩家把纵向偏移手改成 NaN / 负值时按 0 处理，否则 Mathf.Max(0f, NaN) 会得到 NaN，
+        // 条带与 room 全变 NaN，成功页会静默不出板且不打任何日志。主机保持 1.19.14 的原始表达式。
+        float guestOffsetY = Plugin.ResultsOffsetY.Value;
+        if (!float.IsFinite(guestOffsetY) || guestOffsetY < 0f) guestOffsetY = 0f;
+        top = Math.Max(0f, area.Top) + (GuestClient() ? guestOffsetY : Mathf.Max(0f, Plugin.ResultsOffsetY.Value));
         room = Math.Min(area.Bottom, Screen.height - 8f) - top;
-        strip = new BoardStrip(top, top + room, measuredButton, measuredTop, measuredHeight, completionSettled, footerSource);
+        if (GuestClient() && room < MinimumGuestStripHeight)
+        {
+            if (HeadingReports.Add("success-guest-strip-too-short"))
+                Plugin.Logger?.LogInfo($"[DIAG] success board held back: the client page's fixed strip is shorter than the minimum board height after the configured offset ({room:0}px < {MinimumGuestStripHeight:0}px) on a {Screen.height} window; vanilla is retained.");
+            return false;
+        }
+        // 客机没有原生页脚按钮，条带不得标成「按钮已实测」，否则 ResultBoardHold 会按按钮高度算可读性下限。
+        strip = new BoardStrip(top, top + room, GuestClient() ? false : measuredButton, measuredTop, measuredHeight, completionSettled, footerSource);
         return room > 0f;
     }
     // The footer of a result page animates in, so the button's own top edge is only trusted once it has stopped moving -
@@ -1234,16 +1285,33 @@ internal static class ResultsDisplay
         // laid-out rectangle is that control's own height as well - the reveal it is waiting for is alpha, not
         // geometry - so the floor describes the button the player is being asked to press either way.
         buttonHeight = wall.FromButton && lobbyRect.Height > 0f ? lobbyRect.Height : float.NaN;
-        area = buttonMeasured
-            ? ResultsRegion.Resolve(completionMeasured, completion, true, buttonTop, Screen.height, MessageGap)
-            : completionMeasured
-                ? new ResultsSafeArea(Math.Max(0f, completion) + MessageGap, Screen.height - 8f)
-                : default;
-        // Every interaction the scan found stays in the per-draw collision set, but only a control that really
-        // reaches this page's own measured completion boundary may move the strip: the strip starts at that
-        // boundary plus the message gap, so a control above the completion section can never pull it down.
-        if (area.Fits && float.IsFinite(controls.BoardTop))
-            area = new ResultsSafeArea(Math.Max(area.Top, controls.BoardTop), area.Bottom);
+        if (GuestClient())
+        {
+            // 客机页固定存在等待状态文字，任何交互扫描都不可能证明本页为空，所以放行只看锚点（完成区）渲染完成
+            // + 固定页面几何。量到的控件只做事后下界收紧，且不得把区域压到最小板高以下，永远不构成放行前提。
+            area = completionMeasured && ResultsGuestPageGeometry.TryResolve(completion, Screen.width, Screen.height,
+                MessageGap, MinimumGuestStripHeight, out ResultsSafeArea guestArea)
+                ? guestArea : default;
+            if (area.Fits && float.IsFinite(controls.FooterTop) && controls.FooterTop - MessageGap > area.Top)
+            {
+                float tightened = Math.Min(area.Bottom, controls.FooterTop - MessageGap);
+                if (tightened > area.Top && tightened - area.Top >= MinimumGuestStripHeight)
+                    area = new ResultsSafeArea(area.Top, tightened);
+            }
+        }
+        else
+        {
+            area = buttonMeasured
+                ? ResultsRegion.Resolve(completionMeasured, completion, true, buttonTop, Screen.height, MessageGap)
+                : completionMeasured
+                    ? new ResultsSafeArea(Math.Max(0f, completion) + MessageGap, Screen.height - 8f)
+                    : default;
+            // Every interaction the scan found stays in the per-draw collision set, but only a control that really
+            // reaches this page's own measured completion boundary may move the strip: the strip starts at that
+            // boundary plus the message gap, so a control above the completion section can never pull it down.
+            if (area.Fits && float.IsFinite(controls.BoardTop))
+                area = new ResultsSafeArea(Math.Max(area.Top, controls.BoardTop), area.Bottom);
+        }
         if (!controls.ProvenEmpty || nativeFooterVisible) SuccessNoFooter.Forget();
         // The line names which element produced the upper bound as well as the figures it produced, because a
         // board that starts too low is indistinguishable from a board that starts too high without it.
@@ -1546,9 +1614,41 @@ internal static class ResultsDisplay
                 : float.IsFinite(namedTop) && (!float.IsFinite(controls.FooterTop) || namedTop <= controls.FooterTop + 0.5f)
                     ? ResultFooterSource.NamedControl : ResultFooterSource.InteractiveBand;
 
-            top = Math.Max(ResultsPlacement.Top(titleBottom, Plugin.ResultsOffsetY.Value, MessageGap), controls.BoardTop);
-            if (buttonMeasured) bottom = Math.Min(buttonTop - MessageGap, Screen.height - 8f);
-            else bottom = Screen.height - 8f; // Provisional only; Placement still requires the guest no-footer proof.
+            if (GuestClient())
+            {
+                // 客机：本页没有「返回大厅」按钮，只有一行等待厅主的状态文字——而它本身就会被扫描当成一个
+                // 受保护的下边界控件，所以 buttonMeasured 在客机上几乎恒为真，绝不能拿它当分支条件。
+                // 上界 = 锚点（任务失败标题）实测底边 + 玩家配置的纵向偏移，再按 1080p 等比缩放补一个 gap；
+                // 下界 = 参考分辨率等比缩放的固定页面下界。锚点就绪即落板，不数帧、不问页脚。
+                float configuredOffset = Plugin.ResultsOffsetY.Value;
+                if (!float.IsFinite(configuredOffset) || configuredOffset < 0f) configuredOffset = 0f;
+                float guestAnchor = titleBottom + configuredOffset;
+                if (!ResultsGuestPageGeometry.TryResolve(guestAnchor, Screen.width, Screen.height, MessageGap,
+                    MinimumGuestStripHeight, out ResultsSafeArea guestArea))
+                {
+                    if (HeadingReports.Add("failure-guest-geometry-unusable"))
+                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: the client page's fixed geometry is unusable this frame (anchorBottom={(float.IsFinite(titleBottom) ? titleBottom.ToString("0") : "unmeasurable")}, screen={Screen.width}x{Screen.height}); vanilla is retained and the page is measured again.");
+                    return false;
+                }
+                top = guestArea.Top;
+                bottom = guestArea.Bottom;
+                footerSource = ResultFooterSource.ClientNoFooterSafeArea;
+                // 量得到的原生控件只做事后下界收紧：把下界收到它自己上方，收紧后仍装得下最小板高才采纳。
+                if (float.IsFinite(controls.FooterTop))
+                {
+                    float tightened = Math.Min(bottom, controls.FooterTop - MessageGap);
+                    if (tightened > top && tightened - top >= MinimumGuestStripHeight) bottom = tightened;
+                }
+                if (HeadingReports.Add("failure-client-fixed-geometry"))
+                    Plugin.Logger?.LogInfo($"[DIAG] failure footerSource=client-fixed-page-geometry: native lobbyVisible={nativeFooterVisible.ToString().ToLowerInvariant()}, anchor=settled-mission-title, nativeFooterMeasured={buttonMeasured.ToString().ToLowerInvariant()} (logged only), strip=({top:0}..{bottom:0}) of a {Screen.height} window; no interaction scan and no footer button is consulted for release.");
+            }
+            else
+            {
+                // 主机：与 1.19.14 完全一致。
+                top = Math.Max(ResultsPlacement.Top(titleBottom, Plugin.ResultsOffsetY.Value, MessageGap), controls.BoardTop);
+                if (buttonMeasured) bottom = Math.Min(buttonTop - MessageGap, Screen.height - 8f);
+                else bottom = Screen.height - 8f;
+            }
             if (!float.IsFinite(top) || !float.IsFinite(bottom) || !(bottom > top)) return false;
 
             LayoutRect candidateBoard = new LayoutRect(0f, top, Screen.width, Math.Max(0f, bottom - top));

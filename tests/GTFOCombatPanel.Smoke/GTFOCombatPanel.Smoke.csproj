@@ -45,6 +45,7 @@
     <Compile Include="..\..\EnemyDeathLedger.cs" Link="EnemyDeathLedger.cs" />
     <Compile Include="..\..\HealthLossLedger.cs" Link="HealthLossLedger.cs" />
     <Compile Include="..\..\ResultsPagePolicy.cs" Link="ResultsPagePolicy.cs" />
+    <Compile Include="..\..\GuestPageGeometry.cs" Link="GuestPageGeometry.cs" />
     <Compile Include="..\..\SentryShotLedger.cs" Link="SentryShotLedger.cs" />
   </ItemGroup>
 </Project>

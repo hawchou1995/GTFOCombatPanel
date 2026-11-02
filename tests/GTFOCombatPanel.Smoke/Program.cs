@@ -1764,6 +1764,8 @@ internal static partial class Program
         Release11912Scenarios.RunInto(Check);
         // ---- 1.19.14: an active control whose rectangle cannot be read no longer refuses the page -----------
         Release11914Scenarios.RunInto(Check);
+        // ---- 1.19.15: a guest settlement page places from its fixed page geometry once its own anchor has drawn ----
+        Release11915Scenarios.RunInto(Check);
         // ---- the explanation line under each title: a template a player may edit --------------
         ReasonTemplateScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------
