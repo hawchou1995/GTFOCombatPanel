@@ -47,6 +47,47 @@ public static class ResultVisibility
     public static bool PageChanged(IntPtr cached, IntPtr current) => cached != current;
 }
 
+// ---------------------------------------------------------------------------------------------------
+// Which side of the squad the settlement page is running on
+// ---------------------------------------------------------------------------------------------------
+//
+// One explicit answer instead of a `!SNet.IsMaster` repeated at every branch. The roles are not symmetric by nature -
+// a host's page carries the button that sends the squad home and a client's page carries only a waiting status - but
+// every difference between them now names the role it is written for, and each role owns a documented way out of a
+// page whose geometry it cannot use:
+//
+//   client   the page's geometry is fixed and known (`ResultsGuestPageGeometry`), so the strip runs to the foot of
+//            the screen from a settled anchor and no interaction scan is consulted for release.
+//   host     the page's own controls bound the strip, so the strip is measured geometry - and when that measured
+//            strip cannot hold the board's own floor, the measured controls become a gap the table steps around
+//            (`ResultBoardBands.TryBelowActions`) instead of the end of the page. Neither role is ever left with
+//            nothing but silence, which is what a host page had while a 132 px strip refused a 270 px board.
+public enum ResultPageRole { Host = 0, Client = 1 }
+
+public static class ResultPageRolePolicy
+{
+    // The role this machine runs the page as. An unreadable native flag is a host: the host path is the one that
+    // measures the page and refuses, the client path is the one that hands out a fixed safe area.
+    public static ResultPageRole Of(bool isMaster) => isMaster ? ResultPageRole.Host : ResultPageRole.Client;
+    public static ResultPageRole Unreadable => ResultPageRole.Host;
+    public static bool IsClient(ResultPageRole role) => role == ResultPageRole.Client;
+    public static string Name(ResultPageRole role) => role == ResultPageRole.Client ? "client" : "host";
+
+    // The "this page has no footer at all" safe area belongs to the client alone: a host's page really does carry the
+    // button that sends the squad home, and a host that cannot prove its own footer must not be handed a strip that
+    // runs to the foot of the screen. A host's way out is the measured band below its actions, never this proof.
+    public static bool UsesNoFooterSafeArea(ResultPageRole role) => role == ResultPageRole.Client;
+
+    // A host may step around its measured controls when the strip they leave cannot hold the board's own floor. The
+    // answer is about the two measured figures, never about the role alone - a page whose band is also too short is
+    // still refused - and it is deliberately the host's branch: a client's strip is its fixed geometry and is proven
+    // by that geometry, so a client page never needs a second rule.
+    public static bool UsesBandBelowActions(ResultPageRole role, float stripHeight, float floorHeight, float bandHeight)
+        => role == ResultPageRole.Host
+           && float.IsFinite(stripHeight) && float.IsFinite(floorHeight) && float.IsFinite(bandHeight)
+           && floorHeight > 0f && stripHeight + 0.5f < floorHeight && bandHeight + 0.5f >= floorHeight;
+}
+
 // The one latch that decides whether the board stands in for the game's own result blocks.
 //
 // `Fit` may refuse a board outright - the strip the page measured came back shorter than the table - and it used to
@@ -150,7 +191,11 @@ public static class CompletionDrawing
 
 // The lower bound's provenance is retained in the placement so an explicitly proven client safe area cannot be
 // mistaken for an unmeasured-button guess during later recovery or diagnostics.
-public enum ResultFooterSource { None = 0, NamedControl = 1, InteractiveBand = 2, ClientNoFooterSafeArea = 3 }
+//
+// `BelowActions` is the bound that is *not* a lower bound at all: the board stands in the free band under every
+// measured interaction because the strip above them is shorter than the board's own floor. It is recorded here so a
+// held board, a re-measure and a log line can all tell it apart from a strip that is merely bounded by a button.
+public enum ResultFooterSource { None = 0, NamedControl = 1, InteractiveBand = 2, ClientNoFooterSafeArea = 3, BelowActions = 4 }
 
 // The strip of a result page the board may use, together with the footer bound and its measured provenance.
 public readonly struct BoardStrip
@@ -242,5 +287,54 @@ public static class ResultBoardHold
         if (current.ButtonMeasured && float.IsFinite(current.ButtonTop))
             limit = Math.Min(limit, current.ButtonTop - ButtonClearance + slack);
         return bottom <= limit;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Which wall a result page's lower bound came from, said in the field names a log line may print
+// ---------------------------------------------------------------------------------------------------
+//
+// One helper, because the same wall is described by four lines: the success page's own region line and the two band
+// lines inside `SuccessRegion`, plus the per-repaint refusal in `BoardStillSafe`. When each of them spelled the field
+// out itself they drifted, and the drift was a lie about the page: `lobbyButton=` names a control, so it may only be
+// printed when that control was really read (`NamedControl` - as the player can press it, or from its own layout while
+// the page still reveals it). A page whose bound came from the drawn band of everything it drew
+// (`InteractiveBand`, the `LobbyEdgeSource.Band` case) has no measured button at all, and its band top is printed as
+// `lobbyEdgeValue=` next to the source it came from instead. On the run 1.19.16 comes from the real button sat at 683
+// and the band at 743, so calling 743 `lobbyButton` was a true field name over a false number - and the per-repaint
+// refusal made the same claim from a line of its own.
+//
+// The mapping from a resolved reading to a `ResultFooterSource` lives here too, so the page's own `footerSource` and
+// every line that describes the same wall cannot disagree about what was measured.
+public static class ResultFooterProvenance
+{
+    // Which footer source a resolved wall came from: the control itself, the drawn band, or nothing measurable.
+    public static ResultFooterSource Of(ResultsRegion.LobbyEdgeReading wall)
+        => wall.FromButton ? ResultFooterSource.NamedControl
+            : wall.Measured ? ResultFooterSource.InteractiveBand
+            : ResultFooterSource.None;
+
+    public static string LobbyWall(ResultsRegion.LobbyEdgeReading wall) => LobbyWall(Of(wall), wall.Top, wall.Measured);
+
+    // The button's own upper edge when there is a button to name, and otherwise the wall the strip was really built
+    // from together with its source - never that wall under the button's name.
+    public static string LobbyWall(ResultFooterSource source, float top, bool measured)
+    {
+        if (source == ResultFooterSource.NamedControl) return "lobbyButton=" + top.ToString("0");
+        return "lobbyEdgeValue=" + (measured && float.IsFinite(top) ? top.ToString("0") : "unmeasurable")
+            + ",source=" + WallSource(source);
+    }
+
+    // The source word beside `lobbyEdgeValue=`: a wall is either the drawn band of the page's own controls or nothing
+    // at all. The two remaining sources describe a *strip*, not a wall, and are named as such if one ever reaches here.
+    private static string WallSource(ResultFooterSource source)
+    {
+        switch (source)
+        {
+            case ResultFooterSource.InteractiveBand: return "band";
+            case ResultFooterSource.BelowActions: return "below-actions-band";
+            case ResultFooterSource.ClientNoFooterSafeArea: return "client-fixed-page-geometry";
+            default: return "none";
+        }
     }
 }

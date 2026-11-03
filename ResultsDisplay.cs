@@ -80,16 +80,22 @@ internal static class ResultsDisplay
         // control is on the page, measurable or not, nothing may claim the page has no footer - not this answer,
         // not `ResultNoFooterGate`, and not the full-height guest safe area either of them releases.
         public readonly ResultInteractionTally Tally;
+        // The free band under every interaction this scan measured, in window pixels, or a band of no kind when the
+        // page leaves none. It is measured here because this is the one place that holds the rectangles the scan
+        // read: a page whose strip is shorter than the board's own floor can then be answered with the space its own
+        // controls leave free, instead of with the button's upper edge pretending to be the end of the page.
+        public readonly ResultBoardBand BelowActions;
         public bool ProvenEmpty => ResultInteractionScanPolicy.ProvenEmpty(Complete, ParentCoverageComplete, Tally);
         public FooterControls(float footerTop, float boardTop, int count, int scannedCount, bool complete,
             bool parentCoverageComplete, bool overlapsBoard, int hidden = 0, int hiddenPageActions = 0, string reason = "",
-            int unmeasurable = 0)
+            int unmeasurable = 0, ResultBoardBand belowActions = default)
         {
             FooterTop = footerTop; BoardTop = boardTop; Count = count; ScannedCount = scannedCount;
             Complete = complete; ParentCoverageComplete = parentCoverageComplete; OverlapsBoard = overlapsBoard;
             Hidden = hidden; HiddenPageActions = hiddenPageActions; Reason = reason ?? string.Empty;
             Unmeasurable = unmeasurable;
             Tally = new ResultInteractionTally(count, hidden, hiddenPageActions, unmeasurable);
+            BelowActions = belowActions;
         }
     }
 
@@ -267,6 +273,11 @@ internal static class ResultsDisplay
     private static BoardStrip _holdStrip;
     private static readonly ResultAnchorDrift Drift = new ResultAnchorDrift();
     private static readonly CompletionReadiness Readiness = new CompletionReadiness();
+    // The height below which no strip can hold this page's board, whatever glyph size is tried: the settlement board's
+    // own row count at the smallest readable glyph the table may be drawn at. It is what tells a strip that is merely
+    // tight from one that can never hold the board, and it is page independent, so the page can be judged against it
+    // before a single size has been searched for. Set for every page visit in `Prepare` and dropped with the page.
+    private static float _boardFloor = float.NaN;
 
     private static void ForgetPage()
     {
@@ -281,7 +292,7 @@ internal static class ResultsDisplay
         SuccessNoFooter.Forget(); FailureNoFooter.Forget();
         _holdStrip = default;
         Drift.Forget();
-        _placedOnFallback = false; _fallbackRecoveries = 0;
+        _placedOnFallback = false; _fallbackRecoveries = 0; _boardFloor = float.NaN;
         // A different screen has a different board, and the wheel is only ever aimed at the one on the page now.
         ClearHit();
         Readiness.Forget();
@@ -318,7 +329,16 @@ internal static class ResultsDisplay
         // Nothing is touched until the board is really about to be drawn: the vanilla blocks belong to the
         // page and are only put away while a board stands in for them. Hiding them for a page whose board
         // never appears leaves the screen half-empty with nothing drawn over the gap.
-        if (_grid == null || _content == null || _page == null || !_page.gameObject.activeInHierarchy) return;
+        if (_grid == null || _content == null || _page == null || !_page.gameObject.activeInHierarchy)
+        {
+            // Nothing was placed for this page (or the page has gone away), so there is nothing to draw and nothing
+            // to touch. Said once per page rather than silently: a screen that shows the vanilla page because no
+            // placement was ever made, and a screen that shows it because the fit refused, look identical otherwise.
+            ReportHeldBack("draw", _page == null || !PageActive(_page) ? "no-live-page" : "no-placement",
+                "grid=" + (_grid != null ? _grid.Width.ToString("0") + "x" + _grid.Height.ToString("0") : "none")
+                + ",content=" + (_content != null) + ",boardFloor=" + _boardFloor.ToString("0"));
+            return;
+        }
 
         float opacity = 1f;
         if (!_succeeded && _content.Kinds != null)
@@ -335,7 +355,12 @@ internal static class ResultsDisplay
                 _holdOpacity = 1f; // Once shown, only the explicit visibility switches can hide this page's board.
                 opacity = _holdOpacity;
                 bool buttonMeasured = LobbyButtonTop(_page, out float buttonTop);
-                if (!ResultBoardHold.TryHold(new BoardStrip(_holdBoard.Y, _holdBoard.Bottom, buttonMeasured, buttonTop), _holdBoard, Screen.height, out LayoutRect held)) return;
+                if (!ResultBoardHold.TryHold(new BoardStrip(_holdBoard.Y, _holdBoard.Bottom, buttonMeasured, buttonTop), _holdBoard, Screen.height, out LayoutRect held))
+                {
+                    ReportHeldBack("failure-hold", "held-board-unreadable",
+                        "buttonMeasured=" + buttonMeasured + ",buttonTop=" + (float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable"));
+                    return;
+                }
                 if (Math.Abs(_origin.Y - held.Y) > 0.5f && HeadingReports.Add("failure-board-lifted"))
                     Plugin.Logger?.LogInfo($"[DIAG] failure board lifted clear of the lobby button: the board was at y={_origin.Y:0}, the button's own top edge is {(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")}, and the board now stands at y={held.Y:0}; it is lifted rather than dropped.");
                 _origin = held;
@@ -392,9 +417,54 @@ internal static class ResultsDisplay
     }
 
     // 客机结算页没有「返回大厅」按钮，只有一行等待状态文字；本模组的落板不依赖任何原生控件。
-    private static bool GuestClient()
+    //
+    // The role is read once per decision and named in every branch that depends on it, so a host is never answered
+    // with a client's rule (and never told about a proof it can never have). An unreadable native flag is a host: that
+    // is the path that measures the page and refuses, not the one that hands out a fixed safe area.
+    private static ResultPageRole Role()
     {
-        try { return !SNet.IsMaster; } catch { return false; }
+        try { return ResultPageRolePolicy.Of(SNet.IsMaster); } catch { return ResultPageRolePolicy.Unreadable; }
+    }
+
+    private static bool GuestClient() => ResultPageRolePolicy.IsClient(Role());
+
+    private static bool PageActive(Component page)
+    {
+        if (page == null) return false;
+        try { return page.gameObject.activeInHierarchy; } catch { return false; }
+    }
+
+    // The vertical offset the player configured for the settlement board, sanitised once for both roles. A value that is
+    // not a number - or below zero, which would move the board over the section it hangs from - reads as no offset;
+    // `Mathf.Max(0f, NaN)` is NaN, and a NaN strip is a board that silently never appears, which is the one thing this
+    // path may not do.
+    private static float OffsetY()
+    {
+        float offset = Plugin.ResultsOffsetY.Value;
+        return float.IsFinite(offset) && offset > 0f ? offset : 0f;
+    }
+
+    // One bounded line per page for a frame in which the board was held back for a reason no other line reports: the
+    // real numbers, the role, and the reason in the few words a live log can afford. Once per page and per reason -
+    // a per-frame repaint must not turn a diagnostic into a flood - and never a player's identity.
+    private static void ReportHeldBack(string where, string reason, string detail)
+    {
+        if (!HeadingReports.Add("held-back-" + where + "-" + reason)) return;
+        // A board that was never placed has no strip to report, and printing "0..0" for it would be the same kind of
+        // half-truth this helper exists to remove. The figures are named for what they are: the strip this page last
+        // gave the board, the height the board cannot be drawn under, and the figures that produced the refusal -
+        // and a page that never gave the board a strip says so instead of printing the zero box the strip's own
+        // fields hold when they were never written (`heldStrip=none` next to `top=0, bottom=0` was that same false
+        // reading, one line removed).
+        bool held = _holdStrip.Bottom > _holdStrip.Top;
+        string strip = held
+            ? "heldStrip=" + _holdStrip.Top.ToString("0") + ".." + _holdStrip.Bottom.ToString("0")
+              + " (" + (_holdStrip.Bottom - _holdStrip.Top).ToString("0") + "px), have=" + (_holdStrip.Bottom - _holdStrip.Top).ToString("0") + "px,"
+              + " top=" + _holdStrip.Top.ToString("0") + ", bottom=" + _holdStrip.Bottom.ToString("0") + ","
+            : "heldStrip=none, have=unmeasurable, top=unmeasurable, bottom=unmeasurable,";
+        Plugin.Logger?.LogInfo($"[DIAG] {where} board not drawn: reason={reason}, role={ResultPageRolePolicy.Name(Role())}, "
+            + $"{strip} need={_boardFloor:0}px, "
+            + $"screen={Screen.width}x{Screen.height}, detail={detail}; the vanilla result page is left exactly as the game drew it and the page is measured again.");
     }
 
     // Before drawing cached settlement geometry, revalidate the page's measured anchor and every native/Unity action.
@@ -416,22 +486,64 @@ internal static class ResultsDisplay
                 ReportIncompleteScan("success", successControls, successArea.Top, successArea.Height, successFooterSource);
                 return false;
             }
-            if (!Completion.Observe(Time.frameCount, true, successArea.Top)) return false;
+            if (!Completion.Observe(Time.frameCount, true, successArea.Top))
+            {
+                ReportHeldBack("success-edge", "completion-edge-unsettled",
+                    "completionTop=" + successArea.Top.ToString("0") + ",completionSettled=false");
+                return false;
+            }
             if (successControls.OverlapsBoard)
             {
                 ReportBoardOverlap("success", successControls, successArea.Top, successArea.Height, successFooterSource);
                 return false;
             }
-            float safeTop = Math.Max(0f, successArea.Top) + Mathf.Max(0f, Plugin.ResultsOffsetY.Value);
+            // The band under the page's measured actions is a placement the fit itself accepted: its own two edges are
+            // the whole contract, and no button sits under the board to keep clear of. Every other placement is still
+            // bounded by the button the player has to press.
+            bool belowActions = successFooterSource == ResultFooterSource.BelowActions;
+            float safeTop = Math.Max(0f, successArea.Top) + OffsetY();
             float bottom = Math.Min(successArea.Bottom, Screen.height - 8f);
-            if (board.Y < safeTop - BoardSlack || board.Bottom > bottom + BoardSlack) return false;
-            if (successButtonMeasured && board.Bottom > successButtonTop - ResultBoardHold.ButtonClearance + BoardSlack) return false;
+            if (!float.IsFinite(safeTop) || !float.IsFinite(bottom) || !(bottom >= safeTop))
+            {
+                ReportHeldBack("success-strip", "strip-unusable",
+                    "safeTop=" + safeTop.ToString("0") + ",stripBottom=" + bottom.ToString("0") + ",source=" + successFooterSource);
+                return false;
+            }
+            if (board.Y < safeTop - BoardSlack || board.Bottom > bottom + BoardSlack)
+            {
+                ReportHeldBack("success-strip", "board-outside-strip",
+                    "boardY=" + board.Y.ToString("0") + ",boardBottom=" + board.Bottom.ToString("0")
+                    + ",safeTop=" + safeTop.ToString("0") + ",stripBottom=" + bottom.ToString("0") + ",source=" + successFooterSource);
+                return false;
+            }
+            if (!belowActions && successButtonMeasured
+                && board.Bottom > successButtonTop - ResultBoardHold.ButtonClearance + BoardSlack)
+            {
+                ReportHeldBack("success-strip", "board-reaches-button",
+                    "boardBottom=" + board.Bottom.ToString("0") + "," + ResultFooterProvenance.LobbyWall(successFooterSource, successButtonTop, successButtonMeasured)
+                    + ",clearance=" + ResultBoardHold.ButtonClearance.ToString("0"));
+                return false;
+            }
             // 客机：没有本页可用的 no-footer 证明（等待状态文字本身就是 active 控件），此门槛只属于主机。
-            if (!GuestClient() && !successButtonMeasured && (!SuccessNoFooter.Ready || !successControls.ProvenEmpty || successNativeFooterVisible)) return false;
+            if (!GuestClient() && !successButtonMeasured && (!SuccessNoFooter.Ready || !successControls.ProvenEmpty || successNativeFooterVisible))
+            {
+                ReportHeldBack("success-strip", "no-footer-unproofed",
+                    "buttonMeasured=false,noFooterReady=" + SuccessNoFooter.Ready
+                    + ",nativeVisible=" + successNativeFooterVisible + ",count=" + successControls.Count + ",complete=" + successControls.Complete);
+                return false;
+            }
             float room = bottom - safeTop;
-            var current = new BoardStrip(safeTop, safeTop + room, successButtonMeasured, successButtonTop, successButtonHeight,
+            var current = new BoardStrip(safeTop, safeTop + room, belowActions ? false : successButtonMeasured, successButtonTop, successButtonHeight,
                 true, successFooterSource);
-            return ResultBoardHold.HeldGridFits(_holdStrip, current, board, _grid.Height, Screen.height, BoardSlack);
+            if (!ResultBoardHold.HeldGridFits(_holdStrip, current, board, _grid.Height, Screen.height, BoardSlack))
+            {
+                ReportHeldBack("success-strip", "grid-would-reach-edge",
+                    "boardBottom=" + (board.Y + _grid.Height).ToString("0") + ",heldStripBottom="
+                    + (float.IsFinite(_holdStrip.Bottom) ? _holdStrip.Bottom.ToString("0") : "unmeasured")
+                    + ",source=" + successFooterSource);
+                return false;
+            }
+            return true;
         }
 
         if (!FailureStrip(_page, out float failureTop, out float failureBottom, out _, out bool failureFooterMeasured,
@@ -443,19 +555,50 @@ internal static class ResultsDisplay
             ReportIncompleteScan("failure", failureControls, failureTop, Math.Min(failureBottom, Screen.height - 8f) - failureTop, failureFooterSource);
             return false;
         }
-        if (!failureTitleSettled) return false;
+        if (!failureTitleSettled)
+        {
+            ReportHeldBack("failure-strip", "title-edge-unsettled", "titleEdge=" + (float.IsFinite(Title.Edge) ? Title.Edge.ToString("0") : "unmeasurable"));
+            return false;
+        }
         if (failureControls.OverlapsBoard)
         {
             ReportBoardOverlap("failure", failureControls, failureTop, Math.Min(failureBottom, Screen.height - 8f) - failureTop, failureFooterSource);
             return false;
         }
-        if (board.Y < failureTop - BoardSlack || board.Bottom > Math.Min(failureBottom, Screen.height - 8f) + BoardSlack) return false;
-        if (failureFooterMeasured && board.Bottom > failureFooterTop - ResultBoardHold.ButtonClearance + BoardSlack) return false;
+        float failureBottom2 = Math.Min(failureBottom, Screen.height - 8f);
+        if (board.Y < failureTop - BoardSlack || board.Bottom > failureBottom2 + BoardSlack)
+        {
+            ReportHeldBack("failure-strip", "board-outside-strip",
+                "boardY=" + board.Y.ToString("0") + ",boardBottom=" + board.Bottom.ToString("0")
+                + ",stripTop=" + failureTop.ToString("0") + ",stripBottom=" + failureBottom2.ToString("0") + ",source=" + failureFooterSource);
+            return false;
+        }
+        if (failureFooterMeasured && board.Bottom > failureFooterTop - ResultBoardHold.ButtonClearance + BoardSlack)
+        {
+            ReportHeldBack("failure-strip", "board-reaches-button",
+                "boardBottom=" + board.Bottom.ToString("0")
+                + ",footerTop=" + (float.IsFinite(failureFooterTop) ? failureFooterTop.ToString("0") : "unmeasurable")
+                + ",clearance=" + ResultBoardHold.ButtonClearance.ToString("0"));
+            return false;
+        }
         // 客机：量到的控件只用于事后重叠保护，不构成放行前提。
-        if (!GuestClient() && !failureFooterMeasured && (!FailureNoFooter.Ready || !failureControls.ProvenEmpty || failureNativeFooterVisible)) return false;
+        if (!GuestClient() && !failureFooterMeasured && (!FailureNoFooter.Ready || !failureControls.ProvenEmpty || failureNativeFooterVisible))
+        {
+            ReportHeldBack("failure-strip", "no-footer-unproofed",
+                "buttonMeasured=false,noFooterReady=" + FailureNoFooter.Ready
+                + ",nativeVisible=" + failureNativeFooterVisible + ",count=" + failureControls.Count + ",complete=" + failureControls.Complete);
+            return false;
+        }
         var failureStrip = new BoardStrip(failureTop, failureBottom, failureFooterMeasured, failureFooterTop, failureFooterHeight,
             failureTitleSettled, failureFooterSource);
-        return ResultBoardHold.HeldGridFits(_holdStrip, failureStrip, board, _grid.Height, Screen.height, BoardSlack);
+        if (!ResultBoardHold.HeldGridFits(_holdStrip, failureStrip, board, _grid.Height, Screen.height, BoardSlack))
+        {
+            ReportHeldBack("failure-strip", "grid-would-reach-edge",
+                "boardBottom=" + (board.Y + _grid.Height).ToString("0") + ",heldStripBottom="
+                + (float.IsFinite(_holdStrip.Bottom) ? _holdStrip.Bottom.ToString("0") : "unmeasured"));
+            return false;
+        }
+        return true;
     }
 
     private static void DeferBoardForInteraction()
@@ -583,7 +726,7 @@ internal static class ResultsDisplay
                             successControls.FooterTop, MessageGap)) return false;
                 }
                 if (!successArea.Fits) return false;
-                top = Math.Max(0f, successArea.Top) + Mathf.Max(0f, Plugin.ResultsOffsetY.Value);
+                top = Math.Max(0f, successArea.Top) + OffsetY();
                 bottom = Math.Min(successArea.Bottom, Screen.height - 8f);
                 return float.IsFinite(top) && float.IsFinite(bottom) && bottom > top;
             }
@@ -673,6 +816,13 @@ internal static class ResultsDisplay
 
     private static void Prepare(Component page, bool succeeded)
     {
+        // The board's own floor, measured before the page is asked for a strip: this is the one figure that tells a
+        // strip that is merely tight from one the table can never be drawn into, and the page's own decision about
+        // where the board may stand is made against it (see the host branch of `SuccessRegion`). The settlement board
+        // is always drawn with its three kill tiers split, so the row count is the split board's and does not depend
+        // on how many players are in the squad.
+        _boardFloor = ResultsFontGrowth.MinimumBoardHeight(ImpactBoard.RowCount(true),
+            HudTable.RowEm(ResultsFontGrowth.MinimumReadablePixels), Plugin.Density);
         if (!Placement(page, succeeded, out _, out float room, out BoardStrip strip)) return;
         ImpactReport report = BuildReport(succeeded);
         if (report.Entries.Count == 0)
@@ -692,10 +842,18 @@ internal static class ResultsDisplay
             Dividers = Dividers(board),
             Kinds = board.Kinds
         };
-        if (room <= 0f) return;
+        if (room <= 0f)
+        {
+            ReportHeldBack("prepare", "strip-empty", "source=" + strip.FooterSource + ",anchorTop=" + strip.Top.ToString("0"));
+            return;
+        }
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
         PanelGrid grid = FitBoard(content, room, boardWidth, succeeded, strip.ButtonHeight);
-        if (grid == null) return;
+        if (grid == null)
+        {
+            ReportHeldBack("prepare", "grid-unmeasurable", "rows=" + content.Rows + ",columns=" + content.ColumnCount + ",source=" + strip.FooterSource);
+            return;
+        }
         // A fit that could not put the board on the page is not a placement: the vanilla blocks only make way for a
         // board that is really there, so a refused frame leaves the page exactly as the game drew it and is asked
         // again next frame, instead of hiding its own blocks and drawing nothing over the gap.
@@ -708,7 +866,12 @@ internal static class ResultsDisplay
         // is therefore the case that keeps the right to exactly one second look, taken when that control's own
         // rectangle becomes readable. With the strict gates above, a strip is only ever placed from measured edges, so
         // this is now a precision backstop rather than the normal path.
+        // A board standing in the band below the page's actions is not a guess: that band is measured geometry, and the
+        // second look exists for a strip that was laid out before one of the page's own edges could be read - which is
+        // never this one. It keeps the same right to a re-measure every other measured strip has, through the drift
+        // check, and spends no recovery budget on top of it.
         _placedOnFallback = strip.FooterSource != ResultFooterSource.ClientNoFooterSafeArea
+            && strip.FooterSource != ResultFooterSource.BelowActions
             && ResultAnchorRecovery.LatchFallback(_fallbackRecoveries,
                 strip.ButtonMeasured && strip.AnchorMeasured && float.IsFinite(strip.ButtonHeight));
     }
@@ -965,7 +1128,7 @@ internal static class ResultsDisplay
             if (!ResultBoardHold.HeldGridFits(_holdStrip, strip, _holdBoard, grid.Height, Screen.height, BoardSlack))
             {
                 if (HeadingReports.Add("board-growth-refused"))
-                    Plugin.Logger?.LogInfo($"[DIAG] result board kept at its measured size: a refreshed {grid.Width:0}x{grid.Height:0} board would come within the lobby button's clearance line (button top {(float.IsFinite(strip.ButtonTop) ? strip.ButtonTop.ToString("0") : "unmeasurable")}) or run past the strip it was measured into ({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), so the grid already on the page is kept and the next snapshot asks again.");
+                    Plugin.Logger?.LogInfo($"[DIAG] result board kept at its measured size: a refreshed {grid.Width:0}x{grid.Height:0} board would cross the wall the held grid has to stay above (wall={(float.IsFinite(strip.ButtonTop) ? strip.ButtonTop.ToString("0") : "unmeasurable")}, source={DescribeBand(strip.FooterSource)}) or run past the strip it was measured into ({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), so the grid already on the page is kept and the next snapshot asks again.");
                 return true;
             }
             _origin = _holdBoard;
@@ -974,7 +1137,15 @@ internal static class ResultsDisplay
                 Plugin.Logger?.LogInfo($"[DIAG] result board kept: the strip measured {strip.Top:0}..{strip.Bottom:0} cannot hold the {grid.Width:0}x{grid.Height:0} board that is already up, so it keeps the place it was measured into at ({_holdBoard.X:0},{_holdBoard.Y:0}), and only the lobby button is read from here on.");
             return true;
         }
-        if (HeadingReports.Add("fit-failed")) Plugin.Logger?.LogWarning($"[DIAG] result board cannot fit: top={strip.Top:0}, bottom={strip.Bottom:0}, grid={grid.Width:0}x{grid.Height:0}, screen={Screen.width}x{Screen.height}.");
+        // The one line a refused fit must never be silent about, and must never dress up: the real strip, the real height
+        // the board needs, the role and the page it was measured on. `need` is the board's own floor - the height it
+        // cannot be drawn under at any glyph size - so the two figures say whether the strip was tight or impossible.
+        if (HeadingReports.Add("fit-failed"))
+            Plugin.Logger?.LogWarning($"[DIAG] result board cannot fit: role={ResultPageRolePolicy.Name(Role())}, page={(succeeded ? "success" : "failure")}, "
+                + $"top={strip.Top:0}, bottom={strip.Bottom:0}, strip={(strip.Bottom - strip.Top):0}px, grid={grid.Width:0}x{grid.Height:0}, "
+                + $"need={grid.Height:0}px at the {grid.FontPixels:0}px glyph it was built with (floor={_boardFloor:0}px for {grid.Rows} rows), "
+                + $"have={((strip.Bottom - strip.Top)):0}px, footerSource={strip.FooterSource}, buttonTop={(float.IsFinite(strip.ButtonTop) ? strip.ButtonTop.ToString("0") : "unmeasurable")}, "
+                + $"screen={Screen.width}x{Screen.height}; nothing is drawn over the page - the vanilla result screen is kept and the strip is measured again.");
         return false;
     }
 
@@ -1018,12 +1189,17 @@ internal static class ResultsDisplay
                 // 1.19.14 原样：没有实测按钮时先清掉按钮 settle 状态，否则 Footer 的稳定计数会跨未测帧残留，
                 // A→B→A 的输入会让 ButtonSettled 在单帧读数上就放行，且 Footer.Exhausted 永不成立、诊断日志不打印。
                 ButtonSettled(false, float.NaN);
-                bool failureNoFooterReady = FailureNoFooter.Observe(Time.frameCount, !SNet.IsMaster, failureTitleSettled,
+                bool failureNoFooterReady = FailureNoFooter.Observe(Time.frameCount,
+                    ResultPageRolePolicy.UsesNoFooterSafeArea(Role()), failureTitleSettled,
                     page != null, failureNativeFooterVisible, failureControls.Complete, failureControls.Count, failureControls.Unmeasurable);
                 if (!failureNoFooterReady)
                 {
+                    // The role decides what this line is allowed to say; see the matching line on the success page.
                     if (Footer.Exhausted && HeadingReports.Add("failure-footer-unsettled"))
-                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: no stable native footer was measured and the guest safe-area proof is incomplete ({failureControls.Count} interaction items, complete={failureControls.Complete}, nativeVisible={failureNativeFooterVisible}); vanilla is kept and placement is retried.");
+                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: role={ResultPageRolePolicy.Name(Role())}, no stable native footer edge was measured; "
+                            + $"noFooterProof={(ResultPageRolePolicy.UsesNoFooterSafeArea(Role()) ? "available" : "not-this-role")} (ready={FailureNoFooter.Ready}, samples={FailureNoFooter.Samples}), "
+                            + $"count={failureControls.Count},unmeasurable={failureControls.Unmeasurable},complete={failureControls.Complete},nativeVisible={failureNativeFooterVisible},footerTop={(float.IsFinite(failureControls.FooterTop) ? failureControls.FooterTop.ToString("0") : "unmeasurable")}, "
+                            + $"need={_boardFloor:0}px; vanilla is kept and placement is retried.");
                     return false;
                 }
                 if (!ResultNoFooterSafeArea.TryResolve(top, Screen.height, out ResultsSafeArea safeArea,
@@ -1043,7 +1219,14 @@ internal static class ResultsDisplay
         bool completionMeasured = SuccessRegion(page, out ResultsSafeArea area, out bool measuredButton,
             out float measuredTop, out float measuredHeight, out FooterControls successControls,
             out bool successNativeFooterVisible, out ResultFooterSource footerSource);
-        if (!completionMeasured) return false;
+        if (!completionMeasured)
+        {
+            // The page has no completion section this build could read: nothing proves where a board would hang from, so
+            // the vanilla page is kept and the line says which read failed rather than leaving the silence.
+            ReportHeldBack("success-anchor", "completion-unmeasurable",
+                "completionEdge=" + (float.IsFinite(Completion.Edge) ? Completion.Edge.ToString("0") : "unmeasured") + ",boardFloor=" + _boardFloor.ToString("0"));
+            return false;
+        }
         bool completionSettled = Completion.Observe(Time.frameCount, true, area.Top);
         // 客机：同上——完整扫描证明只约束主机；客机放行只看锚点渲染完成 + 固定页面几何。
         if (!GuestClient() && !successControls.Complete)
@@ -1051,7 +1234,11 @@ internal static class ResultsDisplay
             ReportIncompleteScan("success", successControls, area.Top, area.Height, footerSource);
             return false;
         }
-        if (!completionSettled) return false;
+        if (!completionSettled)
+        {
+            ReportHeldBack("success-edge", "completion-edge-unsettled", "completionTop=" + area.Top.ToString("0"));
+            return false;
+        }
         if (GuestClient())
         {
             // 客机：条带已由 SuccessRegion 的客机分支按固定几何算好；完成区上界稳定即落板。
@@ -1071,12 +1258,20 @@ internal static class ResultsDisplay
             // 1.19.14 原样：没有实测按钮时先清掉按钮 settle 状态，否则 Footer 的稳定计数会跨未测帧残留，
             // A→B→A 的输入会让 ButtonSettled 在单帧读数上就放行，且 Footer.Exhausted 永不成立、诊断日志不打印。
             ButtonSettled(false, float.NaN);
-            bool successNoFooterReady = SuccessNoFooter.Observe(Time.frameCount, !SNet.IsMaster, completionSettled,
+            bool successNoFooterReady = SuccessNoFooter.Observe(Time.frameCount,
+                ResultPageRolePolicy.UsesNoFooterSafeArea(Role()), completionSettled,
                 page != null, successNativeFooterVisible, successControls.Complete, successControls.Count, successControls.Unmeasurable);
             if (!successNoFooterReady)
             {
+                // The role decides what this line is allowed to say. Only a client can hold the "this page has no footer"
+                // proof, so a host that cannot measure its own button is held back by the *measured* footer it could not
+                // read - it is never told about a client proof it can never have, which is what this line used to print
+                // for the host that was reporting the bug.
                 if (Footer.Exhausted && HeadingReports.Add("success-footer-unsettled"))
-                    Plugin.Logger?.LogInfo($"[DIAG] success board held back: no stable native footer was measured and the guest safe-area proof is incomplete ({successControls.Count} interaction items, complete={successControls.Complete}, nativeVisible={successNativeFooterVisible}); vanilla is kept and placement is retried.");
+                    Plugin.Logger?.LogInfo($"[DIAG] success board held back: role={ResultPageRolePolicy.Name(Role())}, no stable native footer edge was measured; "
+                        + $"noFooterProof={(ResultPageRolePolicy.UsesNoFooterSafeArea(Role()) ? "available" : "not-this-role")} (ready={SuccessNoFooter.Ready}, samples={SuccessNoFooter.Samples}), "
+                        + $"count={successControls.Count},unmeasurable={successControls.Unmeasurable},complete={successControls.Complete},nativeVisible={successNativeFooterVisible},footerTop={(float.IsFinite(successControls.FooterTop) ? successControls.FooterTop.ToString("0") : "unmeasurable")}, "
+                        + $"need={_boardFloor:0}px; vanilla is kept and the page is measured again at the bounded cadence.");
                 return false;
             }
             if (!ResultNoFooterSafeArea.TryResolve(area.Top, Screen.height, out area,
@@ -1091,11 +1286,9 @@ internal static class ResultsDisplay
                 Plugin.Logger?.LogWarning($"[DIAG] success board deferred: the measured completion section leaves no usable strip ({area.Top:0}..{area.Bottom:0} of {Screen.height}); vanilla is retained.");
             return false;
         }
-        // 客机：玩家把纵向偏移手改成 NaN / 负值时按 0 处理，否则 Mathf.Max(0f, NaN) 会得到 NaN，
-        // 条带与 room 全变 NaN，成功页会静默不出板且不打任何日志。主机保持 1.19.14 的原始表达式。
-        float guestOffsetY = Plugin.ResultsOffsetY.Value;
-        if (!float.IsFinite(guestOffsetY) || guestOffsetY < 0f) guestOffsetY = 0f;
-        top = Math.Max(0f, area.Top) + (GuestClient() ? guestOffsetY : Mathf.Max(0f, Plugin.ResultsOffsetY.Value));
+        // 玩家把纵向偏移手改成 NaN / 负值时按 0 处理：`Mathf.Max(0f, NaN)` 会得到 NaN，条带与 room 全变 NaN，
+        // 结算页会静默不出板且不打任何日志。这一条对主机与客机同样成立（`OffsetY`）。
+        top = Math.Max(0f, area.Top) + OffsetY();
         room = Math.Min(area.Bottom, Screen.height - 8f) - top;
         if (GuestClient() && room < MinimumGuestStripHeight)
         {
@@ -1104,7 +1297,10 @@ internal static class ResultsDisplay
             return false;
         }
         // 客机没有原生页脚按钮，条带不得标成「按钮已实测」，否则 ResultBoardHold 会按按钮高度算可读性下限。
-        strip = new BoardStrip(top, top + room, GuestClient() ? false : measuredButton, measuredTop, measuredHeight, completionSettled, footerSource);
+        // The band below the page's actions has no button under it either, for the same reason: the board's readability
+        // floor there is the absolute one, not a share of a control that is not underneath it.
+        bool belowActions = footerSource == ResultFooterSource.BelowActions;
+        strip = new BoardStrip(top, top + room, GuestClient() || belowActions ? false : measuredButton, measuredTop, measuredHeight, completionSettled, footerSource);
         return room > 0f;
     }
     // The footer of a result page animates in, so the button's own top edge is only trusted once it has stopped moving -
@@ -1122,7 +1318,7 @@ internal static class ResultsDisplay
     private static void ReportIncompleteScan(string where, FooterControls controls, float top, float room, ResultFooterSource source)
     {
         if (!HeadingReports.Add("scan-incomplete-" + where)) return;
-        Plugin.Logger?.LogInfo($"[DIAG] {where} board held back: the interaction scan could not finish (scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},reason={(string.IsNullOrEmpty(controls.Reason) ? "none" : controls.Reason)},count={controls.Count},hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},unmeasurable={controls.Unmeasurable},scanned={controls.ScannedCount},footerSource={source},top={top:0},room={room:0}); vanilla is retained and the page is measured again.");
+        Plugin.Logger?.LogInfo($"[DIAG] {where} board held back: the interaction scan could not finish (scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},reason={(string.IsNullOrEmpty(controls.Reason) ? "none" : controls.Reason)},count={controls.Count},hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},unmeasurable={controls.Unmeasurable},scanned={controls.ScannedCount},footerSource={source},{DescribeStrip(top, room)}); vanilla is retained and the page is measured again.");
     }
 
     // One bounded line per page visit for the page that used to be refused for ever.
@@ -1136,13 +1332,13 @@ internal static class ResultsDisplay
     {
         if (!ResultInteractionScanPolicy.DowngradeIsWhy(controls.Complete, controls.ParentCoverageComplete, controls.Tally)) return;
         if (!HeadingReports.Add("control-downgraded-" + where)) return;
-        Plugin.Logger?.LogInfo($"[DIAG] {where} board allowed past an unmeasurable interaction: count={controls.Count},unmeasurable={controls.Unmeasurable},hidden={controls.Hidden},scanned={controls.ScannedCount},footerSource={source},top={top:0},room={room:0}; the control is active but its geometry could not be read, so its collision was ignored and the board is drawn as usual. The per-repaint scan re-reads it and takes the vanilla page back the moment it has a rectangle that reaches the board.");
+        Plugin.Logger?.LogInfo($"[DIAG] {where} board allowed past an unmeasurable interaction: count={controls.Count},unmeasurable={controls.Unmeasurable},hidden={controls.Hidden},scanned={controls.ScannedCount},footerSource={source},{DescribeStrip(top, room)}; the control is active but its geometry could not be read, so its collision was ignored and this page is not deferred on account of it. Whether the table is drawn is the fit's own answer - it reports its line when it refuses - and the per-repaint scan re-reads the control and takes the vanilla page back the moment it has a rectangle that reaches the board.");
     }
 
     private static void ReportBoardOverlap(string where, FooterControls controls, float top, float room, ResultFooterSource source)
     {
         if (!HeadingReports.Add("board-overlap-" + where)) return;
-        Plugin.Logger?.LogInfo($"[DIAG] {where} board deferred: an interaction the scan can see now reaches the placed board (count={controls.Count},hidden={controls.Hidden},scanned={controls.ScannedCount},footerSource={source},top={top:0},room={room:0}); vanilla is restored and the board is measured again before it may return.");
+        Plugin.Logger?.LogInfo($"[DIAG] {where} board deferred: an interaction the scan can see now reaches the placed board (count={controls.Count},hidden={controls.Hidden},scanned={controls.ScannedCount},footerSource={source},{DescribeStrip(top, room)}); vanilla is restored and the board is measured again before it may return.");
     }
 
     private static string _completionState;
@@ -1277,8 +1473,7 @@ internal static class ResultsDisplay
         bool completionMeasured = float.IsFinite(completion);
 
         buttonMeasured = wall.Measured;
-        footerSource = wall.FromButton ? ResultFooterSource.NamedControl
-            : wall.Measured ? ResultFooterSource.InteractiveBand : ResultFooterSource.None;
+        footerSource = ResultFooterProvenance.Of(wall);
         buttonTop = buttonMeasured ? button : float.NaN;
         // The height of that same button, and only of that button: when the bound came from the drawn band
         // there is no single control to measure, and the board keeps its absolute readability floor. The
@@ -1311,12 +1506,69 @@ internal static class ResultsDisplay
             // boundary plus the message gap, so a control above the completion section can never pull it down.
             if (area.Fits && float.IsFinite(controls.BoardTop))
                 area = new ResultsSafeArea(Math.Max(area.Top, controls.BoardTop), area.Bottom);
+            // 1.19.16 - the strip above the button is the *preferred* band, not the only one the page offers.
+            //
+            // The button's own upper edge is a lower bound for that band; it is not the end of the page. A real host
+            // success page put its completion section at 519 of 1440 and its lobby button at 683, which is a 132 px
+            // strip - and the settlement board cannot be drawn under 270 px at any readable glyph size, so the board
+            // was never drawn at all even though more than 700 px of the page below that button were empty. When the
+            // strip cannot hold the board's own floor, the measured controls therefore become a gap the table steps
+            // around and the board stands in the free band below them. Every control the scan measured is outside that
+            // band by construction (`ResultBoardBands.TryBelowActions`), so nothing a player can press is covered, and
+            // the blank row at the button stays blank.
+            float anchoredHeight = area.Height;
+            float anchoredTop = area.Top, anchoredBottom = area.Bottom;
+            if (ResultPageRolePolicy.UsesBandBelowActions(Role(), anchoredHeight, _boardFloor, controls.BelowActions.Height))
+            {
+                area = new ResultsSafeArea(controls.BelowActions.Top, controls.BelowActions.Bottom);
+                footerSource = ResultFooterSource.BelowActions;
+                if (HeadingReports.Add("success-band-below-actions"))
+                    Plugin.Logger?.LogInfo($"[DIAG] success strip cannot hold the board's own floor: role={ResultPageRolePolicy.Name(Role())}, "
+                        + $"strip=({anchoredTop:0}..{anchoredBottom:0}) is {anchoredHeight:0}px but the {ImpactBoard.RowCount(true)}-row board cannot be drawn under {_boardFloor:0}px at any readable glyph size on a {Screen.height} window; "
+                        + $"the page's measured actions are stepped around instead of ending the strip - {DescribeLobbyWall(wall)}, lobbyEdge={DescribeLobbyEdge(wall)} - "
+                        + $"and the free band below them is offered to the fit: boardBand=({controls.BelowActions.Top:0}..{controls.BelowActions.Bottom:0}) is {controls.BelowActions.Height:0}px, footerSource=below-actions-band. "
+                        + "Every control the scan measured is outside that band, so no interaction is covered.");
+            }
+            else if (area.Fits && float.IsFinite(_boardFloor) && _boardFloor > 0f && anchoredHeight + 0.5f < _boardFloor)
+            {
+                // The honest refusal: the strip cannot hold the board and the page leaves no band that could. The numbers
+                // are the whole point of the line - a strip of 132 px and a band of 40 px are two different faults.
+                if (HeadingReports.Add("success-band-unavailable"))
+                    Plugin.Logger?.LogWarning($"[DIAG] success board deferred: role={ResultPageRolePolicy.Name(Role())}, need={_boardFloor:0}px for the {ImpactBoard.RowCount(true)}-row board, "
+                        + $"have={anchoredHeight:0}px in the strip ({anchoredTop:0}..{anchoredBottom:0}) above the page's own actions"
+                        + (controls.BelowActions.Fits
+                            ? $", and the free band below them ({controls.BelowActions.Top:0}..{controls.BelowActions.Bottom:0}) is only {controls.BelowActions.Height:0}px"
+                            : ", and the page's measured actions leave no free band below them")
+                        + $", {DescribeLobbyWall(wall)}, lobbyEdge={DescribeLobbyEdge(wall)}, screen={Screen.width}x{Screen.height}; the vanilla result screen is kept rather than drawn over any control.");
+            }
         }
         if (!controls.ProvenEmpty || nativeFooterVisible) SuccessNoFooter.Forget();
-        // The line names which element produced the upper bound as well as the figures it produced, because a
-        // board that starts too low is indistinguishable from a board that starts too high without it.
+        // The line names which element produced the upper bound, which band the board may use and the figures behind
+        // both, because a board that starts too low is indistinguishable from a board that starts too high without it.
+        //
+        // It says what was *measured* and nothing about what will be drawn: whether the table lands in this strip is
+        // the fit's answer, and the fit reports its own line - with the real numbers - when it refuses. The sentence
+        // this line used to end with claimed the strip was either drawn already or laid out while still revealing, which
+        // was read as a board being on the page; on the host page it was printed for a strip the board was then never
+        // drawn into.
+        //
+        // The same rule applies field by field. `boardBand=` names the band the board may use (`band=` collided with
+        // `lobbyEdge=band`, which is a *source*, not a band). `lobbyButton=` is printed only when the page's own button
+        // was really read: a page whose bound came from the drawn band (`lobbyEdge=band`) has no measured button, and
+        // the band's own top edge is printed as `lobbyEdgeValue=<px>,source=<band|none>` instead - on the run this
+        // release came from the real button was at 683 while the band started at 743, so calling 743 `lobbyButton` was
+        // a true field name over a false number. `ResultFooterProvenance.LobbyWall` is the only place that spells out
+        // either name, so the per-repaint refusal in `BoardStillSafe` prints that same figure under that same field. A
+        // page that handed over no strip at all says `boardTop=unmeasurable`, not a zero box.
         if (HeadingReports.Add("success-region"))
-            Plugin.Logger?.LogInfo($"[DIAG] success region: anchorSource={completionSource}, completion={(completionMeasured ? completion.ToString("0") : "unmeasurable")} (deepest visible part of the completion section, gap={MessageGap:0}px), lobbyButton={(buttonMeasured ? buttonTop.ToString("0") : "unmeasurable")}, lobbyEdge={DescribeLobbyEdge(wall)}, boardTop={area.Top:0}, room={area.Height:0} of a {Screen.height} window; the strip runs from the completion section to the button's own upper edge - drawn, or laid out and still revealing - not to a hidden, transparent or off-page control, and all four players scale into it rather than being trimmed to it.");
+            Plugin.Logger?.LogInfo($"[DIAG] success region: anchorSource={completionSource}, completion={(completionMeasured ? completion.ToString("0") : "unmeasurable")} (deepest visible part of the completion section, gap={MessageGap:0}px), "
+                + $"{DescribeLobbyWall(wall)}, lobbyEdge={DescribeLobbyEdge(wall)}, "
+                + (area.Fits ? $"boardTop={area.Top:0}, room={area.Height:0}" : "boardTop=unmeasurable, room=unmeasurable")
+                + $" of a {Screen.height} window, "
+                + $"boardBand={DescribeBand(footerSource)}, boardFloor={(_boardFloor):0}, role={ResultPageRolePolicy.Name(Role())}; "
+                + "the strip is bounded by this page's own measured geometry - the completion section above and, below, the lobby button's upper edge or the free band under the page's measured actions - "
+                + "never by a hidden, transparent or off-page control, and it is measured from drawn geometry rather than inferred from the draw. All four players scale into whichever band is used, "
+                + "and the fit that decides whether the table is drawn into it reports its own line when it is not.");
         ReportDowngradedControls("success", controls, area.Top, area.Height, footerSource);
         // What the caller may act on is whether the *section* was measured: the strip's own fit is asked separately
         // through `ResultsUpperBound.Decide`, so a section that could not be read and a strip that cannot hold the
@@ -1335,6 +1587,40 @@ internal static class ResultsDisplay
             case ResultsRegion.LobbyEdgeSource.Layout: return "layout";
             case ResultsRegion.LobbyEdgeSource.Band: return "band";
             default: return "unmeasurable";
+        }
+    }
+
+    // The button's own upper edge, or the honest statement of the wall this page really gave - in one place, so the
+    // three `SuccessRegion` lines that call it and the per-repaint refusal in `BoardStillSafe` cannot drift apart again.
+    //
+    // The field names and the argument for them live in `ResultFooterProvenance.LobbyWall` (`ResultVisibility.cs`):
+    // `lobbyButton=` means that control was read, and a band top is printed as `lobbyEdgeValue=` with its source. This
+    // wrapper only turns the resolved reading into the pair the shared helper takes.
+    private static string DescribeLobbyWall(ResultsRegion.LobbyEdgeReading wall) => ResultFooterProvenance.LobbyWall(wall);
+
+    // The strip a line is about and the room it gave, printed only when the page really resolved one.
+    //
+    // `ResultsSafeArea.Fits` is `Height > 0`, and the zero box an unresolved one holds is not a strip at 0 with no
+    // room - it is no strip at all. Printing `top=0, room=0` for it is the same half-truth as printing `0..0` for a
+    // held-back board: a reader has no way to tell "the page gave 0 px" from "the page gave nothing".
+    private static string DescribeStrip(float top, float room)
+    {
+        if (!(room > 0f) || !float.IsFinite(top) || !float.IsFinite(room)) return "top=unmeasurable, room=unmeasurable";
+        return "top=" + top.ToString("0") + ", room=" + room.ToString("0");
+    }
+
+    // Which band the board may use, spelled out so one log line is enough to tell the two apart: the strip between the
+    // page's anchor and the controls it measured, and the free band below those controls when that strip cannot hold the
+    // board at all.
+    private static string DescribeBand(ResultFooterSource source)
+    {
+        switch (source)
+        {
+            case ResultFooterSource.BelowActions: return "below-actions-band";
+            case ResultFooterSource.ClientNoFooterSafeArea: return "client-fixed-page-geometry";
+            case ResultFooterSource.NamedControl: return "anchor-to-named-button";
+            case ResultFooterSource.InteractiveBand: return "anchor-to-measured-band";
+            default: return "unresolved";
         }
     }
 
@@ -1529,8 +1815,9 @@ internal static class ResultsDisplay
             bool missionTextPresent = false;
             try { missionTextPresent = missionPresent && !string.IsNullOrWhiteSpace(missionTitle.text); } catch { }
             nativeFooterVisible = fail.m_lobbyButtonVisible;
-            bool client = false;
-            try { client = !SNet.IsMaster; } catch { }
+            // The role, named: the failure page's own anchor policy and its no-footer proof are client-only, and the
+            // answer comes from the one place that reads the native flag.
+            bool client = ResultPageRolePolicy.IsClient(Role());
             LayoutRect missionRect = default;
             bool missionGeometryMeasured = missionPresent && TryScreenRect(missionTitle, out missionRect);
             bool sequenceFinished = FailureSequence.IsFinished(page.Pointer);
@@ -1587,7 +1874,11 @@ internal static class ResultsDisplay
                 return false;
             }
             bool titleKnown = float.IsFinite(titleBottom);
-            if (!titleKnown) return false;
+            if (!titleKnown)
+            {
+                ReportHeldBack("failure-title", "title-edge-unknown", "titleSource=" + titleSource + ",anchorSettled=" + anchorSettled);
+                return false;
+            }
             if (HeadingReports.Add("failure-native-anchor-ready"))
                 Plugin.Logger?.LogInfo($"[DIAG] failure native anchor ready: titleSource={titleSource}; activeTitle={active.ToString().ToLowerInvariant()},alpha={(float.IsFinite(alpha) ? alpha.ToString("0.00") : "unreadable")},geometryMeasured={measured.ToString().ToLowerInvariant()},failureSequenceFinished={sequenceFinished.ToString().ToLowerInvariant()},edge={titleBottom:0},opaqueReadings={Title.OpaqueFrames},sameFrameInvalidations={Title.SameFrameInvalidations}; waiting-status remains a lower protection only.");
 
@@ -1649,7 +1940,14 @@ internal static class ResultsDisplay
                 if (buttonMeasured) bottom = Math.Min(buttonTop - MessageGap, Screen.height - 8f);
                 else bottom = Screen.height - 8f;
             }
-            if (!float.IsFinite(top) || !float.IsFinite(bottom) || !(bottom > top)) return false;
+            if (!float.IsFinite(top) || !float.IsFinite(bottom) || !(bottom > top))
+            {
+                ReportHeldBack("failure-strip-measured", "strip-arithmetic-unnumbered",
+                    "stripTop=" + (float.IsFinite(top) ? top.ToString("0") : "unmeasurable")
+                    + ",stripBottom=" + (float.IsFinite(bottom) ? bottom.ToString("0") : "unmeasurable")
+                    + ",anchorBottom=" + titleBottom.ToString("0") + ",footerSource=" + footerSource);
+                return false;
+            }
 
             LayoutRect candidateBoard = new LayoutRect(0f, top, Screen.width, Math.Max(0f, bottom - top));
             bool overlapsLobby = controls.OverlapsBoard;
@@ -1747,7 +2045,7 @@ internal static class ResultsDisplay
         bool complete = true, overlaps = false, client = false, parentCoverageComplete = true;
         // The client flag decides which result action the page is expected to have hidden, so an unreadable one is
         // a coverage edge of the scan itself and keeps the vanilla page up rather than being guessed at.
-        try { client = !SNet.IsMaster; } catch { complete = false; reason = "client-state-unreadable"; }
+        try { client = ResultPageRolePolicy.IsClient(ResultPageRolePolicy.Of(SNet.IsMaster)); } catch { complete = false; reason = "client-state-unreadable"; }
 
         // Two different questions, deliberately kept apart:
         //   * can this control take the pointer right now - only an *active* control can, so a control the game
@@ -1884,10 +2182,10 @@ internal static class ResultsDisplay
         // counted as an interaction that is on the page and was not measured - two readings of the same element,
         // exactly like an active control with an unreadable rectangle - which keeps `ProvenEmpty` false and keeps
         // `ResultNoFooterGate` off its zero here. `Unmeasurable` is deliberately left alone: it is the count the
-        // one-off downgrade line reads, and that line's sentence is "the board is drawn as usual", which is not
-        // true of an element that stops the guest safe area outright. A line whose own *state* cannot be read is
-        // still the structural case and keeps the scan incomplete, because there is no telling whether it is on
-        // the screen at all.
+        // one-off downgrade line reads, and that line's sentence is "this page is not deferred on account of it",
+        // which is not true of an element that stops the guest safe area outright. A line whose own *state* cannot
+        // be read is still the structural case and keeps the scan incomplete, because there is no telling whether it
+        // is on the screen at all.
         if (protectedPageText != null)
         {
             try
@@ -1923,9 +2221,17 @@ internal static class ResultsDisplay
         // `strip.FooterActionCount`, a diagnostic of the strip alone. `Count` is what `Tally`, `ProvenEmpty`,
         // `BoardStillSafe` and `ResultNoFooterGate.Observe` all read, so taking it from the strip is exactly how a
         // page whose every active control was unmeasurable came to claim it had no footer and hand the guest safe
+        // page whose every active control was unmeasurable came to claim it had no footer and hand the guest safe
         // area the whole screen. `ScannedCount` is everything the scan visited, switched on or off.
+        //
+        // the board: `ResultBoardBands.TryBelowActions` carves the measured rectangles out of the page and answers with
+        // the tallest band left. It is measured from the strip's own top, so a control that pushed the strip down can
+        // never leave a band above itself. Nothing is decided from it here - the page's own role decides whether it may
+        // be used - and a scan that found no control gets no band, which is the same answer as "the strip is the page".
+        float bandAnchor = float.IsFinite(strip.BoardTop) ? strip.BoardTop : anchorBottom + gap;
+        ResultBoardBands.TryBelowActions(bandAnchor, Screen.height, actions, gap, out ResultBoardBand belowActions);
         return new FooterControls(strip.FooterTop, strip.BoardTop, tally.Active, tally.Hidden + tally.Active, complete, parentCoverageComplete, overlaps,
-            tally.Hidden, tally.HiddenPageActions, reason, tally.Unmeasurable);
+            tally.Hidden, tally.HiddenPageActions, reason, tally.Unmeasurable, belowActions);
     }
 
     private static bool IsKnownClientHiddenLobbyAction(Component page, Component control)

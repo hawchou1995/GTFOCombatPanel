@@ -482,6 +482,108 @@ public static class ResultInteractionStripPolicy
            && rect.Width > 0f && rect.Height > 0f;
 }
 
+// ---------------------------------------------------------------------------------------------------
+// The vertical bands a result page offers the settlement board
+// ---------------------------------------------------------------------------------------------------
+
+// Which band of the page a resolved strip describes.
+//
+// `BetweenAnchorAndActions` is the strip the board has always been fitted into: from the page's own upper anchor
+// (the success page's completion section, the failure page's title) down to the first interaction the scan
+// measured. `BelowActions` is the band under every measured interaction, and it exists because that first strip
+// is bounded by a *control* rather than by the window: a real host success page put its lobby button at 683 of a
+// 1440 window while the completion section ended at 519, which left 132 px - less than the 270 px the board
+// cannot be drawn under at any readable glyph size - and the board was therefore never drawn, although 757 px of
+// the page below that button were empty. A control is a gap the table must step around, not the end of the page.
+public enum ResultBoardBandKind { None = 0, BetweenAnchorAndActions = 1, BelowActions = 2 }
+
+// One free vertical band of a result page, in window pixels with y counted from the top.
+public readonly struct ResultBoardBand
+{
+    public readonly float Top, Bottom;
+    public readonly ResultBoardBandKind Kind;
+
+    public ResultBoardBand(float top, float bottom, ResultBoardBandKind kind) { Top = top; Bottom = bottom; Kind = kind; }
+
+    public float Height { get { return Bottom > Top ? Bottom - Top : 0f; } }
+    public bool Fits { get { return Height > 0f && Kind != ResultBoardBandKind.None; } }
+    public static ResultBoardBand None { get { return default; } }
+}
+
+public static class ResultBoardBands
+{
+    // The margin every placement already keeps below the last pixel of the window.
+    public const float ScreenMargin = 8f;
+
+    // The free band below every interaction the page's own scan measured, or false when the page leaves none.
+    //
+    // The band is built by carving the measured controls out of the page: each control is widened by the page's own
+    // gap so the table never touches the edge of a control it steps around, the remaining free intervals are taken in
+    // order, and the interval that starts at the anchor is *not* a candidate - that one is the strip the board is
+    // fitted into first. What is left is every band the board could stand in without covering anything a player can
+    // press, and the tallest of those is answered.
+    //
+    // Nothing here reads a role, a page kind or a config value: it is page geometry, so a host page and a client page
+    // are judged by the same arithmetic, and the caller decides whether its own role may use the answer.
+    //
+    // `gap` is the caller's contract, and a zero is allowed: a control widened by nothing still blocks its own
+    // rectangle. What a *caller* has to guarantee is that the gap it passes is at least
+    // `ResultBoardHold.ButtonClearance` (6 px), because the per-repaint overlap check is `OverlapsBoard`, which keeps
+    // that 6 px band above the board. A band measured with a smaller gap would place the board inside a control's
+    // clearance and be taken back on the next repaint - a board that appears and disappears once per page. The one
+    // call site (`ResultsDisplay`'s scan) passes the page's own `MessageGap` (16 px), so the inequality holds there;
+    // it is written down here rather than asserted at runtime because it describes the caller's arithmetic, not the
+    // page's geometry.
+    public static bool TryBelowActions(float anchorTop, float screenHeight, IReadOnlyList<ResultActionBounds> controls,
+        float gap, out ResultBoardBand band)
+    {
+        band = default;
+        if (!float.IsFinite(anchorTop) || !float.IsFinite(screenHeight)) return false;
+        if (screenHeight <= ScreenMargin + 1f) return false;
+        if (!float.IsFinite(gap) || gap < 0f) gap = 0f;
+        float top = Math.Max(0f, anchorTop);
+        float limit = screenHeight - ScreenMargin;
+        if (!(limit > top + 0.5f)) return false;
+
+        // Every measured control, as the interval it takes away from the page.
+        var blocked = new List<(float Top, float Bottom)>();
+        if (controls != null)
+        {
+            for (int index = 0; index < controls.Count; index++)
+            {
+                LayoutRect rect = controls[index].Bounds;
+                if (!float.IsFinite(rect.Y) || !float.IsFinite(rect.Height)) continue;
+                if (!(rect.Width > 0f) || !(rect.Height > 0f)) continue;
+                float start = Math.Max(top, rect.Y - gap);
+                float end = Math.Min(limit, rect.Bottom + gap);
+                if (end > start) blocked.Add((start, end));
+            }
+        }
+        if (blocked.Count == 0) return false;
+        blocked.Sort((left, right) => left.Top.CompareTo(right.Top));
+
+        // The free intervals, in page order. The one that starts at the anchor is the strip the caller already has.
+        bool found = false;
+        float cursor = top;
+        for (int index = 0; index <= blocked.Count; index++)
+        {
+            float freeTop = cursor;
+            float freeBottom = index < blocked.Count ? Math.Min(blocked[index].Top, limit) : limit;
+            if (freeBottom > freeTop && freeTop > top + 0.5f)
+            {
+                float height = freeBottom - freeTop;
+                if (!found || height > band.Height + 0.5f)
+                {
+                    band = new ResultBoardBand(freeTop, freeBottom, ResultBoardBandKind.BelowActions);
+                    found = true;
+                }
+            }
+            if (index < blocked.Count) cursor = Math.Max(cursor, blocked[index].Bottom);
+        }
+        return found && band.Fits;
+    }
+}
+
 // The tally one result page's interaction scan builds up, and the decisions that are read off it.
 //
 // A scan has to answer two questions that are not the same question, and confusing them is what kept a real
@@ -1031,6 +1133,27 @@ public static class ResultsFontGrowth
         if (floor < MinimumReadablePixels) floor = MinimumReadablePixels;
         if (floor > MaximumReadabilityFloor) floor = MaximumReadabilityFloor;
         return floor;
+    }
+
+    // The height below which no strip can hold this table, whatever glyph size is tried.
+    //
+    // `HudTable.BuildGrid` refuses to shrink a settlement table below the floor the caller handed it, and the floor
+    // never goes below `MinimumReadablePixels`. A table of `rows` rows needs at least that many rows of the smallest
+    // glyph the face can be drawn at, so this is the one figure a strip has to clear before a fit can succeed at
+    // all - a strip shorter than it is not a tight strip, it is a strip the board can never be drawn into.
+    //
+    // `rowEm` is the face's own line height for the size being drawn, as `HudTable.RowEm` measures it; a face that
+    // reports nothing falls back to `PanelGeometry.MinimumRowEm`, the clipping guard `PanelGeometry.Build` uses.
+    // The figure is page independent, which is what makes it something a page can be judged against before a single
+    // glyph size has been searched for.
+    public static float MinimumBoardHeight(int rows, float rowEm, PanelDensity density)
+    {
+        if (rows < 1) rows = 1;
+        float font = MinimumReadablePixels;
+        float em = float.IsFinite(rowEm) && rowEm > 1f ? rowEm : PanelGeometry.MinimumRowEm;
+        float rowScale = float.IsFinite(density.Row) && density.Row > 0f ? density.Row : PanelDensity.Compact.Row;
+        float rowHeight = Math.Max(font * PanelGeometry.RowFactor * rowScale, font * Math.Max(1f, em));
+        return rowHeight * rows;
     }
 
     // The glyph size to draw the settlement board at, when the seed itself is the wrong size.

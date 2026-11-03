@@ -47,5 +47,7 @@
     <Compile Include="..\..\ResultsPagePolicy.cs" Link="ResultsPagePolicy.cs" />
     <Compile Include="..\..\GuestPageGeometry.cs" Link="GuestPageGeometry.cs" />
     <Compile Include="..\..\SentryShotLedger.cs" Link="SentryShotLedger.cs" />
+    <Compile Include="..\..\SquadDiagnostics.cs" Link="SquadDiagnostics.cs" />
+    <Compile Include="..\..\AnchorSamplePolicy.cs" Link="AnchorSamplePolicy.cs" />
   </ItemGroup>
 </Project>

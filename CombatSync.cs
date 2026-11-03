@@ -48,10 +48,11 @@ internal static class CombatSync
     private static eGameStateName _lastState = eGameStateName.Lobby;
     // The level clock for the inbound diagnostic, and the two once-per-level lines it guards. A squad that
     // exchanges nothing looks identical, from either screen, to a build that cannot exchange anything, so
-    // both facts are written down while the level is up rather than inferred afterwards.
-    private const float NoInboundSeconds = 20f;
-    private static float _levelSince = -1f;
-    private static bool _loggedNoInbound, _loggedOutboundRows;
+    // both facts are written down while the level is up rather than inferred afterwards. The clock, the two
+    // latches and the evidence they are decided on (`Heard`) belong to one object and to one level: they
+    // start on the tick a level begins and stop on the tick it ends, which is what stops a new level from
+    // inheriting the previous one's clock - and therefore from being told it is 1416 s old and silent.
+    private static readonly LevelDiagnosticClock LevelClock = new LevelDiagnosticClock();
     // Which direction is known to work: a peer is heard here the moment any packet of its arrives, and this
     // machine is known to be heard by it the moment it sends again after this machine sent it something.
     private static readonly Dictionary<ulong, int> Heard = new Dictionary<ulong, int>();
@@ -258,6 +259,9 @@ internal static class CombatSync
     internal static void ResetExpedition()
     {
         Heard.Clear(); SentTo.Clear(); Confirmed.Clear(); Mismatched.Clear(); ReportedSync.Clear();
+        // The level clock and its two latches describe the expedition that just ended, so they go with the
+        // evidence: the next level starts its own clock whether or not a lobby and a generation ran between.
+        LevelClock.Forget();
         SquadNet.ResetRoutes();
         Exchange.Configure(OwnLookup(), PrimarySlot, SpecialSlot, ClassSlot, MeleeSlot);
         Exchange.ResetForExpedition();
@@ -283,6 +287,22 @@ internal static class CombatSync
                     ? "[DIAG] squad sync: this machine is the host now, so every row is measured here and a received row is only ever merged into a projection."
                     : "[DIAG] squad sync: authority moved to another player; the rows this machine did not measure itself are cleared and the new host is greeted afresh until it speaks.");
             }
+            // The phase this tick belongs to, and the level clock with it. The clock restarts on the tick a level
+            // begins and stops on the tick it ends, so the two lines it guards describe this level and never the
+            // one before it. That is exactly what a lobby and a generation between two levels used to leave
+            // behind: the old build only ever restarted the clock on the `InLevel` branch and only ever cleared
+            // it on a branch that branch had already returned past, so the first frame of a new level reported
+            // the previous level's age - "1416s in the level" - and the two latches behaved the other way round,
+            // printing once per session instead of once per level.
+            LevelPhase phase = PhaseOf(state);
+            if (LevelClock.Enter(phase, now))
+            {
+                // The level clock restarted, so the evidence it is decided on restarts with it. `Heard` is "who
+                // has been heard from inside this level", and a peer heard in the lobby before it is not a peer
+                // heard in it. Only this per-level figure is dropped here: `SentTo` and `Confirmed` are the
+                // session's evidence that a direction works at all, and the lobby's own reset above owns them.
+                Heard.Clear();
+            }
             if (state != _lastState)
             {
                 _lastState = state;
@@ -299,7 +319,9 @@ internal static class CombatSync
                     Exchange.ResetPeers();
                 }
             }
-            if (state != eGameStateName.InLevel && state != eGameStateName.ExpeditionSuccess && state != eGameStateName.ExpeditionFail) return;
+            // A lobby, a generation and every other state that is neither a level nor a result page own no exchange
+            // work. The clock has already been told what this tick was, above - which is the whole of the fix.
+            if (phase == LevelPhase.Outside) return;
             ulong local = OwnLookup();
             if (local == 0UL) return;
             Exchange.Configure(local, PrimarySlot, SpecialSlot, ClassSlot, MeleeSlot);
@@ -317,12 +339,10 @@ internal static class CombatSync
 
             // One line each way, once per level. Together they say whether the exchange is running at all and
             // in which direction it is still blind, which is the pair of facts every "nothing is shared"
-            // report has to be answered with and neither of which can be read off a screenshot.
-            if (state == eGameStateName.InLevel && _levelSince < 0f)
-            {
-                _levelSince = now; _loggedNoInbound = false; _loggedOutboundRows = false;
-            }
-            if (state != eGameStateName.InLevel) _levelSince = -1f;
+            // report has to be answered with and neither of which can be read off a screenshot. Both latches
+            // now live in the level clock, so they are spent again on every level instead of once per session,
+            // and the inbound one is measured from *this* level's first frame rather than from a clock a lobby
+            // and a generation may have carried over from the level before it.
 
             int rows = 0;
             ulong firstRowPeer = 0UL;
@@ -335,16 +355,14 @@ internal static class CombatSync
                 rows++;
                 if (firstRowPeer == 0UL) firstRowPeer = send.Target;
             }
-            if (rows > 0 && !_loggedOutboundRows)
+            if (rows > 0 && LevelClock.OutboundOwed)
             {
-                _loggedOutboundRows = true;
+                LevelClock.OutboundWritten();
                 Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build, {Exchange.WithheldPeers} are being sent nothing, sharing={(ShareMode ? "every player in the slot list" : "named and proven players only")}, receivedButUnusable={SquadNet.UnusablePackets}. This send receipt alone does not prove remote acceptance.");
             }
-            if (!_loggedNoInbound && _levelSince >= 0f && now - _levelSince >= NoInboundSeconds
-                && Exchange.HumanPeers > 0 && Heard.Count == 0)
+            if (LevelClock.NoInboundOwed(now, Exchange.HumanPeers, Heard.Count))
             {
-                _loggedNoInbound = true;
-                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {now - _levelSince:0}s in the level with {Exchange.HumanPeers} human peer(s) in the roster and not one packet heard from any of them, so no other player's row can appear on this screen. Outbound sharing is {(ShareMode ? "on for the whole slot list" : "restricted to named and proven players")} and {Exchange.WithheldPeers} peer(s) are being sent nothing; receivedButUnusable={SquadNet.UnusablePackets} (packets of this build's protocol that reached this machine and could not be decoded - a figure above zero means the transport is delivering and the shape is wrong, a zero means nothing arrived at all). If this machine is broadcasting and still hears nothing, the two builds are not reaching each other's transport - read the armed line above for which transport this machine uses - or a peer answered with another protocol version and was then left alone on purpose. Greetings keep going on the keep-alive cadence either way.");
+                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {LevelClock.Seconds(now):0}s since this level began, with {Exchange.HumanPeers} human peer(s) in the roster and not one packet from any of them handled in this level, so no other player's row can appear on this screen. Outbound sharing is {(ShareMode ? "on for the whole slot list" : "restricted to named and proven players")} and {Exchange.WithheldPeers} peer(s) are being sent nothing; receivedButUnusable={SquadNet.UnusablePackets} counts packets of this build's protocol that reached this machine and could not be decoded - it counts nothing else, so a zero there says no packet was undecodable, never that none arrived, and this line is decided by the per-level count above. If this machine is broadcasting and still hears nothing, the two builds are not reaching each other's transport - read the armed line above for which transport this machine uses - or a peer answered with another protocol version and was then left alone on purpose. Greetings keep going on the keep-alive cadence either way.");
             }
         }
         catch (Exception error)
@@ -530,6 +548,16 @@ internal static class CombatSync
     internal static bool TryOwnMeasurement(out CombatPlayer own) => CombatTracker.Store.TryGet(OwnLookup(), out own) && own != null;
 
     // ---------------------------------------------------------------- helpers
+
+    // The game's own state name, mapped onto the three phases the level diagnostic knows about. A result page
+    // is its own phase rather than part of "outside": the exchange keeps ticking there, so a row can still go
+    // out on it, and the figures it quotes are the level that produced it.
+    private static LevelPhase PhaseOf(eGameStateName state)
+    {
+        if (state == eGameStateName.InLevel) return LevelPhase.InLevel;
+        if (state == eGameStateName.ExpeditionSuccess || state == eGameStateName.ExpeditionFail) return LevelPhase.Result;
+        return LevelPhase.Outside;
+    }
 
     private static void Line(string text)
     {

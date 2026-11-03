@@ -1766,6 +1766,10 @@ internal static partial class Program
         Release11914Scenarios.RunInto(Check);
         // ---- 1.19.15: a guest settlement page places from its fixed page geometry once its own anchor has drawn ----
         Release11915Scenarios.RunInto(Check);
+        // ---- 1.19.16: a host success page whose strip cannot hold the board steps around its own measured controls ----
+        Release11916Scenarios.RunInto(Check);
+        // ---- 1.19.16 (b): the level clock and its two latches are per level, and the anchor is retried -----
+        Release11916bScenarios.RunInto(Check);
         // ---- the explanation line under each title: a template a player may edit --------------
         ReasonTemplateScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------

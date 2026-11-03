@@ -38,14 +38,25 @@ public sealed class PanelBehaviour : MonoBehaviour
     private PanelGrid _grid;
     private LayoutRect _origin;
 
-    // Anchor sampling state. The anchor is sampled at most until it settles, then never again.
+    // Anchor sampling state. The anchor is sampled until it settles and is then frozen. A sample that could not
+    // be read at all is not a verdict any more: the HUD's camera answers null for a moment while a level is
+    // coming up, so a failed sample buys a retry on the bounded schedule in `AnchorSamplePolicy` instead of
+    // locking the table onto the configured position for the rest of the session.
     private bool _anchorLocked;
     private bool _anchorUnavailable;
+    // A sample has already failed in this measurement round, so the configured PositionX/PositionY is drawn
+    // while the retries continue: the table is never blank for the length of a retry schedule, and an anchor
+    // that does arrive a moment later moves it once instead of never being used at all.
+    private bool _anchorFallback;
     private float _anchorSettle;
     private float _anchorSampled;
     private float _anchorLastX = float.NaN, _anchorLastY = float.NaN;
     private int _anchorScreenWidth, _anchorScreenHeight;
     private LayoutRect _anchorRect;
+    private readonly AnchorSamplePolicy _anchorPolicy = new AnchorSamplePolicy();
+    // Whether the last frame this component saw was inside a level, so that entering one grants the anchor a
+    // fresh measurement round without disturbing an anchor that has already locked.
+    private bool _inLevel;
 
     public PanelBehaviour(IntPtr pointer) : base(pointer) { }
 
@@ -63,10 +74,16 @@ public sealed class PanelBehaviour : MonoBehaviour
     {
         _anchorLocked = false;
         _anchorUnavailable = false;
+        _anchorFallback = false;
         _anchorSettle = 0f;
         _anchorSampled = 0f;
         _anchorLastX = float.NaN;
         _anchorLastY = float.NaN;
+        // A re-anchor is a fresh measurement, so it gets a fresh retry budget and its own failure line. A
+        // configuration reload or a resolution change is exactly the moment the table is allowed to move, so
+        // the schedule that gave up before must not be inherited by it.
+        _anchorPolicy.Restart();
+        _loggedAnchorFailure = false;
     }
 
     private void Update()
@@ -76,6 +93,21 @@ public sealed class PanelBehaviour : MonoBehaviour
         {
             var state = GameStateManager.CurrentStateName;
             bool inLevel = state == eGameStateName.InLevel;
+            if (inLevel != _inLevel)
+            {
+                _inLevel = inLevel;
+                // A level is a different scene with its own HUD, so a verdict about the previous level's anchor
+                // says nothing about this one: entering it grants the retry budget again and lifts a give-up. An
+                // anchor that had already locked is left exactly where it was - only the budget and the verdict
+                // about a failed one are reset here, so a table that works never moves for this.
+                if (inLevel)
+                {
+                    _anchorPolicy.Restart();
+                    _anchorUnavailable = false;
+                    _anchorFallback = false;
+                    _loggedAnchorFailure = false;
+                }
+            }
             bool visible = inLevel ? Plugin.ShowPanel.Value : Plugin.ShowResultOverlay.Value;
             if (Plugin.ToggleKey.Value != KeyCode.None && Input.GetKeyDown(Plugin.ToggleKey.Value))
             {
@@ -182,7 +214,7 @@ public sealed class PanelBehaviour : MonoBehaviour
         var layer = GuiManager.Current?.m_playerLayer;
         if (layer == null || !layer.IsVisible() || layer.Inventory?.m_iconDisplay == null) return;
 
-        if (Plugin.AnchorToFlashlight.Value && !_anchorLocked && !_anchorUnavailable) SampleAnchor(layer);
+        if (Plugin.AnchorToFlashlight.Value && !_anchorLocked && !_anchorUnavailable) SampleAnchor(layer, Time.unscaledTime);
 
         var columns = Columns();
         var players = CombatSync.DisplayRows().OrderBy(p => p.DisplaySlot).Take(MaxPlayers).ToList();
@@ -229,33 +261,48 @@ public sealed class PanelBehaviour : MonoBehaviour
 
     // Samples the flashlight icon's screen rectangle. The HUD animates while a level loads, so a
     // single sample can be far off; the sample is repeated until it stops moving, and the first
-    // sample that holds still is the one that is frozen. If this cannot be measured at all, the
-    // configured PositionX/PositionY is used instead and the failure is reported once.
+    // sample that holds still is the one that is frozen.
+    //
+    // A sample that could not be read at all is a different thing from one that moved: the HUD's own camera
+    // answers null for a moment while a level is coming up, which used to be read as "this icon does not
+    // exist" and latched the table onto the configured position for the whole session. `_anchorPolicy` owns
+    // the difference - a throttled, finite retry that ends either in a lock or in one explicit give-up line -
+    // and the configured position is drawn from the first failed sample onward, so the table is never blank
+    // while the retries are still running.
     [HideFromIl2Cpp]
-    private void SampleAnchor(PlayerGuiLayer layer)
+    private void SampleAnchor(PlayerGuiLayer layer, float now)
     {
+        // Never per frame: a retry delay that is still running, and a budget that is spent, both answer false
+        // here, so a HUD that cannot be measured costs a handful of comparisons rather than a poll of the
+        // camera sixty times a second.
+        if (!_anchorPolicy.Due(now)) return;
         _anchorSampled += SampleInterval;
-        Camera camera = null;
-        try { camera = layer.GuiLayerBase != null ? layer.GuiLayerBase.GetWorldCamera() : null; }
-        catch { camera = null; }
-        SpriteRenderer sprite = null;
-        try
+        // The whole attempt - the two HUD reads, the projection of the icon's own bounds and the verdict - is run by
+        // the policy, so a read that *throws* spends one of its twelve measurements instead of leaving the budget
+        // untouched. That read used to sit between `Began` and `Failed` here, where an exception skipped the failure
+        // altogether: the retry delay never advanced and the HUD was re-read on every settle tick for the whole level,
+        // which is the poll this budget exists to prevent.
+        AnchorSample sample = _anchorPolicy.Attempt(now, () => ReadAnchor(layer), out bool gaveUp);
+        if (!sample.Measured)
         {
-            var icon = layer.Inventory != null && layer.Inventory.m_iconDisplay != null ? layer.Inventory.m_iconDisplay.FlashLightIcon : null;
-            if (icon != null) sprite = icon.Enabled != null ? icon.Enabled : icon.Disabled;
-        }
-        catch { sprite = null; }
-
-        if (camera == null || sprite == null || !TryScreenRect(sprite, camera, out var rect))
-        {
+            AnchorSampleFailure failure = _anchorPolicy.LastFailure;
             if (!_loggedAnchorFailure)
             {
                 _loggedAnchorFailure = true;
-                Plugin.Logger.LogWarning($"[DIAG] the flashlight icon could not be measured (camera={(camera == null ? "null" : "ok")}, icon={(sprite == null ? "null" : "ok")}); the table uses PositionX/PositionY instead.");
+                string threw = string.IsNullOrEmpty(sample.Error) ? string.Empty : ", the read itself threw: " + sample.Error;
+                Plugin.Logger.LogWarning($"[DIAG] the flashlight anchor could not be measured yet ({AnchorSamplePolicy.Describe(failure)}{threw}, attempt {_anchorPolicy.Attempts} of {AnchorSamplePolicy.Budget}); the table uses PositionX/PositionY meanwhile and the measurement is retried in {AnchorSamplePolicy.DelayAfter(_anchorPolicy.Failures):0.##}s, {Math.Max(0, AnchorSamplePolicy.Budget - _anchorPolicy.Failures)} retry(s) left.");
             }
-            _anchorUnavailable = true;
+            // The configured position is drawn while the retries continue: a HUD that is a moment late must not
+            // blank the table, and an anchor that does arrive moves it once instead of never being used.
+            _anchorFallback = true;
+            if (gaveUp)
+            {
+                _anchorUnavailable = true;
+                Plugin.Logger.LogWarning($"[DIAG] the flashlight anchor was given up on for this level after {_anchorPolicy.Attempts} attempt(s) and {_anchorPolicy.Waited:0.#}s of waiting ({AnchorSamplePolicy.Describe(_anchorPolicy.LastFailure)}); the table keeps the configured PositionX/PositionY. A new level, a configuration reload or a resolution change measures it again.");
+            }
             return;
         }
+        LayoutRect rect = sample.Rect;
 
         bool still = !float.IsNaN(_anchorLastX) && Mathf.Abs(rect.X - _anchorLastX) < 2f && Mathf.Abs(rect.Y - _anchorLastY) < 2f;
         _anchorSettle = still ? _anchorSettle + SampleInterval : 0f;
@@ -264,9 +311,34 @@ public sealed class PanelBehaviour : MonoBehaviour
         if (_anchorSettle >= 1f || _anchorSampled >= 6f)
         {
             _anchorLocked = true;
+            _anchorFallback = false;
             _anchorScreenWidth = Screen.width; _anchorScreenHeight = Screen.height;
             Plugin.Logger.LogInfo($"[DIAG] flashlight anchor locked after {_anchorSampled:0.00}s at ({rect.X:0},{rect.Y:0}) size {rect.Width:0}x{rect.Height:0} screen px, sampled through the HUD's own camera; the table is positioned relative to this and then held.");
         }
+    }
+
+    // The HUD read itself: the session's camera, the flashlight icon's renderer, and the projection of that
+    // renderer's own bounds. Kept in one place so the attempt around it has a single body to run, and free of any
+    // verdict of its own - each of the three misses is a state the HUD passes through on its way up, and a
+    // projection that throws is the unreadable rectangle it really is rather than evidence about the icon.
+    [HideFromIl2Cpp]
+    private static AnchorSample ReadAnchor(PlayerGuiLayer layer)
+    {
+        Camera camera = null;
+        try { camera = layer != null && layer.GuiLayerBase != null ? layer.GuiLayerBase.GetWorldCamera() : null; }
+        catch { camera = null; }
+        SpriteRenderer sprite = null;
+        try
+        {
+            var icon = layer != null && layer.Inventory != null && layer.Inventory.m_iconDisplay != null ? layer.Inventory.m_iconDisplay.FlashLightIcon : null;
+            if (icon != null) sprite = icon.Enabled != null ? icon.Enabled : icon.Disabled;
+        }
+        catch { sprite = null; }
+        if (camera == null) return AnchorSample.Missing(AnchorSampleFailure.NoCamera);
+        if (sprite == null) return AnchorSample.Missing(AnchorSampleFailure.NoIcon);
+        return TryScreenRect(sprite, camera, out LayoutRect rect)
+            ? AnchorSample.Of(rect)
+            : AnchorSample.Missing(AnchorSampleFailure.Unmeasurable);
     }
 
     [HideFromIl2Cpp]
@@ -295,18 +367,23 @@ public sealed class PanelBehaviour : MonoBehaviour
 
     // With the flashlight anchor the table hangs below the icon, right-aligned with it, so it sits
     // in the right-hand gear column wherever that column happens to be. A negative PositionX/Y
-    // measures from the right/bottom edge, which is the fallback when the icon cannot be measured.
-    // Either way the whole table is clamped inside the window.
+    // measures from the right/bottom edge, which is the fallback used whenever the icon cannot be
+    // measured - a sample that failed, or a budget that gave up - so the table is on screen either
+    // way. Either way the whole table is clamped inside the window.
     [HideFromIl2Cpp]
     private bool TryResolveOrigin(PanelGrid grid, out LayoutRect origin)
     {
         origin = default;
         float x, y;
-        if (Plugin.AnchorToFlashlight.Value && !_anchorUnavailable)
+        bool anchored = Plugin.AnchorToFlashlight.Value && _anchorLocked;
+        if (anchored)
         {
-            if (!_anchorLocked) return false;   // still settling: draw nothing rather than jump
             x = _anchorRect.Right - grid.Width + Plugin.OffsetX.Value;
             y = _anchorRect.Bottom + 8f + Plugin.OffsetY.Value;
+        }
+        else if (Plugin.AnchorToFlashlight.Value && !_anchorUnavailable && !_anchorFallback)
+        {
+            return false;   // still settling: draw nothing rather than jump
         }
         else
         {
