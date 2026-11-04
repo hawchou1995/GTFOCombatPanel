@@ -195,7 +195,10 @@ public static class CompletionDrawing
 // `BelowActions` is the bound that is *not* a lower bound at all: the board stands in the free band under every
 // measured interaction because the strip above them is shorter than the board's own floor. It is recorded here so a
 // held board, a re-measure and a log line can all tell it apart from a strip that is merely bounded by a button.
-public enum ResultFooterSource { None = 0, NamedControl = 1, InteractiveBand = 2, ClientNoFooterSafeArea = 3, BelowActions = 4 }
+// `ScreenSafeArea` is the fail-open source: the board stands in the window's own safe area because the page never
+// proved its own geometry (`FallbackLayout.cs`). It is a named source of its own so a log line, a held board and a
+// regression test can tell a fall-open placement from one the page measured.
+public enum ResultFooterSource { None = 0, NamedControl = 1, InteractiveBand = 2, ClientNoFooterSafeArea = 3, BelowActions = 4, ScreenSafeArea = 5 }
 
 // The strip of a result page the board may use, together with the footer bound and its measured provenance.
 public readonly struct BoardStrip
@@ -253,7 +256,13 @@ public static class ResultBoardHold
     // does - does not take it away, and the board is never moved down. The button is still a wall: a board
     // that really would reach it is lifted onto the clearance line, and only if even that would leave the
     // page is it left where it is, because there is nothing else to do with it that keeps both promises.
-    public static bool TryHold(BoardStrip strip, LayoutRect placed, float screenHeight, out LayoutRect rect)
+    //
+    // `topBound` is the fall-open board's other wall: its upper edge is the band's own top, and lifting must never carry it
+    // above that - a board that cannot clear the footer without crossing its band is left on the band's edge and drawn
+    // fainter by its caller, which is the trade the fail-open rule makes. It is NaN for a strict board, whose upper edge is
+    // the page's own anchor and never moves.
+    public static bool TryHold(BoardStrip strip, LayoutRect placed, float screenHeight, out LayoutRect rect,
+        float topBound = float.NaN)
     {
         rect = placed;
         if (!(placed.Width > 0f) || !(placed.Height > 0f)) return false;
@@ -262,7 +271,9 @@ public static class ResultBoardHold
         float wall = Math.Min(strip.ButtonTop - ButtonClearance, screenHeight - 8f);
         if (!float.IsFinite(wall)) return true;
         if (placed.Bottom <= wall) return true;
-        rect = new LayoutRect(placed.X, Math.Max(0f, wall - placed.Height), placed.Width, placed.Height);
+        float lifted = Math.Max(0f, wall - placed.Height);
+        if (float.IsFinite(topBound)) lifted = Math.Max(lifted, Math.Max(0f, topBound));
+        rect = new LayoutRect(placed.X, lifted, placed.Width, placed.Height);
         return true;
     }
 
@@ -334,6 +345,7 @@ public static class ResultFooterProvenance
             case ResultFooterSource.InteractiveBand: return "band";
             case ResultFooterSource.BelowActions: return "below-actions-band";
             case ResultFooterSource.ClientNoFooterSafeArea: return "client-fixed-page-geometry";
+            case ResultFooterSource.ScreenSafeArea: return "fail-open-screen-safe-area";
             default: return "none";
         }
     }

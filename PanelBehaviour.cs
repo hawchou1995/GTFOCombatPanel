@@ -111,9 +111,28 @@ public sealed class PanelBehaviour : MonoBehaviour
             bool visible = inLevel ? Plugin.ShowPanel.Value : Plugin.ShowResultOverlay.Value;
             if (Plugin.ToggleKey.Value != KeyCode.None && Input.GetKeyDown(Plugin.ToggleKey.Value))
             {
-                visible = !visible;
-                Plugin.PersistToggle(visible);
-                Plugin.Logger?.LogInfo($"[DIAG] F8 visibility: state={state}, requested={visible}, ShowPanel={Plugin.ShowPanel.Value}, ShowResultOverlay={Plugin.ShowResultOverlay.Value}, ShowResults={Plugin.ShowResults.Value}, ShowImpactBoard={Plugin.ShowImpactBoard.Value}.");
+                bool resultPage = state == eGameStateName.ExpeditionSuccess || state == eGameStateName.ExpeditionFail;
+                if (resultPage)
+                {
+                    // F8 on a result page is this mod's fail-open override and not a visibility switch: the first press
+                    // puts the settlement board on the screen from the screen's own safe area whatever the page's own
+                    // anchors did - held back, never placed, already deferred - and the second press hands the page back
+                    // to the ordinary judgement. Nothing here waits for a gate to be ready, and the key is handled even
+                    // when this game build already binds it to something else: a key that silently stopped working would
+                    // leave the player with a blank result page and no way at all to ask for the table.
+                    bool forced = ResultsDisplay.ToggleForcedFallback();
+                    if (forced) visible = true;
+                    Plugin.Logger?.LogInfo($"[DIAG] F8 on a result page: force={(forced ? "fallback-on" : "fallback-off")}; state={state}, "
+                        + $"ShowResults={Plugin.ShowResults.Value}, ShowResultOverlay={Plugin.ShowResultOverlay.Value}, ShowImpactBoard={Plugin.ShowImpactBoard.Value}, "
+                        + $"ToggleState={visible}; the key is handled here whether or not another action is bound to it, and the board it asks for "
+                        + "depends on no settled title, no settled completion edge, no measured footer and no interaction proof.");
+                }
+                else
+                {
+                    visible = !visible;
+                    Plugin.PersistToggle(visible);
+                    Plugin.Logger?.LogInfo($"[DIAG] F8 visibility: state={state}, requested={visible}, ShowPanel={Plugin.ShowPanel.Value}, ShowResultOverlay={Plugin.ShowResultOverlay.Value}, ShowResults={Plugin.ShowResults.Value}, ShowImpactBoard={Plugin.ShowImpactBoard.Value}.");
+                }
             }
             // Config is the source of truth, including a manual edit made after an F8 toggle.
             _visible = Plugin.ShowPanel.Value;

@@ -306,7 +306,10 @@ internal static class HudTable
                 // The smallest glyph size this build may shrink the settlement board to. The caller passes the
                 // readability floor it derived from the lobby button's own measured height; the in-level HUD
                 // passes nothing and keeps the historical six pixels, so its behaviour is untouched.
-                int floor = minimumPixels < 6 ? 6 : minimumPixels;
+                // The floor the caller passes is honoured as given: a settlement band that cannot hold the readable
+                // minimum hands over its own answer (`ResultsBandFit.FloorForBand`) and the glyph and the row shrink
+                // together. The in-level HUD passes nothing and keeps the historical six pixels.
+                int floor = minimumPixels < 1 ? 1 : minimumPixels;
                 int working = Mathf.Max(floor, Mathf.FloorToInt(fontSize * Mathf.Clamp(fit, PanelGeometry.MinimumShrink, 1f)));
                 int guard = 0;
                 do

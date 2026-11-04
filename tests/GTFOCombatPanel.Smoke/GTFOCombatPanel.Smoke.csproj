@@ -49,5 +49,7 @@
     <Compile Include="..\..\SentryShotLedger.cs" Link="SentryShotLedger.cs" />
     <Compile Include="..\..\SquadDiagnostics.cs" Link="SquadDiagnostics.cs" />
     <Compile Include="..\..\AnchorSamplePolicy.cs" Link="AnchorSamplePolicy.cs" />
+    <Compile Include="..\..\FallbackLayout.cs" Link="FallbackLayout.cs" />
+    <Compile Include="..\..\ResultsBounds.cs" Link="ResultsBounds.cs" />
   </ItemGroup>
 </Project>

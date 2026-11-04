@@ -1770,6 +1770,10 @@ internal static partial class Program
         Release11916Scenarios.RunInto(Check);
         // ---- 1.19.16 (b): the level clock and its two latches are per level, and the anchor is retried -----
         Release11916bScenarios.RunInto(Check);
+        // ---- 1.19.17: a result page that is on the screen always gets its board, and F8 is the key that asks for it ----
+        Release11917Scenarios.RunInto(Check);
+        // ---- 1.19.18: the board is bounded by the icon row above and the footer this machine can see below ----
+        Release11918Scenarios.RunInto(Check);
         // ---- the explanation line under each title: a template a player may edit --------------
         ReasonTemplateScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------

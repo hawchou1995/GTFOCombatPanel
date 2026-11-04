@@ -131,20 +131,27 @@ internal static class ResultsDisplay
     {
         bool succeeded = state == eGameStateName.ExpeditionSuccess;
         bool results = succeeded || state == eGameStateName.ExpeditionFail;
-        // Leaving the results screens puts every vanilla block this mod moved back exactly where it was and
-        // forgets everything that belonged to the page: the next run's page must never inherit this run's
-        // hiding, its placement or its readiness.
-        if (!results) { RestoreHidden(); ResetPlacement(); ForgetPage(); return; }
-        // Three switches have to agree before a single pixel is drawn, and the F8 toggle stands in front of
-        // all three. With any of them off the result page is left exactly as the game drew it: there is no
-        // older statistics table behind them to fall back to. What the page does keep is what it has already
-        // earned - its placement, the strip it was measured in and the readiness of its completion section -
-        // so turning the board back on is immediate instead of waiting for a section that is already drawn.
+        // Leaving the results screens puts every vanilla block this mod moved back exactly where it was and forgets
+        // everything that belonged to the page: the next run's page must never inherit this run's hiding, its
+        // placement or its readiness. This branch comes before the overlay gate on purpose - a board that had put the
+        // page's own blocks away must not leave them away in the lobby just because the switches are still on, and
+        // F8's `Forced` is a result-page override only: it is not read outside one.
+        if (!results)
+        {
+            RestoreHidden();
+            ResetPlacement();
+            ForgetPage();
+            return;
+        }
         bool overlay = ResultVisibility.Shows(
             Plugin.ShowResults == null || Plugin.ShowResults.Value,
             Plugin.ShowResultOverlay == null || Plugin.ShowResultOverlay.Value,
             Plugin.ShowImpactBoard == null || Plugin.ShowImpactBoard.Value,
-            PanelBehaviour.ToggleState);
+            PanelBehaviour.ToggleState)
+            // F8 on a result page is the fail-open override and outranks every visibility switch: a player who asked
+            // for the board must get it on the next repaint even if a config file, a hot reload or a stale toggle says
+            // otherwise. In a lobby or in a level `Forced` is not read by anything.
+            || Forced;
         if (!overlay)
         {
             if (_page != null) RestoreHidden();
@@ -180,7 +187,15 @@ internal static class ResultsDisplay
         Component page = null;
         if (succeeded && Success != null && Success.gameObject.activeInHierarchy) page = Success;
         else if (!succeeded && Fail != null && Fail.gameObject.activeInHierarchy) page = Fail;
-        if (page == null) return;
+        if (page == null)
+        {
+            // The result state is up but neither page object is live: the screen has already been taken down, or the
+            // page that carries it has not been raised yet. Nothing can be measured or drawn, and saying so once per
+            // page is the difference between "this mod is idle" and "this mod is broken".
+            ReportHeldBack("refresh", "no-live-page", "state=" + (succeeded ? "success" : "failure")
+                + ",successPage=" + (Success != null) + ",failurePage=" + (Fail != null));
+            return;
+        }
         // A different page is a different screen: the placement, the strip it was measured in and the
         // readiness of the previous one are dropped here and nowhere else. A configuration change, the F8
         // write it triggers and the hot reload that follows it all leave them standing.
@@ -278,6 +293,35 @@ internal static class ResultsDisplay
     // tight from one that can never hold the board, and it is page independent, so the page can be judged against it
     // before a single size has been searched for. Set for every page visit in `Prepare` and dropped with the page.
     private static float _boardFloor = float.NaN;
+    // ---- fail-open: a result page that is on the screen always shows its board --------------------------------
+    //
+    // Everything above is a proof about the page, and a page that never hands one over used to keep the vanilla
+    // screen and nothing else - for the whole page, with F8 unable to help, because F8 only cleared the placement
+    // and the same gates refused it again a frame later. A real host failure page did exactly that: the game's own
+    // page was fully drawn (`rawTextAlpha=1.00`) while this mod read `missionTitleActive=false, geometryMeasured=false`
+    // and held the board back for the life of the screen.
+    //
+    // `_strictMisses` counts the measurements on which the strict placement was refused. Once the bounded budget in
+    // `ResultFallbackPolicy` is spent the board is placed from the screen's own safe area (`ResultFallbackLayout`),
+    // labelled as such in the log, and re-checked against the page's controls on every repaint. `Forced` is the F8
+    // override: it skips the budget and the three visibility switches, and it never waits for a gate.
+    private static int _strictMisses;
+    private static bool _fallbackPlaced;
+    private static float _fallbackOpacity = 1f;
+    // How many frames in a row the *fail-open* path itself could not put a board on the page, and how far its own floor has
+    // been lowered in answer. A fail-open fit that keeps refusing used to be a silent, permanent empty screen: the refusal
+    // count had already saturated, so every frame re-decided "use the fail-open band" and every frame failed the same way.
+    // The count gives that path a cadence of its own, and the scale walks the floor down to the smallest grid this build can
+    // draw, which is the one thing that turns "no band can hold the board" into "a tiny band holds a tiny board".
+    private static int _fallbackMisses;
+    private static float _fallbackFloorScale = 1f;
+    internal static bool Forced;
+    // ---- the agreed band: an icon row above, the footer this machine can see below ------------------------------
+    //
+    // The last icon-row bottom this page measured. A page that is still revealing its sector box hands no icon row for
+    // a frame or two, and the band must not fall back to a fraction of the window for that: the last trusted edge is
+    // the edge the page really has, and it is dropped with the page (`ForgetPage`). See `ResultsBounds`.
+    private static float _iconRowBottom = float.NaN;
 
     private static void ForgetPage()
     {
@@ -293,6 +337,14 @@ internal static class ResultsDisplay
         _holdStrip = default;
         Drift.Forget();
         _placedOnFallback = false; _fallbackRecoveries = 0; _boardFloor = float.NaN;
+        // A different screen is a different fail-open decision: the refusal count and the fallback placement belong to
+        // the page they were measured on. `Forced` deliberately survives it - it is the player's answer, given with F8,
+        // and it lasts until the player takes it back.
+        _strictMisses = 0; _fallbackPlaced = false; _fallbackOpacity = 1f;
+        // The fail-open path's own ladder belongs to the page as well: a new screen starts at the measured floor again.
+        _fallbackMisses = 0; _fallbackFloorScale = 1f;
+        // The icon row this page last measured goes with the page: the next result screen has its own.
+        _iconRowBottom = float.NaN;
         // A different screen has a different board, and the wheel is only ever aimed at the one on the page now.
         ClearHit();
         Readiness.Forget();
@@ -300,6 +352,86 @@ internal static class ResultsDisplay
         // session. A page pointer is reused across a session's runs, so a once-per-session latch left every
         // result screen after the first without its own line and its own archive entry in the log.
         _loggedDraw = false;
+    }
+
+    // The success page's "sectors cleared" row: its own label and the four icon slots, and *nothing else*. The white
+    // box behind them is a plate, not the row - it draws far below the icons, and taking it as the row's bottom is
+    // exactly what pushed a real client board some 400 px down the page with a band of empty page above it.
+    private static float IconRowBottom(Component page)
+    {
+        try
+        {
+            var success = page != null ? page.TryCast<CM_PageExpeditionSuccess>() : null;
+            if (success == null) return float.NaN;
+            var parts = new List<CompletionPart>
+            {
+                Read(success.m_sectorHeader),
+                Read(success.m_sectorIconMain),
+                Read(success.m_sectorIconSecond),
+                Read(success.m_sectorIconThird),
+                Read(success.m_sectorIconAllCompleted)
+            };
+            return CompletionBounds.Deepest(parts, out _);
+        }
+        catch { return float.NaN; }
+    }
+
+    // The waiting-status block a client's success page draws where the host's button would be.
+    //
+    // The page has no field for it, so it is measured where it lives: inside the leave-expedition control's own
+    // subtree, as the world-space TextMeshPro objects it is made of, projected through the menu camera by
+    // `TryScreenRect` - the same measurement the sector icons get. The button's own label is in that subtree too and
+    // sits lower, so the highest top this finds is the waiting line, which is the wall the board must stay above.
+    // The source word a waiting block's reading carries: `FooterText` when the page really draws a TextMeshPro of its
+    // own, `FooterTextControl` when only the leave-expedition control's laid-out rectangle could be read. The two are
+    // kept apart in `[DIAG] band` because they mean different things on a real page: one is the waiting line the player
+    // reads, the other is only where that line would be.
+    private static float FooterTextTop(Component page, out ResultBoundSource source)
+    {
+        source = ResultBoundSource.None;
+        try
+        {
+            var success = page != null ? page.TryCast<CM_PageExpeditionSuccess>() : null;
+            if (success == null || success.m_btnLeaveExpedition == null) return float.NaN;
+            float top = float.NaN;
+            foreach (TextMeshPro label in success.m_btnLeaveExpedition.GetComponentsInChildren<TextMeshPro>(true))
+            {
+                if (label == null) continue;
+                // The same rule the failure page's `m_returnToLobby_text` has always been measured by: the text is a wall
+                // only while the page is drawing it. A switched-off or zero-alpha leftover inside this subtree would
+                // otherwise lift the board above a line nobody can see and shorten the band for nothing.
+                bool active;
+                try { active = label.gameObject.activeInHierarchy; } catch { continue; }
+                if (!ResultFooterTextPolicy.Counts(active, HeadingAlpha(label))) continue;
+                if (!TryScreenRect(label, out LayoutRect rect)) continue;
+                top = ResultsRegion.HighestTop(rect.Y, top);
+            }
+            if (float.IsFinite(top))
+            {
+                source = ResultBoundSource.FooterText;
+                return top;
+            }
+            // A build whose waiting line is not a TextMeshPro of its own still lays the control's rectangle out where
+            // that line stands, so the control's own top edge is the block's bound - and it says so.
+            if (TryScreenRect(success.m_btnLeaveExpedition, out LayoutRect control))
+            {
+                source = ResultBoundSource.FooterTextControl;
+                return control.Y;
+            }
+            return float.NaN;
+        }
+        catch { return float.NaN; }
+    }
+    // One line per page for the band the board is really fitted into: the two edges, which fact produced each, and
+    // the room the fit was given. A board that starts too low and a board that starts too high look identical in a
+    // screenshot, and this line is what tells them apart without a second run.
+    private static void ReportBand(string where, ResultsBand band, float iconRow, float footerText, float floor)
+    {
+        if (!HeadingReports.Add("band-" + where)) return;
+        Plugin.Logger?.LogInfo($"[DIAG] {where} band: top={(band.Fits ? band.Top.ToString("0") : "unmeasurable")} (source={ResultsBounds.Name(band.TopSource)}, iconRow={(float.IsFinite(iconRow) ? iconRow.ToString("0") : "unmeasurable")}), "
+            + $"bottom={(band.Fits ? band.Bottom.ToString("0") : "unmeasurable")} (source={ResultsBounds.Name(band.BottomSource)}, waitingText={(float.IsFinite(footerText) ? footerText.ToString("0") : "unmeasurable")}), "
+            + $"room={(band.Fits ? band.Height.ToString("0") : "unmeasurable")}px, clearance={ResultsBounds.Clearance(Screen.height):0.#}px, clamped={band.Clamped.ToString().ToLowerInvariant()}, "
+            + $"boardFloor={floor:0}px, screen={Screen.width}x{Screen.height}, role={ResultPageRolePolicy.Name(Role())}; the board hangs from the top edge and is fitted into the room below it.");
     }
 
     // A configuration change (weights, thresholds, columns, the vanilla-block flags) may move the board or
@@ -318,7 +450,16 @@ internal static class ResultsDisplay
         // F8 hides this mod's overlay on a result page exactly as it hides the table in a level, and the
         // influence-board switch holds it back on its own. The vanilla blocks go back on their own page, so
         // the screen is never left half-hidden.
-        if (!PanelBehaviour.ToggleState || Plugin.ShowImpactBoard != null && !Plugin.ShowImpactBoard.Value)
+        //
+        // `Forced` is the one exception and it is the point of the fail-open rule: a player who pressed F8 on this page
+        // asked for the board, so no switch and no stale toggle may hold it back here. Everything downstream - the
+        // placement, the strip, the fit - is the same code, and the fail-open path is what answers it when the page's
+        // own anchors never became provable.
+        if (!(ResultVisibility.Shows(
+                Plugin.ShowResults == null || Plugin.ShowResults.Value,
+                true,
+                Plugin.ShowImpactBoard == null || Plugin.ShowImpactBoard.Value,
+                PanelBehaviour.ToggleState) || Forced))
         {
             if (_page != null) { RestoreHidden(); ResetPlacement(); }
             // A hidden board is not a wheel target: F8 off means the next notch belongs to the game again.
@@ -352,18 +493,26 @@ internal static class ResultsDisplay
                 // came back while the player happened to hover the page. The one edge that still has to hold is
                 // the button the player has to press, so that is the only measurement made here, and the board
                 // keeps its place unless it would really reach it.
-                _holdOpacity = 1f; // Once shown, only the explicit visibility switches can hide this page's board.
+                // A fallback board keeps the opacity its own band earned: a board drawn over the page because nothing
+                // clear was left is faint, one standing in a free band is not.
+                _holdOpacity = _fallbackPlaced ? _fallbackOpacity : 1f; // Once shown, only the explicit visibility switches can hide this page's board.
                 opacity = _holdOpacity;
                 bool buttonMeasured = LobbyButtonTop(_page, out float buttonTop);
-                if (!ResultBoardHold.TryHold(new BoardStrip(_holdBoard.Y, _holdBoard.Bottom, buttonMeasured, buttonTop), _holdBoard, Screen.height, out LayoutRect held))
+                // A fail-open board's upper edge is the band's top and is as binding as the footer underneath it: the lift
+                // below may never carry it above that edge. A board that then still reaches the button is drawn fainter
+                // instead - the same trade the fit makes when the board is taller than its band.
+                float topBound = _fallbackPlaced ? _holdStrip.Top : float.NaN;
+                if (!ResultBoardHold.TryHold(new BoardStrip(_holdBoard.Y, _holdBoard.Bottom, buttonMeasured, buttonTop),
+                        _holdBoard, Screen.height, out LayoutRect held, topBound))
                 {
                     ReportHeldBack("failure-hold", "held-board-unreadable",
                         "buttonMeasured=" + buttonMeasured + ",buttonTop=" + (float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable"));
                     return;
                 }
-                if (Math.Abs(_origin.Y - held.Y) > 0.5f && HeadingReports.Add("failure-board-lifted"))
-                    Plugin.Logger?.LogInfo($"[DIAG] failure board lifted clear of the lobby button: the board was at y={_origin.Y:0}, the button's own top edge is {(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")}, and the board now stands at y={held.Y:0}; it is lifted rather than dropped.");
-                _origin = held;
+                if (_fallbackPlaced && buttonMeasured && float.IsFinite(buttonTop)
+                    && held.Bottom > buttonTop - ResultBoardHold.ButtonClearance + 0.5f)
+                    _holdOpacity = Math.Min(_holdOpacity, ResultFallbackLayout.OverlapOpacity);
+                opacity = _holdOpacity;
             }
             else
             {
@@ -386,10 +535,20 @@ internal static class ResultsDisplay
         // that can still hold the board back, so a frame that draws nothing also hides nothing: the vanilla
         // blocks only ever make way for a board that is really about to be drawn. It is guarded on its own
         // so a page that has already gone away can never take the board down with it.
-        if (!BoardStillSafe())
+        if (!_fallbackPlaced)
         {
-            DeferBoardForInteraction();
-            return;
+            if (!BoardStillSafe())
+            {
+                DeferBoardForInteraction();
+                return;
+            }
+        }
+        else
+        {
+            // A fail-open board is checked against the page on every repaint too, and the answer is a move or a fainter
+            // board - never a blank screen. A page whose controls moved under it keeps its table.
+            RefreshFallbackSafety();
+            opacity = _fallbackOpacity;
         }
         try { ApplyVanillaBlocks(_page, _succeeded); }
         catch (Exception error)
@@ -612,6 +771,194 @@ internal static class ResultsDisplay
             Plugin.Logger?.LogInfo("[DIAG] result board deferred: the page exposed an unreadable or overlapping native/UI control after placement; vanilla is restored and the strip is measured again before the overlay may return.");
     }
 
+    // ---- the fail-open placement ------------------------------------------------------------------------------
+
+    // Where the board stands when the page could not be proven, and why.
+    //
+    // Nothing in here reads a gate: no title alpha, no completion edge, no footer settle, no interaction proof. It
+    // reads whatever of the page *can* be read - the mission title's rectangle even while it is switched off, the
+    // rectangles the interaction scan did manage to measure, the waiting-status line as a lower wall - and hands the
+    // answer to `ResultFallbackLayout`, which falls back to the window's own safe area when that is nothing at all.
+    // The floor the fail-open path is judged against, after its own failures have walked it down.
+    //
+    // The measured `_boardFloor` is what the page would need for a readable board; a page that cannot offer that much used to
+    // be answered with "no band can hold the board" for ever. Every fail-open attempt that ends without a board lowers this
+    // scale, so the next frame accepts a shorter band and builds a smaller grid - down to the smallest grid this build can
+    // draw (`ResultsBandFit.MinimumDrawableHeight`), which is where it stops. A strict board standing resets it: the page has
+    // proved it can hold the real one.
+    private static float FallbackFloor()
+        => ResultFallbackLadder.Floor(_boardFloor,
+            ResultsBandFit.MinimumDrawableHeight(ImpactBoard.RowCount(true), Plugin.Density), _fallbackFloorScale);
+    private static bool FallbackPlacement(Component page, bool succeeded, out float top, out float room,
+        out BoardStrip strip, out string why)
+    {
+        top = 0f; room = 0f; strip = default; why = "no-page";
+        if (page == null) return false;
+        float anchorBottom = float.NaN;
+        ResultBoundSource anchorSource = ResultBoundSource.ScreenSafeArea;
+        float footerText = float.NaN;
+        ResultBoundSource footerTextSource = ResultBoundSource.None;
+        Component protectedText = null;
+        try
+        {
+            var fail = page.TryCast<CM_PageExpeditionFail>();
+            if (fail != null)
+            {
+                TextMeshPro title = fail.m_missionFailed_text;
+                if (title != null && TryScreenRect(title, out LayoutRect titleRect))
+                {
+                    anchorBottom = titleRect.Bottom;
+                    anchorSource = ResultBoundSource.TitleAnchor;
+                }
+                TextMeshPro waiting = fail.m_returnToLobby_text;
+                if (waiting != null && waiting.gameObject.activeInHierarchy && !string.IsNullOrWhiteSpace(waiting.text))
+                {
+                    protectedText = waiting;
+                    if (TryScreenRect(waiting, out LayoutRect waitingRect)) footerText = waitingRect.Y;
+                }
+            }
+            else
+            {
+                // The success page: the icon row is the upper bound and the client's waiting block the lower one, and
+                // the last trusted icon row stands in for a frame in which the reveal has not drawn it yet.
+                float iconRow = IconRowBottom(page);
+                if (float.IsFinite(iconRow))
+                {
+                    _iconRowBottom = iconRow;
+                    anchorBottom = iconRow;
+                    anchorSource = ResultBoundSource.IconRow;
+                }
+                else if (float.IsFinite(_iconRowBottom))
+                {
+                    anchorBottom = _iconRowBottom;
+                    anchorSource = ResultBoundSource.LastTrustedIconRow;
+                }
+                footerText = FooterTextTop(page, out footerTextSource);
+            }
+        }
+        catch (Exception error) { why = "page-unreadable: " + error.Message; }
+        // The scan is the same one the strict path uses, run with the best top edge this page could give. It is allowed
+        // to answer incomplete here - the rectangles it did read are exactly what the fail-open board has to step
+        // around - and it is not asked to prove anything.
+        float guessTop = float.IsFinite(anchorBottom)
+            ? anchorBottom + ResultsBounds.Clearance(Screen.height)
+            : ResultFallbackLayout.SafeTop(Screen.height);
+        FooterControls controls = default;
+        try { controls = ScanFooterControls(page, guessTop, MessageGap, protectedText); }
+        catch (Exception error) { if (why == "no-page") why = "scan-failed: " + error.Message; }
+        // 1. The agreed band, with the same two edges the strict path uses: the fail-open board may be drawn where the
+        //    page's own geometry could not be proven, but it may not stand where the page draws its icon row or the
+        //    footer the player is reading. This is the case the last release got wrong: the client's band ran under the
+        //    waiting line because the band was the screen's own safe area, not this page's.
+        LobbyButtonTop(page, out float pageButtonTop);
+        if (ResultsBounds.TryResolve(Screen.height, anchorBottom, anchorSource,
+                float.IsFinite(pageButtonTop) ? pageButtonTop : float.NaN,
+                footerText, footerTextSource, controls.FooterTop, out ResultsBand band)
+            && band.Fits
+            // A band that cannot hold the board's own floor is not a band: the board would be taller than the page allows,
+            // and since it hangs from the band's top edge it would run past the footer rather than slide up over the icon
+            // row. Such a band is refused here and the reduced-opacity tier below answers instead, saying so.
+            && ResultFallbackTier.AcceptsPageBand(band.Height, FallbackFloor()))
+        {
+            top = band.Top; room = band.Height;
+            _fallbackOpacity = 1f;
+            strip = new BoardStrip(band.Top, band.Bottom, false, float.NaN, float.NaN, float.IsFinite(anchorBottom),
+                ResultFooterSource.ScreenSafeArea);
+            ReportBand("fail-open", band, anchorBottom, footerText, FallbackFloor());
+            why = "band top=" + band.Top.ToString("0") + " (" + ResultsBounds.Name(band.TopSource) + ")"
+                + ", bottom=" + band.Bottom.ToString("0") + " (" + ResultsBounds.Name(band.BottomSource) + ")"
+                + ", room=" + band.Height.ToString("0") + "px, clamped=" + band.Clamped.ToString().ToLowerInvariant()
+                + ", boardFloor=" + FallbackFloor().ToString("0")
+                + ", anchorBottom=" + (float.IsFinite(anchorBottom) ? anchorBottom.ToString("0") : "unmeasurable")
+                + ", footerText=" + (float.IsFinite(footerText) ? footerText.ToString("0") : "unmeasurable")
+                + " (" + ResultsBounds.Name(footerTextSource) + ")"
+                + ", footerTop=" + (float.IsFinite(controls.FooterTop) ? controls.FooterTop.ToString("0") : "unmeasurable")
+                + ", controls=" + controls.Count + ", hidden=" + controls.Hidden + ", unmeasurable=" + controls.Unmeasurable
+                + ", scanComplete=" + controls.Complete.ToString().ToLowerInvariant();
+            return room > 0f;
+        }
+        // 2. The page offered no band that can hold the board, or offered none at all: the window's own safe area answers,
+        //    and it steps around every control the scan did read **and** around the waiting block. That second wall is what
+        //    this tier used to miss: on a client page whose leave button is not measurable it is the only wall there is, and
+        //    a band that ignored it ran the board straight over the line the player is reading.
+        if (!ResultFallbackLayout.TryResolve(Screen.height, anchorBottom, controls.FooterTop, footerText,
+            controls.BelowActions.Top, controls.BelowActions.Bottom, FallbackFloor(), out ResultFallbackPlan plan))
+        {
+            why = "no-safe-area: anchorBottom=" + (float.IsFinite(anchorBottom) ? anchorBottom.ToString("0") : "unmeasurable")
+                + ",footerTop=" + (float.IsFinite(controls.FooterTop) ? controls.FooterTop.ToString("0") : "unmeasurable")
+                + ",footerText=" + (float.IsFinite(footerText) ? footerText.ToString("0") : "unmeasurable")
+                + " (" + ResultsBounds.Name(footerTextSource) + ")"
+                + ",screen=" + Screen.height + ",boardFloor=" + FallbackFloor().ToString("0");
+            return false;
+        }
+        top = plan.Top; room = plan.Height;
+        _fallbackOpacity = plan.Opacity;
+        strip = new BoardStrip(plan.Top, plan.Bottom, false, float.NaN, float.NaN, float.IsFinite(anchorBottom),
+            plan.BelowControls ? ResultFooterSource.BelowActions : ResultFooterSource.ScreenSafeArea);
+        why = ResultFallbackLayout.Describe(plan, Screen.height, FallbackFloor())
+            + ", anchorBottom=" + (float.IsFinite(anchorBottom) ? anchorBottom.ToString("0") : "unmeasurable")
+            + ", footerText=" + (float.IsFinite(footerText) ? footerText.ToString("0") : "unmeasurable")
+            + " (" + ResultsBounds.Name(footerTextSource) + ")"
+            + ", footerTop=" + (float.IsFinite(controls.FooterTop) ? controls.FooterTop.ToString("0") : "unmeasurable")
+            + ", controls=" + controls.Count + ", hidden=" + controls.Hidden + ", unmeasurable=" + controls.Unmeasurable
+            + ", scanComplete=" + controls.Complete.ToString().ToLowerInvariant();
+        return room > 0f;
+    }
+    // The per-repaint re-check of a fail-open board.
+    //
+    // The strict board is revalidated by `BoardStillSafe`, which answers "safe" or "take it away". A fail-open board
+    // answers the same question differently, on purpose: it is moved out of the way of a control that arrived under
+    // it, and when no clear band is left it is drawn fainter. It is never taken away - a screen with no table is the
+    // defect this whole path exists to remove.
+    private static void RefreshFallbackSafety()
+    {
+        if (_page == null || _grid == null) return;
+        if (!FallbackPlacement(_page, _succeeded, out float top, out float room, out BoardStrip strip, out _)) return;
+        if (room <= 0f) return;
+        if (!ResultFallbackLayout.TryPlaceInBand(Screen.width, Screen.height, top, top + room, _grid.Width, _grid.Height,
+            Plugin.ResultsOffsetX.Value, out LayoutRect rect)) return;
+        // The opacity is re-derived from the same measurement the place is, every repaint - a board that fitted when it was
+        // placed but is over its band now must go faint, and one that has been moved back inside a band must come back to
+        // full strength. The plan's own opacity is the floor of the answer: a band that was only ever the "standing over the
+        // page" tier stays faint whatever the board does inside it.
+        float planned = _fallbackOpacity;
+        bool overBand = float.IsFinite(strip.Bottom) && rect.Bottom > strip.Bottom + 0.5f && strip.Bottom > strip.Top;
+        float opacity = ResultFallbackOpacity.Resolve(planned, rect.Bottom, strip.Top, strip.Bottom);
+        bool opacityChanged = Math.Abs(opacity - _fallbackOpacity) > 0.001f;
+        _fallbackOpacity = opacity;
+        _holdOpacity = opacity;
+        // A dozen pixels of movement is the page's own animation, not a control arriving on top of the board.
+        bool moved = Math.Abs(rect.Y - _origin.Y) > ResultAnchorDrift.MinimumPixels || Math.Abs(rect.X - _origin.X) > ResultAnchorDrift.MinimumPixels;
+        if (moved)
+        {
+            // The board keeps the grid it was fitted with and only its place moves; the strip recorded with the placement is
+            // left alone, so the one place that really records a placement (`Fit`) stays the only one that does.
+            _origin = rect; _holdBoard = rect;
+        }
+        if (!moved && !opacityChanged) return;
+        if (HeadingReports.Add(moved ? "fallback-moved" : "fallback-fade"))
+            Plugin.Logger?.LogInfo($"[DIAG] the fail-open settlement board {(moved ? $"moved to ({rect.X:0},{rect.Y:0})" : "stayed where it was")} "
+                + $"because the page's own controls changed under it; band=({strip.Top:0}..{strip.Bottom:0}), boardBottom={rect.Bottom:0}, "
+                + $"opacity={_fallbackOpacity:0.00}{(overBand ? " (over its band, drawn faint)" : string.Empty)}, role={ResultPageRolePolicy.Name(Role())}. "
+                + "It is moved out of their way and drawn fainter when nothing clear is left, and it is never taken away. The next measurement "
+                + "that proves the page's own anchors places it strictly again.");
+    }
+
+    // F8 on a result page: the override itself.
+    //
+    // It depends on nothing that has to be ready first - not the title gate, not the completion edge, not the footer
+    // settle, not the interaction proof, not even the three visibility switches - and it drops whatever placement was
+    // refused before it, so the very next repaint measures and draws from the fail-open path. Pressing it again hands
+    // the page back to the ordinary judgement.
+    internal static bool ToggleForcedFallback()
+    {
+        Forced = !Forced;
+        Invalidate();
+        _strictMisses = 0;
+        _fallbackPlaced = false;
+        _fallbackOpacity = 1f;
+        return Forced;
+    }
     private static bool _placed;             // a placement has been computed for the screen now up
     private static bool _placedSucceeded;    // and it was computed for this kind of results screen
     internal static bool NeedsAttach()
@@ -796,10 +1143,17 @@ internal static class ResultsDisplay
     // sequence has to be inside the rectangle that is really on screen, and nothing outside it is ever claimed.
     internal static bool ZoomAt(Vector2 point, bool succeeded, int frame)
     {
-        if (!PanelBehaviour.ToggleState) return false;
-        if (Plugin.ShowResults != null && !Plugin.ShowResults.Value) return false;
-        if (Plugin.ShowResultOverlay != null && !Plugin.ShowResultOverlay.Value) return false;
-        if (Plugin.ShowImpactBoard != null && !Plugin.ShowImpactBoard.Value) return false;
+        // The same four switches the board itself is gated by - with one exception that has to agree with the draw: a
+        // player who pressed F8 on this page (`Forced`) has the board on screen whatever the switches say, so the wheel
+        // over it must keep working. A wheel that worked only while the config agreed would be a second, quieter version
+        // of the bug that left a forced board unscalable.
+        if (!Forced)
+        {
+            if (!PanelBehaviour.ToggleState) return false;
+            if (Plugin.ShowResults != null && !Plugin.ShowResults.Value) return false;
+            if (Plugin.ShowResultOverlay != null && !Plugin.ShowResultOverlay.Value) return false;
+            if (Plugin.ShowImpactBoard != null && !Plugin.ShowImpactBoard.Value) return false;
+        }
         // The rest of a gesture that already landed on this page's board during this very frame. Asked before the
         // rectangle, because the rectangle is exactly what the rebuild the first notch started has taken away.
         if (_hitFrame == frame) return true;
@@ -823,7 +1177,14 @@ internal static class ResultsDisplay
         // on how many players are in the squad.
         _boardFloor = ResultsFontGrowth.MinimumBoardHeight(ImpactBoard.RowCount(true),
             HudTable.RowEm(ResultsFontGrowth.MinimumReadablePixels), Plugin.Density);
-        if (!Placement(page, succeeded, out _, out float room, out BoardStrip strip)) return;
+        // The strict placement first, exactly as it has always been: the page's own settled anchor, its measured
+        // footer, its complete interaction scan. **But a placement is only a placement when the fit really puts a board
+        // on the page.** `Placement` answers "the page offered a strip", and a strip can be shorter than the board's own
+        // floor (30 rows x 3 px x 1.5 em = 135 px) while still being non-empty; a page answering `true` there used to
+        // clear the refusal count and then have `Fit` refuse in the very same frame - for ever, with F8 unable to help,
+        // because `ShouldFallback` was never evaluated. The count is therefore spent by what really happened: `TryFit`
+        // below, never by `Placement` on its own.
+        bool strict = Placement(page, succeeded, out _, out float room, out BoardStrip strip);
         ImpactReport report = BuildReport(succeeded);
         if (report.Entries.Count == 0)
         {
@@ -842,34 +1203,103 @@ internal static class ResultsDisplay
             Dividers = Dividers(board),
             Kinds = board.Kinds
         };
-        if (room <= 0f)
+        // The strict attempt is a strict attempt: whatever the previous frame ended in, this one asks the fit to place
+        // inside the strip the page itself measured.
+        _fallbackPlaced = false;
+        string refusal = "reason=placement-refused,room=unmeasurable,source=" + strip.FooterSource;
+        bool placed = strict && TryFit(content, board, report, strip, room, succeeded, out refusal);
+        if (ResultPlacementPolicy.Decide(placed, _strictMisses, Forced) == ResultPlacementOutcome.PlacedStrict)
         {
-            ReportHeldBack("prepare", "strip-empty", "source=" + strip.FooterSource + ",anchorTop=" + strip.Top.ToString("0"));
+            // A board really stands: only now is the refusal count cleared, the fail-open ladder reset (the page has proved
+            // it can hold the real board) and the fail-open flag dropped.
+            _strictMisses = 0;
+            _fallbackMisses = 0;
+            _fallbackFloorScale = 1f;
+            _fallbackOpacity = 1f;
+            FinishPlacement(succeeded, strip);
             return;
         }
+        // could not draw into, and the count is spent here - after the fit, never before it. The same frame may already
+        // be the frame the fail-open path takes over (F8, or a budget that this refusal completed), so it is decided
+        // once, here, and never a frame later.
+        _strictMisses = ResultPlacementPolicy.Spend(_strictMisses);
+        if (ResultPlacementPolicy.Decide(false, _strictMisses, Forced) == ResultPlacementOutcome.Deferred)
+        {
+            // Say why the frame was empty, once per page and per reason: a strip that is merely short and a grid the
+            // fit refused are two different faults and used to look identical.
+            ReportHeldBack("prepare", strict ? "fit-refused" : "strip-refused", refusal);
+            return;
+        }
+        if (!FallbackPlacement(page, succeeded, out _, out room, out strip, out string fallbackWhy))
+        {
+            // The fail-open placement itself found no band this frame. That is a miss of its own: the cadence and the log
+            // below need it, and the floor ladder must not keep asking the same impossible question.
+            _fallbackMisses = ResultPlacementPolicy.Spend(_fallbackMisses);
+            ReportHeldBack("prepare", "fallback-unavailable", fallbackWhy + ", misses=" + _fallbackMisses + ",floor=" + FallbackFloor().ToString("0") + "px");
+            return;
+        }
+        _fallbackPlaced = true;
+        if (!TryFit(content, board, report, strip, room, succeeded, out refusal))
+        {
+            _fallbackPlaced = false;
+            // The fail-open path could not draw either. Said once per page and per reason - never per frame - and the floor
+            // ladder steps down so the next measurement accepts a shorter band and builds a smaller table; it stops at the
+            // shortest grid this build can draw, at which point the page really has no room and the line says so.
+            _fallbackMisses = ResultPlacementPolicy.Spend(_fallbackMisses);
+            float before = FallbackFloor();
+            _fallbackFloorScale = ResultFallbackLadder.Next(_fallbackFloorScale);
+            bool exhausted = FallbackFloor() <= before + 0.01f || before <= ResultsBandFit.MinimumDrawableHeight(ImpactBoard.RowCount(true), Plugin.Density) + 0.01f;
+            ReportHeldBack("prepare", exhausted ? "fallback-floor-exhausted" : "fallback-fit-refused",
+                refusal + ", " + fallbackWhy + ", misses=" + _fallbackMisses + ",floor=" + before.ToString("0")
+                + "px,next=" + FallbackFloor().ToString("0") + "px,opacity=" + _fallbackOpacity.ToString("0.00")
+                + (exhausted ? ", the page has no room for even the shortest board this build can draw" : ""));
+            return;
+        }
+        if (HeadingReports.Add("fallback-" + (succeeded ? "success" : "failure")))
+            Plugin.Logger?.LogInfo($"[DIAG] {(succeeded ? "success" : "failure")} board placed from the fail-open safe area: "
+                + $"{fallbackWhy}, strictRefusals={_strictMisses} of {ResultFallbackPolicy.MissBudget} frames before the budget is spent, "
+                + $"forcedByF8={Forced}, role={ResultPageRolePolicy.Name(Role())}; the page's own anchors could not be proven, so the screen's "
+                + "own geometry is used and the page's controls are stepped around instead of the board being dropped.");
+        FinishPlacement(succeeded, strip);
+    }
+
+    // One attempt with one strip: the grid this room allows, and the fit that really puts it on the page.
+    //
+    // Answers whether a board stands now - which is the only thing the refusal count may be cleared by - and says why
+    // when it does not: an empty room, a grid nobody could measure, or a fit that refused the grid it was given.
+    private static bool TryFit(TableContent content, ImpactBoardLayout board, ImpactReport report, BoardStrip strip,
+        float room, bool succeeded, out string refusal)
+    {
+        refusal = "room=" + (float.IsFinite(room) ? room.ToString("0") + "px" : "unmeasurable")
+            + ",boardFloor=" + (float.IsFinite(_boardFloor) ? _boardFloor.ToString("0") : "unmeasured")
+            + ",source=" + strip.FooterSource;
+        if (!(room > 0f)) { refusal = "reason=strip-empty," + refusal; return false; }
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
         PanelGrid grid = FitBoard(content, room, boardWidth, succeeded, strip.ButtonHeight);
         if (grid == null)
         {
-            ReportHeldBack("prepare", "grid-unmeasurable", "rows=" + content.Rows + ",columns=" + content.ColumnCount + ",source=" + strip.FooterSource);
-            return;
+            refusal = "reason=grid-unmeasurable,rows=" + content.Rows + ",columns=" + content.ColumnCount + "," + refusal;
+            return false;
         }
-        // A fit that could not put the board on the page is not a placement: the vanilla blocks only make way for a
-        // board that is really there, so a refused frame leaves the page exactly as the game drew it and is asked
-        // again next frame, instead of hiding its own blocks and drawing nothing over the gap.
-        if (!ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded), _grid != null, _content != null)) return;
+        if (!ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded), _grid != null, _content != null))
+        {
+            refusal = "reason=fit-refused,grid=" + grid.Width.ToString("0") + "x" + grid.Height.ToString("0")
+                + ",strip=(" + strip.Top.ToString("0") + ".." + strip.Bottom.ToString("0") + ")," + refusal;
+            return false;
+        }
+        return true;
+    }
+
+    // What a placed board records about itself, whether it stands inside the page's own strip or in the fail-open band.
+    private static void FinishPlacement(bool succeeded, BoardStrip strip)
+    {
         _placed = true; _placedSucceeded = succeeded;
         // A strip whose three facts were all measured is not a guess and the board is never re-measured away from it:
         // the anchor it hangs from in its settled state, the button's own top edge, and that button's height - which is
         // the one figure the readability floor is taken from and which only exists when the bound came from a named
-        // control rather than from the drawn band of everything the page put at its bottom. A strip built from the band
-        // is therefore the case that keeps the right to exactly one second look, taken when that control's own
-        // rectangle becomes readable. With the strict gates above, a strip is only ever placed from measured edges, so
-        // this is now a precision backstop rather than the normal path.
-        // A board standing in the band below the page's actions is not a guess: that band is measured geometry, and the
-        // second look exists for a strip that was laid out before one of the page's own edges could be read - which is
-        // never this one. It keeps the same right to a re-measure every other measured strip has, through the drift
-        // check, and spends no recovery budget on top of it.
+        // control rather than from the drawn band of everything the page put at its bottom.
+        // A board standing in the band below the page's actions is not a guess either: that band is measured geometry,
+        // and the second look exists for a strip that was laid out before one of the page's own edges could be read.
         _placedOnFallback = strip.FooterSource != ResultFooterSource.ClientNoFooterSafeArea
             && strip.FooterSource != ResultFooterSource.BelowActions
             && ResultAnchorRecovery.LatchFallback(_fallbackRecoveries,
@@ -901,27 +1331,43 @@ internal static class ResultsDisplay
         // the glyph size and the row height the board is drawn at honour it. A page that hands no measurable
         // button height keeps the absolute minimum, and every figure here is what it was before.
         int requested = ResultsFontGrowth.ReadabilityFloor(buttonHeight);
-        // The floor is a preference, not a licence to draw nothing. A strip too short to hold the table at
-        // the readable size used to end up with a grid taller than the strip, which the placement then
-        // refused - the board vanished instead of shrinking. The size is asked for from a search that
-        // reports which floor it really used, and the grid that comes out of it is checked against the strip
-        // as well: a board that still overruns is rebuilt at the absolute minimum, which is the same board
-        // this page drew before the floor existed.
-        int fitted = ResultsFontGrowth.FitBoardIntoStrip(seed, requested, int.MaxValue, room, boardWidth,
-            size => NaturalSize(content, size, requested), out int floor);
+        // ---- band height -> row height / glyph size ---------------------------------------------------------
+        //
+        // The band is the promise; the glyph size is what gets spent on it. `ResultsBandFit` turns the room the page
+        // gave into a row budget (`room / rows`) and then into a glyph size:
+        //
+        //   rowHeight = max(font * RowFactor * density.Row, font * 1.5em)     what HudTable really builds a row at
+        //   font      = floor(bandHeight / rows / thatEmPerGlyphPixel)
+        //
+        // At the compact density that is 19.6 px of row for the 588 px band of a 1440 window over 30 rows, i.e. a
+        // 13 px glyph - the figure the real page logged as `glyph 12px`/`13px`. A 200 px band, which is what a page
+        // squeezed between a tall icon block and an early footer can really offer, still yields a 4 px glyph over
+        // 30 rows (30 x 6 = 180 px). That is below the 6 px the player would like, and that is the trade: the band
+        // may not be crossed, and the page may not be left without a table, so the readability floor is lowered to
+        // the band's own answer and the row shrinks with it. The measured search below then refines that answer
+        // against the real text widths, and the grid is drawn at whatever it produced.
+        int bandFloor = ResultsBandFit.FloorForBand(room, content.Rows, Plugin.Density, requested, out bool squeezed);
+        if (squeezed && HeadingReports.Add("band-squeezed"))
+            Plugin.Logger?.LogInfo($"[DIAG] settlement board squeezed by its band: room={room:0}px for {content.Rows} rows allows a {bandFloor}px glyph, "
+                + $"below the {requested}px this page would have liked; the glyph and the row shrink together so nothing is drawn outside "
+                + $"[top, bottom], and the page is not left without a table. role={ResultPageRolePolicy.Name(Role())}.");
+        int fitted = ResultsFontGrowth.FitBoardIntoStrip(seed, bandFloor, int.MaxValue, room, boardWidth,
+            size => NaturalSize(content, size, bandFloor), out int floor);
         // The player's own wheel preference scales the size the page's own strip produced, inside the box this
         // page really offers: a bigger board is allowed the room the fit's own comfort band leaves free, and a size
         // that would reach the lobby button or leave the width is stepped back until it does not. The two result
         // pages keep their own scale, so the success board and the failure board cannot resize each other.
         int fontSize = ResultsZoom.ScaleSize(fitted, Plugin.ResultFontScale(succeeded), room, boardWidth,
-            size => NaturalSize(content, size, requested));
+            size => NaturalSize(content, size, bandFloor));
         // The floor the grid is built with may not be above the size it is drawn at, or a zoomed-out board
-        // would be rebuilt back up into the room the player just asked it to leave.
-        floor = Mathf.Min(floor, fontSize);
+        // would be rebuilt back up into the room the player just asked it to leave - and it may never be above
+        // the band's own answer either, which is what keeps a short band from being answered with a taller table.
+        floor = Mathf.Max(bandFloor, Mathf.Min(floor, fontSize));
+        if (squeezed) floor = Mathf.Min(floor, Mathf.Max(ResultsBandFit.AbsoluteMinimumPixels, fontSize));
         PanelGrid grid = BoardGrid(content, fontSize, floor, room, boardWidth);
-        if (!InStrip(grid, room, boardWidth) && floor > ResultsFontGrowth.MinimumReadablePixels)
+        if (!InStrip(grid, room, boardWidth) && floor > bandFloor)
         {
-            floor = ResultsFontGrowth.MinimumReadablePixels;
+            floor = bandFloor;
             grid = BoardGrid(content, fontSize, floor, room, boardWidth);
         }
         // The floor the grid on screen was really built with, so a later refresh re-measures with that one
@@ -1085,15 +1531,35 @@ internal static class ResultsDisplay
         // The board is placed inside the strip its own measurement produced, not merely inside the window: a
         // board taller than that strip used to be accepted here and then refused at draw time, which is how a
         // whole table was dropped for a fraction of a pixel of overflow.
-        if (ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, grid.Height,
-            Plugin.ResultsOffsetX.Value, out LayoutRect origin, BoardSlack, bottomAligned: false))
+        bool placedStrictly = ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, grid.Height,
+            Plugin.ResultsOffsetX.Value, out LayoutRect origin, BoardSlack, bottomAligned: false);
+        // A fail-open board is never refused: it hangs from the band's own top edge (never above it) and, when it is
+        // taller than the band, it is drawn at `OverlapOpacity` instead of being dropped or slid up over the page above
+        // it. This is the one placement in the mod that accepts a board over its own band, and it is reachable only from
+        // `_fallbackPlaced`.
+        if (!placedStrictly && _fallbackPlaced)
+            placedStrictly = ResultFallbackLayout.TryPlaceInBand(Screen.width, Screen.height, strip.Top, strip.Bottom,
+                grid.Width, grid.Height, Plugin.ResultsOffsetX.Value, out origin);
+        if (placedStrictly)
         {
             _origin = origin;
             _content = content; _grid = grid;
+            if (_fallbackPlaced && float.IsFinite(strip.Bottom) && origin.Bottom > strip.Bottom + 0.5f
+                && !(strip.Bottom <= strip.Top))
+            {
+                // The board is taller than the band the page allowed. It keeps the band's top edge - the icon row stays
+                // clear - and it is drawn fainter so the footer underneath stays readable. Said once, with the numbers.
+                _fallbackOpacity = Math.Min(_fallbackOpacity, ResultFallbackLayout.OverlapOpacity);
+                if (HeadingReports.Add("fallback-over-band"))
+                    Plugin.Logger?.LogInfo($"[DIAG] fail-open board taller than its band: overBand=({strip.Top:0}..{strip.Bottom:0}) is "
+                        + $"{(strip.Bottom - strip.Top):0}px and the grid is {grid.Height:0}px, so the board keeps the band's top edge "
+                        + $"({origin.Y:0}) and is drawn at opacity {_fallbackOpacity:0.00} instead of sliding up over the page above it. "
+                        + $"role={ResultPageRolePolicy.Name(Role())}, screen={Screen.width}x{Screen.height}.");
+            }
             // The place the board was measured into, kept for as long as this page is up: the F8 write, the hot
             // reload that follows it and the page's own button animation all come back through here, and none of
             // them may cost the board the strip it was already given.
-            _holdValid = true; _holdBoard = origin; _holdOpacity = 0f;
+            _holdValid = true; _holdBoard = origin; _holdOpacity = _fallbackPlaced ? _fallbackOpacity : 0f;
             // The strip itself is kept next to the place, because a page that later offers a different one is a
             // page this board no longer fits: `ResultAnchorDrift` compares the strip's upper edge and the room it
             // gave against what the page measures from now on, and asks for one bounded re-measure when they have
@@ -1203,7 +1669,17 @@ internal static class ResultsDisplay
                     return false;
                 }
                 if (!ResultNoFooterSafeArea.TryResolve(top, Screen.height, out ResultsSafeArea safeArea,
-                    failureControls.FooterTop, MessageGap)) return false;
+                    failureControls.FooterTop, MessageGap))
+                {
+                    // The client page's only bound here is the page's own measured lower wall; a wall that leaves no
+                    // room at all is refused and the page is measured again - and the fail-open path places the board
+                    // from the screen's own safe area meanwhile, so the refusal is never an empty screen.
+                    ReportHeldBack("failure-client-safe-area", "safe-area-unusable",
+                        "anchorTop=" + top.ToString("0") + ",footerTop="
+                        + (float.IsFinite(failureControls.FooterTop) ? failureControls.FooterTop.ToString("0") : "unmeasurable")
+                        + ",gap=" + MessageGap.ToString("0"));
+                    return false;
+                }
                 top = safeArea.Top; failureBottom = safeArea.Bottom;
                 failureFooterSource = ResultFooterSource.ClientNoFooterSafeArea;
                 if (HeadingReports.Add("failure-client-safe-area"))
@@ -1215,7 +1691,15 @@ internal static class ResultsDisplay
             return room > 0f;
         }
 
-        if (!CompletionReady(page)) return false;
+        if (!CompletionReady(page))
+        {
+            // The completion section is the success page's one honest anchor. A page that never finishes drawing it is
+            // refused here - and the fail-open path above then places the board from the screen's own safe area, which is
+            // why this refusal is a log line and not an empty screen.
+            ReportHeldBack("success-anchor", "completion-not-ready",
+                "completion=" + _completionState + ",boardFloor=" + _boardFloor.ToString("0"));
+            return false;
+        }
         bool completionMeasured = SuccessRegion(page, out ResultsSafeArea area, out bool measuredButton,
             out float measuredTop, out float measuredHeight, out FooterControls successControls,
             out bool successNativeFooterVisible, out ResultFooterSource footerSource);
@@ -1275,7 +1759,16 @@ internal static class ResultsDisplay
                 return false;
             }
             if (!ResultNoFooterSafeArea.TryResolve(area.Top, Screen.height, out area,
-                successControls.FooterTop, MessageGap)) return false;
+                successControls.FooterTop, MessageGap))
+            {
+                // Same rule as the failure page's client branch: an unusable safe area is refused, said so once, and the
+                // fail-open path places the board from the screen's own safe area instead of leaving the page blank.
+                ReportHeldBack("success-client-safe-area", "safe-area-unusable",
+                    "completionTop=" + area.Top.ToString("0") + ",footerTop="
+                    + (float.IsFinite(successControls.FooterTop) ? successControls.FooterTop.ToString("0") : "unmeasurable")
+                    + ",gap=" + MessageGap.ToString("0"));
+                return false;
+            }
             footerSource = ResultFooterSource.ClientNoFooterSafeArea;
             if (HeadingReports.Add("success-client-safe-area"))
                 Plugin.Logger?.LogInfo($"[DIAG] success footerSource=client-no-native-footer-safe-area: native lobbyVisible=false, complete interaction scan empty for {SuccessNoFooter.Samples} distinct frames, Blink and completion edge settled; safe strip=({area.Top:0}..{area.Bottom:0}).");
@@ -1540,6 +2033,40 @@ internal static class ResultsDisplay
                             ? $", and the free band below them ({controls.BelowActions.Top:0}..{controls.BelowActions.Bottom:0}) is only {controls.BelowActions.Height:0}px"
                             : ", and the page's measured actions leave no free band below them")
                         + $", {DescribeLobbyWall(wall)}, lobbyEdge={DescribeLobbyEdge(wall)}, screen={Screen.width}x{Screen.height}; the vanilla result screen is kept rather than drawn over any control.");
+            }
+        }
+        // ---- the agreed band: icon row above, the footer this machine can see below ---------------------------------
+        //
+        // The strip the two branches above produced is *a* band, not *the* band: the success branch hangs it from the
+        // deepest part of the whole completion section (the white plate behind the icons on a client page) and the
+        // guest branch runs it to the foot of the window. Both are replaced here by the one rule this mod agreed on
+        // with its players:
+        //
+        //   top    the sector-icon row's own bottom edge (label included) plus a clearance scaled from 16 px at 1080p
+        //   bottom the highest footer this machine can measure minus the same clearance: the host's leave button, or
+        //          the client's waiting-status text block, whichever the page really draws
+        //
+        // The board hangs from the top edge, so a taller band is a taller table and never a table further down; the
+        // measured free band under the page's actions (1.19.16) is left exactly as it was measured, because its own two
+        // edges are the whole contract.
+        float iconRow = IconRowBottom(success);
+        if (float.IsFinite(iconRow)) _iconRowBottom = iconRow;
+        float waitingText = FooterTextTop(success, out ResultBoundSource waitingTextSource);
+        float bandAnchor = float.IsFinite(iconRow) ? iconRow : _iconRowBottom;
+        ResultBoundSource bandAnchorSource = float.IsFinite(iconRow) ? ResultBoundSource.IconRow
+            : float.IsFinite(_iconRowBottom) ? ResultBoundSource.LastTrustedIconRow
+            : ResultBoundSource.ScreenSafeArea;
+        if (ResultsBounds.TryResolve(Screen.height, bandAnchor, bandAnchorSource,
+                buttonMeasured ? buttonTop : float.NaN, waitingText, waitingTextSource, controls.FooterTop, out ResultsBand band))
+        {
+            ReportBand("success", band, iconRow, waitingText, _boardFloor);
+            if (band.Fits && footerSource != ResultFooterSource.BelowActions)
+            {
+                // The band is the whole answer when the page handed nothing else, and it tightens the page's own strip
+                // otherwise: never above the icon row, never below the footer the player is reading.
+                float bandBottom = area.Fits ? Math.Min(band.Bottom, area.Bottom) : band.Bottom;
+                if (!(bandBottom > band.Top)) bandBottom = band.Bottom;
+                area = new ResultsSafeArea(band.Top, bandBottom);
             }
         }
         if (!controls.ProvenEmpty || nativeFooterVisible) SuccessNoFooter.Forget();
@@ -1939,6 +2466,29 @@ internal static class ResultsDisplay
                 top = Math.Max(ResultsPlacement.Top(titleBottom, Plugin.ResultsOffsetY.Value, MessageGap), controls.BoardTop);
                 if (buttonMeasured) bottom = Math.Min(buttonTop - MessageGap, Screen.height - 8f);
                 else bottom = Screen.height - 8f;
+            }
+            // ---- the agreed band, on the failure page too ----------------------------------------------------
+            //
+            // Upper: the page's own mission-failed title edge. Lower: the button the host presses, or - on a client,
+            // which has no button at all - the waiting-status text block, measured as the world-space text it is. The
+            // existing figures are kept as *extra* walls (never loosened): the band may only pull the strip tighter or
+            // start it higher, so a configured vertical offset and the 1.19.13 guest geometry both still hold.
+            float waitingTextTop = float.NaN;
+            try
+            {
+                if (guestStatus != null && guestStatus.gameObject.activeInHierarchy
+                    && TryScreenRect(guestStatus, out LayoutRect waitingRect)) waitingTextTop = waitingRect.Y;
+            }
+            catch { }
+            if (ResultsBounds.TryResolve(Screen.height, titleBottom, ResultBoundSource.TitleAnchor,
+                    buttonMeasured ? buttonTop : float.NaN, waitingTextTop, controls.FooterTop, out ResultsBand pageBand))
+            {
+                ReportBand("failure", pageBand, float.NaN, waitingTextTop, _boardFloor);
+                if (pageBand.Fits && footerSource != ResultFooterSource.BelowActions)
+                {
+                    if (pageBand.Top > top) top = pageBand.Top;
+                    if (pageBand.Bottom < bottom) bottom = pageBand.Bottom;
+                }
             }
             if (!float.IsFinite(top) || !float.IsFinite(bottom) || !(bottom > top))
             {
