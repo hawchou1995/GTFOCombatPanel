@@ -194,6 +194,7 @@ public static class CombatStrings
                 case ImpactRating.FriendlyFire: return "Friendly-fire hazard";
                 case ImpactRating.MeleeKills: return "Melee ace";
                 case ImpactRating.ScoutKills: return "Scout hunter";
+                case ImpactRating.AllRound: return "All-round anchor";
                 default: return "Unremarkable";
             }
         }
@@ -213,16 +214,17 @@ public static class CombatStrings
             case ImpactRating.Supply: return "后勤大师";
             case ImpactRating.Scan: return "侦察之眼";
             case ImpactRating.LoneSurvivor: return "背水一战";
-            case ImpactRating.Downs: return "反复倒地";
+            case ImpactRating.Downs: return "仰卧起坐";
             case ImpactRating.FriendlyFire: return "敌我不分";
             case ImpactRating.MeleeKills: return "近战强袭";
             case ImpactRating.ScoutKills: return "触手猎手";
+            case ImpactRating.AllRound: return "全能中坚";
             default: return "平平无奇";
         }
     }
 
     // What each sentence means, in one line, in both languages. A penalty sentence says so plainly,
-    // because 铁壁生存 is awarded to the squad's most-downed player, not to the one who avoided going down.
+    // because 仰卧起坐 is awarded to the squad's most-downed player, not to the one who avoided going down.
     private static string DescriptionText(ImpactRating rating, bool english)
     {
         switch (rating)
@@ -262,7 +264,9 @@ public static class CombatStrings
             case ImpactRating.MeleeKills:
                 return english ? "Most melee kills; a sleeping kill counts double." : "近战击杀数全队最高，沉睡击杀加倍计入。";
             case ImpactRating.ScoutKills:
-                return english ? "Most Scouts killed in the squad; a sleeping kill counts double." : "Scout 击杀数全队最高，沉睡击杀加倍计入。";
+                return english ? "Most Scouts killed in the squad; a sleeping kill counts double." : "触手击杀数全队最高，沉睡击杀加倍计入。";
+            case ImpactRating.AllRound:
+                return english ? "First on the composite score without leading a single row." : "综合评分全队第一，各项没有单独领先。";
             default:
                 return english ? "No single lead this run; steady work." : "本局没有单项领先，稳定完成本职。";
         }
@@ -399,7 +403,10 @@ public static class CombatStrings
     public static string ReasonScoutKills(long kills)
         => TryReason(ImpactRating.ScoutKills, out string template)
             ? Substitute(template, ("kills", Count(kills)))
-            : Pick("Scout 击杀 " + Count(kills) + " 只", Count(kills) + " Scouts killed");
+            : Pick("触手击杀 " + Count(kills) + " 只", Count(kills) + " Scouts killed");
+    // The first place that leads no single row: it has no figure of its own to print, so the line says what
+    // the sentence is about. Like every other line it is the scoring file's when the file carries one.
+    public static string ReasonAllRound { get { return TryReason(ImpactRating.AllRound, out string template) ? Substitute(template) : Pick("综合评分全队第一，无单项领先", "top composite score, no single row led"); } }
 
     // The rating each kill class is scored as, so a custom template for 小怪/精英/BOSS takes effect on
     // the one sentence it names.

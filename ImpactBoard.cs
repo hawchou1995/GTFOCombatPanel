@@ -245,6 +245,7 @@ public static class ImpactBoard
                 }
             case ImpactRating.MeleeKills: return CombatStrings.ReasonMeleeKills(counters.MeleeKills, MeleeDamageText(input));
             case ImpactRating.ScoutKills: return CombatStrings.ReasonScoutKills(counters.ScoutKills);
+            case ImpactRating.AllRound: return CombatStrings.ReasonAllRound;
             default: return CombatStrings.Placeholder;
         }
     }

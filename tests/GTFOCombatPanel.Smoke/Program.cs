@@ -716,8 +716,11 @@ internal static partial class Program
         Check(!tied.IsGold(0, ImpactMetric.TotalDamage) && !tied.IsGold(1, ImpactMetric.TotalDamage), "a tie for the lead earns nobody a gold star");
         Check(Math.Abs(tied.Entries[0].Score - tied.Entries[1].Score) < 1e-9, "an even squad scores evenly");
         Check(tied.CountAtMax[(int)ImpactMetric.TotalDamage] == 2, "a tie is recorded as two players at the top");
-        Check(tied.Entries[0].Score > 0 && tied.Entries[0].Rating == ImpactRating.TeamPillar, "equal positive contributions have no unique top and earn neutral titles");
-        Check(tied.Entries.All(e => e.Rating == ImpactRating.TeamPillar), "neutral titles may repeat for tied players");
+        // Both places are rank 1 and neither leads a single row, so both wear the all-round sentence - the
+        // same "a tied first place is still a first place" rule the rank in the name row already follows.
+        Check(tied.Entries.All(e => e.Rank == 1 && e.Score > 0 && e.Rating == ImpactRating.AllRound && e.RatingMetric == -1),
+            "equal positive contributions have no unique top, so both first places wear the all-round sentence");
+        Check(tied.Entries.Select(e => e.Rating).Distinct().Count() == 1, "the all-round sentence may repeat for tied players like the neutral one");
         var alone = ImpactScoring.Evaluate(new[] { new ImpactInput { Name = "Solo", EnemyDamage = 10 } }, ImpactScoring.DefaultWeights, 1.0, 1.0);
         Check(alone.Entries.Count == 1 && alone.Entries[0].Score >= 0 && alone.Entries[0].Score <= 100, "a squad of one scores without dividing by zero");
         Check(ImpactScoring.Evaluate(null, null, 1.0, 1.0).Entries.Count == 0, "an empty squad yields an empty board");
@@ -740,7 +743,7 @@ internal static partial class Program
         }
         var squad = ImpactScoring.Evaluate(four, ImpactScoring.DefaultWeights, 1.0, 1.0);
         Check(squad.Entries.Count == 4, "a full squad is scored");
-        Check(squad.Entries.Where(e => e.Rating != ImpactRating.TeamPillar).Select(e => e.Rating).Distinct().Count() == squad.Entries.Count(e => e.Rating != ImpactRating.TeamPillar), "earned titles are distinct; neutral titles may repeat");
+        Check(squad.Entries.Where(e => e.Rating != ImpactRating.TeamPillar && e.Rating != ImpactRating.AllRound).Select(e => e.Rating).Distinct().Count() == squad.Entries.Count(e => e.Rating != ImpactRating.TeamPillar && e.Rating != ImpactRating.AllRound), "earned titles are distinct; the two fallback sentences may repeat");
         Check(squad.Entries[0].Rating == ImpactRating.Damage, "the best placed player takes the sentence they earned before anyone else is evaluated");
         Check(squad.Entries.All(entry => !string.IsNullOrEmpty(CombatStrings.Title(entry.Rating))), "every sentence is one a player can read");
 

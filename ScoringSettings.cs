@@ -19,7 +19,7 @@ public sealed class ScoringSettings
 {
     public static readonly string[] MetricNames = { "TotalDamage", "Stagger", "Kills", "Revives", "WeakspotRate", "Accuracy", "SupplyEfficiency", "ToolEfficiency", "LoneSurvivor", "Downs", "FriendlyFire", "MeleeKills", "ScoutKills" };
 
-    public string Guidance { get; set; } = "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚。MeleeKills / ScoutKills 分别按近战击杀与 Scout 击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingMeleeKillMultiplier / SleepingScoutKillMultiplier 分别为近战击杀、触手击杀中沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的那一部分，状态未知按清醒计；小怪/精英/BOSS 三档不再使用睡眠倍率，只统计总数。旧的 SleepingKillMultiplier 保留，作为文件中缺少这两项时的回退来源。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。Reasons 为每一句结算说明的模板，占位符只允许 ReasonTokens 里列出的名字：TeamPillar {damage} {count}、Damage {damage} {share}、Stagger / MinorKills / EliteKills / BossKills / Revives / LoneSurvivor / Downs {count}、Weakspot {weakspots} {hits}、Accuracy {hits} {shots}、Supply {uses} {efficiency}、Scan {uses} {firstMarks}、FriendlyFire {damage} {deaths}、MeleeKills {kills} {damage}、ScoutKills {kills}，ZeroScore 无占位符；每句上限 96 字符，空串表示该行不显示说明，留出厂模板即跟随语言设置，未知占位符或超长会导致该文件被当作无效并保留上次有效配置，缺失时自动创建默认文件。";
+    public string Guidance { get; set; } = "本机评分，不同步队友。Weights 为十三项权重(0-10)，0 不计分；EnabledMetrics 为 null 时全部启用，否则仅启用列出的名称。ToolEfficiency 显示工具统计，但评分继续只使用扫描首次标记数；FriendlyFire 按友伤伤害与友伤致倒次数分别相对归一后等权惩罚；FriendlyFireGrace 为友伤「伤害」容差（默认 10，范围 0-1000，单位与面板显示的敌伤相同）：不超过它的伤害按 0 计分，友伤致倒次数不受它影响、仍照常计入并可因此获「敌我不分」，超过容差的伤害照旧按全队最大友伤归一。MeleeKills / ScoutKills 分别按近战击杀与触手击杀数计分；近战行同时显示 GearMelee 已采集的累计伤害。MinorHealth / EliteHealth 为小怪/精英血量上限。FirepowerBonus 为辅助火力补偿(1-1.3，仅作用于总伤害与硬直阻止)，UtilityBonus 为辅助效用倍率(1-1.3)。SupportToolNames 为辅助工具名称子串；ExcludedTools 优先排除(哨戒炮/绊雷)；OtherToolsAreSupport 将其余非空工具归为辅助。RescueFloor 为救援计分下限，AccuracyConfidencePellets 为命中率置信样本。MinorKillWeight / EliteKillWeight / BossKillWeight 为三档击杀的相对价值，必须满足 小怪 ≤ 精英 ≤ boss（默认 0.5 / 1 / 1.5）；Weights 里的 Kills 是整行权重，两者相乘。SleepingMeleeKillMultiplier / SleepingScoutKillMultiplier 分别为近战击杀、触手击杀中沉睡击杀相对同类清醒击杀的倍率(默认 2，有效范围 1-10)，只加成已判定为沉睡的那一部分，状态未知按清醒计；小怪/精英/BOSS 三档不再使用睡眠倍率，只统计总数。旧的 SleepingKillMultiplier 保留，作为文件中缺少这两项时的回退来源。Titles 为每一句结算称号的 Title / Description：小怪、精英、BOSS 三档与总伤害各有独立称号，负面称号(Downs / FriendlyFire)按惩罚严重度授予全队最严重者；保持默认文本即跟随语言设置，改动后即为自定义。Reasons 为每一句结算说明的模板，占位符只允许 ReasonTokens 里列出的名字：TeamPillar {damage} {count}、Damage {damage} {share}、Stagger / MinorKills / EliteKills / BossKills / Revives / LoneSurvivor / Downs {count}、Weakspot {weakspots} {hits}、Accuracy {hits} {shots}、Supply {uses} {efficiency}、Scan {uses} {firstMarks}、FriendlyFire {damage} {deaths}、MeleeKills {kills} {damage}、ScoutKills {kills}，ZeroScore / AllRound 无占位符；每句上限 96 字符，空串表示该行不显示说明，留出厂模板即跟随语言设置，未知占位符或超长会导致该文件被当作无效并保留上次有效配置，缺失时自动创建默认文件。";
 
     public Dictionary<string, double> Weights { get; set; } = DefaultWeights();
     public string[] EnabledMetrics { get; set; }
@@ -46,6 +46,12 @@ public sealed class ScoringSettings
     public bool OtherToolsAreSupport { get; set; } = true;
     public int RescueFloor { get; set; } = ImpactScoring.MinimumRescuesForScoring;
     public int AccuracyConfidencePellets { get; set; } = ImpactScoring.AccuracyConfidencePellets;
+    // Friendly fire below this many points of damage is not friendly fire: it is applied to the figure
+    // before the squad scale is taken, so a grazed teammate does not lose the row. The grace covers the
+    // damage and nothing else - the friendly-fire down count is scored exactly as it always was, so a
+    // grazed teammate who still downed somebody can wear 「敌我不分」 on that count alone.
+    // Absolute damage, no unit, bounded to the same ceiling the code clamps to.
+    public double FriendlyFireGrace { get; set; } = ImpactScoring.DefaultFriendlyFireGrace;
 
     // ---- the settlement sentences ---------------------------------------------------------------
     // One entry per sentence the board can print. `Title` is the word the board shows and `Description`
@@ -56,7 +62,8 @@ public sealed class ScoringSettings
     public static readonly string[] TitleNames =
     {
         "TeamPillar", "ZeroScore", "Damage", "Stagger", "MinorKills", "EliteKills", "BossKills", "Revives",
-        "Weakspot", "Accuracy", "Supply", "Scan", "LoneSurvivor", "Downs", "FriendlyFire", "MeleeKills", "ScoutKills"
+        "Weakspot", "Accuracy", "Supply", "Scan", "LoneSurvivor", "Downs", "FriendlyFire", "MeleeKills", "ScoutKills",
+        "AllRound"
     };
     public Dictionary<string, ScoringTitle> Titles { get; set; } = DefaultTitles();
 
@@ -101,7 +108,9 @@ public sealed class ScoringSettings
         { "Downs", new[] { "count" } },
         { "FriendlyFire", new[] { "damage", "deaths" } },
         { "MeleeKills", new[] { "kills", "damage" } },
-        { "ScoutKills", new[] { "kills" } }
+        { "ScoutKills", new[] { "kills" } },
+        // The first place that leads no single row has no figure to name, so its line takes no placeholder.
+        { "AllRound", Array.Empty<string>() }
     };
     public Dictionary<string, string> Reasons { get; set; } = DefaultReasons();
 
@@ -134,7 +143,8 @@ public sealed class ScoringSettings
             case "Downs": return "阵亡 {count} 次";
             case "FriendlyFire": return "友伤 {damage}，致倒 {deaths} 次";
             case "MeleeKills": return "近战击杀 {kills} 次，伤害 {damage}";
-            case "ScoutKills": return "Scout 击杀 {kills} 只";
+            case "ScoutKills": return "触手击杀 {kills} 只";
+            case "AllRound": return "综合评分全队第一，无单项领先";
             default: return string.Empty;
         }
     }
@@ -239,6 +249,7 @@ public sealed class ScoringSettings
         Bound(UtilityBonus, 1, ImpactScoring.MaxRoleBonus, "UtilityBonus");
         if (RescueFloor < 0 || RescueFloor > 100) throw new FormatException("RescueFloor must be between 0 and 100.");
         if (AccuracyConfidencePellets < 1 || AccuracyConfidencePellets > 100000) throw new FormatException("AccuracyConfidencePellets must be between 1 and 100000.");
+        Bound(FriendlyFireGrace, 0, ImpactScoring.MaxFriendlyFireGrace, "FriendlyFireGrace");
         if (EnabledMetrics != null && (EnabledMetrics.Any(name => name == null || !MetricNames.Contains(name)) || EnabledMetrics.Distinct().Count() != EnabledMetrics.Length))
             throw new FormatException("EnabledMetrics contains unknown or repeated names.");
         ValidateNames(SupportToolNames, "SupportToolNames");
@@ -460,7 +471,8 @@ public sealed class ScoringSettings
         text.Append("reasons=");
         foreach (string name in TitleNames)
             text.Append(name).Append('=').Append(Reasons != null && Reasons.TryGetValue(name, out string reason) ? reason : string.Empty).Append(';');
-        text.Append("floor=").Append(RescueFloor).Append('/').Append(AccuracyConfidencePellets);
+        text.Append("floor=").Append(RescueFloor).Append('/').Append(AccuracyConfidencePellets)
+            .Append(";grace=").Append(FriendlyFireGrace.ToString("R", CultureInfo.InvariantCulture));
         return text.ToString();
     }
 }

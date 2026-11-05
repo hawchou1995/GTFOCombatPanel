@@ -170,6 +170,7 @@ public sealed class Plugin : BasePlugin
         Scoring = loaded;
         ImpactScoring.RescueFloor = loaded.RescueFloor;
         ImpactScoring.AccuracyConfidence = loaded.AccuracyConfidencePellets;
+        ImpactScoring.SetFriendlyFireGrace(loaded.FriendlyFireGrace);
         ApplyKillWeights();
         if (created) Logger?.LogInfo($"[DIAG] scoring file created once from this release's defaults at {ScoringPath}; every weight, threshold and support rule can now be edited there without recompiling.");
         if (!string.IsNullOrEmpty(error)) Logger?.LogWarning("[DIAG] the scoring file was written but could not be reported cleanly: " + error);
@@ -199,6 +200,9 @@ public sealed class Plugin : BasePlugin
         // default stands, which is what a build carrying no file at all scores with.
         ImpactScoring.SetSleepingKillMultiplier(ImpactScoring.DefaultSleepingKillMultiplier);
         ImpactScoring.SetSleepingKillMultipliers(ImpactScoring.DefaultSleepingKillMultiplier, ImpactScoring.DefaultSleepingKillMultiplier);
+        // The friendly-fire grace has no .cfg entry either, so the fallback is the published default - the
+        // same rule the sleeping multipliers follow, and the same figure a build with no file scores with.
+        ImpactScoring.SetFriendlyFireGrace(ImpactScoring.DefaultFriendlyFireGrace);
     }
 
     // The settlement sentences in force: the scoring file's wording when it is usable, the shipped wording

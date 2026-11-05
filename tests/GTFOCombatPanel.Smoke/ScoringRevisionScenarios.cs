@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using HawChow.GTFOCombatPanel;
 
 // 1.18.0 scoring revision: the reweighted defaults, the sleeping-kill model, the two new cell figures and
@@ -246,15 +247,44 @@ internal static partial class Program
         var tieLeft = new ImpactInput { Name = "TieLeft", EnemyDamage = 40 };
         var tieRight = new ImpactInput { Name = "TieRight", EnemyDamage = 40 };
         var tieReport = ImpactScoring.Evaluate(new[] { tieLeft, tieRight }, ImpactScoring.DefaultWeights, 1.0, 1.0);
-        Check(tieReport.Entries.All(entry => entry.Rating == ImpactRating.TeamPillar && entry.RatingMetric == -1),
-            "a stable tie awards nothing: nobody leads the other");
+        Check(tieReport.Entries.All(entry => entry.Rank == 1 && entry.Rating == ImpactRating.AllRound && entry.RatingMetric == -1),
+            "a stable tie awards no single-row sentence: both first places wear the all-round one");
         Check(tieReport.Entries.All(entry => entry.Rating != ImpactRating.ZeroScore), "a tied positive score is still not a zero-score row");
         var zeroSquadRevision = ImpactScoring.Evaluate(new[]
         {
             new ImpactInput { Name = "Z1" }, new ImpactInput { Name = "Z2" }, new ImpactInput { Name = "Z3" }, new ImpactInput { Name = "Z4" }
         }, ImpactScoring.DefaultWeights, 1.0, 1.0);
-        Check(zeroSquadRevision.Entries.All(entry => entry.Rating == ImpactRating.TeamPillar), "zero data has no outstanding top and uses the repeatable neutral title");
+        Check(zeroSquadRevision.Entries.All(entry => entry.Rating == ImpactRating.TeamPillar), "zero data has no top to stand on, so it uses the repeatable neutral title");
         Check(zeroSquadRevision.Entries.Select(entry => entry.Rating).Distinct().Count() == 1, "and it is the only repeated sentence there");
+
+        // ---- the first place that leads no single row ------------------------------------------------
+        // A top built out of steady second places is a contribution of its own, and it must not read
+        // 平平无奇 beside a gold #1. Four players so exactly one of them is first: the damage lead goes to
+        // Heavy, the stagger lead to Stopper, Steady wins only by being second at both, and Light trails
+        // both rows to prove the sentence is not handed out below the top.
+        var steady = new ImpactInput { Name = "Steady", EnemyDamage = 100 };
+        steady.Counters.Stagger = 100;
+        var heavy = new ImpactInput { Name = "Heavy", EnemyDamage = 120 };
+        var stopper = new ImpactInput { Name = "Stopper" };
+        stopper.Counters.Stagger = 130;
+        var light = new ImpactInput { Name = "Light", EnemyDamage = 10 };
+        light.Counters.Stagger = 10;
+        var allRoundReport = ImpactScoring.Evaluate(new[] { steady, heavy, stopper, light }, ImpactScoring.DefaultWeights, 1.0, 1.0);
+        ImpactEntry steadyEntry = allRoundReport.Entries.First(entry => entry.Name == "Steady");
+        ImpactEntry lightEntry = allRoundReport.Entries.First(entry => entry.Name == "Light");
+        Check(steadyEntry.Rank == 1 && steadyEntry.Rating == ImpactRating.AllRound && steadyEntry.RatingMetric == -1,
+            "a first place that leads no single row wears the all-round sentence and names no metric");
+        Check(CombatStrings.Title(steadyEntry.Rating) == "全能中坚",
+            "the sentence for the top that leads no row is 全能中坚");
+        Check(ImpactBoard.ReasonText(steadyEntry, allRoundReport.Entries.Sum(entry => entry.Input.EnemyDamage)) == "综合评分全队第一，无单项领先",
+            "its explanation line says why it was earned without claiming a figure it never led");
+        Check(allRoundReport.Entries.First(entry => entry.Name == "Heavy").Rating == ImpactRating.Damage
+            && allRoundReport.Entries.First(entry => entry.Name == "Stopper").Rating == ImpactRating.Stagger,
+            "the rows the others really led are still their own sentences");
+        Check(lightEntry.Rank > 1 && lightEntry.Rating == ImpactRating.TeamPillar && lightEntry.RatingMetric == -1,
+            "a player below the top who leads nothing keeps 平平无奇");
+        Check(leadReport.Entries[0].Rating == ImpactRating.Damage && leadReport.Entries[0].Rating != ImpactRating.AllRound,
+            "a first place that does lead a row is never re-labelled as the all-round one");
 
         // ---- a penalty row is decided by the penalty, not by the points kept for avoiding it --------
         var clean = new ImpactInput { Name = "Clean", EnemyDamage = 300 };
@@ -287,6 +317,141 @@ internal static partial class Program
         var penaltyOnlyReport = ImpactScoring.Evaluate(new[] { penaltyOnly, penaltyMate }, ImpactScoring.DefaultWeights, 1.0, 1.0);
         Check(penaltyOnlyReport.Entries.First(entry => entry.Name == "PenaltyOnly").Rating == ImpactRating.FriendlyFire,
             "a zero-score player with a unique penalty top earns that penalty title rather than bypassing the top rule");
+
+        // ---- the friendly-fire grace: a grazed teammate is not the one shot in the back ----------------
+        // `FriendlyFireGrace` is an absolute damage figure applied to the row's own input, before the squad
+        // scale is taken, so a squad whose whole friendly fire fits inside it lands in the existing "nobody
+        // scored here" branch. The tests below set the value they need and restore the published one at the
+        // end, so none of them silently depends on tomorrow's default.
+        double publishedGrace = ImpactScoring.DefaultFriendlyFireGrace;
+        Check(publishedGrace == 10, "the published friendly-fire grace is ten points of damage");
+        ImpactScoring.SetFriendlyFireGrace(publishedGrace);
+        var grazed = new ImpactInput { Name = "Grazed", EnemyDamage = 300, FriendlyFireObserved = true, FriendlyFireDamage = publishedGrace };
+        var untouched = new ImpactInput { Name = "Untouched", EnemyDamage = 300 };
+        var grazedReport = ImpactScoring.Evaluate(new[] { grazed, untouched }, ImpactScoring.DefaultWeights, 1.0, 1.0);
+        ImpactEntry grazedEntry = grazedReport.Entries.First(entry => entry.Name == "Grazed");
+        ImpactEntry untouchedEntry = grazedReport.Entries.First(entry => entry.Name == "Untouched");
+        Check(grazedReport.Entries.All(entry => entry.Rating != ImpactRating.FriendlyFire),
+            "friendly fire inside the grace earns no 敌我不分 when nobody went down to it, even as the squad's only friendly fire");
+        Check(grazedReport.MaxRaw[(int)ImpactMetric.FriendlyFire] == 0
+            && grazedEntry.Normalized[(int)ImpactMetric.FriendlyFire] == 0
+            && untouchedEntry.Normalized[(int)ImpactMetric.FriendlyFire] == 0,
+            "a squad whose whole friendly fire fits inside the grace has no friendly-fire scale at all");
+        Check(Math.Abs(grazedEntry.Score - untouchedEntry.Score) < 1e-9,
+            "a grazed teammate is scored exactly like the teammate who took no friendly fire");
+        var burned = new ImpactInput { Name = "Burned", EnemyDamage = 60, FriendlyFireObserved = true, FriendlyFireDamage = publishedGrace + 40 };
+        var burnedMate = new ImpactInput { Name = "BurnedMate", EnemyDamage = 300 };
+        var burnedReport = ImpactScoring.Evaluate(new[] { burned, burnedMate }, ImpactScoring.DefaultWeights, 1.0, 1.0);
+        ImpactEntry burnedEntry = burnedReport.Entries.First(entry => entry.Name == "Burned");
+        Check(burnedEntry.Rating == ImpactRating.FriendlyFire && burnedEntry.RatingMetric == (int)ImpactMetric.FriendlyFire,
+            "friendly fire above the grace still earns 敌我不分, exactly as it always did");
+        Check(burnedEntry.Normalized[(int)ImpactMetric.FriendlyFire] == 0
+            && burnedReport.Entries.First(entry => entry.Name == "BurnedMate").Normalized[(int)ImpactMetric.FriendlyFire] == 1,
+            "above the grace the row still inverts the squad-relative severity, so the worst player keeps the full penalty");
+        var allWithinGrace = ImpactScoring.Evaluate(new[]
+        {
+            new ImpactInput { Name = "W1", EnemyDamage = 40, FriendlyFireObserved = true, FriendlyFireDamage = 4 },
+            new ImpactInput { Name = "W2", EnemyDamage = 40, FriendlyFireObserved = true, FriendlyFireDamage = publishedGrace },
+            new ImpactInput { Name = "W3", EnemyDamage = 40 }
+        }, ImpactScoring.DefaultWeights, 1.0, 1.0);
+        Check(allWithinGrace.Entries.All(entry => entry.Rating != ImpactRating.FriendlyFire) && allWithinGrace.MaxRaw[(int)ImpactMetric.FriendlyFire] == 0,
+            "a squad whose friendly fire all fits inside the grace and took no friendly-fire downs has nobody called 敌我不分 and no fabricated scale");
+        // The contract is that a graze costs nothing at all, so it has to hold on the finished score and not
+        // only on the row's normalised value: W2 carries the full grace and W3 carries none, and the two must
+        // end on the identical total (the whole squad shares one damage figure, so nothing else can differ).
+        ImpactEntry graceW2 = allWithinGrace.Entries.First(entry => entry.Name == "W2");
+        ImpactEntry graceW3 = allWithinGrace.Entries.First(entry => entry.Name == "W3");
+        Check(Math.Abs(graceW2.Score - graceW3.Score) < 1e-9
+            && allWithinGrace.Entries.Select(entry => entry.Score).Distinct().Count() == 1,
+            "a grazed teammate finishes on exactly the same score as the teammate who took no friendly fire");
+        // The grace is a damage figure and nothing else. A player who did down a teammate stays in the row:
+        // their damage is zeroed, the down count is not, so they keep a severity of their own and can still
+        // wear 敌我不分. This is the behaviour the README's wording now describes, so it is pinned here.
+        var grazedButDowned = new ImpactInput { Name = "GrazedButDowned", EnemyDamage = 60, FriendlyFireObserved = true, FriendlyFireDamage = 8 };
+        grazedButDowned.Counters.FriendlyFireDeaths = 1;
+        var downsReport = ImpactScoring.Evaluate(new[] { grazedButDowned, new ImpactInput { Name = "DownsMate", EnemyDamage = 300 } },
+            ImpactScoring.DefaultWeights, 1.0, 1.0);
+        ImpactEntry grazedButDownedEntry = downsReport.Entries.First(entry => entry.Name == "GrazedButDowned");
+        Check(grazedButDownedEntry.Rating == ImpactRating.FriendlyFire && grazedButDownedEntry.RatingMetric == (int)ImpactMetric.FriendlyFire,
+            "downs sit outside the grace: a player inside the damage grace who still downed a teammate earns 敌我不分");
+        Check(downsReport.MaxRaw[(int)ImpactMetric.FriendlyFire] == 1
+            && grazedButDownedEntry.Normalized[(int)ImpactMetric.FriendlyFire] == 0,
+            "that severity is the down share alone: the grace dropped the damage component and nothing else");
+        // The documented consequence of that split: a big hit with no downs and a grazed hit with one down
+        // can land on the same severity, and 敌我不分 only ever goes to a unique worst.
+        var hitHard = new ImpactInput { Name = "HitHard", EnemyDamage = 60, FriendlyFireObserved = true, FriendlyFireDamage = 40 };
+        var hitGrazed = new ImpactInput { Name = "HitGrazed", EnemyDamage = 200, FriendlyFireObserved = true, FriendlyFireDamage = 8 };
+        hitGrazed.Counters.FriendlyFireDeaths = 1;
+        var severityTie = ImpactScoring.Evaluate(new[] { hitHard, hitGrazed }, ImpactScoring.DefaultWeights, 1.0, 1.0);
+        double hitHardSeverity = severityTie.Entries.First(entry => entry.Name == "HitHard").Raw[(int)ImpactMetric.FriendlyFire];
+        double hitGrazedSeverity = severityTie.Entries.First(entry => entry.Name == "HitGrazed").Raw[(int)ImpactMetric.FriendlyFire];
+        Check(Math.Abs(hitHardSeverity - 0.5) < 1e-9 && Math.Abs(hitGrazedSeverity - 0.5) < 1e-9
+            && severityTie.CountAtMax[(int)ImpactMetric.FriendlyFire] == 2,
+            "a 40-damage hit with no downs and an 8-damage hit with one down share one severity, so the row has no unique worst");
+        Check(severityTie.Entries.All(entry => entry.Rating != ImpactRating.FriendlyFire),
+            "that tie means nobody wears 敌我不分 - the existing unique-worst rule, not a sentence that went missing");
+        // A squad with the grace switched off is the old behaviour: one point of friendly fire costs the row.
+        ImpactScoring.SetFriendlyFireGrace(0);
+        var strictReport = ImpactScoring.Evaluate(new[]
+        {
+            new ImpactInput { Name = "Strict", EnemyDamage = 100, FriendlyFireObserved = true, FriendlyFireDamage = 1 },
+            new ImpactInput { Name = "Clean", EnemyDamage = 100 }
+        }, ImpactScoring.DefaultWeights, 1.0, 1.0);
+        Check(strictReport.Entries.First(entry => entry.Name == "Strict").Score
+            < strictReport.Entries.First(entry => entry.Name == "Clean").Score,
+            "with the grace at zero a single point of friendly fire costs the row again");
+        ImpactScoring.SetFriendlyFireGrace(9999);
+        bool graceClamped = ImpactScoring.FriendlyFireGrace == ImpactScoring.MaxFriendlyFireGrace;
+        ImpactScoring.SetFriendlyFireGrace(double.NaN);
+        bool graceNanFallback = ImpactScoring.FriendlyFireGrace == publishedGrace;
+        ImpactScoring.SetFriendlyFireGrace(-5);
+        bool graceNegativeFallback = ImpactScoring.FriendlyFireGrace == publishedGrace;
+        Check(graceClamped && graceNanFallback && graceNegativeFallback,
+            "the grace is clamped to its ceiling and falls back to the published default when unreadable or negative");
+        Check(ImpactScoring.IsDisplayedZero(0.0499) && ImpactScoring.ScoreText(0.0499) == "0.0" && !ImpactScoring.IsDisplayedZero(0.06),
+            "the first-place guard reads the same one-decimal score the board prints, so a row showing 0.0 can never wear it");
+        // That only pins the definition of `IsDisplayedZero`. The rule that decides who may wear 全能中坚
+        // could be reverted to `row.Score > 0` and every behavioural assertion here would still pass,
+        // because no reachable squad produces a top score that both differs from 0 and rounds down to it.
+        // So the wiring is checked on the source text - the same kind of static check the 1.19.16/1.19.17
+        // suites already use - and it fails the moment that line is reverted.
+        string scoringSourceRoot = SourceRoot();
+        Check(scoringSourceRoot != null && File.Exists(Path.Combine(scoringSourceRoot, "ImpactMetrics.cs")),
+            "the scoring model's source is reachable from the test run, so the wiring checks below mean something");
+        string scoringSource = scoringSourceRoot == null ? string.Empty : File.ReadAllText(Path.Combine(scoringSourceRoot, "ImpactMetrics.cs"));
+        Check(Regex.IsMatch(scoringSource, @"bool\s+standsOnFirstPlace\s*=\s*row\.Rank\s*==\s*1\s*&&\s*!\s*IsDisplayedZero\(\s*row\.Score\s*\)\s*;"),
+            "the all-round guard is wired to the displayed score, not to the raw figure");
+        Check(!Regex.IsMatch(scoringSource, @"standsOnFirstPlace\s*=[^;]*row\.Score\s*>\s*0"),
+            "and no `row.Score > 0` form of that guard survives in the scoring model");
+        ImpactScoring.SetFriendlyFireGrace(publishedGrace + 100);
+        var generousGrace = ImpactScoring.Evaluate(new[] { burned, burnedMate }, ImpactScoring.DefaultWeights, 1.0, 1.0);
+        Check(generousGrace.Entries.All(entry => entry.Rating != ImpactRating.FriendlyFire),
+            "raising the grace moves the same hit inside it, so the sentence disappears - the threshold is live");
+        ImpactScoring.SetFriendlyFireGrace(publishedGrace);
+        Check(ScoringSettings.Parse("{\"FriendlyFireGrace\":40}").FriendlyFireGrace == 40
+            && ScoringSettings.Parse("{}").FriendlyFireGrace == publishedGrace
+            && ScoringSettings.Defaults().ToJson().Contains("\"FriendlyFireGrace\"")
+            && ScoringSettings.Parse(ScoringSettings.Defaults().ToJson()).FriendlyFireGrace == publishedGrace,
+            "the grace is carried by the scoring file and falls back to the published default when absent");
+        bool impossibleGrace = false;
+        try { ScoringSettings.Parse("{\"FriendlyFireGrace\":-1}"); } catch (FormatException) { impossibleGrace = true; }
+        Check(impossibleGrace, "an impossible grace is refused like every other out-of-range scoring value");
+        string gracePath = Path.Combine(Path.GetTempPath(), "combatpanel-grace-" + Guid.NewGuid().ToString("N") + ".json");
+        ScoringFiles.Write(gracePath, ScoringSettings.Parse("{\"FriendlyFireGrace\":25}"));
+        ScoringSettings graceFromDisk = ScoringFiles.Load(gracePath, out bool graceCreated, out string graceError);
+        Check(!graceCreated && graceError == null && graceFromDisk != null && graceFromDisk.FriendlyFireGrace == 25,
+            "a grace edited on disk is exactly what the production loader hands the runtime");
+        File.Delete(gracePath);
+
+        // ---- the down sentence's display name -------------------------------------------------------
+        Check(CombatStrings.Title(ImpactRating.Downs) == "仰卧起坐" && CombatStrings.DefaultTitle(ImpactRating.Downs) == "仰卧起坐"
+            && ScoringSettings.Defaults().Titles["Downs"].Title == "仰卧起坐",
+            "the down sentence reads 仰卧起坐 in Chinese everywhere it is shipped");
+        string previousDownLanguage = CombatStrings.Language;
+        CombatStrings.Language = "en";
+        Check(CombatStrings.Title(ImpactRating.Downs) == "Frequent faller",
+            "renaming the Chinese sentence leaves the English one alone");
+        CombatStrings.Language = previousDownLanguage;
 
         // ---- every kill class is its own sentence, and the three shares add back up ------------------
         var minorKing = new ImpactInput { Name = "MinorKing", Counters = new ImpactCounters { MinorKills = 4, SleepingMinorKills = 2 } };
@@ -337,7 +502,7 @@ internal static partial class Program
             fullSquad.Add(member);
         }
         var fullReport = ImpactScoring.Evaluate(fullSquad, ImpactScoring.DefaultWeights, 1.0, 1.0);
-        var earnedSentences = fullReport.Entries.Where(entry => entry.Rating != ImpactRating.TeamPillar && entry.Rating != ImpactRating.ZeroScore)
+        var earnedSentences = fullReport.Entries.Where(entry => entry.Rating != ImpactRating.TeamPillar && entry.Rating != ImpactRating.AllRound && entry.Rating != ImpactRating.ZeroScore)
             .Select(entry => entry.Rating).ToArray();
         Check(earnedSentences.Length == earnedSentences.Distinct().Count(),
             "an earned sentence is never worn by two players at once");
@@ -435,4 +600,13 @@ internal static partial class Program
         => "{\"Weights\":{\"TotalDamage\":0.95,\"Stagger\":1.4,\"Kills\":0.7,\"Revives\":0.28,\"WeakspotRate\":0.44,"
          + "\"Accuracy\":0.28,\"SupplyEfficiency\":0.78,\"ToolEfficiency\":0.8,\"LoneSurvivor\":0.47,\"Downs\":0.55,"
          + "\"FriendlyFire\":0.75,\"MeleeKills\":0.55,\"ScoutKills\":0.6}}";
+
+    // The plugin's own source directory, found the same way the 1.19.16/1.19.17 suites find it: walk up
+    // from the test binary until the project file is in sight, so no absolute path is ever written down.
+    private static string SourceRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory != null && !File.Exists(Path.Combine(directory.FullName, "GTFOCombatPanel.csproj"))) directory = directory.Parent;
+        return directory != null ? directory.FullName : null;
+    }
 }

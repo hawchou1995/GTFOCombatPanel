@@ -49,7 +49,10 @@ public enum ImpactRating
     MeleeKills,
     ScoutKills,
     ZeroScore,
-    Unavailable
+    Unavailable,
+    // Appended last on purpose: the settlement board, the scoring file and the archive all key off this
+    // order, so a member inserted in the middle would quietly renumber everything after it.
+    AllRound
 }
 
 public static class KillClassifier
@@ -563,6 +566,29 @@ public static class ImpactScoring
             ? Math.Min(multiplier, MaxSleepingKillMultiplier)
             : DefaultSleepingKillMultiplier;
 
+    // Friendly fire below this many points of damage is not friendly fire at all: it is the stray pellet of
+    // a shotgun fight in a corridor, not the teammate shot in the back. The figure is absolute, and it is
+    // applied where the number enters scoring - before the squad scale is taken and before any
+    // normalisation - so a squad whose whole friendly fire fits inside it simply lands in the existing
+    // "nobody scored here" branch, with no special case anywhere. Damage above it scores exactly as it
+    // always did. Carried by the scoring file; an unreadable value falls back to the published default.
+    public const double DefaultFriendlyFireGrace = 10;
+    public const double MaxFriendlyFireGrace = 1000;
+    public static double FriendlyFireGrace { get; set; } = DefaultFriendlyFireGrace;
+    public static void SetFriendlyFireGrace(double grace)
+        => FriendlyFireGrace = double.IsFinite(grace) && grace >= 0
+            ? Math.Min(grace, MaxFriendlyFireGrace)
+            : DefaultFriendlyFireGrace;
+
+    // The friendly-fire damage that counts for scoring: anything at or below the grace is none at all.
+    // The board still prints the real figure it measured; this is the one the score is computed from.
+    public static double CountedFriendlyFireDamage(ImpactInput player)
+    {
+        if (player == null || !player.FriendlyFireObserved) return 0;
+        double damage = Safe(player.FriendlyFireDamage, 0);
+        return damage > FriendlyFireGrace ? damage : 0;
+    }
+
     // The weighted kill count the kill row scores with, in tier order. A class is worth its own weight times
     // its total and nothing else: the sleeping part of a count was worth the multiplier in an earlier release,
     // and that is exactly the behaviour this one removed - a stealth-heavy squad must not be able to inflate
@@ -608,6 +634,7 @@ public static class ImpactScoring
         SetKillWeights(DefaultMinorKillWeight, DefaultEliteKillWeight, DefaultBossKillWeight);
         SetSleepingKillMultiplier(DefaultSleepingKillMultiplier);
         SetSleepingKillMultipliers(DefaultSleepingKillMultiplier, DefaultSleepingKillMultiplier);
+        SetFriendlyFireGrace(DefaultFriendlyFireGrace);
     }
 
     // Every published default migrates; any hand-edited list remains intact. The thirteen-metric list of
@@ -731,7 +758,9 @@ public static class ImpactScoring
         }
     }
 
-    // Damage and lethal incidents use separate squad-relative scales, then contribute equally.
+    // Damage and lethal incidents use separate squad-relative scales, then contribute equally. A damage
+    // figure inside `FriendlyFireGrace` counts as no damage at all, so a grazed teammate can only ever be
+    // sentenced by the down count - the grace is applied to the figure, never to the down count.
     public static double FriendlyFireSeverity(ImpactInput player, double maxDamage, long maxDeaths)
     {
         if (player == null) return 0;
@@ -739,7 +768,7 @@ public static class ImpactScoring
         int components = 0;
         if (double.IsFinite(maxDamage) && maxDamage > 0)
         {
-            double damage = player.FriendlyFireObserved ? Safe(player.FriendlyFireDamage, 0) : 0;
+            double damage = CountedFriendlyFireDamage(player);
             sum += Clamp01(damage / maxDamage);
             components++;
         }
@@ -785,7 +814,9 @@ public static class ImpactScoring
         {
             ImpactInput input = squad[player];
             if (input == null) continue;
-            if (input.FriendlyFireObserved) maxFriendlyFireDamage = Math.Max(maxFriendlyFireDamage, Safe(input.FriendlyFireDamage, 0));
+            // The grace is taken here, at the widest end of the row: the squad scale itself is built from
+            // figures that already ignore a grazed teammate, so nothing downstream has to know about it.
+            maxFriendlyFireDamage = Math.Max(maxFriendlyFireDamage, CountedFriendlyFireDamage(input));
             maxFriendlyFireDeaths = Math.Max(maxFriendlyFireDeaths, input.Counters == null ? 0 : input.Counters.FriendlyFireDeaths);
         }
         var raw = new double[players][];
@@ -871,7 +902,10 @@ public static class ImpactScoring
     // registered is not evidence - and a penalty row is judged by the severity of the penalty the
     // player carried, never by the points they kept for avoiding it. A sentence somebody above them
     // already wears is passed over for their own next best; a player who leads nothing at all reads
-    // 平平无奇 instead of borrowing a sentence they never earned.
+    // 平平无奇 instead of borrowing a sentence they never earned - unless they are first on the composite
+    // score, which is a contribution in its own right and wears 全能中坚: every figure of theirs is
+    // somebody else's second best, and calling that 平平无奇 beside a gold #1 is the contradiction this
+    // sentence exists to answer. A first place that does lead a row keeps that row's sentence.
     public static string ScoreText(double score) => score.ToString("0.0", CultureInfo.InvariantCulture);
     public static bool IsDisplayedZero(double score) => double.IsFinite(score) && score >= 0 && ScoreText(score) == "0.0";
 
@@ -895,6 +929,15 @@ public static class ImpactScoring
             ratings[index] = ImpactRating.TeamPillar;
             metrics[index] = -1;
             if (!row.ScoreAvailable) continue;
+            // The first place is a contribution of its own even when no single row was led: a top built out
+            // of steady second places would otherwise read 平平无奇 right beside a gold #1. It is granted
+            // only when the walk below found nothing at all, so a first place that does lead a row keeps
+            // that row's sentence, and it is never taken from `used` - like the neutral sentence it is a
+            // fallback and may repeat. The rank is the same field the board prints as `#N`, so a tie for
+            // first hands it to everyone the board ties there. The test is the displayed score, not the raw
+            // one: a row the board prints as `0.0` has no first place to stand on however the raw figure
+            // rounds, and those rows keep the neutral sentence (a squad where nobody scored is all of them).
+            bool standsOnFirstPlace = row.Rank == 1 && !IsDisplayedZero(row.Score);
             foreach (TitleCandidate candidate in TitleCandidates(report, row, index))
             {
                 // The higher placed player already wears it: pass to this player's next best lead.
@@ -903,6 +946,7 @@ public static class ImpactScoring
                 metrics[index] = candidate.Metric;
                 break;
             }
+            if (metrics[index] < 0 && standsOnFirstPlace) ratings[index] = ImpactRating.AllRound;
         }
         for (int index = 0; index < players; index++)
         {
