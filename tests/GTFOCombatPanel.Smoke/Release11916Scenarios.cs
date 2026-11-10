@@ -63,6 +63,8 @@ internal static class Release11916Scenarios
         APageThatLeavesNoBandIsRefusedWithItsNumbers(check);
         TheClientPageIsUnchangedAndNeverNeedsTheBand(check);
         TheClearanceLineIsNamedForWhatItMeasured(check);
+        TheRoomIsTheBoundAndTheCliffIsGone(check);
+        TheKillTierRowsAreOnlySpentWhenTheyBuyAGlyph(check);
         Wiring(check);
     }
 
@@ -276,6 +278,119 @@ internal static class Release11916Scenarios
     // when that button was really read: `SuccessRegion` marks the reading `Measured` for the drawn band as well, so
     // "measured" alone cannot license the button's name. These run the production helper itself rather than reading its
     // source - the band case is the one a real host run printed (real button 683, band 743).
+    // ------------------------------------------------------- the room is the bound, and the cliff is gone
+    //
+    // The host run this release came from, in the numbers the log printed: the success page measured a strip of 269 px
+    // on one frame and 286 px on another, and the two frames ended in opposite answers - 269 px drew no board at all
+    // (`success board deferred: need=270px ... have=240px`) while 286 px drew a 6 px table. Nothing about the page
+    // changed between them except seventeen pixels, and the figure that decided it was a *readable* preference
+    // (30 rows x 6 px x 1.5 em = 270 px) rather than the room the table can really be drawn in.
+    //
+    // `DrawableBoardHeight` answers the second question. These assertions pin its answers: the readable floor is
+    // returned untouched when the room can hold it, the shortest drawable grid is returned when it cannot, and an
+    // unmeasured room falls back to the readable floor so a page whose geometry could not be read behaves exactly as
+    // it did before this existed.
+    // ------------------------------------------------------- B: the kill-tier rows are a trade, not a default
+    //
+    // The split board is three kill rows rather than one, and those two extra rows only mean anything if they buy a
+    // bigger glyph: `glyph = floor(room / rows / emPerGlyph)`. On a page with room to spare they buy nothing worth
+    // having, so the board must not shed them. On a genuinely cramped page they can be worth a whole pixel of readable
+    // text, and that is the only case in which this build collapses them.
+    private static void TheKillTierRowsAreOnlySpentWhenTheyBuyAGlyph(Action<bool, string> check)
+    {
+        float emPerGlyph = ResultsBandFit.EmPerGlyphPixel(PanelDensity.Compact, 1.5f);
+        check(Math.Abs(emPerGlyph - 1.5f) < 0.01f,
+            $"one glyph pixel costs 1.5 row pixels at compact density: emPerGlyph={emPerGlyph:0.##}");
+        check(ImpactBoard.RowCount(true) == 30 && ImpactBoard.RowCount(false) == 28,
+            $"the split board is 30 rows and the collapsed one 28: {ImpactBoard.RowCount(true)}/{ImpactBoard.RowCount(false)}");
+
+        // Every page that has room for a readable table keeps all 30 rows - the behaviour this build inherits.
+        foreach (float room in new[] { 270f, 286f, 400f, 588f, 800f, 1080f })
+            check(ImpactBoard.SplitKillTiersFor(room, emPerGlyph),
+                $"a {room:0}px page has room to spare and keeps its three kill tiers");
+
+        // A page too short for either board keeps them too: the rule only spends them when they buy something.
+        foreach (float room in new[] { 100f, 135f, 150f, 180f, 200f })
+            check(ImpactBoard.SplitKillTiersFor(room, emPerGlyph),
+                $"a {room:0}px page gains nothing from two fewer rows and keeps its three kill tiers");
+
+        // The cramped band the log printed: 269 px gives a 5 px glyph at 30 rows and a 6 px one at 28, so the rows are
+        // spent - that is the page this rule is for.
+        check(!ImpactBoard.SplitKillTiersFor(269f, emPerGlyph),
+            "a 269px page buys a 5px -> 6px glyph with the two rows, so the collapsed board is chosen");
+
+        // An unmeasured room is not a licence to change the board's content.
+        check(ImpactBoard.SplitKillTiersFor(float.NaN, emPerGlyph)
+              && ImpactBoard.SplitKillTiersFor(0f, emPerGlyph)
+              && ImpactBoard.SplitKillTiersFor(-10f, emPerGlyph),
+            "an unmeasured, zero or negative room keeps the richer board");
+        check(ImpactBoard.SplitKillTiersFor(269f, float.NaN) && ImpactBoard.SplitKillTiersFor(269f, 0f),
+            "an unmeasured glyph cost keeps the richer board");
+
+        // The two boards hold the same fields; only the kill tiers are merged.
+        check(ImpactBoard.MetricRowCount(true) - ImpactBoard.MetricRowCount(false) == 2,
+            "collapsing the tiers costs exactly two metric rows");
+    }
+
+    private static void TheRoomIsTheBoundAndTheCliffIsGone(Action<bool, string> check)
+    {
+        float readable = ResultsFontGrowth.MinimumBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact);
+        check(Math.Abs(readable - BoardFloorFromLog) < 0.01f,
+            $"the readable floor is still the {BoardFloorFromLog:0}px it always was: floor={readable:0.##}");
+
+        // The shortest grid this build can draw: 30 rows at the 3 px absolute minimum, 1.5 em per row = 135 px.
+        float shortest = ResultsBandFit.MinimumDrawableHeight(RowsFromLog, PanelDensity.Compact);
+        check(Math.Abs(shortest - 135f) < 0.01f,
+            $"the shortest grid this build can draw for {RowsFromLog} rows is 135px: shortest={shortest:0.##}");
+
+        // The two strips the log printed, and the answer each of them now gets.
+        float tight = ResultsFontGrowth.DrawableBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact, 269f);
+        float roomy = ResultsFontGrowth.DrawableBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact, 286f);
+        check(Math.Abs(tight - shortest) < 0.01f,
+            $"a 286px strip is judged by the same room rule, so the two frames no longer disagree: floor={roomy:0.##}");
+        check(tight <= 269f + 0.5f && roomy <= 286f + 0.5f,
+            $"neither floor is taller than the strip that produced it: tight={tight:0.##} of 269, roomy={roomy:0.##} of 286");
+
+        check(Math.Abs(roomy - readable) < 0.01f,
+            $"a 286px strip can hold the readable table, so it keeps the 270px floor: floor={roomy:0.##}");
+        // The two answers now differ by the real reason - 286 px can hold a readable table and 269 px cannot - instead
+        // of by seventeen pixels straddling a preference. Both are placements; neither is a blank page.
+        check(tight < roomy,
+            $"the two frames no longer straddle a cliff: 269px asks for {tight:0.##}px and 286px asks for {roomy:0.##}px");
+        check(tight <= 269f + 0.5f && roomy <= 286f + 0.5f,
+            $"neither floor is taller than the strip that produced it: tight={tight:0.##} of 269, roomy={roomy:0.##} of 286");
+
+        // The property the bug was about: a 269 px strip is no longer refused. The board that fits it is the shortest
+        // grid, and the production placement accepts it in the strip the page measured.
+        var strip = new BoardStrip(999f, 1268f, false, float.NaN, float.NaN, true, ResultFooterSource.ScreenSafeArea);
+        check(Math.Abs((strip.Bottom - strip.Top) - 269f) < 0.01f,
+            $"the strip is the 269px one the log printed: ({strip.Top:0}..{strip.Bottom:0})");
+        check(ResultBoardHold.TryPlace(ScreenWidth, ScreenHeight, strip, 529f, shortest, 0f, out _),
+            "the 269px strip that drew nothing now holds the shortest grid the board can be built at");
+
+        // A room that can hold the readable table keeps it: the fix lowers the judgement figure, never the target.
+        float large = ResultsFontGrowth.DrawableBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact, 588f);
+        check(Math.Abs(large - readable) < 0.01f,
+            $"a 588px strip is still judged against the 270px readable floor: floor={large:0.##}");
+
+        // No measurement is not a licence to lower the bar.
+        check(Math.Abs(ResultsFontGrowth.DrawableBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact, float.NaN) - readable) < 0.01f
+              && Math.Abs(ResultsFontGrowth.DrawableBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact, 0f) - readable) < 0.01f
+              && Math.Abs(ResultsFontGrowth.DrawableBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact, -40f) - readable) < 0.01f,
+            "an unmeasured, zero or negative room keeps the readable floor, so an unreadable page behaves as it did before");
+
+        // A band shorter than the shortest grid is still refused - by the real figure, not by a preference.
+        check(Math.Abs(ResultsFontGrowth.DrawableBoardHeight(RowsFromLog, 1.5f, PanelDensity.Compact, 100f) - shortest) < 0.01f,
+            "a 100px strip is judged against the shortest grid, so a refusal is about the room and not about a glyph preference");
+        var cramped = new BoardStrip(400f, 500f, false, float.NaN, float.NaN, true, ResultFooterSource.ScreenSafeArea);
+        check(!ResultBoardHold.TryPlace(ScreenWidth, ScreenHeight, cramped, 529f, shortest, 0f, out _),
+            "a 100px strip still cannot hold a 135px grid: the floor was lowered to the room, not removed");
+    }
+
+    // The figure the per-repaint refusal prints is the figure the page was placed against, and it is a *button* only
+    // when that button was really read: `SuccessRegion` marks the reading `Measured` for the drawn band as well, so
+    // "measured" alone cannot license the button's name. These run the production helper itself rather than reading its
+    // source - the band case is the one a real host run printed (real button 683, band 743).
     private static void TheClearanceLineIsNamedForWhatItMeasured(Action<bool, string> check)
     {
         // The band of a page whose own button could not be read by name: measured, and still not a button.
@@ -290,6 +405,7 @@ internal static class Release11916Scenarios
         check(ResultFooterProvenance.Of(drawn) == ResultFooterSource.InteractiveBand
               && ResultFooterProvenance.LobbyWall(drawn) == "lobbyEdgeValue=743,source=band",
             $"a band reading is recorded as a band and printed as one: {ResultFooterProvenance.LobbyWall(drawn)}");
+
 
         // ...and the button itself, read while the player can press it and read from its own layout while the page is
         // still revealing it. Both are that control's own upper edge, so both are named as it - with the real figure.
@@ -344,8 +460,34 @@ internal static class Release11916Scenarios
         // The scan measures the band, the page decides to use it, and the placement records it.
         check(CountOf(results, "ResultBoardBands.TryBelowActions(") == 1,
             $"the band is measured exactly once, in the scan that holds the rectangles: calls={CountOf(results, "ResultBoardBands.TryBelowActions(")}");
-        check(results.Contains("ResultPageRolePolicy.UsesBandBelowActions(Role(), anchoredHeight, _boardFloor, controls.BelowActions.Height)"),
+        // 1.19.20: the host branch asks the policy with the floor resolved *from the strip this page measured*
+        // (`stripFloor`), because judging a 269 px strip against the 270 px readable floor is the cliff that drew no
+        // board next to a 286 px strip that drew a 6 px one. The figure passed in must be the room-resolved one, and it
+        // must still come from a policy call rather than being written as a number.
+        check(results.Contains("ResultPageRolePolicy.UsesBandBelowActions(Role(), anchoredHeight, bandQuestion, controls.BelowActions.Height)"),
             "the success page's host branch asks the role policy before it moves the board into the band");
+        check(results.Contains("float stripFloor = area.Fits")
+              && results.Contains("ResultsFontGrowth.DrawableBoardHeight(stripRows, stripRowEm, Plugin.Density, anchoredHeight)"),
+            "the figure the band policy is asked with is resolved from the strip the page measured, not from the readable floor");
+        // C: the escape hatch has to be answerable. The band under the page's actions on the run this came from measured
+        // 85-88 px, and the question asked of it used to be the 270 px readable floor - a comparison no page could ever
+        // win, which is why the branch never fired there. It is asked with the room figure now.
+        // The policy fires exactly when the strip cannot hold the board *and* the band under the page's actions can:
+        // 100 px of strip against a 135 px drawable grid, with a 200 px band beneath the controls, is that case.
+        check(ResultPageRolePolicy.UsesBandBelowActions(ResultPageRole.Host, 100f, 135f, 200f),
+            "a 100 px strip that cannot hold the board steps into a 200 px band when 135 px is the drawable floor");
+        // A strip that already holds the board needs no escape hatch: the board simply stands in it.
+        check(!ResultPageRolePolicy.UsesBandBelowActions(ResultPageRole.Host, 269f, 135f, 200f),
+            "a 269 px strip that already holds the board is used as it is, without stepping around the page's actions");
+        // The run this came from measured an 85-88 px band against a 135 px drawable grid, so on that page the answer
+        // stays no - honestly. What C fixes is that the question is answerable at all: the old form compared 88 px
+        // against the 270 px readable floor, which no band on that page could ever clear.
+        check(!ResultPageRolePolicy.UsesBandBelowActions(ResultPageRole.Host, 100f, 135f, 88f),
+            "an 88 px band is refused against a 135 px drawable grid instead of against a 270 px preference");
+        check(!ResultPageRolePolicy.UsesBandBelowActions(ResultPageRole.Host, 100f, 135f, 134f),
+            "a band still shorter than the drawable floor is not offered: the floor was lowered to the room, not removed");
+        check(!ResultPageRolePolicy.UsesBandBelowActions(ResultPageRole.Client, 100f, 135f, 1000f),
+            "a client page never uses the host's band escape hatch, whatever band it has");
         check(results.Contains("footerSource = ResultFooterSource.BelowActions;"),
             "the band placement records its own footer source");
         check(GuardedFromGuestBranch(results, "ResultPageRolePolicy.UsesBandBelowActions(Role(), anchoredHeight"),

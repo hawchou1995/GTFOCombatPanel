@@ -72,6 +72,47 @@ public static class ImpactBoard
 
     public static int RowCount(bool splitKillTiers) { return FixedRows + SeparatorRows + MetricRowCount(splitKillTiers); }
 
+    // Whether the settlement board may spend three rows on the kill tiers in the room this page offers.
+    //
+    // The split board is the richer one and stays the default: three kill rows (minor/elite/boss) rather than one.
+    // It costs two extra rows, and the whole point of the row count is the glyph size those rows buy back:
+    //
+    //   glyph = floor(room / rows / em-per-glyph)
+    //
+    // so two rows of thirty are 6.7% of the vertical budget. Collapsing them only helps when it moves the glyph size
+    // to the next whole pixel; when it does not, it has taken three rows of detail off the page and paid nothing for
+    // them. That is the rule here, and it is decided against the *shortest grid this build can draw* - the same
+    // `ResultsBandFit.MinimumDrawableHeight` the fit itself works down to - not against the readable floor, because a
+    // readable floor is what a short page can never reach and a comparison against it would collapse the board on
+    // every such page.
+    public static bool SplitKillTiersFor(float room, float emPerGlyph)
+    {
+        if (!float.IsFinite(room) || room <= 0f) return true;
+        if (!float.IsFinite(emPerGlyph) || emPerGlyph <= 0f) return true;
+        int splitRows = RowCount(true), collapsedRows = RowCount(false);
+        int splitGlyph = GlyphFor(room, splitRows, emPerGlyph);
+        int collapsedGlyph = GlyphFor(room, collapsedRows, emPerGlyph);
+        // The board only gives up its kill-tier rows when the page is genuinely cramped *and* the rows buy a bigger
+        // glyph. "Genuinely cramped" is the split board's own readable size not fitting the room: on a page with room
+        // to spare the figures are already comfortable, and shaving two rows to gain one pixel of a table nobody is
+        // struggling to read would be this build spending the player's data for no reason. The threshold is the
+        // readable glyph (`MinimumReadablePixels`), so every page that was fine before this existed keeps all 30 rows.
+        if (GlyphFor(room, splitRows, emPerGlyph) >= ResultsFontGrowth.MinimumReadablePixels) return true;
+        return collapsedGlyph <= splitGlyph;
+    }
+
+    // The glyph size a room produces for a row count, by the same arithmetic `ResultsBandFit.FontForBand` uses:
+    // `floor(room / rows / emPerGlyph)`. It is zero for a room that is not a room, which keeps every caller's
+    // comparison against it honest rather than running on a NaN.
+    private static int GlyphFor(float room, int rows, float emPerGlyph)
+    {
+        if (rows < 1 || !float.IsFinite(room) || room <= 0f) return 0;
+        if (!float.IsFinite(emPerGlyph) || emPerGlyph <= 0f) return 0;
+        float budget = room / rows;
+        if (!(budget > 0f)) return 0;
+        return (int)Math.Floor(budget / emPerGlyph);
+    }
+
     // Rank is conveyed only by colour; no medal word is appended to a score.
     public static ImpactTone RankTone(int rank)
     {

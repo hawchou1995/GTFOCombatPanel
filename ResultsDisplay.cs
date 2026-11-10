@@ -288,10 +288,19 @@ internal static class ResultsDisplay
     private static BoardStrip _holdStrip;
     private static readonly ResultAnchorDrift Drift = new ResultAnchorDrift();
     private static readonly CompletionReadiness Readiness = new CompletionReadiness();
-    // The height below which no strip can hold this page's board, whatever glyph size is tried: the settlement board's
-    // own row count at the smallest readable glyph the table may be drawn at. It is what tells a strip that is merely
-    // tight from one that can never hold the board, and it is page independent, so the page can be judged against it
-    // before a single size has been searched for. Set for every page visit in `Prepare` and dropped with the page.
+    // The height the table wants, and the height the page is judged against. Kept apart on purpose, because they
+    // answer different questions and conflating them is what made a 269 px strip draw nothing while a 286 px strip
+    // drew a 6 px table.
+    //
+    // `_readableFloor` is 30 rows at the smallest *readable* glyph (270 px at compact): what the fit aims at, and what
+    // a page has to clear to get a table the player can read.
+    //
+    // `_boardFloor` is the height this table can actually be drawn at in the room the page measured
+    // (`ResultsFontGrowth.DrawableBoardHeight`). It starts at the readable floor and is refreshed from the strip each
+    // frame measures, so a page that offers less than the readable floor is still held to a figure about the room it
+    // really gave instead of a preference it can never meet. Both are set for every page visit in `Prepare` and
+    // dropped with the page.
+    private static float _readableFloor = float.NaN;
     private static float _boardFloor = float.NaN;
     // ---- fail-open: a result page that is on the screen always shows its board --------------------------------
     //
@@ -1170,13 +1179,24 @@ internal static class ResultsDisplay
 
     private static void Prepare(Component page, bool succeeded)
     {
-        // The board's own floor, measured before the page is asked for a strip: this is the one figure that tells a
-        // strip that is merely tight from one the table can never be drawn into, and the page's own decision about
-        // where the board may stand is made against it (see the host branch of `SuccessRegion`). The settlement board
-        // is always drawn with its three kill tiers split, so the row count is the split board's and does not depend
-        // on how many players are in the squad.
-        _boardFloor = ResultsFontGrowth.MinimumBoardHeight(ImpactBoard.RowCount(true),
+        // Two floors, two questions, deliberately kept apart.
+        //
+        // `_readableFloor` is what the table wants: its own row count at the smallest *readable* glyph, 270 px at
+        // compact for the split board. It is the figure the fit aims at, and a page that can hold it gets a table the
+        // player can read.
+        //
+        // `_boardFloor` is what the page is *judged* against, and it is the height this table can actually be drawn at
+        // in the room the page measured (`ResultsFontGrowth.DrawableBoardHeight`). Judging the page by the readable
+        // floor is what turned a 269 px strip into no board at all while a 286 px strip drew a 6 px one: the same
+        // page, seventeen pixels apart, and nothing in between. The room is only known after `Placement`, so the
+        // judgement figure is refreshed from the strip this frame measured, and stays on the readable floor for every
+        // frame whose geometry could not be read - exactly the behaviour a page with no measurement had before.
+        //
+        // Both are computed for the split board and re-derived below once `Placement` has answered, because the row
+        // count itself depends on the room (see `splitTiers`).
+        _readableFloor = ResultsFontGrowth.MinimumBoardHeight(ImpactBoard.RowCount(true),
             HudTable.RowEm(ResultsFontGrowth.MinimumReadablePixels), Plugin.Density);
+        _boardFloor = _readableFloor;
         // The strict placement first, exactly as it has always been: the page's own settled anchor, its measured
         // footer, its complete interaction scan. **But a placement is only a placement when the fit really puts a board
         // on the page.** `Placement` answers "the page offered a strip", and a strip can be shorter than the board's own
@@ -1185,13 +1205,30 @@ internal static class ResultsDisplay
         // because `ShouldFallback` was never evaluated. The count is therefore spent by what really happened: `TryFit`
         // below, never by `Placement` on its own.
         bool strict = Placement(page, succeeded, out _, out float room, out BoardStrip strip);
+        // The row count the board is built with, decided once per frame from the room the page measured. On every
+        // page that can hold the split board this is the 30 rows it has always been; on a settlement page whose band
+        // `SplitKillTiersFor` keeps the split board for an unmeasured room, for a room too short for either board and
+        // for a room where the two rows buy no glyph pixel at all, so a page this rule cannot help keeps exactly the
+        // content it had.
+        float rowEm = HudTable.RowEm(ResultsFontGrowth.MinimumReadablePixels);
+        bool splitTiers = ImpactBoard.SplitKillTiersFor(strict ? room : float.NaN,
+            ResultsBandFit.EmPerGlyphPixel(Plugin.Density, rowEm));
+        int rows = ImpactBoard.RowCount(splitTiers);
+        // The pair is re-derived for the row count this frame really uses, so every figure quoted below - the fit's
+        // target, the page's judgement, the fail-open ladder and the log lines - describes the same table.
+        _readableFloor = ResultsFontGrowth.MinimumBoardHeight(rows, rowEm, Plugin.Density);
+        _boardFloor = strict && float.IsFinite(room) && room > 0f
+            ? ResultsFontGrowth.DrawableBoardHeight(rows, rowEm, Plugin.Density, room)
+            : _readableFloor;
         ImpactReport report = BuildReport(succeeded);
         if (report.Entries.Count == 0)
         {
             if (HeadingReports.Add("empty-roster")) Plugin.Logger?.LogWarning("[DIAG] result board waiting: no retained player counters.");
             return;
         }
-        ImpactBoardLayout board = ImpactBoard.Build(report, true, succeeded); // Settlement kill tiers are always explicit.
+        // The settlement board's kill tiers are explicit whenever the room allows them (`splitTiers`), which is the
+        // only case in which this build ever collapsed them.
+        ImpactBoardLayout board = ImpactBoard.Build(report, splitTiers, succeeded);
         // The initial accepted projection is archived; later snapshots refresh the same file in place.
         ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation);
         var content = new TableContent
@@ -2011,23 +2048,49 @@ internal static class ResultsDisplay
             // the blank row at the button stays blank.
             float anchoredHeight = area.Height;
             float anchoredTop = area.Top, anchoredBottom = area.Bottom;
-            if (ResultPageRolePolicy.UsesBandBelowActions(Role(), anchoredHeight, _boardFloor, controls.BelowActions.Height))
+            // ---- D: the page is judged by the room it measured, not by a printable preference ---------------------
+            //
+            // `_boardFloor` arrives here as the readable floor, because this method runs inside `Placement` and
+            // `Prepare` only learns `room` after that returns. Comparing a measured 269 px strip against a 270 px
+            // preference is the cliff this build is fixing: 269 px drew nothing at all while 286 px drew a 6 px table,
+            // although the table can be drawn far shorter than either. The strip this page just measured is the bound
+            // that really holds, so it is resolved here - at this frame's own row count - and written back to
+            // `_boardFloor` for the rest of the frame, so the fit, the fail-open ladder and the log lines all quote one
+            // figure about the room.
+            float stripRowEm = HudTable.RowEm(ResultsFontGrowth.MinimumReadablePixels);
+            int stripRows = ImpactBoard.RowCount(
+                ImpactBoard.SplitKillTiersFor(anchoredHeight,
+                    ResultsBandFit.EmPerGlyphPixel(Plugin.Density, stripRowEm)));
+            float stripFloor = area.Fits
+                ? ResultsFontGrowth.DrawableBoardHeight(stripRows, stripRowEm, Plugin.Density, anchoredHeight)
+                : _boardFloor;
+            bool roomKnown = stripFloor > 0f && float.IsFinite(stripFloor);
+            // C: the band-below-actions question is asked with the figure the room produced, which is the only figure
+            // that can answer it. Asking with the readable floor made the escape hatch unreachable on every page whose
+            // free band was shorter than a readable table - which, on the run this came from, was every page: the band
+            // under the controls measured 85-88 px against a 270 px question.
+            float bandQuestion = roomKnown ? stripFloor : _boardFloor;
+            if (roomKnown && stripFloor < _boardFloor) _boardFloor = stripFloor;
+            if (ResultPageRolePolicy.UsesBandBelowActions(Role(), anchoredHeight, bandQuestion, controls.BelowActions.Height))
             {
                 area = new ResultsSafeArea(controls.BelowActions.Top, controls.BelowActions.Bottom);
                 footerSource = ResultFooterSource.BelowActions;
                 if (HeadingReports.Add("success-band-below-actions"))
                     Plugin.Logger?.LogInfo($"[DIAG] success strip cannot hold the board's own floor: role={ResultPageRolePolicy.Name(Role())}, "
-                        + $"strip=({anchoredTop:0}..{anchoredBottom:0}) is {anchoredHeight:0}px but the {ImpactBoard.RowCount(true)}-row board cannot be drawn under {_boardFloor:0}px at any readable glyph size on a {Screen.height} window; "
+                        + $"strip=({anchoredTop:0}..{anchoredBottom:0}) is {anchoredHeight:0}px but the {stripRows}-row board cannot be drawn under {_boardFloor:0}px at its shortest drawable grid on a {Screen.height} window; "
                         + $"the page's measured actions are stepped around instead of ending the strip - {DescribeLobbyWall(wall)}, lobbyEdge={DescribeLobbyEdge(wall)} - "
                         + $"and the free band below them is offered to the fit: boardBand=({controls.BelowActions.Top:0}..{controls.BelowActions.Bottom:0}) is {controls.BelowActions.Height:0}px, footerSource=below-actions-band. "
                         + "Every control the scan measured is outside that band, so no interaction is covered.");
             }
             else if (area.Fits && float.IsFinite(_boardFloor) && _boardFloor > 0f && anchoredHeight + 0.5f < _boardFloor)
             {
-                // The honest refusal: the strip cannot hold the board and the page leaves no band that could. The numbers
-                // are the whole point of the line - a strip of 132 px and a band of 40 px are two different faults.
+                // The honest refusal: the strip cannot hold the board *even at the shortest grid this build can draw*
+                // and the page leaves no band that could. The numbers are the whole point of the line - a strip of
+                // 132 px and a band of 40 px are two different faults - and `need` here is the room figure, not the
+                // readable one, so the line can no longer say "270 px needed" about a 269 px strip that could have
+                // held a 135 px table.
                 if (HeadingReports.Add("success-band-unavailable"))
-                    Plugin.Logger?.LogWarning($"[DIAG] success board deferred: role={ResultPageRolePolicy.Name(Role())}, need={_boardFloor:0}px for the {ImpactBoard.RowCount(true)}-row board, "
+                    Plugin.Logger?.LogWarning($"[DIAG] success board deferred: role={ResultPageRolePolicy.Name(Role())}, need={_boardFloor:0}px for the {ImpactBoard.RowCount(true)}-row board at its shortest drawable grid (readable floor {_readableFloor:0}px), "
                         + $"have={anchoredHeight:0}px in the strip ({anchoredTop:0}..{anchoredBottom:0}) above the page's own actions"
                         + (controls.BelowActions.Fits
                             ? $", and the free band below them ({controls.BelowActions.Top:0}..{controls.BelowActions.Bottom:0}) is only {controls.BelowActions.Height:0}px"

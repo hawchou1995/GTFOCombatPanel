@@ -1156,6 +1156,31 @@ public static class ResultsFontGrowth
         return rowHeight * rows;
     }
 
+    // The height this board may not be drawn under *in the room it is actually being offered*, which is the figure the
+    // page is judged against - not the readable floor above.
+    //
+    // `MinimumBoardHeight` answers a different question and keeps its answer: it is the height a board needs to be
+    // drawn at the smallest *readable* glyph, and it is what a strip has to clear before a fit is even worth running.
+    // On a real settlement page that figure is 30 rows x 6 px x 1.5 em = 270 px, and judging the page by it is how a
+    // host page that measured 269 px of strip was answered with no board at all while the same page at 286 px drew
+    // one - a cliff between "nothing" and "a 6 px table" that no page can be asked to clear.
+    //
+    // The room is the bound that actually holds. `HudTable.BuildGrid` will draw this table at any floor down to
+    // `ResultsBandFit.MinimumDrawableHeight`, and the fit searches every size between that floor and its ceiling; so
+    // the height a page has to offer is the shortest grid that floor can produce. A page that offers more than this is
+    // fitted up to the readable glyph and beyond; a page that offers less is a page this build refuses, and the
+    // refusal names a figure about the room instead of about a preference.
+    //
+    // `room` is the band the page measured, in the same pixels. A caller with no measurement passes NaN and gets the
+    // readable floor back, so every page whose geometry could not be read behaves exactly as it did before.
+    public static float DrawableBoardHeight(int rows, float rowEm, PanelDensity density, float room)
+    {
+        float readable = MinimumBoardHeight(rows, rowEm, density);
+        if (float.IsFinite(room) && room > 0f && room + 0.5f < readable)
+            return Math.Min(readable, ResultsBandFit.MinimumDrawableHeight(rows, density));
+        return readable;
+    }
+
     // The glyph size to draw the settlement board at, when the seed itself is the wrong size.
     //
     // `FitResultFontSize` above is a climb: a board that already overruns its strip is returned unchanged,
