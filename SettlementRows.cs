@@ -54,7 +54,39 @@ internal sealed class SettlementRows
         if (a.SupplyUses < b.SupplyUses) { a.SupplyUses = b.SupplyUses; a.SupplyEfficiencySum = b.SupplyEfficiencySum; }
         if (a.ScanUses < b.ScanUses || a.ScanUses == b.ScanUses && a.ScanMarks < b.ScanMarks)
         { a.ScanUses = b.ScanUses; a.ScanFirstMarks = b.ScanFirstMarks; a.ScanMarks = b.ScanMarks; a.ScanEstimated = b.ScanEstimated; }
-        a.SelfSupplyUses = Math.Max(a.SelfSupplyUses, b.SelfSupplyUses); a.SelfAmmoUses = Math.Max(a.SelfAmmoUses, b.SelfAmmoUses);
+        // 1.19.34: the pack split moves as one block, like the glue triple. A side that never split its use (an older peer, a
+        // row rebuilt from a v8 snapshot) must not be maxed field by field into a block that no longer adds up to its own
+        // total, so one side's block is taken whole and the other is left alone. The larger total wins, because a split can
+        // only describe packs it counted; when the side holding that pair has no split to go with it, the block is marked
+        // unknown again rather than keeping kinds that describe fewer packs than the row prints.
+        if (b.SelfSupplyKindsKnown && (b.SelfSupplyUses > a.SelfSupplyUses
+            || !a.SelfSupplyKindsKnown && b.SelfSupplyUses == a.SelfSupplyUses))
+        {
+            a.SelfSupplyUses = b.SelfSupplyUses; a.SelfAmmoUses = b.SelfAmmoUses;
+            a.SelfToolUses = b.SelfToolUses; a.SelfMedicalUses = b.SelfMedicalUses;
+            a.SelfSupplyKindsKnown = true;
+        }
+        else if (a.SelfSupplyKindsKnown && b.SelfSupplyUses > a.SelfSupplyUses)
+        {
+            a.SelfSupplyUses = b.SelfSupplyUses; a.SelfAmmoUses = b.SelfAmmoUses;
+            a.SelfToolUses = 0; a.SelfMedicalUses = 0; a.SelfSupplyKindsKnown = false;
+        }
+        else if (!a.SelfSupplyKindsKnown)
+        {
+            // 1.19.35 (review fix): an unsplit pair is one measurement, so one side is taken whole. Maxing the two fields apart
+            // produced a pair no machine ever reported - (total 3, ammo 0) out of one side's (3, 3) and the other's (2, 0) -
+            // and could hand on a pair whose ammo part is larger than its own total. The larger total wins, because a pair can
+            // only describe the packs it counted; an equal total leaves the pair this run already settled alone, which is the
+            // rule the glue triple uses below. An ammo part larger than its own total is impossible, so it is cut to the
+            // total: the total is the figure the row prints and the one the split has to describe.
+            if (b.SelfSupplyUses > a.SelfSupplyUses)
+            {
+                a.SelfSupplyUses = b.SelfSupplyUses;
+                a.SelfAmmoUses = b.SelfAmmoUses;
+            }
+            if (a.SelfAmmoUses > a.SelfSupplyUses) a.SelfAmmoUses = a.SelfSupplyUses;
+            a.SelfToolUses = 0; a.SelfMedicalUses = 0;
+        }
         a.Downs = Math.Max(a.Downs, b.Downs); a.FriendlyFireDeaths = Math.Max(a.FriendlyFireDeaths, b.FriendlyFireDeaths);
         a.LoneSurvivor = Math.Max(a.LoneSurvivor, b.LoneSurvivor); a.HealthLost = Math.Max(a.HealthLost, b.HealthLost);
         a.SentryShots = Math.Max(a.SentryShots, b.SentryShots); a.SentryHits = Math.Max(a.SentryHits, b.SentryHits);

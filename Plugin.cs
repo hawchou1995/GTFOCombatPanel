@@ -43,48 +43,48 @@ public sealed class Plugin : BasePlugin
     {
         Instance = this;
         Logger = Log;
-        LanguageConfig = Config.Bind("General", "Language", "zh", "Panel language: zh = Chinese (default), en = English. zh-CN, cn and English are accepted too.");
-        DensityConfig = Config.Bind("General", "Density", "compact", "Table compactness: compact (default, smallest footprint), normal, spacious.");
-        ShowPanel = Config.Bind("Panel", "ShowPanel", true, "Show the combat table during an expedition.");
-        ToggleKey = Config.Bind("Panel", "ToggleKey", KeyCode.F8, "Toggle HUD; None disables the shortcut. The same key hides and shows the settlement board on the result screens, so F8 behaves the same in a level and after one.");
-        ShowDamage = Config.Bind("Columns", "ShowDamage", true, "Show the damage / damage-share column.");
-        ShowFriendlyFire = Config.Bind("Columns", "ShowFriendlyFire", true, "Show the friendly fire column.");
-        ShowAccuracy = Config.Bind("Columns", "ShowAccuracy", true, "Show the hit rate column.");
-        ShowWeakspot = Config.Bind("Columns", "ShowWeakspot", true, "Show the weakspot rate column.");
-        ShowProjectiles = Config.Bind("Columns", "ShowProjectiles", true, "Show the pellet column (total / hit / weakspot).");
-        AnchorToFlashlight = Config.Bind("Layout", "AnchorToFlashlight", true, "Hang the table under the native flashlight icon in the right-hand gear column. The icon's screen rectangle is sampled through the HUD's own camera until it settles, then frozen, so the table follows the icon at any resolution but never inherits the HUD's motion. Set false to use PositionX/PositionY instead.");
-        PositionX = Config.Bind("Layout", "PositionX", -0.03f, "Fallback position: a fraction of the window width, or negative to measure from the right edge. Only used when AnchorToFlashlight is off or the icon cannot be measured.");
-        PositionY = Config.Bind("Layout", "PositionY", 0.365f, "Table position: a fraction of the window height, or negative to measure from the bottom edge. The default sits just below the flashlight icon in the gear column; the table is clamped so every row stays on screen.");
-        OffsetX = Config.Bind("Layout", "OffsetX", 0f, "Pixel offset added to PositionX; positive moves right.");
-        OffsetY = Config.Bind("Layout", "OffsetY", 0f, "Pixel offset added to PositionY; positive moves down.");
-        FontSize = Config.Bind("Layout", "FontSize", 17f, "Glyph size at 1080p, before the Density factor. 0 hides the columns of text rather than showing unreadable ones.");
+        LanguageConfig = Config.Bind("General", "Language", "zh", "面板语言：zh = 中文（默认），en = 英文。zh-CN、cn 与 English 等拼写同样接受。");
+        DensityConfig = Config.Bind("General", "Density", "compact", "表格紧凑度：compact（默认，占地最小）、normal、spacious。");
+        ShowPanel = Config.Bind("Panel", "ShowPanel", true, "远征期间显示战斗表格。");
+        ToggleKey = Config.Bind("Panel", "ToggleKey", KeyCode.F8, "切换 HUD 显隐；None 关闭该快捷键。同一个键在结算页隐藏与显示结算板，因此 F8 在关卡内与结算后的行为一致。");
+        ShowDamage = Config.Bind("Columns", "ShowDamage", true, "显示伤害 / 伤害占比列。");
+        ShowFriendlyFire = Config.Bind("Columns", "ShowFriendlyFire", true, "显示友伤列。");
+        ShowAccuracy = Config.Bind("Columns", "ShowAccuracy", true, "显示命中率列。");
+        ShowWeakspot = Config.Bind("Columns", "ShowWeakspot", true, "显示弱点率列。");
+        ShowProjectiles = Config.Bind("Columns", "ShowProjectiles", true, "显示弹丸列（总弹丸 / 命中 / 弱点）。");
+        AnchorToFlashlight = Config.Bind("Layout", "AnchorToFlashlight", true, "把表格挂在右侧装备栏原生手电筒图标下方。图标的屏幕矩形用 HUD 自己的相机采样，直至稳定后冻结，因此表格在任何分辨率下都跟随图标、但从不继承 HUD 的运动。设 false 改用 PositionX/PositionY。");
+        PositionX = Config.Bind("Layout", "PositionX", -0.03f, "回退位置：窗口宽度的分数，负数表示从右边缘起算。仅在 AnchorToFlashlight 关闭或图标无法测量时使用。");
+        PositionY = Config.Bind("Layout", "PositionY", 0.365f, "表格位置：窗口高度的分数，负数表示从下边缘起算。默认值正好位于装备栏手电筒图标下方；表格会被夹住，保证每一行都显示在屏幕上。");
+        OffsetX = Config.Bind("Layout", "OffsetX", 0f, "加在 PositionX 上的像素偏移；正数向右移。");
+        OffsetY = Config.Bind("Layout", "OffsetY", 0f, "加在 PositionY 上的像素偏移；正数向下移。");
+        FontSize = Config.Bind("Layout", "FontSize", 17f, "1080p 基准字号（乘 Density 系数之前）。0 表示隐藏文字列，而不是显示无法辨认的小字。");
         PanelOpacity = Config.Bind("Layout", "PanelOpacity", PanelAppearance.InLevelOpacity,
-            new ConfigDescription("How heavy the in-level table's own plate is: 0 = the game shows through untouched, 1 = a solid plate. The plate is dark on purpose so a row of figures survives a bright scene; lower this number if the table reads as a black box over the level. Read on every draw, so an edit here or a hot reload is on screen the next frame. The settlement board has its own approved plate and is not affected by this key.",
+            new ConfigDescription("局内表格自身底板的浓淡：0 = 完全透出游戏画面，1 = 实心底板。底板做成深色是有意的，好让一排数字在明亮场景下也看得清；若表格看起来像压在关卡上的黑块，就把这个数调低。每次绘制都重新读取，所以改这里或一次热重载下一帧就会上屏。结算板有自己的底板取值，不受这个键影响。",
                 new AcceptableValueRange<float>(0f, 1f)));
-        ShowResults = Config.Bind("Results", "ShowResults", true, "Show the settlement board on success/failure screens at all. This is the master switch; the two below choose what it draws.");
-        ShowResultOverlay = Config.Bind("Results", "ShowResultOverlay", true, "Draw this mod's board over the result pages. Set false to leave the vanilla result screens exactly as the game drew them, with no board and no legacy table put in their place.");
-        ResultsOffsetX = Config.Bind("Results", "OffsetX", 0f, "Pixel offset of the result table from its default place on the page; positive moves right.");
-        ResultsOffsetY = Config.Bind("Results", "OffsetY", 0f, "Pixel offset of the result table from its default place on the page; positive moves down.");
+        ShowResults = Config.Bind("Results", "ShowResults", true, "成功/失败结算页上是否显示结算板。这是总开关；下面两个键决定它画什么。");
+        ShowResultOverlay = Config.Bind("Results", "ShowResultOverlay", true, "把本模组的板子画在结算页之上。设 false 则结算页保持游戏原样：不画板，也不放回旧统计表。");
+        ResultsOffsetX = Config.Bind("Results", "OffsetX", 0f, "结算表相对页面默认位置的像素偏移；正数向右移。");
+        ResultsOffsetY = Config.Bind("Results", "OffsetY", 0f, "结算表相对页面默认位置的像素偏移；正数向下移。");
         // The wheel's two preferences. Readable keys, the same section as the rest of the result-page settings,
         // and a range the wheel itself steps through - so a hand edit, a re-read and a scroll all agree.
         SuccessFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.SuccessKey, ResultsZoom.Default,
-            new ConfigDescription("Glyph scale of the settlement board on the SUCCESS screen, changed with the mouse wheel over the board and remembered on its own. 1.0 is the size the page's own strip allows - the strip between the completion section and the button that sends the squad home. Below 1 draws a smaller board; above 1 is clamped back onto the strip's own size, so the wheel can never make the board cover that button. One notch is one step of 0.1.",
+            new ConfigDescription("SUCCESS 页结算板的字号缩放，用滚轮在板上调节并单独记忆。1.0 是页面自身条带允许的大小——即完成区与送全队返回大厅按钮之间的那段条带。低于 1 画出更小的板；高于 1 会被夹回条带自身的大小，滚轮永远不会让板子盖住那个按钮。滚轮一挡就是一步 0.1。",
                 new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
         FailureFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.FailureKey, ResultsZoom.Default,
-            new ConfigDescription("Glyph scale of the settlement board on the FAILURE screen, changed with the mouse wheel over the board and remembered on its own. 1.0 is the size the page's own strip allows - the strip between the mission-failed message and the buttons below it. Below 1 draws a smaller board; above 1 is clamped back onto the strip's own size, so the wheel can never make the board cover a button. One notch is one step of 0.1.",
+            new ConfigDescription("FAILURE 页结算板的字号缩放，用滚轮在板上调节并单独记忆。1.0 是页面自身条带允许的大小——即任务失败提示与下方按钮之间的那段条带。低于 1 画出更小的板；高于 1 会被夹回条带自身的大小，滚轮永远不会让板子盖住按钮。滚轮一挡就是一步 0.1。",
                 new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
         // The influence board, and the thirteen metrics it scores.
-        ShowImpactBoard = Config.Bind("Results", "ShowImpactBoard", true, "Draw the influence board (every player scored out of 100, ranked, with a sentence and thirteen metrics) on result screens. Set false and the result page is left exactly as the game drew it: there is no older statistics table to fall back to. The same key that toggles the HUD in a level (ToggleKey, F8 by default) also hides and shows this board on a result screen, but it never writes this key: F8 stores ShowPanel and ShowResultOverlay, and this value stays exactly as it is set here.");
-        ShowSuccessArtifacts = Config.Bind("Results", "ShowSuccessArtifacts", false, "Show the vanilla red crystal (artifact) block on the success screen: the artifact inventory, its summary line and the checkpoint usage. Off by default - 建议关闭显示以免影响观感 - so this mod's board owns the page; switch it on to see the game's own artifact figures beside the board. Every block is put back exactly where the game drew it the moment this is switched on, the page changes or the results screen is left.");
-        ShowSuccessPlayerReports = Config.Bind("Results", "ShowSuccessPlayerReports", false, "Show the four vanilla prisoner report cards on the success screen, with the anchors they hang on. Off by default - 建议关闭显示以免影响观感 - and kept separate from the artifact block because the two are different pieces of the page; restored exactly when switched on.");
-        HideVanillaFailBlocks = Config.Bind("Results", "HideVanillaFailBlocks", true, "On the failure screen, move the artifact inventory and its summary line off the page and switch them off, so the board has the room. The result pages animate their content in and switch it back on as they go, so this is re-applied on every frame the page is up. Set false to put the vanilla blocks back without recompiling.");
-        SplitKillTiers = Config.Bind("Scoring", "SplitKillTiers", true, "Legacy setting retained for older configurations. Settlement boards always show Minor, Elite and Boss kills on three explicitly labelled rows; scoring is unchanged.");
-        KillMinorMaxHealth = Config.Bind("Scoring", "KillMinorMaxHealth", 120f, "An enemy whose maximum health is below this counts as a minor kill. Graded from the enemy's own health, so a modded enemy is graded by what it is.");
-        KillEliteMaxHealth = Config.Bind("Scoring", "KillEliteMaxHealth", 1000f, "An enemy whose maximum health is below this counts as an elite kill; at or above it counts as a boss.");
-        MinorKillWeight = Config.Bind("Scoring", "MinorKillWeight", (float)ImpactScoring.DefaultMinorKillWeight, "What one minor kill is worth when the kill row is scored. The three tier weights are relative to each other and must be non-decreasing in tier order (minor <= elite <= boss); the published default is the 1 : 2 : 3 ratio. Used only when the scoring file is switched off or unreadable - the scoring file is the editable surface.");
-        EliteKillWeight = Config.Bind("Scoring", "EliteKillWeight", (float)ImpactScoring.DefaultEliteKillWeight, "What one elite kill is worth. See MinorKillWeight; must be at least MinorKillWeight and at most BossKillWeight.");
-        BossKillWeight = Config.Bind("Scoring", "BossKillWeight", (float)ImpactScoring.DefaultBossKillWeight, "What one boss kill is worth. See MinorKillWeight; must be at least EliteKillWeight.");
-        WeightsConfig = Config.Bind("Scoring", "Weights", ImpactScoring.DefaultWeightsText, "Fallback weights of thirteen metrics in board order (total damage, stagger, kills, revives, weakspot rate, hit rate, supply, tool efficiency, lone survivor, downs, friendly fire, melee kills, Scout kills). Used only when scoring.json is off or unreadable; invalid lists fall back to the defaults.");
+        ShowImpactBoard = Config.Bind("Results", "ShowImpactBoard", true, "在结算页画影响力看板（每位玩家按 100 分制打分并排名，配一句称号与十三项指标）。设 false 则结算页保持游戏原样：没有旧统计表可回落。在关卡内切换 HUD 的同一个键（ToggleKey，默认 F8）在结算页也用于隐藏与显示这块板，但它从不写这个键：F8 保存的是 ShowPanel 和 ShowResultOverlay，此值始终保持这里设置的样子。");
+        ShowSuccessArtifacts = Config.Bind("Results", "ShowSuccessArtifacts", false, "显示成功页原版红晶（神器）块：神器清单、总结行与检查点消耗。默认关闭 - 建议关闭显示以免影响观感 - 好让本模组的板子独占页面；打开后可在板子旁边看到游戏自己的神器数字。打开、换页或离开结算页的瞬间，每一块都会精确放回游戏原来绘制的位置。");
+        ShowSuccessPlayerReports = Config.Bind("Results", "ShowSuccessPlayerReports", false, "显示成功页四张原版囚犯报告卡及它们悬挂的锚点。默认关闭 - 建议关闭显示以免影响观感 -，并与神器块分开控制，因为两者是页面上不同的部件；打开时精确还原。");
+        HideVanillaFailBlocks = Config.Bind("Results", "HideVanillaFailBlocks", true, "失败页上把神器清单与总结行移出页面并关闭，为板子腾出空间。结算页会一边播动画一边把内容再打开，因此页面在的每一帧都会重新应用这个设置；设 false 则无需重新编译即可恢复原版块。");
+        SplitKillTiers = Config.Bind("Scoring", "SplitKillTiers", true, "为旧配置保留的遗留设置。结算板始终把小怪、精英与 BOSS 击杀显示在三行带明确标签的行上；评分不变。");
+        KillMinorMaxHealth = Config.Bind("Scoring", "KillMinorMaxHealth", 120f, "生命上限低于此值的敌人按小怪击杀计。按敌人自己的生命上限分级，模改敌人也按其真实属性分级。");
+        KillEliteMaxHealth = Config.Bind("Scoring", "KillEliteMaxHealth", 1000f, "生命上限低于此值的敌人按精英击杀计；达到或超过则按 BOSS 计。");
+        MinorKillWeight = Config.Bind("Scoring", "MinorKillWeight", (float)ImpactScoring.DefaultMinorKillWeight, "击杀行计分时一个小怪击杀的价值。三档权重彼此相对，且必须按档位顺序非递减（小怪 <= 精英 <= BOSS）；发布默认是 1 : 2 : 3 比例。仅在评分文件关闭或不可读时使用——评分文件才是可编辑的界面。");
+        EliteKillWeight = Config.Bind("Scoring", "EliteKillWeight", (float)ImpactScoring.DefaultEliteKillWeight, "一个精英击杀的价值。见 MinorKillWeight；必须不小于 MinorKillWeight 且不大于 BossKillWeight。");
+        BossKillWeight = Config.Bind("Scoring", "BossKillWeight", (float)ImpactScoring.DefaultBossKillWeight, "一个 BOSS 击杀的价值。见 MinorKillWeight；必须不小于 EliteKillWeight。");
+        WeightsConfig = Config.Bind("Scoring", "Weights", ImpactScoring.DefaultWeightsText, "十三项指标的备用权重，按看板顺序（总伤害、硬直、击杀、救援、弱点率、命中率、补给、工具效率、独自存活、倒地、友伤、近战击杀、触手击杀）。仅在 scoring.json 关闭或不可读时使用；非法列表回退默认值。");
 
         // A saved configuration keeps whatever it holds. Published default lists migrate to the current
         // thirteen weights; a custom eleven-item list keeps its values and receives the two new suffixes.
@@ -94,24 +94,25 @@ public sealed class Plugin : BasePlugin
             Logger.LogInfo($"[DIAG] scoring weights migrated from a published legacy default to the thirteen-metric defaults ({ImpactScoring.DefaultWeightsText}); melee and Scout kills now score separately.");
         }
         SupportRoleFirepowerBonus = Config.Bind("Scoring", "SupportRoleFirepowerBonus", 1.15f,
-            new ConfigDescription("Multiplier applied to a support player's firepower metrics - total damage and stagger only, never aim or kills. 1.0 disables it; the ceiling is 1.3 whatever the file says.",
+            new ConfigDescription("辅助玩家火力指标上的乘数——只作用于总伤害与硬直，绝不作用于瞄准或击杀。1.0 表示关闭；无论文件里写多少，上限都是 1.3。",
                 new AcceptableValueRange<float>(1f, 1.3f)));
         SupportRoleUtilityBonus = Config.Bind("Scoring", "SupportRoleUtilityBonus", 1.0f,
-            new ConfigDescription("Multiplier applied to a support player's utility metrics (tool efficiency, supply, revives, lone survivor). 1.0 by default; the ceiling is 1.3 whatever the file says.",
+            new ConfigDescription("辅助玩家效用指标上的乘数（工具效率、补给、救援、独自存活）。默认 1.0；无论文件里写多少，上限都是 1.3。",
                 new AcceptableValueRange<float>(1f, 1.3f)));
-        SupportToolNames = Config.Bind("Scoring", "SupportToolNames", SupportTools.DefaultNames, "Comma separated tool names, matched case insensitively as a substring against the equipped class tool, that mark a player as support: the bio tracker, glue, C-Foam and the lock melter by default.");
-        SupportExcludedTools = Config.Bind("Scoring", "SupportExcludedTools", SupportTools.DefaultExcluded, "Comma separated tool names that are never a support kit however they are named: sentries and tripmines by default, because they shoot for their owner rather than being a kit the owner gave their gun up for.");
-        SupportOtherTools = Config.Bind("Scoring", "SupportOtherTools", true, "Treat any other non-empty tool as a support kit, so a modded non-damaging tool is included without having to be named. The exclusion list still wins.");
-        ScoringFileEnabled = Config.Bind("Scoring", "ScoringFile", true, "Read CombatPanel-config/scoring.json next to this DLL: thirteen weights, enabled metrics, health thresholds, rescue floor, accuracy confidence, role bonuses, the sleeping-kill multiplier and every settlement sentence. ToolEfficiency displays tool-use figures but its score remains scan first-marks. FriendlyFire penalizes friendly damage and lethal incidents. MeleeKills and ScoutKills score their kill counts; melee damage is displayed from the existing GearMelee row. SleepingKillMultiplier (1-10, default 2) rewards a kill landed on an enemy that was still asleep; a kill whose state could not be read is worth an awake one. Titles carries one Title/Description pair per sentence: the three kill classes and total damage each have their own, and a negative sentence (Downs, FriendlyFire) goes to the squad's worst by penalty severity. An entry left exactly as published keeps following the Language setting. Invalid files keep the last good copy and use the .cfg fallback; user files are never overwritten and both sources hot reload on the main thread.");
+        SupportToolNames = Config.Bind("Scoring", "SupportToolNames", SupportTools.DefaultNames, "逗号分隔的工具名，不区分大小写、按子串匹配装备的职业工具，命中即把该玩家记为辅助：默认是生物追踪仪、胶枪、C-Foam 与开锁器。");
+        SupportExcludedTools = Config.Bind("Scoring", "SupportExcludedTools", SupportTools.DefaultExcluded, "逗号分隔的工具名，无论如何命名都永不算辅助套件：默认是哨戒炮与绊雷，因为它们是替主人开枪的，而不是主人为套件让出自己那把枪换来的。");
+        SupportOtherTools = Config.Bind("Scoring", "SupportOtherTools", true, "把任何其它非空工具都当作辅助套件，模改的无伤害工具无需点名即可纳入。排除名单仍然优先。");
+        ScoringFileEnabled = Config.Bind("Scoring", "ScoringFile", true, "从游戏自身持久数据目录读取 CombatPanel-config/scoring.json（仅当那里没有时才会一次性导入插件目录里的副本）：十三项权重、启用指标、血量阈值、救援下限、命中率置信、角色加成、睡眠击杀倍率与每句结算称号。ToolEfficiency 显示工具使用数据，但评分仍然是扫描首次标记数。FriendlyFire 惩罚友伤伤害与致倒事故。MeleeKills 与 ScoutKills 按其击杀数计分；近战伤害仍显示在既有 GearMelee 行。SleepingKillMultiplier（1-10，默认 2）奖励打在仍沉睡敌人身上的击杀；状态读不出的击杀按清醒计。Titles 为每句称号携带一对 Title/Description：三档击杀与总伤害各有独立称号，负面称号（Downs、FriendlyFire）按惩罚严重度授予全队最严重者。与出厂完全一致的条目继续跟随 Language 设置。无效文件保留上一次有效副本并回退 .cfg 值；用户文件从不被覆盖——包更新也绝不替换稳定副本——两个来源都在主线程热重载。");
 
         Config.SettingChanged += (sender, args) => { if (!_persistingToggle) ApplyConfig(); };
         Config.ConfigReloaded += (sender, args) => ApplyConfig();
         // The scoring file has to be resolved before the watcher is armed, because the watcher watches it too.
         LoadScoringFile();
+        ResultsSaver.Initialize();
         ConfigWatcher.Watch(Config, ScoringPath);
         ApplyConfig();
+        StaggerNeedsAttack = Config.Bind("Scoring", "StaggerNeedsAttack", true, "仅当伤害落下的瞬间敌人的攻击正在进行且尚未结束时才计一次硬直。击杀绝不算作打断——无论游戏为它报告哪种受击反应——夺走敌人最后一滴血的一击也不算。设 false 则计入任何到达该行的受击反应。");
         var harmony = new Harmony(PluginInfo.Guid);
-        StaggerNeedsAttack = Config.Bind("Scoring", "StaggerNeedsAttack", true, "Only credit a stagger when the enemy's attack was under way and not yet finished at the moment the damage landed. A kill is never counted as an interrupt, whichever hit react the game reports for it, and neither is a blow that takes the last of the enemy's health. Set false to credit any hit react that reaches the row.");
 
         harmony.PatchAll();
         EwcProjectileBridge.EnsureInitialized();
@@ -133,8 +134,9 @@ public sealed class Plugin : BasePlugin
         => PanelAppearance.Plate(PanelOpacity != null ? PanelOpacity.Value : float.NaN, false)
             .ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
 
-    // The directory this plugin's DLL lives in. The scoring file is resolved from here so it always sits
-    // beside the plugin it belongs to, in its own CombatPanel-config sub folder (never a naked file).
+    // The directory this plugin's DLL lives in. It is the source of the one-time scoring/record imports and the
+    // fallback location when the game's persistent data path is unusable; the stable copies live under the
+    // persistent data path, in their own CombatPanel sub folders (never a naked file).
     internal static string PluginDirectory()
     {
         try
@@ -146,17 +148,25 @@ public sealed class Plugin : BasePlugin
         try { return Paths.PluginPath; } catch { return null; }
     }
 
-    // Reads the scoring file. A missing file is created once from the defaults; an invalid one is reported
-    // and the last good copy is kept (the file itself is never written over). Called on the main thread.
+    // Reads the scoring file, from the stable location the pure ScoringFileLocation policy resolves: the
+    // player's copy in the game's persistent data path wins; the plugin folder's copy is imported once when
+    // that root has none; the shipped defaults are written once to the stable root when nothing exists
+    // anywhere. A package install or update therefore never replaces an edited scoring file. An invalid one
+    // is reported and the last good copy is kept (the file itself is never written over). Called on the main
+    // thread; the policy's own line states which file was used.
     internal static void LoadScoringFile()
     {
-        ScoringPath = ScoringFiles.Resolve(PluginDirectory());
+        string persistentDataPath = null;
+        try { persistentDataPath = Application.persistentDataPath; } catch { }
+        ScoringFilePlan plan = ScoringFileLocation.Resolve(persistentDataPath, PluginDirectory());
+        ScoringPath = plan.Path;
         if (ScoringFileEnabled != null && !ScoringFileEnabled.Value)
         {
             Scoring = null;
             ApplyKillWeights();
             return;
         }
+        if (!string.IsNullOrEmpty(plan.Message)) Logger?.LogInfo(plan.Message);
         ScoringSettings loaded = null;
         string error = null;
         bool created = false;

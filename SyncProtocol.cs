@@ -185,8 +185,16 @@ public static class SyncProtocol
     public const uint Version = 8;
     // The two packet kinds the envelope carries. They live here (rather than in the Unity-facing transport)
     // so the headless framing tests and the runtime sender agree on them by construction.
+    //
+    // 1.19.34 adds a third kind instead of growing the snapshot. The snapshot's length is checked exactly by every
+    // build that reads it, so a v8 member appended to it - or a version bump - would make every packet of this
+    // build unreadable to a v8 peer, which is the one thing a mixed lobby may not lose: their damage and their
+    // settlement rows. The kinds therefore travel beside the snapshot, in a packet a v8 peer consumes and ignores
+    // (its parser answers `Unknown`, and `IsOurs` keeps it away from the game). A v8 peer's rows keep arriving
+    // without kinds, and they print as unknown - never as a zero.
     public const ushort KindHello = 1;
     public const ushort KindSnapshot = 2;
+    public const ushort KindSupplyKinds = 3;
     // The snapshot is all primitives, so it goes on the wire as the bytes it already is. Its size is
     // asserted in the smoke suite, and every packet carries that size as a length, so a build that added
     // a member can never be read as though it had not.
@@ -209,6 +217,85 @@ public static class SyncProtocol
         snapshot = default;
         if (buffer == null || count != SnapshotSize || offset < 0 || buffer.Length - offset < SnapshotSize) return false;
         snapshot = MemoryMarshal.Read<SyncSnapshot>(new ReadOnlySpan<byte>(buffer, offset, SnapshotSize));
+        return true;
+    }
+
+    // ---------------------------------------------------------------- 1.19.34: the pack kinds, beside the row
+
+    // The three pack kinds as the machine that owns the backpack counted them. This travels beside the snapshot
+    // rather than inside it, because the snapshot's length is checked exactly by every build that reads it - and a
+    // v8 peer must keep reading this build's rows.
+    //
+    // The block is self-checking on purpose: `IsUsable` refuses a block whose parts do not add up to its total, and
+    // that is the shape in which a kind would otherwise be fabricated from somebody else's arithmetic.
+    public struct SupplyKinds
+    {
+        public ulong Owner;
+        public uint Total, Ammo, Tool, Medical;
+
+        public bool IsUsable
+        {
+            get
+            {
+                if (Owner == 0UL) return false;
+                // 1.19.35: a block of zeros is not a measurement. "This player consumed no packs" is an absence of a split, and a
+                // block that says it would mark every row it lands on as *observed* - after which a pair that grows later would be
+                // read beside two zeros that were never counted (review C5). The block is refused at both ends instead.
+                if (Total == 0) return false;
+                if (Ammo > Total || Tool > Total || Medical > Total) return false;
+                return (ulong)Ammo + Tool + Medical == Total;
+            }
+        }
+    }
+
+    public static int SupplyKindsSize => Marshal.SizeOf<SupplyKinds>();
+
+    public static byte[] EncodeSupplyKinds(in SupplyKinds kinds)
+    {
+        var bytes = new byte[SupplyKindsSize];
+        var copy = kinds;
+        MemoryMarshal.Write(bytes, ref copy);
+        return bytes;
+    }
+
+    // Exact length, and the block has to add up before it is handed on: a body that decodes into a block which does
+    // not sum is a build that disagrees with itself, not a measurement to print.
+    public static bool DecodeSupplyKinds(byte[] buffer, int offset, int count, out SupplyKinds kinds)
+    {
+        kinds = default;
+        if (buffer == null || count != SupplyKindsSize || offset < 0 || buffer.Length - offset < SupplyKindsSize) return false;
+        kinds = MemoryMarshal.Read<SupplyKinds>(buffer.AsSpan(offset, SupplyKindsSize));
+        return kinds.IsUsable;
+    }
+
+    // The kinds this machine may claim for a row it owns. `false` when it never split them - a row restored from a
+    // snapshot, or one that only ever carried the v8 pair - because a packet of zeros is a claim that there were no
+    // packs of those kinds, and an absence is not a zero.
+    public static bool TryCaptureSupplyKinds(CombatPlayer player, out SupplyKinds kinds)
+    {
+        kinds = default;
+        if (player == null || player.Lookup == 0UL) return false;
+        ImpactCounters impact = player.Impact;
+        if (impact == null || !impact.SelfSupplyKindsKnown) return false;
+        long total = impact.SelfSupplyUses, ammo = impact.SelfAmmoUses, tool = impact.SelfToolUses, medical = impact.SelfMedicalUses;
+        if (total < 0 || ammo < 0 || tool < 0 || medical < 0) return false;
+        if (total == 0) return false;                          // no packs, no split: an absence is never published as a block of zeros
+        if (total != ammo + tool + medical) return false;      // a row that does not add up is never published
+        kinds = new SupplyKinds { Owner = player.Lookup, Total = Clamp(total), Ammo = Clamp(ammo), Tool = Clamp(tool), Medical = Clamp(medical) };
+        return kinds.IsUsable;
+    }
+
+    // Write the owner's block onto a row that already holds exactly that pair. An exact match only: the block may add
+    // the split to figures this machine already shows, and may never replace them with a different count from another
+    // sender - so `SelfSupplyUses == SelfAmmoUses + SelfToolUses + SelfMedicalUses` holds on every row this is applied
+    // to, and a row whose pair came from somebody else stays unknown instead of being assembled from two sources.
+    public static bool ApplySupplyKinds(ImpactCounters impact, in SupplyKinds kinds, bool own)
+    {
+        if (impact == null || own || !kinds.IsUsable) return false;
+        if (kinds.Total != impact.SelfSupplyUses || kinds.Ammo != impact.SelfAmmoUses) return false;
+        impact.SelfToolUses = kinds.Tool;
+        impact.SelfMedicalUses = kinds.Medical;
+        impact.SelfSupplyKindsKnown = true;
         return true;
     }
 
@@ -444,6 +531,13 @@ public static class SyncProtocol
         impact.UnknownStateBossKills = snap.UnknownStateBossKills;
         impact.UnknownStateMeleeKills = snap.UnknownStateMeleeKills;
         impact.UnknownStateScoutKills = snap.UnknownStateScoutKills;
+        // 1.19.34: `SyncProtocol.Apply` rebuilds a row from a v8 snapshot, which carries the pair and never the split, so a
+        // split that no longer describes the pair being written is dropped here rather than left beside it.
+        if (impact.SelfSupplyKindsKnown
+            && (snap.SelfSupplyUses != impact.SelfSupplyUses || snap.SelfAmmoUses != impact.SelfAmmoUses))
+        {
+            impact.SelfToolUses = 0; impact.SelfMedicalUses = 0; impact.SelfSupplyKindsKnown = false;
+        }
         impact.SelfSupplyUses = snap.SelfSupplyUses;
         impact.SelfAmmoUses = snap.SelfAmmoUses;
         impact.HealthLost = PositiveFinite(snap.HealthLost);

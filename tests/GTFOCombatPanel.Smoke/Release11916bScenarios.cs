@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using HawChow.GTFOCombatPanel;
 
@@ -45,6 +46,7 @@ internal static class Release11916bScenarios
         ThePerLevelLatchesAreSpentAgainOnEveryLevel(check);
         ATransientAnchorFailureIsRetriedAndLocks(check);
         TheRetryScheduleIsBoundedAndNeverPerFrame(check);
+        TheAnchorLinesFollowTheScheduleAndStopAtTheGiveUp(check);
         TheGiveUpEndsTheRoundAndSaysWhy(check);
         ASampleThatThrowsStillSpendsTheBudget(check);
         TheDiagnosticTextTellsTheTruth(check);
@@ -298,8 +300,9 @@ internal static class Release11916bScenarios
             $"and each of those attempts ran the read exactly once: reads={thrown}");
         check(always.Waited > 39f && always.Waited < 40f,
             $"the waiting the give-up line reports is the schedule the budget comment promises (0.5 + 1 + 2 + 4x9 = 39.5 s), not a fraction of it: waited={always.Waited:0.##}s");
-        check(!always.Due(now + 1000f),
-            "an abandoned round stays abandoned after a throw as well");
+        check(always.Abandoned && always.Due(now + 1000f)
+              && !always.Due(now + 1000f + AnchorSamplePolicy.WatchInterval * 0.5f),
+            $"an abandoned round stays abandoned after a throw as well, and answers only on its watch interval - never on the settle cadence again (watches={always.Watches})");
 
         // The wrapper adds nothing to the good path: a sample that answers hands its rectangle straight back.
         var good = new AnchorSamplePolicy();
@@ -308,16 +311,16 @@ internal static class Release11916bScenarios
             "a sample that answers hands its rectangle back through the same call");
         check(good.Failures == 0 && good.Due(0.25f) && !good.Due(0.2f),
             "and the good path keeps the settle cadence, with no failure to its name");
-
-        // A spent budget is not a poll either: the read is not even run.
+        // 1.19.26: a spent budget is not a poll, and it is not silence either. The attempt runs - that is the watch, and it is
+        // how an element that appears after the twelve samples is ever found - but it spends nothing and answers no give-up.
         var stopped = new AnchorSamplePolicy();
         for (int failure = 0; failure < AnchorSamplePolicy.Budget; failure++) stopped.Failed(0f, AnchorSampleFailure.NoCamera);
         bool ran = false;
         AnchorSample late = stopped.Attempt(0f, () => { ran = true; return AnchorSample.Missing(AnchorSampleFailure.NoIcon); }, out bool spentLate);
-        check(!ran && !spentLate && !late.Measured,
-            "an abandoned round never runs the read again, so a spent budget costs nothing per tick");
-        check(stopped.Attempts == 0 && stopped.Failures == AnchorSamplePolicy.Budget,
-            "and a failure that never began an attempt cannot inflate the attempt count the give-up line reports");
+        check(ran && !spentLate && !late.Measured,
+            "a watch really reads the HUD, and a watch that finds nothing answers no give-up: the level is abandoned exactly once");
+        check(stopped.Abandoned && stopped.Watches == 1 && stopped.Attempts == 0 && stopped.Failures == AnchorSamplePolicy.Budget,
+            "and the watch spends nothing at all - no attempt, no failure - so a spent budget costs no poll and no second give-up line");
     }
 
     private static void TheGiveUpEndsTheRoundAndSaysWhy(Action<bool, string> check)
@@ -338,10 +341,14 @@ internal static class Release11916bScenarios
             "the policy is abandoned once the budget is spent");
         check(policy.LastFailure == AnchorSampleFailure.Unmeasurable,
             "the reason the give-up line prints is the last real one, not a placeholder");
-        check(!policy.Due(now + 1000f) && !policy.Due(float.PositiveInfinity),
-            "an abandoned round never measures again, so a HUD that cannot be read is not polled for the rest of the level");
+        // 1.19.26: an abandoned round is no longer silent for the level - it waits out one WatchInterval and then watches. The
+        // settle-cadence poll is still refused, which is what this block was written for.
         check(policy.Attempts == AnchorSamplePolicy.Budget,
             "the attempt count the give-up line reports is the number of measurements really taken");
+        check(policy.Due(now + 1000f),
+            "an abandoned round is still looked at once every WatchInterval, instead of going silent for the rest of the level");
+        check(!policy.WatchDue(now + 1000f + AnchorSamplePolicy.WatchInterval * 0.5f),
+            "but never twice inside one interval: the watch is a cadence, not a poll");
         check(policy.Waited > 0f && policy.Waited < AnchorSamplePolicy.MaximumRetryDelay * (AnchorSamplePolicy.Budget + 1),
             "the wait the give-up line reports is the sum of the delays, inside its own bound");
 
@@ -360,6 +367,159 @@ internal static class Release11916bScenarios
             "each failure the give-up line can name is described in words a reader can act on");
         check(AnchorSamplePolicy.Describe(AnchorSampleFailure.NoCamera) != AnchorSamplePolicy.Describe(AnchorSampleFailure.NoIcon),
             "and the three reasons are not collapsed into one sentence");
+    }
+
+    // ------------------------------------------------------------- the flood: a line per attempt, not per repaint
+    //
+    // The recorded expedition holds 625 of these lines, four to a second, and every one of them reads "attempt 1 of
+    // 12 ... 11 retry(s) left". The round underneath the line was being rebuilt on every repaint, so the figure the
+    // line printed never advanced and the retry delay never gated it: the budget could not be spent and the give-up
+    // line was unreachable. The lines are owed by the round itself now - `DueToReport` answers true for an attempt
+    // that has not been written yet and false for a tick that was not one - which is what puts them on the schedule
+    // (0.5 s, 1 s, 2 s, then the 4 s ceiling) instead of on the frame rate. Everything below drives the real policy
+    // through a model of `SampleAnchor`, and the last paragraph reads the production source and says so.
+    private const float AnchorFrame = 1f / 60f;
+
+    private static void TheAnchorLinesFollowTheScheduleAndStopAtTheGiveUp(Action<bool, string> check)
+    {
+        // Ten seconds of a silent HUD at the frame rate the panel is really polled on. A per-frame sampler would
+        // attempt 600 times; this one attempts five - one immediately, then half a second, one, two and four
+        // seconds later - and writes exactly one line for each.
+        int attempts = RunSilentHud(600, out List<int> written, out List<int> left, out bool abandoned);
+        check(attempts == 5,
+            $"ten seconds of failing frames at 60 Hz cost {attempts} measurements, not one per frame");
+        check(!abandoned && written.Count == 1,
+            $"1.19.22: a HUD whose answer cannot change writes one failure line - the first, with its reason: {written.Count} line(s) for five attempts, never five identical warnings");
+        check(string.Join(",", written) == "1",
+            $"the one line printed is the round's own first attempt: {string.Join(",", written)}");
+        bool advancing = true, countingDown = true;
+        for (int index = 1; index < written.Count; index++)
+        {
+            if (written[index] <= written[index - 1]) advancing = false;
+            if (left[index] >= left[index - 1]) countingDown = false;
+        }
+        check(advancing,
+            "no line repeats an attempt number - the 625-line expedition printed \"attempt 1 of 12\" every single time");
+        check(countingDown && left.Count > 0 && left[0] == AnchorSamplePolicy.Budget - 1,
+            $"and the retries left in that first line count down from {AnchorSamplePolicy.Budget - 1}: {string.Join(",", left)}");
+
+        // The whole budget, at the same frame rate: the schedule spends it and the give-up closes the round.
+        int frames = 60 * 50;   // fifty seconds, past the 39.5 s the twelve attempts really span
+        int full = RunSilentHud(frames, out List<int> fullWritten, out _, out bool fullAbandoned);
+        check(full == AnchorSamplePolicy.Budget && fullAbandoned,
+            $"fifty seconds of a HUD that answers nothing spends the whole {AnchorSamplePolicy.Budget}-attempt budget and gives up (attempts={full})");
+        check(fullWritten.Count == 2,
+            $"1.19.22: the log costs exactly two lines - the first failure with its reason (attempt 1) and the give-up - {fullWritten.Count} line(s) in fifty seconds of frames, never twelve identical warnings");
+        check(fullWritten.Count > 0 && fullWritten[fullWritten.Count - 1] == AnchorSamplePolicy.Budget,
+            "the last line is the give-up line, and it speaks for the attempt that spent the budget");
+        bool fullAdvancing = true;
+        for (int index = 1; index < fullWritten.Count; index++) if (fullWritten[index] <= fullWritten[index - 1]) fullAdvancing = false;
+        check(fullAdvancing, $"every line of the whole round advances the attempt: {string.Join(",", fullWritten)}");
+
+        // Nothing at all once the round is abandoned - three times as many frames, the same log.
+        int after = RunSilentHud(frames * 3, out List<int> afterWritten, out _, out bool afterAbandoned);
+        check(after == AnchorSamplePolicy.Budget && afterAbandoned && afterWritten.Count == fullWritten.Count
+              && string.Join(",", afterWritten) == string.Join(",", fullWritten),
+            $"an abandoned round prints nothing more however long the level runs: {afterWritten.Count} line(s) after 150 s, the same as after 50 s (attempts={after})");
+
+        // The policy itself refuses the line, so the caller cannot print one by asking again.
+        var spent = new AnchorSamplePolicy();
+        for (int attempt = 0; attempt < AnchorSamplePolicy.Budget; attempt++)
+            spent.Attempt(attempt, () => AnchorSample.Missing(AnchorSampleFailure.NoCamera), out _);
+        check(spent.Abandoned && !spent.DueToReport,
+            "a round that has spent its budget owes no line for the attempt that abandoned it either");
+        spent.Reported();
+        check(!spent.DueToReport && spent.Lines == 0,
+            "and writing a line cannot re-arm an abandoned round: the report is spent nowhere after the give-up");
+
+        // A successful read resets what the schedule counts, not the round's identity.
+        var recovered = new AnchorSamplePolicy();
+        float now = 0f;
+        int lines = 0;
+        for (int frame = 0; frame < 240; frame++)     // four seconds: attempts 1..4, one line each
+        {
+            now = frame * AnchorFrame;
+            if (!recovered.Due(now)) continue;
+            if (!recovered.Attempt(now, () => AnchorSample.Missing(AnchorSampleFailure.NoCamera), out _).Measured && recovered.DueToReport)
+            {
+                if (recovered.FreshWarning) lines++;   // 1.19.22: the first failure prints, its four identical repeats do not
+                recovered.Reported();
+            }
+        }
+        check(recovered.Attempts == 4 && lines == 1,
+            $"four failing attempts in four seconds, one line - the first reads the reason, the identical repeats are suppressed (attempts={recovered.Attempts}, lines={lines})");
+        AnchorSample good = recovered.Attempt(now, () => AnchorSample.Of(new LayoutRect(1848f, 526f, 40f, 40f)), out bool gaveUpLate);
+        check(good.Measured && !gaveUpLate && recovered.Failures == 0,
+            "the HUD's camera comes up and the sample measures: the failure streak is over");
+        check(recovered.Attempts == 5 && recovered.Lines == 4 && recovered.DueToReport,
+            "the round keeps counting its attempts, and the measurement it just took owes no failure line");
+        recovered.Attempt(now + 0.25f, () => AnchorSample.Missing(AnchorSampleFailure.NoCamera), out _);
+        check(recovered.Attempts == 6 && recovered.Failures == 1,
+            "the next miss is a first miss again, not the sixth failure of a streak");
+        check(Math.Abs(AnchorSamplePolicy.DelayAfter(recovered.Failures) - AnchorSamplePolicy.FirstRetryDelay) < 0.001f,
+            "so it retries in half a second, which is the sequence a successful read resets");
+        check(Math.Max(0, AnchorSamplePolicy.Budget - recovered.Failures) == AnchorSamplePolicy.Budget - 1,
+            "and the retries left the next line prints count down from eleven again, not from the eighth a long streak would leave");
+        recovered.Reported();
+        check(!recovered.DueToReport && recovered.Attempts == 6,
+            "that line is spent exactly once, so the same attempt is never printed twice");
+        recovered.Restart();
+        check(recovered.Attempts == 0 && recovered.Lines == 0 && recovered.Failures == 0 && !recovered.Abandoned,
+            "a new level - or a resolution change, or a config reload - forgets the count and the lines together");
+        recovered.Attempt(500f, () => AnchorSample.Missing(AnchorSampleFailure.NoCamera), out _);
+        check(recovered.Attempts == 1 && recovered.DueToReport,
+            "which is what makes the new round's first line say \"attempt 1\" again, exactly as the latch this replaces did");
+
+        // The production wiring: the panel asks the round and keeps no latch of its own for a re-anchor to clear.
+        string root = SourceRoot();
+        check(root != null, "the anchor flood scenario locates the production sources");
+        if (root == null) return;
+        string panel = File.ReadAllText(Path.Combine(root, "PanelBehaviour.cs"));
+        check(!panel.Contains("_loggedAnchorFailure"),
+            "no one-shot failure latch is left in the panel - that latch cleared on every re-anchor, which is what printed the same first attempt four times a second");
+        check(panel.Contains("if (_anchorPolicy.DueToReport)"),
+            "the failure line is gated by the round's own report test, so a tick that was not an attempt prints nothing");
+        check(CountOf(panel, "_anchorPolicy.Reported();") == 2,
+            "both lines the panel writes - the failure and the give-up - spend the report, so neither can be printed twice");
+        check(CountOf(panel, "_anchorPolicy.Restart();") >= 2,
+            "and both a re-anchor and a new level restart the round, which is what resets the attempt number and the lines with it");
+    }
+
+    // `PanelBehaviour.Refresh` -> `SampleAnchor`, frame for frame: the sampling guard, the policy's throttle, the whole
+    // attempt through the policy, and the two lines it writes through `DueToReport`. Nothing here is a second opinion
+    // about the schedule; it is the model `AnchorAndFinalGeometryScenarios` already uses for the same gate.
+    private static int RunSilentHud(int frames, out List<int> written, out List<int> left, out bool abandoned)
+    {
+        var policy = new AnchorSamplePolicy();
+        written = new List<int>();
+        left = new List<int>();
+        bool unavailable = false;
+        float now = 0f;
+        for (int frame = 0; frame < frames; frame++)
+        {
+            // The frame's own timestamp, multiplied rather than accumulated, so a retry boundary that falls between two
+            // frames lands where the schedule says and not where float drift puts it.
+            now = frame * AnchorFrame;
+            if (unavailable) continue;                  // a given-up anchor is not sampled at all
+            if (!policy.Due(now)) continue;             // the retry schedule, never the frame rate
+            AnchorSample sample = policy.Attempt(now, () => AnchorSample.Missing(AnchorSampleFailure.NoCamera), out bool gaveUp);
+            if (sample.Measured) continue;
+            if (policy.DueToReport)
+            {
+                if (policy.FreshWarning)   // 1.19.22: an identical failure prints nothing new, so only the first is written
+                {
+                    written.Add(policy.Attempts);
+                    left.Add(Math.Max(0, AnchorSamplePolicy.Budget - policy.Failures));
+                }
+                policy.Reported();
+            }
+            if (!gaveUp) continue;
+            unavailable = true;
+            written.Add(policy.Attempts);               // the give-up line, which speaks for that attempt
+            policy.Reported();
+        }
+        abandoned = policy.Abandoned;
+        return policy.Attempts;
     }
 
     // ------------------------------------------------------------- the wording, read from the production source
@@ -434,8 +594,8 @@ internal static class Release11916bScenarios
         // The config description may only say what the runtime does.
         check(!plugin.Contains("and writes the new value back to this file"),
             "the ShowImpactBoard description no longer claims F8 writes that key");
-        check(plugin.Contains("but it never writes this key: F8 stores ShowPanel and ShowResultOverlay"),
-            "and it says what F8 really stores instead");
+        check(plugin.Contains("从不写这个键：F8 保存的是 ShowPanel 和 ShowResultOverlay"),
+            "and it says what F8 really stores instead - the corrected wording is now Chinese");
         check(overlay.Contains("public static ToggleAction Apply(bool visible) => new ToggleAction(visible, visible, true);"),
             "the write set the description now matches is still the two overlay switches - this release changed no key of it");
         ToggleAction off = TogglePolicy.Apply(false);

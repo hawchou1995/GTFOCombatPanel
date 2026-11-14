@@ -174,7 +174,7 @@ internal static partial class Program
 
         // Own resupply and lifetime lost are recorded the way the collection layer needs them.
         var ownSupply = new ImpactCounters();
-        ownSupply.CreditSelfSupply(true); ownSupply.CreditSelfSupply(false);
+        ownSupply.CreditSelfSupply(SupplyPackKind.Ammo); ownSupply.CreditSelfSupply(SupplyPackKind.Tool);
         Check(ownSupply.SelfSupplyUses == 2 && ownSupply.SelfAmmoUses == 1, "own resupply counts every pack and the ammo packs among them");
         var lost = new ImpactCounters();
         lost.AddHealthLost(120); lost.AddHealthLost(double.NaN); lost.AddHealthLost(-5); lost.AddHealthLost(80);
@@ -206,10 +206,13 @@ internal static partial class Program
         Check(meleeFields.Length == 3 && meleeFields[0] == "4" && meleeFields[1] == "0",
             "the melee row reports its sleeping column even when it is empty, so the two rows line up column for column");
         var supplyCounters = new ImpactCounters();
-        supplyCounters.RecordSupply(30, 100); supplyCounters.CreditSelfSupply(true);
+        supplyCounters.RecordSupply(30, 100); supplyCounters.CreditSelfSupply(SupplyPackKind.Ammo);
         var supplyEntry = new ImpactEntry(new ImpactInput { Name = "Supplier", Counters = supplyCounters }, null, null, 40, 1, ImpactRating.Supply, (int)ImpactMetric.SupplyEfficiency);
-        Check(ImpactBoard.MetricFields(supplyEntry, ImpactMetric.SupplyEfficiency, KillTier.Minor, false, true)[0] == "30.0% / 1 / 1",
-            "the supply cell shows the utilization and this player's own pack use");
+        // 1.19.34 re-point: the row is one cell of four fields, so the released `30.0% / 1 / 1` (efficiency / use / ammo)
+        // became `30.0% / 1 / 0 / 0` (efficiency / ammo packs / tool packs / medical packs). The use counted here was an ammo
+        // pack, which is why the total and the ammo field agree and the two non-ammo kinds are a counted zero.
+        Check(ImpactBoard.MetricFields(supplyEntry, ImpactMetric.SupplyEfficiency, KillTier.Minor, false, true)[0] == "30.0% / 1 / 0 / 0",
+            "the supply cell shows the utilization and this player's own pack use, split into the three kinds it prints");
         var efficiencyOnly = new ImpactCounters();
         efficiencyOnly.RecordSupply(30, 100);
         var efficiencyEntry = new ImpactEntry(new ImpactInput { Name = "NoOwnUse", Counters = efficiencyOnly }, null, null, 40, 1, ImpactRating.Supply, (int)ImpactMetric.SupplyEfficiency);

@@ -40,6 +40,9 @@ internal static partial class Program
         shot.BeginPellet(); shot.Contact(false); shot.Contact(true); shot.Contact(true);
         Check(shot.Fired == 1 && shot.Hits == 1 && shot.WeakspotHits == 1, "penetration contacts count once and upgrade weakspot once");
         RunSquadGateScenarios();
+        // The same rule measured where it actually matters - the packets the production transport hands to
+        // `SNet.Core.SendBytes` - instead of at the exchange's queue.
+        RunSquadProbeWireGateScenarios();
         var shotgun = new ShotSample();
         for (int i = 0; i < 8; i++) { shotgun.BeginPellet(); if (i < 4) { shotgun.Contact(i < 2); shotgun.Contact(false); } }
         Check(shotgun.Fired == 8 && shotgun.Hits == 4 && shotgun.WeakspotHits == 2, "shotgun pellets, misses, penetration and weakspots are independently counted");
@@ -1403,28 +1406,47 @@ internal static partial class Program
         Check(decodedWire.Generation == 12u, "a snapshot carries the run it belongs to");
         Check(SquadPackets.Parse(snapshotWire, snapshotWire.Length - 1).Kind == SquadPacketKind.Malformed, "a truncated snapshot is consumed rather than half-read");
 
-        // The hello: sent at once, retried on a cadence until the peer is heard from, re-sent after a
-        // silence, and bounded so a peer that does not run this mod is never spammed.
+        // The hello: sent at once, retried on a cadence while the peer has not answered, re-sent after a
+        // silence - and, for a peer that never proved it runs this build, bounded by the probe budget.
         var handshake = new HandshakePolicy();
         Check(handshake.ShouldGreet(5UL, 0f), "the first hello goes out at once");
         Check(!handshake.ShouldGreet(5UL, 0f), "a second hello in the same instant is not sent");
         Check(handshake.ShouldGreet(5UL, HandshakePolicy.RetrySeconds), "the hello is retried on the cadence");
-        // The quick cadence is a burst, not a budget. A fixed number of attempts wrote a peer off for the
-        // whole run - and the ordinary case for a peer whose machine is still on the loading screen during
-        // those ten seconds is exactly the failure it produced: two machines that exchange nothing, which
-        // looks from either screen like a build that cannot share at all.
+        // 1.19.38 replaced the rule asserted here up to 1.19.37: "a peer that never answers is greeted over the
+        // first ten seconds and then on the keep-alive cadence, and is never written off for the run". A run
+        // beside a machine that runs no mod retired it with hard evidence - GTFO-API writes one `[Error]` line
+        // into that machine's own log for every packet of this event it is handed, 10225 of them for this event
+        // in one session - so the cadence below is now the cadence a peer that has proved itself keeps, and a
+        // never-answering peer runs into the wire gate (asserted just below), not into this policy.
         var keepAlive = new HandshakePolicy();
         var helloAt = new List<float>();
         for (float at = 0f; at <= 60f; at += 0.25f) if (keepAlive.ShouldGreet(9UL, at)) helloAt.Add(at);
         // The burst covers the first ten seconds - five retries at the quick cadence, the sixth greeting
-        // landing at the ten-second mark - and every greeting after that is on the keep-alive cadence, so a
-        // peer whose machine was still loading, or whose greetings were dropped, is still found later in the
-        // same run instead of being written off until the next lobby.
+        // landing at the ten-second mark - and every greeting after that is on the keep-alive cadence. The
+        // cadence itself is unchanged, and it is how a peer that answered and then went quiet is picked up again.
         Check(helloAt.Count == 11 && near(helloAt[5], 10f) && near(helloAt[6], 20f) && near(helloAt[10], 60f),
-            "a peer that never answers is greeted over the first ten seconds and then on the keep-alive cadence, and is never written off for the run");
+            "the greeting policy still retries a peer over the first ten seconds and then on the keep-alive cadence, which is the cadence a peer that proved itself keeps");
         Check(near(helloAt[7] - helloAt[6], HandshakePolicy.KeepAliveSeconds)
             && HandshakePolicy.KeepAliveSeconds > HandshakePolicy.RetrySeconds,
-            "and the cadence it settles on is the slow one, so a peer that does not run this mod is still not spammed");
+            "and the cadence it settles on is the slow one");
+        // What 1.19.38 changed is the wire, not the cadence: the gate that decides whether a packet goes out at
+        // all answers `Probe` for an unproven peer only while its budget lasts, so the eleven greetings above can
+        // never all leave this machine for a peer that runs no mod.
+        var boundedProbe = new SquadCapability();
+        boundedProbe.SetBroadcast(true);
+        Check(boundedProbe.MaySend(9UL, out SquadEvidence whyProbe) && whyProbe == SquadEvidence.Probe,
+            "1.19.38: sharing with the slot list opens a bounded probe for an unproven peer, not an open channel");
+        int probePackets = 0;
+        for (int greeting = 0; greeting < 100; greeting++)
+        {
+            if (!boundedProbe.MaySend(9UL)) break;
+            boundedProbe.NoteProbeSent(9UL);
+            probePackets++;
+        }
+        Check(probePackets == SquadCapability.ProbeBudget && SquadCapability.ProbeBudget < helloAt.Count,
+            "1.19.38: an unproven peer costs ProbeBudget (" + SquadCapability.ProbeBudget + ") packets, not the eleven the keep-alive cadence would have put on the wire");
+        Check(!boundedProbe.MaySend(9UL) && boundedProbe.Describe(9UL).Contains("spent"),
+            "1.19.38: after that the gate answers nothing and the diagnostic names the spent budget rather than missing evidence");
         // Which rule gates the relay: a peer that once proved it runs this mod keeps being sent rows even
         // after its own uplink has been quiet for longer than the silence window. It can still receive, and
         // stopping the relay there was a second way this build could go silent for a whole run.
@@ -1727,7 +1749,10 @@ internal static partial class Program
         nativeBlink.Start(11, 101); nativeBlink.Start(12, 102); nativeBlink.Start(13, 103);
         Check(nativeBlink.Count == 3 && nativeBlink.Names == 1 && nativeBlink.Artwork == 2 && !nativeBlink.Ready, "the actual background, skull and optional title are required, not unused prefabs");
         nativeBlink.Finish(11, 101, true); nativeBlink.Finish(12, 102, true);
-        Check(!nativeBlink.Ready && !nativeBlink.NamesReady && nativeBlink.ArtworkReady, "a title whose native BlinkIn is still running holds the board back");
+        // 1.19.21 re-point: the native BlinkIn ledger still reports "not ready" while a title's own blink is running -
+        // it is the drawn-pixel route's record - but that state no longer holds the settlement board back: the board
+        // is placed from the section's final layout, which is readable before any of the reveal has drawn.
+        Check(!nativeBlink.Ready && !nativeBlink.NamesReady && nativeBlink.ArtworkReady, "a title whose native BlinkIn is still running is still recorded as not yet drawn - and no longer holds the board back, which is placed from the section's final layout");
         nativeBlink.Finish(13, 103, false);
         Check(!nativeBlink.Ready, "aborted or BlinkOut completion does not count as revealed");
         nativeBlink.Finish(13, 103, true);
@@ -1777,8 +1802,120 @@ internal static partial class Program
         Release11917Scenarios.RunInto(Check);
         // ---- 1.19.18: the board is bounded by the icon row above and the footer this machine can see below ----
         Release11918Scenarios.RunInto(Check);
+        // ---- the two defects this round fixes on top of 1.19.20: the flashlight anchor's restarted retry round and
+        //      the settlement board drawn against a mid-reveal edge --------------------------------------------
+        AnchorAndFinalGeometryScenarios.RunInto(Check);
+        // The official 1.19.20 assertions this workspace's own Release11916Scenarios.cs does not carry (36 runs: the two
+        // scenario methods and the band-policy block of `Wiring`), restored without touching that file.
+        Release11920OfficialRegressionScenarios.RunInto(Check);
+        // ---- 1.19.21: the settlement board is drawn at its final layout geometry from the very first frame the page
+        //      exists - the drawn-pixel settle gates are diagnostics, and the band never moves afterwards ----------
+        Release11921Scenarios.RunInto(Check);
+        Console.WriteLine("---- 1.19.22: the forced F8 frame and the anchor warning cap ----");
+        Release11922Scenarios.RunInto(Check);
+        // ---- 1.19.23: a settlement record and an edited scoring file are lost only when the player deletes them --
+        Console.WriteLine("---- 1.19.23: settlement records are lost only when the player deletes them ----");
+        Release11923Scenarios.RunInto(Check);
+        // ---- 1.19.24: every player-facing configuration description is Chinese, and scoring.json teaches its own edits --
+        Console.WriteLine("---- 1.19.24: every player-facing configuration description is Chinese ----");
+        Release11924Scenarios.RunInto(Check);
+        // ---- 1.19.25: the review round - one line per F8 press, no double answer, an honest hidden-page archive and
+        //      a failed scoring import that keeps the player's legacy file in charge --------------------------------
+        Console.WriteLine("---- 1.19.25: the review round: press-once reporting, honest archive, import-safe scoring ----");
+        Release11925Scenarios.RunInto(Check);
+        // ---- 1.19.26: F8's answer read from the display, and the second look that may only be spent on a footer the
+        //      page really measured (the fail-open/second-look/withdraw livelock) ------------------------------------
+        Console.WriteLine("---- 1.19.26: F8 from the display, and a second look only on a measured footer ----");
+        Release11926Scenarios.RunInto(Check);
+        // ---- the in-level anchor's second native source: the flashlight row's own `Background Fade` --------------
+        BackgroundFadeAnchorScenarios.RunInto(Check);
+        // ---- the two defects of the independent review: a fail-open board's band is asked about both edges, and a failed
+        //      background lookup is never remembered as "this HUD has no background" -------------------------------
+        ResultBoardBandIntrusionScenarios.RunInto(Check);
+        // ---- 1.19.26: the flashlight anchor's second source is no longer lost to a first-frame miss, and the camera/canvas
+        //      rules that decide whether a sprite may be projected at all are driven as they really are ------------
+        Console.WriteLine("---- 1.19.26: the anchor lookup's bounded miss retry and the sprite's camera rules ----");
+        Release11926AnchorScenarios.RunInto(Check);
+        // ---- 1.19.26: the anchor's outer budget and the lookup's inner one are driven together over a frame timeline ----
+        Console.WriteLine("---- 1.19.26: the anchor watch - a row that appears after the twelve samples is still found ----");
+        Release11926AnchorWatchScenarios.RunInto(Check);
+        // ---- 1.19.26: every settlement record also gets a visible copy next to the DLL, in its own `Results` folder ----
+        Console.WriteLine("---- 1.19.26: the settlement copy next to the mod, and the package whitelist that cannot carry it ----");
+        Release11926ResultsMirrorScenarios.RunInto(Check);
+        // ---- 1.19.27: the flashlight anchor had never measured anything on any recorded level - the element lookup must see
+        //      an inactive row, and a RectTransform inside a screen-space canvas needs no camera to say where it was drawn --
+        Console.WriteLine("---- 1.19.27: the anchor's canvas geometry - a RectTransform inside a screen-space canvas ----");
+        Release11927Scenarios.RunInto(Check);
+        // ---- 1.19.28: the three things that kept the anchor from ever answering - the walk compared the log token instead of the
+        //      prefab's name, the candidate list had no CellUI camera, and the geometry answer projected through a null camera ---
+        Console.WriteLine("---- 1.19.28: the anchor's constant, the CellUI camera and the icon row's own layout rectangle ----");
+        Release11928Scenarios.RunInto(Check);
+        // ---- 1.19.29: the recorded level's `anchorSource=canvas-geometry` beside two `gate=refused`s was an authorization
+        //      printed as an answer, and `cellUiMaskProof=no` folded three questions into one word. The answer and the
+        //      authorization now have their own fields, and every candidate's own facts are printed once per round -----------
+        Console.WriteLine("---- 1.19.29: an anchor's answer versus the authorization it was measured under ----");
+        Release11929Scenarios.RunInto(Check);
+        // ---- 1.19.32: this game's HUD carries no `Canvas` at all, so the two answers the anchor had (an ancestor canvas, or a
+        //      camera whose mask proves it draws the layer) were both correct refusals and the anchor never measured anything.
+        //      The HUD's own manual canvas - `m_cellUICanvas.m_UICamera` rendering into a texture the size of the window - is the
+        //      authority now, per element and per attempt, and the CellUI camera proof compares native pointers instead of
+        //      wrappers (`cellUiMaskProof=offered=no` beside `each=#0:cellui`) ------------------------------------------------
+        Console.WriteLine("---- 1.19.32: the manual canvas as the projection authority, and a camera's native identity ----");
+        Release11932Scenarios.RunInto(Check);
+        // ---- 1.19.33: the first blow of a run was credited to nobody. The ledger only credits a drop against a mark, and
+        //      the first observation of a (damage base, owner) pair only plants one - so when `Setup` did not plant it (the
+        //      owner is not trackable yet at that moment), the recorded `healthLost=23.7` against a 25.0 friendly-fire total
+        //      lost exactly one hit. The damage entry now reads the real pre-call health and seeds the mark with it ----------
+        Console.WriteLine("---- 1.19.33: the first blow a machine sees for a player is measured, from the life they really had ----");
+        Release11933Scenarios.RunInto(Check);
+        // ---- 1.19.34: the settlement board's supply row keeps its one row and prints four fields per player -
+        //      `补给效率 / 弹药包 / 工具包 / 血包`. The split is counted, never inferred: one pack is one use of one kind, the
+        //      three kinds add up to the total the row already printed, the efficiency and its giver stay exactly as they
+        //      were, and a peer that still speaks the v8 pair keeps its row (its kinds print `?`, never 0) ----------------
+        Console.WriteLine("---- 1.19.34: the supply row is one row with four fields per player, and a v8 peer keeps its row ----");
+        Release11934Scenarios.RunInto(Check);
+        // ---- 1.19.35 review fixes: a medical pack is never counted as a tool pack (the one-bit overload that did that is
+        //      gone), the settlement mirror takes one side's unsplit pair whole instead of maxing its two fields apart, and a
+        //      seeded seat whose own observation never came is counted on a bounded diagnostic line instead of being guessed at.
+        //      1.19.36 kept that cell at four fields in every branch: an unsplit row keeps the ammo part it really sent and
+        //      prints `?` in the two kinds, because the three kinds replaced the old "all packs" total ----------------
+        Console.WriteLine("---- 1.19.35 review fixes: a heal is not a tool pack, an unsplit pair is one block, four cells in every branch ----");
+        Release11935Scenarios.RunInto(Check);
+        // ---- 1.19.37: host damage attribution, plus failure and success pages whose own measured bands are safe proof.
+        //      The failure route preserves complete-scan and overlap refusal; the success route requires the IconRow,
+        //      page-measured footer, complete parent coverage and an empty interaction scan when its button is unreadable.
+        Console.WriteLine("---- 1.19.37: host damage attribution and overlap-safe result-page band proofs ----");
+        Release11937Scenarios.RunInto(Check);
+        // ---- 1.19.38: the bounded probe. A machine that runs no mod is not silent about this build's packets -
+        //      GTFO-API logs one error line per unregistered event on the receiving side, and a recorded run beside
+        //      such a machine collected 10225 of them for `CombatPanelSquad`. Sharing with the slot list therefore
+        //      buys an unproven peer a fixed number of greetings and never a row, and stops until it answers, the
+        //      expedition changes or the seat changes hands ---------------------------------------------------
+        Console.WriteLine("---- 1.19.38: the bounded probe - three greetings per unproven peer, rows only to proven and named peers ----");
+        RunRelease11938SquadScenarios();
+        // ---- 1.19.38: the client failure page's strip is the page's fixed geometry, not the waiting line. 记录页面
+        //      2560x1440：标题 815、等待文字 1228、固定几何 836..1429（593px）。旧规则把下界夹到 1207（370px，30 行
+        //      只剩 8px 字号），等待文字下移 30px 还会再触发一次重排；这一版条带 593px / 12px，等待文字只以
+        //      `waitingText=` 进日志，既不是墙也不撤板 ------------------------------------------------------
+        RunRelease11938ClientResultsScenarios();
+        RunRelease11938SurvivalLogScenarios();
+        // ---- 1.19.40: 客机失败页的 fail-open 条带与严格落位读同一份事实。旧兜底把那行状态文字（1228）当文字墙、
+        //      又把含它的 `FooterTop` 当页脚控件，于是同一张 2560x1440 页面上兜底只有 370px（8px 字号）、严格有
+        //      593px；现在两层都走 `ResultPageLowerBoundPolicy` + `ResultFallbackBandPolicy` ----------------------
+        RunRelease11940ClientFallbackBandScenarios();
+        // ---- the client settlement page's own band: a band that ends above the waiting-status block may be filled to its
+        //      foot, so the recorded 316px client page draws the 7px / 315px table instead of a 6px / 270px one and then
+        //      re-fitting itself 30px lower - and every host band keeps the comfort ceiling -------------------------
+        Console.WriteLine("---- client settlement band: the waiting line is the wall, so the band may be filled to its foot ----");
+        GuestSettlementBandScenarios.RunInto(Check);
         // ---- the explanation line under each title: a template a player may edit --------------
         ReasonTemplateScenarios.RunInto(Check);
+        // ---- 1.19.41: the three settlement-placement gates - the client failure page's first placement waits for the
+        //      page's own result actions, the success page's first placement waits for the native BlinkIn ledger (with an
+        //      escape that is never a frame count), and the success page's upper bound is the deeper of the section's
+        //      container and the captions it really draws once the reveal has finished ---------------------------
+        Console.WriteLine("---- settlement placement gates: page actions, native reveal ledger, drawn caption edge ----");
+        ResultSettlementPlacementScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------
         // EWC announces a shot when the weapon fires and a hit when the pellet lands, in two separate
         // updates; the second one carries hits with a count of zero. Reading each update as one complete

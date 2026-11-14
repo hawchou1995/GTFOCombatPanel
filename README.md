@@ -2,8 +2,8 @@
 
 独立 GTFO 战斗统计面板：局内看战斗数据，成功或失败结算看队伍贡献。表格由 IMGUI 画在窗口像素里，不写入任何原版文字对象。
 
-- **当前状态**：最新正式发布版本为 **`1.19.20`**，已在 GitHub 发布（`v1.19.20` tag + Release，Release 附件为构建好的 zip）；Thunderstore 由 `Hawchou` 自行上传。本版是结算面板布局修复，**不含评分/协议/同步变更**。发布包 `GTFOCombatPanel-1.19.20.zip` 为 **372,173 字节**、SHA-256 **`99AA3CE6ABBA26603724B82EF27168A4FF5C6D52681DA9671531D3011C09127A`**，包内 `BepInEx/plugins/GTFOCombatPanel/GTFOCombatPanel.dll` 为 **438,784 字节**、SHA-256 **`EB216EC33B3CD15F6FDD5FBB8DCDDFB592504B646A0B8D937D8D37EADD8500B1`**、FileVersion `1.19.20.0`。构建环境：本机无 GTFO 安装，`BepInEx/core` 取自 Thunderstore `BepInEx-BepInExPack_GTFO-3.2.4`，`BepInEx/interop` 取自用户提供的已运行 profile `D:\下载\Compressed\Survival`；`scripts/Verify.ps1` 全量通过（`VERIFY: PASS`，0 警告 0 错误，`PASS: 2705 combat-panel assertions`、Scan 38、Supply 50、ConfigWatcher 9、`OPTIONAL_EWC_BRIDGE` / `EWC_API_CONTRACT` / `SCOUT_HOOK_SAFETY` 均 PASS）。本工程构建非确定性：同源不同输出目录会得到**同尺寸但不同 SHA-256** 的 DLL（MVID 含源绝对路径），跨目录 hash 不能当作一致性判据，一致性与验证只用「同一输出目录原地重编，hash 与字节均不变」证明。逐版变更、验证记录与未验证项只写在 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；Thunderstore 详情页与包内 `Thunderstore/README.md` 只保留常青的功能/配置/安装文档，不列更新日志。
-- **安装**：r2modman / Thunderstore Mod Manager 搜索 `CombatPanel`（自动带上 BepInEx 依赖）；或手动把包内 `BepInEx/plugins/GTFOCombatPanel/` 整个目录放进 GTFO 目录下的同一路径。`CombatPanel-config/scoring.json` 只在缺失时创建一次，手改过的配置不会被覆盖。已有 `.cfg` 在升级时保留，新配置项下次加载自动补齐。
+- **当前状态**：源码版本为 1.19.38；Thunderstore 的实际发布状态以商店页面为准。本工程构建非确定性：同源不同输出目录会得到**同尺寸但不同 SHA-256** 的 DLL（MVID 含源绝对路径），跨目录 hash 不能当作一致性判据，一致性与验证只用「同一输出目录原地重编，hash 与字节均不变」证明。近期变更见 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；包内 `Thunderstore/README.md` 保留功能、配置与安装文档。
+- **安装**：模组包管理器（Thunderstore Mod Manager 等）搜索 `CombatPanel`（自动带上 BepInEx 依赖）；或手动把包内 `BepInEx/plugins/GTFOCombatPanel/` 整个目录放进 GTFO 目录下的同一路径。`CombatPanel-config/scoring.json` 放在**游戏持久数据目录**下（GTFO 即 `…\AppData\LocalLow\10 Chambers Collective\GTFO\`）并只在缺失时创建一次；插件目录里的旧副本会在首次使用时自动导入、此后以持久目录为准，手改过的配置不会被覆盖，也不会被升级包替换。已有 `.cfg` 在升级时保留，新配置项下次加载自动补齐。
 - **兼容**：仅依赖 **BepInEx-BepInExPack_GTFO-3.2.4**；EWC（ExtraWeaponCustomization）是可选集成，公共 DLL 不带它的程序集引用。多人快照协议为 **v8**，与旧协议不兼容（旧协议包会被明确拒收）。需要共享统计的每台机器装同一版本。
 - **反馈**：<https://qingju.me>；开黑语音频道（小黑盒语音）<https://chat.xiaoheihe.cn/in1wpsjd>。
 
@@ -65,12 +65,13 @@
 
 ## 结算板的落位与字号
 
-两个结算页的板子都在**页面自己的动画真正结束、锚点确实量得到之后**才落位并显示，而且这个条件是硬的：
+结算板优先等待页面的原生动画和可测锚点稳定，再确定位置；无法证明页面定稿时，部分路径会明确记录并使用兜底布局，而不是把超时当成动画完成。
 
-- 上边缘挂在失败页 `任务失败` 标题的实测底边、或成功页完成区块的实测下沿之下。失败页还要求标题**文字已经完整显示**（它的透明度乘以上层所有 CanvasGroup，达到满不透明）**并且**实测底边连续两次读数一致；只有矩形不动、文字仍在淡入不算就绪。成功页要求完成区块上界同样稳定。
-- 下边缘以「返回大厅 / 送所有囚犯回大厅」按钮的上沿为严格下限（`ButtonClearance`），并且要求这条边被真正读到两次一致的值。
-- **任何一条真实锚点拿不到时，什么都不画、也不隐藏原版内容**：原版结算画面保持原样，等待期间以有界节流（前两秒逐帧、之后约每半秒一次）复测，不会用窗口比例猜一块微型面板来伪装成功。一旦真实锚点稳定可测，面板自动出现，不需要 `F8` 关开。
-- 字号由这段真实条带搜索得到（到条带 92%–96% 或页面可用宽度即停，最高为局内字号的 3.5 倍），可读下限取自该按钮自己的实测高度。
+- 成功页追踪原生分区图标的 BlinkIn 完成信号，并测量图标与题注的可见下沿；失败页参考任务标题和页面可测的控件边界。
+- 客机失败页暂时量不到可交互控件时会先等待；拒收预算用尽后，可使用同一套页面几何兜底，并继续避让测到的控件。
+- **已知边界**：成功页如果已经观察到部分 BlinkIn 目标，但其中一个目标中止或完成回调始终没有到达，当前版本可能一直等待；可按 `F8` 请求兜底显示。该情形尚未在真人游戏中复现验证。
+- 兜底显示不等于页面已定稿；页面之后变化时，板子可能重新测量和调整，不保证首次显示的位置或尺寸永远不变。
+- 字号由这段真实条带搜索得到（最高为局内字号的 3.5 倍），可读下限取自该按钮自己的实测高度。**表格能填到条带的哪一处分两种情形：客机结算页的带子下沿就是页面上真正量到的等待状态文字块，带子本身已经停在那行字上方一段净空，所以这条带可以填到自己的下沿，也就是 100%；主机页那条由「返回大厅」按钮界定的带、以及客机仍然够到页面边缘、下沿没有量到任何墙的带，仍按原舒适上限停，表格最多用到条带高的 96%——按钮和页面边缘都不会被压到。**两种情形都在页面可用宽度用尽时停。
 - 板子落位后不会因为一两帧的抖动移动；**页面本身在落位后又明显移动或改变尺寸时（别的模组重排页脚、分辨率变化等），板子自动重新测量并按新条带重新拟合**，每页有次数预算，不需要 F8 关开。
 - 结算页仍在持续收快照：数据让表格变大时，会先按落位时真正用到的条带与该帧按钮净空校验；装不下就保留已上板的网格，绝不压按钮或标题。
 - 鼠标滚轮在板子上可缩放字号，两页各存一份（`[Results] SuccessFontScale` / `FailureFontScale`）。缩放只乘在页面自己量出的字号上，往上最多夹回该字号。
@@ -86,8 +87,8 @@
 面板在 **窗口像素**里绘制（`OnGUI` 的 `EventType.Repaint`）：
 
 - IMGUI 由 Unity 在**所有相机和所有 canvas 之后**合成，并且只相对窗口定位。因此它**不继承任何视角运动、HUD 运动或 HUD 视差**：游戏里没有任何东西能让它动，只有改配置（热重载）才会重新定位。
-- 位置基准是**原生手电筒图标**（右侧装备栏那个）：用 **HUD 自己那台相机**量出它的屏幕矩形，**每 0.25 秒采样一次直到连续 1 秒不动**（进关时 HUD 有入场动画，只采第一帧会偏几百像素），然后**锁死**。面板挂在图标正下方、右边缘与图标对齐。
-- 之后不再采样，所以也没有视差；整张表还会被**夹进窗口内**，所有列一定完整可见。
+- 位置基准是右侧装备栏那一行的**图标行**（`PUI_InventoryIconDisplay`）。它占的屏幕矩形有两条**都合法**的算法，日志里的 `anchorSource=` 与 `measuredFrom=` 会写明这一次是哪一条、量的又是哪块矩形：**相机投影**——先证明 HUD 上真有一台活着的相机在画这个元素所在的 layer（不是渲染到 RenderTexture 的相机），再按那台相机投影；或者**元素自身几何**——元素自带 `RectTransform`、而它所属的画布是屏幕空间时，把这个 `RectTransform` 声明的 `rect` 的**四个角**投成窗口像素，就是它占的屏幕矩形。1.19.31 起，「这块画布是什么模式、归哪台相机」**只由元素自己的祖先 `Canvas`（归一到根画布）决定**（`AnchorElementCanvasPolicy`）：真·屏幕空间 **overlay** 画布按 Unity 的**零相机**身份投影——这时**即使旁边有活相机也不会传相机**，否则等于把已经是像素的坐标再投影一次；**screen-space-camera** 画布只认**它自己那台** `worldCamera`（必须活着、且不渲染到 RenderTexture），拿不到就**如实拒绝、退回配置坐标**，绝不拿别的相机顶替；元素层级里完全没有 `Canvas`（或画布是 world-space）时几何这条**根本不成立**。两条路都走同一道合理性闸门（有限值、宽高超过 1 px、在窗口内、不是整窗），并且**每 0.25 秒采样一次直到连续 1 秒不动**（进关时 HUD 有入场动画，只采第一帧会偏几百像素），然后**锁死**。日志里 `anchorSource=` 只报这一次**真正量到**的那条，`authorization=` 报这一次被授权的规则（没量到时带 `(refused)`）；两条都量不到时才退回配置坐标（`anchorSource=config`）。面板挂在这一行正下方、右边缘与它对齐。
+- **采样预算用尽后不是永久放弃，而是守望**：连续失败 12 次、表格退回配置坐标之后，HUD 仍**每 2 秒被看一次**（没有预算在背后、也不再刷失败日志）；只要重新量到图标，或者量到同一行装备栏的 `Background Fade`，面板就**复活**并重开稳定窗——采样时间、稳定窗与来源记录一律从零开始，必须重新连续 1 秒不动才锁死，不会拿废弃回合的静止证据直接锁上。锁定之后不再采样，所以也没有视差；整张表还会被**夹进窗口内**，所有列一定完整可见。
 - 只在改配置（热重载）或换分辨率时重新采样。`AnchorToFlashlight = false` 或量不到图标时，退回 `PositionX/PositionY`（负值表示**从右边/下边**量）。
 - 绘制从不处理输入，所以它不会吃掉鼠标点击。
 
@@ -122,7 +123,7 @@
 
 ## 配置热重载
 
-插件自带配置文件监听。**游戏中直接编辑** `BepInEx/config/HawChow.GTFOCombatPanel.cfg` 或与 DLL 同目录的 `CombatPanel-config/scoring.json` 并保存，约 0.3 秒后自动生效：语言、紧凑度、列开关、字号与位置、十三项权重与辅助工具规则全部立即重算，无需重启游戏。生效时日志会输出：
+插件自带配置文件监听。**游戏中直接编辑** `BepInEx/config/HawChow.GTFOCombatPanel.cfg` 或游戏持久数据目录（`…\AppData\LocalLow\10 Chambers Collective\GTFO\`）下的 `CombatPanel-config/scoring.json` 并保存，约 0.3 秒后自动生效：语言、紧凑度、列开关、字号与位置、十三项权重与辅助工具规则全部立即重算，无需重启游戏。生效时日志会输出：
 
 ```
 [HOTRELOAD] config reloaded; language=...; density=...; columns=...; the table is rebuilt and repositioned from the new settings.
@@ -132,7 +133,7 @@ BepInEx 6 自身不监听配置文件，本插件用 `FileSystemWatcher` 监听�
 
 ## 统计口径
 
-> 逐项的数据来源、准确度与限制（尤其是「房主装了本模组」与「房主没装」两种情况），见 [`DATA-AVAILABILITY.md`](DATA-AVAILABILITY.md)。
+> 逐项数据来源可参考历史文档 [`DATA-AVAILABILITY.md`](DATA-AVAILABILITY.md)；该文档主要记录 1.17.18 口径，不应视作 1.19.38 的完整实时规范。
 
 - 本机玩家和房主控制的机器人：钩住实际普通枪、霰弹枪及同步武器 `Fire`，在同一次开火内统计各颗初始弹丸射线；穿透续射只升级同一颗弹丸的命中/弱点标记。
 - 命中率 = 命中敌人的弹丸数 / 总发射弹丸数。击中队友只产生友伤，不提高对敌命中率。
@@ -152,6 +153,8 @@ BepInEx 6 自身不监听配置文件，本插件用 `FileSystemWatcher` 监听�
 - `[Results] OffsetX/OffsetY`（像素）调整看板位置；超出窗口时整体等比缩小并夹回屏内。
 
 成功、失败、回到大厅及检查点回滚不会清除统计。只在下一次新远征生成时清空（检查点重试按本次远征累计）。
+
+**结算记录**：每张结算页写一份 JSON 主档，落在游戏持久数据目录的 `CombatPanel-results\`（Unity `Application.persistentDataPath`；GTFO 即 `…\AppData\LocalLow\10 Chambers Collective\GTFO\CombatPanel-results\`，路径由游戏给，不在本模组里写死）；同时在**本模组 DLL 旁的 `Results\`** 写一份**同样内容**的副本，方便直接找到或发给别人。两份都**从不**由本模组删除；写副本失败只影响副本、主档照常，日志写明原因与主档路径；目标位置已有同名文件一律不覆盖（重名自动加数字后缀）；玩家删掉副本后不会自动重建。`Results\` 与旧的历史导入目录 `CombatPanel-results\` 是不同目录，副本不写进那里，也不参与导入。
 
 ## 配置
 
@@ -208,7 +211,7 @@ KillEliteMaxHealth = 1000
 StaggerNeedsAttack = true
 ```
 
-- `AnchorToFlashlight = true`：以原生手电筒图标的屏幕矩形为基准，挂在它下方并与右边缘对齐；该矩形**采样到不动之后才锁死**，所以面板贴在装备栏旁边但从不跟随移动。
+- `AnchorToFlashlight = true`：以右侧装备栏那一行**图标行**（`PUI_InventoryIconDisplay`）的屏幕矩形为基准，挂在它下方并与右边缘对齐；该矩形由「相机投影」或「元素自身 `RectTransform` 四角投影」得到，两者的相机都是**元素自己那块画布**（归一到根画布）在用的那台（1.19.31 起）：screen-space-camera 画布只认它自己的 `worldCamera`（必须活着、非 RenderTexture，拿不到就退回配置坐标、不拿别的相机顶替），overlay 画布则按 Unity 的**零相机**身份投影（即使旁边有活相机也不传）；日志里的 `anchorSource=` 与 `measuredFrom=` 会写明是哪一条、量的哪块矩形，**采样到不动之后才锁死**，所以面板贴在装备栏旁边但从不跟随移动。
 - `FontSize`：1080p 基准字号，随窗口高度与紧凑度缩放。
 - `PanelOpacity`（默认 0.28）：**局内面板底板的浓淡**，0 = 完全透出游戏画面，1 = 实心板。底板本身是深色，为了在亮背景下也能看清数字；嫌它像块黑板就往下调。每一帧都重新读，所以改文件或热重载下一帧就生效。**结算影响板不受这个键影响**（保留它自己的底板值）。
 - `[Results] ShowResultOverlay`（默认 true）：关掉后结算页保持游戏原样，**不再回退旧统计表**。`ShowImpactBoard`（默认 true）：影响板整块开关。`ShowSuccessArtifacts`（默认 false = 隐藏成功页红晶/神器栏、总结行、检查点消耗）、`ShowSuccessPlayerReports`（默认 false = 隐藏四张囚犯报告卡及其锚点）、`HideVanillaFailBlocks`（默认 true = 隐藏失败页红晶面板）：打开即精确还原；两条成功页开关的描述里都带提示「建议关闭显示以免影响观感」。
@@ -217,7 +220,7 @@ StaggerNeedsAttack = true
 - `[Scoring] ScoringFile`（默认 true）：是否读取 `CombatPanel-config/scoring.json`；`Weights` 只是回退值（关闭或文件不可读时生效）。
 - 以上全部支持热重载（`.cfg` 与 `scoring.json` 都在主线程重载）。位置不顺手就改 `PositionX/PositionY`，大小不合适就改 `FontSize`，保存即生效。
 
-**评分文件 `CombatPanel-config/scoring.json`**（与 DLL 同目录；只在缺失时创建一次，非法时保留上一次有效配置并回落 `.cfg`，绝不覆盖用户文件，写入原子）字段：`Guidance`、`Weights`（十三项，顺序同上看板；默认合计 9.68）、`EnabledMetrics`（`null` = 全开，权重设 0 即不计分）、`MinorHealth`（默认 120）、`EliteHealth`（默认 1000）、`MinorKillWeight` / `EliteKillWeight` / `BossKillWeight`（三档击杀的相对价值，默认 0.5 / 1 / 1.5，必须单调不减；与整行 `Kills` 权重相乘）、`SleepingMeleeKillMultiplier` / `SleepingScoutKillMultiplier`（默认 2，范围 1–10）、`FirepowerBonus`（默认 1.15，≤1.3）、`UtilityBonus`（默认 1.0，≤1.3）、`SupportToolNames[]`、`ExcludedTools[]`、`OtherToolsAreSupport`（默认 true）、`RescueFloor`（默认 2）、`AccuracyConfidencePellets`（默认 20）、`FriendlyFireGrace`（友伤**伤害**容差：默认 10，范围 0–1000，单位与面板显示的敌伤相同；不超过它的伤害按 0 计入评分，友伤致倒次数不受它影响、仍照常计入并可因此获「敌我不分」）、`Titles`、`Reasons`。
+**评分文件 `CombatPanel-config/scoring.json`**（位于游戏持久数据目录，GTFO 即 `…\AppData\LocalLow\10 Chambers Collective\GTFO\CombatPanel-config\`；插件目录里的旧副本首次使用时一次性导入；只在缺失时创建一次，非法时保留上一次有效配置并回落 `.cfg`，绝不覆盖用户文件、升级包也不会替换它，写入原子）字段：`Guidance`、`Weights`（十三项，顺序同上看板；默认合计 9.68）、`EnabledMetrics`（`null` = 全开，权重设 0 即不计分）、`MinorHealth`（默认 120）、`EliteHealth`（默认 1000）、`MinorKillWeight` / `EliteKillWeight` / `BossKillWeight`（三档击杀的相对价值，默认 0.5 / 1 / 1.5，必须单调不减；与整行 `Kills` 权重相乘）、`SleepingMeleeKillMultiplier` / `SleepingScoutKillMultiplier`（默认 2，范围 1–10）、`FirepowerBonus`（默认 1.15，≤1.3）、`UtilityBonus`（默认 1.0，≤1.3）、`SupportToolNames[]`、`ExcludedTools[]`、`OtherToolsAreSupport`（默认 true）、`RescueFloor`（默认 2）、`AccuracyConfidencePellets`（默认 20）、`FriendlyFireGrace`（友伤**伤害**容差：默认 10，范围 0–1000，单位与面板显示的敌伤相同；不超过它的伤害按 0 计入评分，友伤致倒次数不受它影响、仍照常计入并可因此获「敌我不分」）、`Titles`、`Reasons`。
 
 ## 实机待确认
 

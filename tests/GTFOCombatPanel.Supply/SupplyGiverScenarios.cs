@@ -1,12 +1,16 @@
 using System;
+using System.Collections.Generic;
+using System.IO;
 using HawChow.GTFOCombatPanel;
 
 namespace HawChow.GTFOCombatPanel.SupplyTests;
 
 // Regression cover for the ammo supply giver that is missing on a client: `pAmmoGive` names the receiver
 // only and the authority relays it, so the giver has to come from the give the pack user's own machine
-// made. Everything SupplyTracker decides is delegated to SupplyUse.cs and is asserted here; the native
-// callbacks themselves (GiveAmmoRel/ReceiveAmmoGive/PickupAmmo) can only be exercised in a live session.
+// made. Everything SupplyTracker decides is delegated to SupplyUse.cs and is asserted here - including which kind a
+// giver-sourced heal was, on a client whose tracking rule only ever covers its own row; the native callbacks themselves
+// (GiveAmmoRel/ReceiveAmmoGive/PickupAmmo/ReceiveAddHealth) can only be exercised in a live session, so the lines that
+// wire the health kind are read as source in the last scenario.
 internal static class SupplyGiverScenarios
 {
     private const ulong Client = 0x2BUL;
@@ -29,6 +33,8 @@ internal static class SupplyGiverScenarios
             UnusableGivesAreRefused();
             LedgerStaysBounded();
             OverflowAndBackwardsReadings();
+            HealthKindFollowsThePacketNotTheObserver();
+            TheHealthKindRuleIsWiredIntoTheTracker();
             Console.WriteLine($"PASS {_assertions} supply giver assertions");
         }
         catch (Exception error)
@@ -70,7 +76,7 @@ internal static class SupplyGiverScenarios
         use.AddChange(100, 120, 20);   // standard: the full share arrived
         use.AddChange(30, 40, 20);     // special: half of the share fit
         Check(use.Record(giver), "the matched use is credited to the pack user");
-        Check(use.RecordConsumption(receiver, true), "the benefiting player still earns the consumption credit");
+        Check(use.RecordConsumption(receiver, SupplyPackKind.Ammo), "the benefiting player still earns the consumption credit");
         Check(giver.SupplyUses == 1 && Math.Abs(giver.SupplyEfficiency - 0.75) < 1e-9, "both channels of one give form one utilization sample");
         Check(receiver.SelfSupplyUses == 1 && receiver.SelfAmmoUses == 1 && receiver.SupplyUses == 0, "efficiency belongs to the giver, consumption to the receiver");
     }
@@ -94,7 +100,7 @@ internal static class SupplyGiverScenarios
         Check(use.Record(counters) && !use.Record(counters) && counters.SupplyUses == 1, "one use cannot be committed twice");
         var fittedNowhere = new SupplyUse();
         fittedNowhere.AddChange(50, 50, 25);
-        Check(!fittedNowhere.RecordConsumption(new ImpactCounters(), true),
+        Check(!fittedNowhere.RecordConsumption(new ImpactCounters(), SupplyPackKind.Ammo),
             "a use in which the receiver gained nothing claims no consumption (a full player)");
 
         var tool = new SupplyGiveLedger();
@@ -213,6 +219,111 @@ internal static class SupplyGiverScenarios
         var half = new SupplyUse(); half.AddChange(0, 10, 20);
         once.Record(mean); half.Record(mean);
         Check(mean.SupplyUses == 2 && Math.Abs(mean.SupplyEfficiency - 0.75) < 1e-9, "uses are averaged, not summed");
+    }
+
+    // The reported defect: on a client `CombatTracker.ShouldTrack` is `isInSlot && (isMaster || isLocal)`, so it is true
+    // for the client's own row and for nobody else. `CompleteHealth` asked that test about the *giver* to decide the
+    // pack's *kind*, so a teammate's health pack - a `pAddHealthData.source` that really does resolve to a
+    // `PlayerAgent` - was counted as a pack of no name on the client, while the host called the same heal a medical
+    // pack. One event, two answers. The kind rule's only input is what the packet said about its source, so the four
+    // ownership cases a session produces are asserted against that one rule here: they cannot disagree any more.
+    private static void HealthKindFollowsThePacketNotTheObserver()
+    {
+        // A client, a remote giver (host or teammate), the heal landing on the client's own row.
+        var clientRow = new ImpactCounters();
+        var teammateHeal = new SupplyUse();
+        teammateHeal.AddChange(20.0, 50.0, 30.0);
+        Check(teammateHeal.RecordHealthConsumption(clientRow, true),
+            "a client counts the teammate's health pack it consumed");
+        Check(clientRow.SelfSupplyUses == 1 && clientRow.SelfMedicalUses == 1 && clientRow.SelfAmmoUses == 0
+              && clientRow.SelfToolUses == 0 && clientRow.SelfSupplyKindsKnown,
+            "and the kind is the one the packet named: one medical pack whose split describes the total, not the `?` a client used to print for a giver outside its own row");
+
+        // A client, its own giver: the ordinary path, which the fix must not disturb.
+        var ownRow = new ImpactCounters();
+        var ownHeal = new SupplyUse();
+        ownHeal.AddChange(10.0, 40.0, 30.0);
+        Check(ownHeal.RecordHealthConsumption(ownRow, true) && ownRow.SelfMedicalUses == 1 && ownRow.SelfSupplyKindsKnown,
+            "the client's own health pack is still one medical pack with the split intact");
+
+        // The authority, whose heal to a teammate also resolves to a player source: the same answer as the client.
+        var hostRow = new ImpactCounters();
+        var hostHeal = new SupplyUse();
+        hostHeal.AddChange(5.0, 30.0, 30.0);
+        Check(hostHeal.RecordHealthConsumption(hostRow, true) && hostRow.SelfMedicalUses == 1 && hostRow.SelfSupplyKindsKnown,
+            "and the host answers the same way about the same heal, which is what makes the two machines agree at all");
+
+        // The source resolved, but not to a player (a non-player healer): a use this machine really measured, of a kind
+        // it cannot claim.
+        var unnamedRow = new ImpactCounters();
+        var nonPlayerHeal = new SupplyUse();
+        nonPlayerHeal.AddChange(20.0, 50.0, 30.0);
+        Check(nonPlayerHeal.RecordHealthConsumption(unnamedRow, false),
+            "a heal whose source is not a player agent is a use this machine measured");
+        Check(unnamedRow.SelfSupplyUses == 1 && unnamedRow.SelfMedicalUses == 0 && !unnamedRow.SelfSupplyKindsKnown,
+            "so the total keeps it and no kind claims it: the unknown stays unknown instead of being promoted to a medical pack");
+        string unnamedCell = CombatStrings.SupplyCell(CombatStrings.Placeholder, unnamedRow.SelfSupplyUses,
+            unnamedRow.SelfAmmoUses, unnamedRow.SelfToolUses, unnamedRow.SelfMedicalUses, unnamedRow.SelfSupplyKindsKnown);
+        Check(unnamedCell.EndsWith("/ 0 / " + CombatStrings.Unknown + " / " + CombatStrings.Unknown, StringComparison.Ordinal),
+            "and the cell prints the ammo it knows (a counted zero) beside `?` for both kinds, never a zero that would claim no pack: " + unnamedCell);
+
+        // A source that never resolved never reaches a measurement at all, so it consumes nothing.
+        var unresolvedRow = new ImpactCounters();
+        var unmeasured = new SupplyUse();
+        Check(!unmeasured.RecordHealthConsumption(unresolvedRow, false) && unresolvedRow.SelfSupplyUses == 0
+              && !unresolvedRow.SelfSupplyKindsKnown,
+            "a heal whose source never resolved is not measured, so it counts no pack of any kind and fabricates no split");
+
+        // One use, one pack: the second callback on the same use counts nothing, whichever answer it gave.
+        Check(!nonPlayerHeal.RecordHealthConsumption(unnamedRow, false) && unnamedRow.SelfSupplyUses == 1,
+            "one use is one pack: a repeated callback on an unnamed use cannot add a second");
+        Check(!teammateHeal.RecordHealthConsumption(clientRow, true) && clientRow.SelfSupplyUses == 1,
+            "and the same holds for a named one");
+
+        // A row that counted both keeps the kind it can name and withdraws the split: the unknown is never written as 0.
+        var mixedRow = new ImpactCounters();
+        var named = new SupplyUse(); named.AddChange(10.0, 40.0, 30.0);
+        var unnamed = new SupplyUse(); unnamed.AddChange(10.0, 40.0, 30.0);
+        Check(named.RecordHealthConsumption(mixedRow, true) && unnamed.RecordHealthConsumption(mixedRow, false),
+            "a row that saw a named heal and an unnamed one counts both");
+        Check(mixedRow.SelfSupplyUses == 2 && mixedRow.SelfAmmoUses == 0 && mixedRow.SelfMedicalUses == 1
+              && !mixedRow.SelfSupplyKindsKnown,
+            "keeps the medical pack it can name and withdraws the split, instead of printing the unnamed pack as a zero of some kind: "
+            + mixedRow.SelfSupplyUses + " uses beside " + mixedRow.SelfMedicalUses + " medical");
+    }
+
+    // The rule above only decides anything if the native path asks it. `SupplyTracker` binds game types and cannot be
+    // linked here, so its lines are read as source - the same static wiring check the release suites use, with the
+    // comments stripped so a comment may still name a call this build must not make.
+    private static void TheHealthKindRuleIsWiredIntoTheTracker()
+    {
+        string root = SourceRoot();
+        if (root == null) return;
+        string tracker = Code(File.ReadAllText(Path.Combine(root, "SupplyTracker.cs")));
+        Check(tracker.Contains("if (!data.source.TryGet(out var agent)) return null;"),
+            "the tracker measures a heal only when the packet named a source agent at all, so a heal with no resolvable source never becomes a pack");
+        Check(tracker.Contains("bool sourceIsPlayer = giver != null;"),
+            "the tracker records whether the packet's source resolved to a player agent at all");
+        Check(tracker.Contains("use.RecordHealthConsumption(counters, change.SourceIsPlayer);"),
+            "and hands that fact to the one kind rule, so the kind travels with the heal instead of with the observer");
+        Check(!tracker.Contains("ShouldTrack(change.Giver)") && !tracker.Contains("SupplyPackKind.Medical"),
+            "and neither the tracked-player test nor the medical kind is named in this file at all: a client that does not track the giver still cannot turn that player's pack into an unknown one, and a heal of a source that is not a player cannot be promoted to a 血包 here either");
+    }
+
+    private static string Code(string text)
+    {
+        if (text == null) return string.Empty;
+        var kept = new List<string>(text.Length / 40 + 8);
+        foreach (string line in text.Split('\n'))
+            if (!line.TrimStart().StartsWith("//", StringComparison.Ordinal)) kept.Add(line);
+        return string.Join("\n", kept);
+    }
+
+    private static string SourceRoot()
+    {
+        var directory = new DirectoryInfo(AppContext.BaseDirectory);
+        while (directory != null && !File.Exists(Path.Combine(directory.FullName, "GTFOCombatPanel.csproj"))) directory = directory.Parent;
+        return directory != null ? directory.FullName : null;
     }
 
     private static void Check(bool condition, string description)

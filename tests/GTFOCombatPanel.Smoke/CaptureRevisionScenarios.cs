@@ -129,14 +129,19 @@ internal static partial class Program
 
         var giver = new ImpactCounters(); var receiver = new ImpactCounters();
         var use = new SupplyUse(); use.AddChange(20, 40, 20); use.AddChange(10, 30, 20);
-        Check(use.Record(giver) && use.RecordConsumption(receiver, true), "efficiency belongs to giver while consumption belongs to receiver");
+        Check(use.Record(giver) && use.RecordConsumption(receiver, SupplyPackKind.Ammo), "efficiency belongs to giver while consumption belongs to receiver");
         Check(giver.SelfSupplyUses == 0 && receiver.SelfSupplyUses == 1 && receiver.SelfAmmoUses == 1 && receiver.SupplyUses == 0, "giving to somebody else never credits giver self consumption");
-        Check(!use.RecordConsumption(receiver, true) && receiver.SelfSupplyUses == 1, "nested ammo channels count one consumed use");
-        var medical = new SupplyUse(); medical.AddChange(50, 70, 20); medical.RecordConsumption(receiver, false);
-        Check(receiver.SelfSupplyUses == 2 && receiver.SelfAmmoUses == 1, "medical use increments total but not ammo uses");
+        Check(!use.RecordConsumption(receiver, SupplyPackKind.Ammo) && receiver.SelfSupplyUses == 1, "nested ammo channels count one consumed use");
+        // 1.19.35 (review fix): the pack's kind is named, never inferred from a bit. A medical pack is a medical pack: it
+        // joins the total and the medical field, and it may not land in the tool field - which is what the released
+        // one-bit overload did with the `false` this line used to pass.
+        var medical = new SupplyUse(); medical.AddChange(50, 70, 20);
+        Check(medical.RecordConsumption(receiver, SupplyPackKind.Medical), "a giver-sourced heal is a pack of its own kind, and the use claims it");
+        Check(receiver.SelfSupplyUses == 2 && receiver.SelfMedicalUses == 1 && receiver.SelfAmmoUses == 1 && receiver.SelfToolUses == 0,
+            "medical use increments the total and the medical field only: not ammo, and never tool");
         var full = new SupplyUse(); full.AddChange(100, 100, 20);
-        Check(!full.RecordConsumption(receiver, true), "no received resource gain does not claim a consumed benefit");
+        Check(!full.RecordConsumption(receiver, SupplyPackKind.Ammo), "no received resource gain does not claim a consumed benefit");
         var invalid = new SupplyUse(); invalid.AddChange(double.NaN, 0, 20);
-        Check(!invalid.RecordConsumption(receiver, true), "unobserved supply does not manufacture consumption");
+        Check(!invalid.RecordConsumption(receiver, SupplyPackKind.Ammo), "unobserved supply does not manufacture consumption");
     }
 }

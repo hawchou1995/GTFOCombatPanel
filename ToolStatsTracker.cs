@@ -309,7 +309,12 @@ internal static class ToolStatsTracker
             SNet_Player owner = core?.Owner?.Owner;
             if (mine == null || core == null || owner == null)
             {
-                LogMineDiagnostic($"mine instance spawn unresolved: item={(mine == null ? "missing" : mine.Pointer.ToString())}; core={(core == null ? "missing" : core.Pointer.ToString())}; owner={(owner?.Lookup ?? 0UL)}");
+                // Named apart, and honest about what was compared. In every line of the recorded expedition this
+                // printed the same pointer for `item` and for `core`, because the figure this build hands back for a
+                // mine and the one it hands back for that mine's core are the same object pointer - so the pair said
+                // nothing about which of the two was missing, and `owner=0` read like a player id when it only ever
+                // meant "no owner could be read".
+                LogMineDiagnostic($"mine instance spawn unresolved: item={(mine == null ? "missing" : mine.Pointer.ToString())}; core={(core == null ? "missing" : core.Pointer.ToString())}; samePointer={(mine != null && core != null && mine.Pointer == core.Pointer)}; owner={(owner == null ? "missing" : owner.Lookup.ToString())}; missing={(mine == null ? "item" : core == null ? "core" : "owner")}");
                 return;
             }
             if (!CombatTracker.ShouldTrack(owner))
@@ -346,7 +351,6 @@ internal static class ToolStatsTracker
             // item's category belongs to the mine, never to whatever the player happened to be holding.
             MineDeployerFirstPerson deployer = item.TryCast<MineDeployerFirstPerson>();
             bool consumptionKnown = deployer != null;
-            bool consumable = consumptionKnown && deployer.m_isConsumable;
             if (mineCategory == 0u)
             {
                 LogMineDiagnostic($"mine instance spawn has no category to attribute: owner={owner.Lookup}; toolCategory={toolCategory}; item={mine.Pointer}; core={core.Pointer}");
@@ -355,9 +359,18 @@ internal static class ToolStatsTracker
             // `consumptionKnown` must NOT gate the count: a bot exposes no first-person face, so requiring
             // it turned every bot-deployed mine into "carried in" and the deployment column read zero.
             // Only a face that positively says "consumable" rules a mine out; otherwise the category decides.
-            bool counts = !consumable && ToolImpactLedger.MineBelongsToSlot(toolCategory, mineCategory);
-            if (!counts && !consumable)
-                LogMineDiagnostic($"mine instance spawn attributed but not counted: owner={owner.Lookup}; firstPerson={consumptionKnown}; toolCategory={toolCategory}; coreCategory={mineCategory}; item={mine.Pointer}; core={core.Pointer}");
+            // 1.19.38: the field log's `toolCategory=9; coreCategory=13` was a carried-in mine, not a wrong slot:
+            // the same mine's `MineDeployerFirstPerson.PlaceMine` line in that frame says `consumable=True`, and the
+            // slot read is the *player's own class tool* - asked only to answer "is the carried tool the deployer?".
+            // The two claims that line makes are derived from the same inputs as the count now, instead of being
+            // written by hand beside it: `consumable` is tri-state (`unreadable` when a bot exposes no face) and
+            // `carriedIn` is `true` only when that face itself proved it - a line may never say "carried in" about
+            // a mine whose face it could not read, or whose face said "not consumable".
+            ToolImpactLedger.MineInstanceEvidence evidence = ToolImpactLedger.DescribeInstance(
+                consumptionKnown, consumptionKnown && deployer.m_isConsumable, toolCategory, mineCategory);
+            bool counts = evidence.Counted;
+            if (!counts && evidence.Consumption != ToolImpactLedger.MineConsumableReading.Consumable)
+                LogMineDiagnostic($"mine instance spawn attributed but not counted: owner={owner.Lookup}; consumptionKnown={consumptionKnown}; firstPerson={consumptionKnown}; consumable={ToolImpactLedger.Name(evidence.Consumption)}; toolCategory={toolCategory}; coreCategory={mineCategory}; slotToolMatchesMine={evidence.SlotToolMatchesMine}; carriedIn={(evidence.CarriedIn ? "true" : "unknown")}; item={mine.Pointer}; core={core.Pointer}");
             RegisterMine(mine, core.Pointer, owner, "synced-item OnSpawn", owner, owner, counts);
         }
         catch (Exception error) { CombatTracker.LogToolError("mine instance spawn", error); }
@@ -380,9 +393,19 @@ internal static class ToolStatsTracker
         // One registration path for both kinds of mine. The ledger keeps every mine's placer so a blast is
         // attributed, and only counts the ones this flag marks, which is what keeps a carried-in mine out
         // of the deployment and trigger columns without losing its damage.
+        //
+        // `TryDeployMine` answers two questions with one bool - did *this call* count the mine, and may it be counted
+        // at all - and a repeat of a mine the ledger already holds answers false while that mine stays counted. The
+        // line below used to print that bool alone, which is why one recorded expedition read `counted=True` for a
+        // mine and `counted=False` for the same pointer two lines later: nothing had been taken back, the second
+        // registration was a repeat of the first (the spawn callback and `OnSpawn` both fire for one mine). The three
+        // facts are reported apart now - the judgement this call made, the ledger's verdict on it, and what the ledger
+        // already knew - so a repeat can no longer be read as a mine that lost its count.
+        bool known = Ledger.TryGetMineOwner(mine.Pointer, out ulong knownOwner);
+        bool wasCounted = Ledger.IsCountedMine(mine.Pointer);
         bool counted = Ledger.TryDeployMine(mine.Pointer, corePointer, owner.Lookup, !countsAsDeployment);
         if (counted) CombatTracker.ObservePlayer(owner).Impact.CreditMineDeployment();
-        LogMineDiagnostic($"mine placement: source={source}; counted={counted}; owner={owner.Lookup}; sourceOwner={(sourceOwner?.Lookup ?? 0UL)}; coreOwner={(coreOwner?.Lookup ?? 0UL)}; item={mine.Pointer}; core={(corePointer == IntPtr.Zero ? "missing" : corePointer.ToString())}; carriedIn={!countsAsDeployment}");
+        LogMineDiagnostic($"mine placement: source={source}; counted={counted}; decided={countsAsDeployment}; repeat={known}; wasCounted={wasCounted}; ledgerOwner={(known ? knownOwner.ToString() : "unattributed")}; owner={owner.Lookup}; sourceOwner={(sourceOwner?.Lookup ?? 0UL)}; coreOwner={(coreOwner?.Lookup ?? 0UL)}; item={mine.Pointer}; core={(corePointer == IntPtr.Zero ? "missing" : corePointer.ToString())}; samePointer={(corePointer == mine.Pointer)}; carriedIn={!countsAsDeployment}");
         return counted;
     }
 

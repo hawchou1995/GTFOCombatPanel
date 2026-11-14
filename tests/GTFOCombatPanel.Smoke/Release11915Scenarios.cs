@@ -175,14 +175,17 @@ internal static class Release11915Scenarios
         check(geometry.Contains("class ResultsGuestPageGeometry"),
             "that file really declares the policy this suite drives: ResultsGuestPageGeometry");
 
-        // Both guest pages place from the same policy, once each: the success page's completion branch and the
-        // failure page's title branch. Any further call would be a second, divergent page geometry.
+        // Both guest pages place from the same policy, once each: the success page's completion branch, and the
+        // failure page's own branch - which since 1.19.39 asks the shared `ResultClientFailureStrip` entry point
+        // instead of resolving the geometry inline, so the wall gate and the band cannot be composed in two places.
+        // Any further call would be a second, divergent page geometry.
         int uses = 0;
         int at = -1;
         while ((at = results.IndexOf("ResultsGuestPageGeometry.TryResolve", at + 1, StringComparison.Ordinal)) >= 0) uses++;
-        check(uses == 2,
-            $"the guest page geometry is resolved exactly twice in ResultsDisplay.cs - once for the success page and once for the failure page: calls={uses}");
-
+        int decides = CountOf(results, "ResultClientFailureStrip.Decide(");
+        int measures = CountOf(results, "ResultClientFailureStrip.Measure(");
+        check(uses == 1 && decides == 1 && measures == 1,
+            $"the guest page geometry is resolved once in ResultsDisplay.cs for the success page, and the failure page's band comes from the one shared entry point that owns the second resolution: direct={uses}, decide={decides}, measure={measures}");
         // And nowhere else. `Placement` and `AnchorSample` both used to re-derive the strip for themselves; both now
         // read the one the page branch already computed, so the edges they compare are the edges that were placed.
         string placement = MethodBody(results, "private static bool Placement(Component page, bool succeeded");

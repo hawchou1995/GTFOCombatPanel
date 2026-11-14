@@ -3,6 +3,30 @@ using System.Collections.Generic;
 
 namespace HawChow.GTFOCombatPanel;
 
+// Which resource pack a use was (1.19.34). The settlement row prints the three kinds separately, and a use is
+// exactly one of them: an ammo pack is Standard/Special, a tool pack refilled the class channel, and a medical
+// pack is the giver-sourced `ReceiveAddHealth`. Nothing else counts as a pack.
+public enum SupplyPackKind
+{
+    Ammo = 0,
+    Tool = 1,
+    Medical = 2,
+}
+
+// 1.19.38: which half of a use this machine could not read. The recorded expedition printed one sentence -
+// "ammo supply use was not measured completely" - for three different failures (the before-read threw, the
+// after-read threw, the change never arrived), and a reader could not tell an unreadable page from a packet
+// this machine never saw. The flags below are what `AddChange` really compared; the log prints them.
+[Flags]
+public enum SupplyUseGap
+{
+    None = 0,
+    Before = 1,
+    After = 2,
+    Intended = 4,
+    Applied = 8,
+}
+
 // A resource-pack use can fill more than one weapon. Combine its native ammo-unit changes first,
 // then count exactly one utilization ratio. Different uses are averaged by ImpactCounters.
 public sealed class SupplyUse
@@ -10,24 +34,83 @@ public sealed class SupplyUse
     public double Intended { get; private set; }
     public double Effective { get; private set; }
     public int Changes { get; private set; }
+    private SupplyUseGap _gap;
     private bool _recorded;
     private bool _consumptionRecorded;
 
-    public bool RecordConsumption(ImpactCounters receiver, bool ammo)
+
+    public bool RecordConsumption(ImpactCounters receiver, SupplyPackKind kind)
     {
         if (_consumptionRecorded || receiver == null || Invalid || Changes == 0 ||
             !double.IsFinite(Intended) || !double.IsFinite(Effective) || Intended <= 0 || Effective <= 0) return false;
-        if (receiver.SelfSupplyUses < long.MaxValue) receiver.SelfSupplyUses++;
-        if (ammo && receiver.SelfAmmoUses < long.MaxValue) receiver.SelfAmmoUses++;
+        receiver.CreditSelfSupply(kind);
         _consumptionRecorded = true;
         return true;
     }
+    // 1.19.35 (review fix): the released one-bit overload (`true` = ammo pack, `false` = "not an ammo pack") is gone.
+    // `false` was read as a *tool* pack, but the medical path used it too - one bit cannot answer a row with three
+    // kinds, and a medical pack passed through it was counted as a tool pack. Every caller names its kind now, so the
+    // compiler keeps a pack of an unnamed kind out of this method instead of a comment doing it.
+
+    // 1.19.35: the same one-pack-once accounting for a use whose *kind* this machine cannot name - a heal whose native
+    // `pAddHealthData.source` did not resolve to a player agent at all. The pack really was consumed, so the row's total
+    // keeps it; the split is what cannot be claimed, and calling that pack a 血包 was the fabrication this exists to stop. The
+    // validity rule is `RecordConsumption`'s own, so a use nobody gained anything from still counts nothing at all.
+    // 1.19.39: "did not resolve to a player" is the whole test. A player this machine merely does not *track* is not this
+    // case - see `RecordHealthConsumption`, which is what the heal path calls now.
+    public bool RecordConsumptionUnknown(ImpactCounters receiver)
+    {
+        if (_consumptionRecorded || receiver == null || Invalid || Changes == 0 ||
+            !double.IsFinite(Intended) || !double.IsFinite(Effective) || Intended <= 0 || Effective <= 0) return false;
+        receiver.CreditSelfSupplyUnknown();
+        _consumptionRecorded = true;
+        return true;
+    }
+
+    // 1.19.39: a giver-sourced heal answers two questions and the packet settles only one of them. What the heal *was*
+    // comes from `pAddHealthData.source`: it resolved to a player agent, so a player gave a health pack. Whose row this
+    // machine keeps is a different fact - a client keeps its own row and the host publishes the rest - and it used to
+    // decide the kind as well: `SupplyTracker` asked its tracking rule about the giver, so the same heal was one 血包 on
+    // the host and a pack of no name on a client. The kind is read off the packet here; ownership still decides only
+    // where the *efficiency* is credited, which is the tracking test in `SupplyTracker.Record`.
+    public bool RecordHealthConsumption(ImpactCounters receiver, bool sourceResolvedToPlayer)
+        => sourceResolvedToPlayer
+            ? RecordConsumption(receiver, SupplyPackKind.Medical)
+            : RecordConsumptionUnknown(receiver);
+
     public bool Invalid { get; private set; }
+
+    // The gap this use cannot close, named field by field. `Applied` is the case with no unreadable number
+    // at all: the scope ended without a single applied change reaching it, so there is no after-read to
+    // blame and nothing to average - which is a different fact from `After` (a read that ran and failed).
+    public SupplyUseGap Unmeasured => _gap == SupplyUseGap.None && Changes == 0 ? SupplyUseGap.Applied : _gap;
+
+    // The same gap as the words the diagnostic line prints, in a fixed order so two logs compare.
+    public string UnmeasuredFields => Describe(Unmeasured);
+
+    public static string Describe(SupplyUseGap gap)
+    {
+        if (gap == SupplyUseGap.None) return "none";
+        var parts = new List<string>(4);
+        if ((gap & SupplyUseGap.Before) != 0) parts.Add("before");
+        if ((gap & SupplyUseGap.After) != 0) parts.Add("after");
+        if ((gap & SupplyUseGap.Intended) != 0) parts.Add("intended");
+        if ((gap & SupplyUseGap.Applied) != 0) parts.Add("applied");
+        return string.Join("+", parts);
+    }
 
     public void AddChange(double before, double after, double intended)
     {
-        if (!double.IsFinite(before) || !double.IsFinite(after) || !double.IsFinite(intended) ||
-            before < 0 || after < before - 0.0001 || intended <= 0)
+        bool beforeRead = double.IsFinite(before) && before >= 0;
+        bool intendedRead = double.IsFinite(intended) && intended > 0;
+        // The after side is only blamed when there was a before reading to compare it with: an unreadable
+        // before already explains why no difference exists, and naming both would send a reader looking for a
+        // second failure that never happened.
+        bool afterRead = double.IsFinite(after) && after >= before - 0.0001;
+        if (!beforeRead) _gap |= SupplyUseGap.Before;
+        else if (!afterRead) _gap |= SupplyUseGap.After;
+        if (!intendedRead) _gap |= SupplyUseGap.Intended;
+        if (!beforeRead || !afterRead || !intendedRead)
         {
             Invalid = true;
             return;

@@ -122,7 +122,9 @@ public static class CombatStrings
             case ImpactMetric.Revives: return Pick("救援队友", "Revives");
             case ImpactMetric.WeakspotRate: return Pick("弱点命中率", "Weakspot rate");
             case ImpactMetric.Accuracy: return Pick("命中率", "Hit rate");
-            case ImpactMetric.SupplyEfficiency: return Pick("补给效率 / 本人 / 弹药", "Supply efficiency / self / ammo");
+            // 1.19.34: one row, four fields - the utilization the score is built from and this player's own pack
+            // use split into the three packs. Nothing about the order or the number of rows changed.
+            case ImpactMetric.SupplyEfficiency: return SupplyRowLabel;
             case ImpactMetric.ToolEfficiency: return Pick("工具效率", "Tool efficiency");
             case ImpactMetric.LoneSurvivor: return Pick("单人存活", "Lone survivor");
             case ImpactMetric.Downs: return Pick("阵亡 / 失血", "Downs / health lost");
@@ -453,7 +455,50 @@ public static class CombatStrings
         => Compound(Pick("射击 " + shots, "shots " + shots), Pick("命中 " + hits, "hits " + hits), Pick("胶住 " + glued, "stuck " + glued));
 
     // The supply cell: the utilization the score was built from, then how many packs this player actually
-    // consumed and how many of those were ammo. `补给效率 / 本人 / 弹药` names the three in that order.
+    // consumed, split by the kind of pack it was. `补给效率 / 弹药包 / 工具包 / 血包` names the four fields in that
+    // order, and they all live in the one cell the row has always had.
+    //
+    // 1.19.34: `kindsKnown` is false for a row whose only source was a peer that still speaks the v8 pair - it sent
+    // the total and the ammo part and nothing else. Such a row prints `?` in the two kind fields: the split is an
+    // absence, so neither a zero nor a guess is printed.
+    //
+    // 1.19.36: on every player row that carries at least one pack the cell carries four fields, because the label names
+    // four things. The one branch that prints a single field is the row whose total, ammo part and both kind parts are
+    // all zero; that cell is a placeholder the caller hands in (`ImpactBoard` hands in the placeholder for that row
+    // before it ever gets here), so the branch is unreachable in production and is not a fifth shape of the cell. The
+    // three kind fields are what replaced the released "all packs" total, so that total is no longer a field of its own
+    // fields are what replaced the released "all packs" total, so that total is no longer a field of its own and
+    // there is no fifth one. A row whose split cannot be printed therefore prints the ammo part it really sent - a
+    // figure that arrived, shown exactly as it arrived - and `?` in the two kind fields. Where the remainder is a
+    // *proven* zero (the total is exactly its ammo part, so there is nothing left to be a tool or a medical pack)
+    // the two kinds print a counted zero instead. No raw number is changed, and nothing here feeds the score.
+    public static string SupplyCell(string efficiency, long totalUses, long ammoUses, long toolUses, long medicalUses, bool kindsKnown)
+    {
+        long total = totalUses > 0 ? totalUses : 0, ammo = ammoUses > 0 ? ammoUses : 0;
+        long tool = toolUses > 0 ? toolUses : 0, medical = medicalUses > 0 ? medicalUses : 0;
+        if (total == 0 && ammo == 0 && tool == 0 && medical == 0) return efficiency;
+        // 1.19.35: a split may only be printed when it describes the total it is printed beside. Two things can go wrong and
+        // both used to be printed as a *zero*: a pair that was never split (`kindsKnown` false) and, worse, a pair whose own
+        // figures do not add up - a total smaller than its ammo part, or three kinds that do not sum to the total. A zero is
+        // a measurement ("no tool pack was consumed"); neither of those is one, so the two kind fields print `?` and the
+        // ammo figure that did arrive stays exactly as it is.
+        bool describesTheTotal = kindsKnown && ammo + tool + medical == total;
+        if (describesTheTotal) return Compound(efficiency, Count(ammo), Count(tool), Count(medical));
+        // What the total holds beyond its ammo part: unknown when there is a remainder, and a *proven* zero when the total is
+        // exactly its ammo part (there is no remainder left to be a tool or a medical pack). The ammo figure is printed either
+        // way: it travelled, it is a measurement, and it is the one kind this build can name without a split.
+        long remainder = total - ammo;
+        return remainder == 0
+            ? Compound(efficiency, Count(ammo), Count(0), Count(0))
+            : Compound(efficiency, Count(ammo), Unknown, Unknown);
+    }
+    // 1.19.34: the supply row's label, in the two texts the archived settlement files are keyed by. `Legacy` is the label
+    // the released builds wrote (`补给效率 / 本人 / 弹药`); `ResultsLog` writes it beside the new one so a reader of those files
+    // keeps finding the key it has always parsed.
+    public static string SupplyRowLabel { get { return Pick("补给效率 / 弹药包 / 工具包 / 血包", "Supply efficiency / ammo / tool / med"); } }
+    public static string SupplyRowLabelLegacy { get { return Pick("补给效率 / 本人 / 弹药", "Supply efficiency / self / ammo"); } }
+    // The released three-field form (`补给效率 / 本人 / 弹药`): kept because the settlement files and the tests of the
+    // builds before this one are written against it. The board no longer uses it.
     public static string SupplyCell(string efficiency, long selfUses, long ammoUses)
     {
         if (selfUses <= 0 && ammoUses <= 0) return efficiency;
@@ -503,4 +548,8 @@ public static class CombatStrings
     public static string KillTierMark(KillTier tier) => KillTierLabel(tier);
 
     public static string Placeholder { get { return "—"; } }
+    // A figure that was never reported and that no arithmetic can recover. Distinct from the placeholder: `—`
+    // means "this machine observed nothing to print", `?` means "a number of this kind exists and nobody split
+    // it into the parts this row prints". It is never a zero, and it is never guessed into one of the kinds.
+    public const string Unknown = "?";
 }

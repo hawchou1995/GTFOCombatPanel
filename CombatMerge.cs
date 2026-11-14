@@ -190,6 +190,15 @@ public static class CombatMerge
         // zero from a peer never erases one this machine or another peer reported.
         if (!own && snap.SelfSupplyUses != 0)
         {
+            // 1.19.34: a split that no longer describes this pair is dropped rather than left standing beside it. The three
+            // kinds always add up to the total they came with, and the split of the incoming pair arrives in its own packet
+            // (`SquadExchange.Project` applies it after this call), so the row never prints a total of one count and kinds of
+            // another.
+            if (impact.SelfSupplyKindsKnown
+                && (snap.SelfSupplyUses != impact.SelfSupplyUses || snap.SelfAmmoUses != impact.SelfAmmoUses))
+            {
+                impact.SelfToolUses = 0; impact.SelfMedicalUses = 0; impact.SelfSupplyKindsKnown = false;
+            }
             impact.SelfSupplyUses = snap.SelfSupplyUses;
             impact.SelfAmmoUses = snap.SelfAmmoUses;
         }
@@ -418,7 +427,97 @@ public sealed class SnapshotCache
         _squadGeneration = generation;
         _hasSquadTotal = true;
     }
-    public void Remove(ulong owner) { if (owner != 0UL) _rows.Remove(owner); }
-    public void Clear() { _rows.Clear(); _hasSquadTotal = false; _squadTotal = 0; _squadPartial = false; _squadGeneration = 0; }
+    // 1.19.34: the pack kinds a row's owner sent beside its snapshot, kept per owner with the run counter it came from.
+    // They are never merged with another source: only the machine that owns the backpack counts these, so there is
+    // exactly one owner per row, and a straggler from an older run is refused exactly like a row would be.
+    //
+    // 1.19.35: there are two senders after all, and they are not equals. A client that is not connected to another client can still
+    // be told that client's split by the host, which relays the block it observed as that player's receiver (review C2); the owner's
+    // own block, when it arrives, is the authority and replaces a relayed one whatever the counters say, because the two counters
+    // belong to two different machines. `FromOwner` is what keeps them apart.
+    //
+    // 1.19.35 fix: *which* cached row a block describes is a second, separate question, and `FromOwner` cannot answer it. The two
+    // slots of a row are the two senders of a row - the host's copy and the player's own machine - and `Store` decides which one a
+    // packet goes to from the sender's `fromHost` bit alone. An owner that happens to *be* the host therefore writes its row into
+    // the host slot, and its own split has to fill in that same row instead of the empty peer slot beside it. `HostSlot` carries
+    // that bit: it is the sender's `fromHost`, recorded beside the block exactly as `Store` recorded it beside the row.
+    private struct SupplyKindsRow
+    {
+        public SyncProtocol.SupplyKinds Block;
+        public uint Generation;
+        public bool Has;
+        public bool FromOwner;
+        // The slot the block's own sender writes its rows to (`Store`'s `fromHost`), not the slot the owner's rows would go to if
+        // the owner were someone else. A relayed block comes from the host and describes the host's copy; an owner's own block
+        // comes from the owner's machine and describes that machine's copy - the host's, when the owner is the host.
+        public bool HostSlot;
+    }
+    private readonly Dictionary<ulong, SupplyKindsRow> _kinds = new Dictionary<ulong, SupplyKindsRow>();
+
+    public bool StoreSupplyKinds(ulong owner, uint generation, in SyncProtocol.SupplyKinds kinds, bool recovered,
+        bool fromOwner = true, bool senderIsHost = false)
+    {
+        if (owner == 0UL || !kinds.IsUsable) return false;
+        if (_kinds.TryGetValue(owner, out SupplyKindsRow existing) && existing.Has)
+        {
+            // The machine that counted the packs answers for them: its block replaces a relayed one unconditionally.
+            if (fromOwner && !existing.FromOwner)
+            {
+                _kinds[owner] = new SupplyKindsRow { Block = kinds, Generation = generation, Has = true, FromOwner = true, HostSlot = senderIsHost };
+                return true;
+            }
+            // A relay never displaces the owner's own block; and within one sender the run counter still has to be new enough.
+            if (existing.FromOwner && !fromOwner) return false;
+            if (!recovered && !SyncProtocol.IsNewerOrSame(generation, existing.Generation)) return false;
+        }
+        _kinds[owner] = new SupplyKindsRow { Block = kinds, Generation = generation, Has = true, FromOwner = fromOwner, HostSlot = senderIsHost };
+        return true;
+    }
+
+    public bool TryGetSupplyKinds(ulong owner, out SyncProtocol.SupplyKinds kinds)
+    {
+        if (owner != 0UL && _kinds.TryGetValue(owner, out SupplyKindsRow row)) { kinds = row.Block; return true; }
+        kinds = default;
+        return false;
+    }
+
+    // 1.19.35: the split may only fill in a row it describes. The block carries the run counter of the machine that sent it, and
+    // the row carries the counter of the source it came from, so the two have to be the *same* run: a block left over from the
+    // previous expedition could otherwise attach itself to a new row that happens to hold the same total/ammo pair and print
+    // kinds that run never had (review C4). Comparing against the old block's counter - all `StoreSupplyKinds` did - cannot see
+    // that, because the row is a different object.
+    //
+    // The slot is the one `Store` wrote the block's own sender's rows to (`HostSlot`), never inferred a second time here. 1.19.35
+    // fix: this method used to read `FromOwner` as if it answered that question, so a split sent by an owner that is also the host
+    // was looked for in the peer slot the owner's row was never written to, and that row printed `?` for kinds it had counted.
+    // The other side is tried only when the sender's own side holds nothing for that run - and never both, so a row that answers
+    // on either side is still counted once.
+    public bool TryApplySupplyKinds(ulong owner, ImpactCounters impact, bool own)
+    {
+        if (owner == 0UL || impact == null) return false;
+        if (!_kinds.TryGetValue(owner, out SupplyKindsRow kinds) || !kinds.Has) return false;
+        if (!_rows.TryGetValue(owner, out Row row)) return false;
+        if (TryApplyToSlot(row, kinds, kinds.HostSlot, impact, own)) return true;
+        return TryApplyToSlot(row, kinds, !kinds.HostSlot, impact, own);
+    }
+
+    // One side, and only one: the slot has to hold a row from the block's own run, and `ApplySupplyKinds` then refuses unless that
+    // row's total/ammo pair is exactly the pair the block splits. The caller stops at the first side that answers, so a pair both
+    // sides happen to hold cannot be split twice.
+    private static bool TryApplyToSlot(in Row row, in SupplyKindsRow kinds, bool hostSlot, ImpactCounters impact, bool own)
+    {
+        uint rowGeneration = hostSlot ? row.HostGeneration : row.PeerGeneration;
+        bool rowHeld = hostSlot ? row.HasHost : row.HasPeer;
+        if (!rowHeld || rowGeneration != kinds.Generation) return false;
+        return SyncProtocol.ApplySupplyKinds(impact, kinds.Block, own);
+    }
+
+    public void Remove(ulong owner)
+    {
+        if (owner == 0UL) return;
+        _rows.Remove(owner);
+        _kinds.Remove(owner);
+    }
+    public void Clear() { _rows.Clear(); _kinds.Clear(); _hasSquadTotal = false; _squadTotal = 0; _squadPartial = false; _squadGeneration = 0; }
     public IEnumerable<ulong> Owners { get { foreach (ulong owner in _rows.Keys) yield return owner; } }
 }

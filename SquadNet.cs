@@ -24,21 +24,24 @@ namespace HawChow.GTFOCombatPanel;
 //
 // Two transports carry the same packet. `TryBindApi` binds GTFO-API's free-sized event when the library is
 // loaded, and that is the path this build prefers: the event already carries a fixed replicator key, a long
-// magic and a version signature, it is what StatDisplay, AccuracyTracker and the rest of the scene broadcast
-// on, and a machine that runs no mod drops those bytes without any handler being asked for one. The game's
-// own byte channel remains underneath for a machine without the library:
+// magic and a version signature. It is what StatDisplay, AccuracyTracker and the rest of the scene broadcast
+// on - and a machine that runs no mod is *not* silent about it: GTFO-API's receive path looks the event name up
+// in its own registry and, finding nothing, writes `[Error : GTFO-API] [NetworkAPI]: <id> invoked an event
+// <name> which isn't registered` into that machine's log once per packet (10225 for this event in one recorded
+// run). Every packet this machine sends therefore costs an unmodded peer one error line, which is why the send
+// side is a bounded probe. The game's own byte channel remains underneath for a machine without the library:
 //
 //   send    `SNet.Core.SendBytes(bytes, quality, channel, player)` puts that run on the wire.
 //   receive every packet passes `SNet_Replication.RecieveBytes`, which this mod takes in a Harmony
 //           prefix. A packet of ours is recognised by an unused key plus a magic string, and returning
 //           false from the prefix keeps the game from ever looking for a replicator that does not exist.
 //
-// `MaySend` is still the last gate before either route. It is no longer a rule about evidence alone - the
-// default shares with the whole slot list, because that is what every other mod on this transport does and
-// because requiring a peer to prove itself first left two modded machines greeting nothing at each other -
-// but a mistake higher up still cannot turn into a packet for a peer this machine has decided to stay silent
-// with. A gate that was never set refuses everything, which is the safe reading of "nobody said this machine
-// may speak".
+// `MaySend` is still the last gate before either route, and it is asked with the packet's own kind. Its rule is
+// "proved, named, or a greeting still inside the bounded probe" - sharing with the slot list buys an unproven peer
+// `SquadCapability.ProbeBudget` greetings and no rows, because the packets are not free on the other end and because
+// such a peer has no handler for a row. A mistake higher up still cannot turn into a packet for a peer this machine
+// has decided to stay silent with, nor into a row for one that has only been probed. A gate that was never set
+// refuses everything, which is the safe reading of "nobody said this machine may speak".
 //
 // The receive callback is queued, not run in place. The replication layer's thread is not this mod's to
 // assume: a decoded packet is parked in a bounded queue (256) and drained from `CombatSync.Tick`, which
@@ -51,13 +54,28 @@ internal static class SquadNet
     internal static Action<ulong, uint, ulong> OnHello;
     internal static Action<ulong, uint, SyncSnapshot> OnSnapshot;
     internal static Action<ulong, uint> OnProtocolMismatch;
+    // 1.19.34: the pack kinds a peer sends for its own row. A v8 peer never fires this, and this build never needs it to
+    // keep reading that peer's row - it only fills in the split that row's snapshot could not carry.
+    internal static Action<ulong, uint, SyncProtocol.SupplyKinds> OnSupplyKinds;
 
-    // Whether this machine may put one of its own packets on the wire for a peer. Set by CombatSync from
-    // the exchange's evidence; left null (and then refusing everything) until it is.
-    internal static Func<ulong, bool> MaySend;
+    // Whether this machine may put one of its own packets on the wire for a peer, and which packet it is: the
+    // transport asks with the kind it is about to hand over, because the bounded probe this build shares with its
+    // slot list pays for a greeting and for nothing else - a row for a peer that has not proved it can read one is
+    // refused at this seam whatever the queue did or did not ask for. The answer is the evidence that allowed it,
+    // so the transport can tell a probe credit (which buys exactly one physical packet) from a proved or named peer
+    // (whose packet may go out both ways until its route is known). Set by CombatSync from the exchange's evidence;
+    // left null (and then refusing everything) until it is.
+    internal static Func<ulong, SquadPacketKind, SquadEvidence> MaySend;
 
     internal const int MaxQueue = 256;
-    private struct Queued { public SquadPacketKind Kind; public ulong Sender; public ulong HelloOwner; public uint Generation; public uint Version; public SyncSnapshot Snapshot; public bool ViaApi; }
+    private struct Queued
+    {
+        public SquadPacketKind Kind; public ulong Sender; public ulong HelloOwner; public uint Generation; public uint Version;
+        public SyncSnapshot Snapshot;
+        // 1.19.34: set for `SupplyKinds` only; the snapshot is default on those.
+        public SyncProtocol.SupplyKinds Kinds;
+        public bool ViaApi;
+    }
     private static readonly ConcurrentQueue<Queued> Queue = new ConcurrentQueue<Queued>();
     // Which transport each peer has been heard on, and when that was learned: true for GTFO-API's event,
     // false for the game's own byte channel. Written when a packet arrives, read when one is sent, so a mixed
@@ -101,8 +119,20 @@ internal static class SquadNet
 
     // A new expedition, or a new lobby: what was learned about who answers on which transport described the last
     // session and not this one. Forgetting it puts every peer back to "unknown", which is the state that sends
-    // both ways and therefore cannot be wrong about a peer whose route changed with the session.
-    internal static void ResetRoutes() => Route.Clear();
+    // both ways and therefore cannot be wrong about a peer whose route changed with the session. The probe's
+    // channel rotation described the last session too, so it starts over with the same breadth.
+    internal static void ResetRoutes()
+    {
+        Route.Clear();
+        ProbePackets.Clear();
+    }
+
+    // How many probe packets this machine has handed to a transport for each peer, which is what decides which of
+    // the two compatible channels the next one buys: `SquadCapability.ProbeBudget` counts *physical* packets, so the
+    // credits rotate - the preferred transport first, the game's own channel second, and so on - and both channels
+    // are exercised inside the budget even when the budget is small. Transport state, so it lives here: the
+    // capability decides how many packets a peer may cost, this decides where each of them goes.
+    private static readonly Dictionary<ulong, int> ProbePackets = new Dictionary<ulong, int>();
     private static int _queued, _unusable;
     private static readonly HashSet<string> UnusableReported = new HashSet<string>();
     private static bool _loggedOverflow, _loggedReadError, _loggedWithheld;
@@ -293,32 +323,53 @@ internal static class SquadNet
     internal static void SendHello(SNet_Player target, ulong owner, uint generation)
     {
         if (target == null) return;
-        Send(SquadPackets.Hello(owner, generation, SyncProtocol.Version), target);
+        Send(SquadPacketKind.Hello, SquadPackets.Hello(owner, generation, SyncProtocol.Version), target);
     }
 
     internal static void SendSnapshot(SNet_Player target, in SyncSnapshot snapshot, uint generation)
     {
         if (target == null) return;
-        Send(SquadPackets.Snapshot(snapshot, generation, SyncProtocol.Version), target);
+        Send(SquadPacketKind.Snapshot, SquadPackets.Snapshot(snapshot, generation, SyncProtocol.Version), target);
     }
 
-    private static void Send(byte[] packet, SNet_Player target)
+    // 1.19.34: one packet beside the row, for peers that can read it. Nothing about the row's own packet changes.
+    internal static void SendSupplyKinds(SNet_Player target, in SyncProtocol.SupplyKinds kinds, uint generation)
+    {
+        if (target == null) return;
+        Send(SquadPacketKind.SupplyKinds, SquadPackets.SupplyKinds(kinds, generation, SyncProtocol.Version), target);
+    }
+
+    // The packet's own kind travels with it, because the gate below answers per kind: the bounded probe pays for a
+    // greeting and for nothing else, and the transport is the last place that can be enforced when the caller is
+    // not the exchange's own queue.
+    private static void Send(SquadPacketKind kind, byte[] packet, SNet_Player target)
     {
         if (packet == null) return;
-        if (!MaySpeakTo(target))
+        if (!MaySpeakTo(kind, target, out SquadEvidence why))
         {
             if (!_loggedWithheld)
             {
                 _loggedWithheld = true;
-                Plugin.Logger?.LogWarning("a squad packet was withheld: this machine has decided to stay silent with that peer - it speaks another protocol version, or sharing is restricted to named and proven players and it is neither - so nothing, a greeting included, is put on the wire for it.");
+                Plugin.Logger?.LogWarning("a squad packet was withheld: this machine has decided to stay silent with that peer - it speaks another protocol version, its bounded probe is spent, sharing is restricted to named and proven players and it is neither, or the packet was a row for a peer that has not proved it can read one (the bounded probe pays for greetings only) - so nothing is put on the wire for it.");
             }
             return;
         }
+        ulong lookup = 0UL;
+        try { lookup = target.Lookup; } catch (Exception) { }
+        // A probe credit is one packet on one transport: `ProbeBudget` is what the other machine's log pays for, and
+        // it pays per packet, not per logical send. Doing this before the two-way rule below is what stops an
+        // unproven peer from being charged three and handed six.
+        if (why == SquadEvidence.Probe)
+        {
+            SendProbe(packet, target, lookup);
+            return;
+        }
         // Two transports, one packet shape. GTFO-API's free-sized event is the one the rest of the scene shares
-        // on and the one this build prefers: its bytes carry the API's own key, magic and version signature, so a
-        // machine that runs no mod drops them without a handler ever being asked for one. The game's own byte
-        // channel carries the same packet behind this build's own key and magic and is understood by every
-        // machine that runs this mod, whether or not it also runs the API.
+        // on and the one this build prefers: its bytes carry the API's own key, magic and version signature. A
+        // machine that runs no mod does not drop them quietly - the API writes one error line into that machine's
+        // own log for each packet - so this build only ever puts a bounded number of them on that route for a peer
+        // that has not answered. The game's own byte channel carries the same packet behind this build's own key
+        // and magic and is understood by every machine that runs this mod, whether or not it also runs the API.
         //
         // Which one a peer answers on is a fact this machine learns rather than assumes: a build with the API
         // bound and a build without it would otherwise talk past each other in one direction for the whole run.
@@ -326,8 +377,9 @@ internal static class SquadNet
         // read here, only the route it actually used is kept, so the duplicate costs one packet per peer rather
         // than one per second. That memory expires (`TryRoute`): a transport that stops delivering puts the
         // peer back to "unknown" within `RouteSeconds` instead of silencing the pair for the rest of the run.
-        ulong lookup = 0UL;
-        try { lookup = target.Lookup; } catch (Exception) { }
+        //
+        // This path is for a peer that proved it runs this build or that the operator named: nothing here is
+        // budgeted, so the duplicate is the route discovery it always was.
         bool known = TryRoute(lookup, out bool viaApi);
         bool knownApi = known && viaApi;
         bool knownRaw = known && !viaApi;
@@ -339,6 +391,30 @@ internal static class SquadNet
         if (!knownApi || !apiSent) SendRaw(packet, target);
     }
 
+    // One probe credit, one physical packet. The two compatible channels are rotated - the preferred transport on
+    // the first greeting, the game's own channel on the second, and so on - so a budget of `ProbeBudget` packets
+    // covers both without ever costing that peer more than the budget. A credit is spent even when its transport
+    // fails: the next greeting on the cadence buys the other channel rather than sending a second copy now, which is
+    // what keeps a failed send from turning one credit into two packets.
+    private static void SendProbe(byte[] packet, SNet_Player target, ulong lookup)
+    {
+        ProbePackets.TryGetValue(lookup, out int sent);
+        sent++;
+        if (lookup != 0UL) ProbePackets[lookup] = sent;
+        bool known = TryRoute(lookup, out bool routeApi);
+        // A peer whose route is known is sent on that route and no other; a probe normally has no route at all,
+        // because anything this machine heard from a peer proves it and takes it off the probe.
+        bool viaApi = known ? routeApi : (sent % 2) == 1;
+        if (viaApi && ApiUsable()) { TryApiSend(packet, target); return; }
+        SendRaw(packet, target);
+    }
+
+    // Whether the GTFO-API transport can carry a packet on this machine right now. A probe credit assigned to the
+    // preferred transport falls back to the game's own channel when that transport is not bound at all: that is not
+    // duplication, it is the only channel there is. A transport that is bound but fails is a different matter and
+    // `SendProbe` does not retry it on the other channel.
+    private static bool ApiUsable() { return _apiBound && !_apiDisabled && _apiSend != null; }
+
     // The game's own byte channel: a run of bytes behind this build's key and magic, taken back in the
     // `SNet_Replication.RecieveBytes` prefix.
     private static void SendRaw(byte[] packet, SNet_Player target)
@@ -349,17 +425,23 @@ internal static class SquadNet
         SNet.Core.SendBytes(bytes, quality, channel, target);
     }
 
-    // Fail closed: no gate, an unreadable target or a throwing owner all mean "not a byte".
-    private static bool MaySpeakTo(SNet_Player target)
+    // Fail closed: no gate, an unreadable target or a throwing owner all mean "not a byte". The kind travels with
+    // the question so the owner can answer per kind - which is what keeps the bounded probe from paying for a row -
+    // and the answer comes back as the evidence that allowed it, because a probe credit buys one physical packet
+    // while a proved or named peer's packet may go out both ways.
+    private static bool MaySpeakTo(SquadPacketKind kind, SNet_Player target, out SquadEvidence why)
     {
+        why = SquadEvidence.Nothing;
         try
         {
-            Func<ulong, bool> gate = MaySend;
+            Func<ulong, SquadPacketKind, SquadEvidence> gate = MaySend;
             if (gate == null || target == null) return false;
-            return gate(target.Lookup);
+            why = gate(target.Lookup, kind);
+            return why != SquadEvidence.Nothing;
         }
         catch (Exception)
         {
+            why = SquadEvidence.Nothing;
             return false;
         }
     }
@@ -414,7 +496,9 @@ internal static class SquadNet
         // speaks this key and magic, but it proves nothing about which transport can carry a packet this
         // build can read: remembering it as "this peer is on the API" is how one unusable packet switched the
         // working route off for the whole run.
-        if (sender != 0UL && (packet.Kind == SquadPacketKind.Hello || packet.Kind == SquadPacketKind.Snapshot))
+        // 1.19.34: a kinds packet is a readable packet of this build too, so it proves the route exactly as a row does.
+        if (sender != 0UL && (packet.Kind == SquadPacketKind.Hello || packet.Kind == SquadPacketKind.Snapshot
+            || packet.Kind == SquadPacketKind.SupplyKinds))
             Route[sender] = new RouteEntry(viaApi, Seconds);
         // Bounded, and bounded by dropping the oldest: the counter is raised once and lowered once per drop,
         // so a stalled main thread cannot grow the queue without limit and the queue cannot be emptied by the
@@ -434,7 +518,7 @@ internal static class SquadNet
             // Transport identity is not the body identity: a host relays rows owned by other players,
             // and snapshot packets intentionally carry no sender field (Parse leaves it zero).
             Kind = packet.Kind, Sender = sender, HelloOwner = packet.Sender, Generation = packet.Generation,
-            Version = packet.Version, Snapshot = packet.Snapshot, ViaApi = viaApi
+            Version = packet.Version, Snapshot = packet.Snapshot, Kinds = packet.Kinds, ViaApi = viaApi
         });
     }
 
@@ -455,6 +539,11 @@ internal static class SquadNet
                         break;
                     case SquadPacketKind.Snapshot:
                         OnSnapshot?.Invoke(queued.Sender, queued.Generation, queued.Snapshot);
+                        break;
+                    // 1.19.34: the split that rode beside the row. A machine that does not send it leaves every row's
+                    // kinds unknown, which is what this build prints for it.
+                    case SquadPacketKind.SupplyKinds:
+                        OnSupplyKinds?.Invoke(queued.Sender, queued.Generation, queued.Kinds);
                         break;
                     case SquadPacketKind.VersionMismatch:
                         OnProtocolMismatch?.Invoke(queued.Sender, queued.Version);

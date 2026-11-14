@@ -69,12 +69,12 @@ internal static partial class Program
             "G15: a transport whose owner never spoke refuses every packet - a greeting included - rather than sending by default");
 
         // The owner's gate, refusing everything: still nothing on the wire.
-        SquadNet.MaySend = _ => false;
+        SquadNet.MaySend = (_, __) => SquadEvidence.Nothing;
         SquadNet.SendHello(listed_peer, 7UL, 3u);
         Check(SNet.Core.SendCount == sent, "G16: the transport asks its owner before every packet and obeys a refusal");
 
         // A gate that throws is a refusal, not an exception into the replication layer.
-        SquadNet.MaySend = _ => throw new InvalidOperationException("gate fault");
+        SquadNet.MaySend = (_, __) => throw new InvalidOperationException("gate fault");
         bool threw = false;
         try { SquadNet.SendHello(listed_peer, 7UL, 3u); }
         catch (Exception) { threw = true; }
@@ -84,7 +84,7 @@ internal static partial class Program
         // The real capability, wired the way CombatSync wires it.
         capability.ResetEvidence();
         capability.SetAllowlist(listed);
-        SquadNet.MaySend = capability.MaySend;
+        SquadNet.MaySend = capability.MayPutOnWire;
         SquadNet.SendHello(listed_peer, 7UL, 3u);
         Check(SNet.Core.SendCount == sent + 1 && SNet.Core.LastTarget == 9001UL,
             "G18: a named peer is the one byte run that leaves this machine, and it is addressed to that peer");
@@ -100,27 +100,62 @@ internal static partial class Program
         Check(SNet.Core.SendCount == sent + 1 && SNet.Core.LastTarget == 9300UL,
             "G20: once the stranger has spoken first, the same machine may answer it");
 
-        SquadNet.MaySend = capability.MaySend;
+        SquadNet.MaySend = capability.MayPutOnWire;
         bool nullThrew = false;
         try { SquadNet.SendHello(null, 7UL, 3u); }
         catch (Exception) { nullThrew = true; }
         Check(!nullThrew, "G21: a null target is a no-op rather than an exception in the send path");
 
-        // ---- the default this build repairs to -------------------------------
+        // ---- the default this build repairs to ---------------------------------
+        // 1.19.38 replaced the rule this block asserted up to 1.19.37 - "a machine that shares with its slot list
+        // may greet AND SEND to a peer it has never heard from, which is the rule whose absence left two modded
+        // machines silent for a whole run". The field log on a teammate's machine that runs no mod retired it:
+        // GTFO-API writes `[Error : GTFO-API] [NetworkAPI]: <id> invoked an event <name> which isn't registered`
+        // into the receiving machine's log for every packet of an unregistered event, and an unbounded broadcast
+        // put 10225 of those `CombatPanelSquad` lines in that one log in a single session. Sharing now buys the
+        // bounded *probe* only. The assertions below are that new rule, not a loosened version of the old one.
         var sharing = new SquadCapability();
         sharing.SetBroadcast(true);
-        Check(sharing.MaySend(9400UL, out SquadEvidence whyShared) && whyShared == SquadEvidence.Broadcast,
-            "G22: a machine that shares with its slot list may greet and send to a peer it has never heard from, which is the rule whose absence left two modded machines silent for a whole run");
-        Check(sharing.Describe(9400UL).Contains("slot list"),
-            "G23: the diagnostic names sharing as the reason rather than reporting missing evidence");
-        Check(!sharing.MaySend(0UL), "G24: broadcasting still never addresses a lookup of zero");
+        Check(sharing.MaySend(9400UL, out SquadEvidence whyShared) && whyShared == SquadEvidence.Probe,
+            "G22: a machine that shares with its slot list may probe a peer it has never heard from, and probing is all it may do until that peer answers");
+        Check(sharing.Describe(9400UL).Contains("slot list") && sharing.Describe(9400UL).Contains("bounded probe"),
+            "G23: the diagnostic names sharing and its bounded probe rather than reporting missing evidence");
+        Check(!sharing.MaySend(0UL), "G24: probing still never addresses a lookup of zero");
         Check(sharing.NoteInbound(9400UL) && sharing.MaySend(9400UL, out SquadEvidence whyProvenShared)
             && whyProvenShared == SquadEvidence.Proven,
-            "G25: proof from the peer outranks the broadcast flag in the diagnostic");
+            "G25: proof from the peer outranks the probe in the diagnostic");
         Check(sharing.NoteIncompatible(9400UL) && !sharing.MaySend(9400UL),
-            "G26: a peer on another protocol version stays silent even while broadcasting, because nothing this build sends can be read by it");
+            "G26: a peer on another protocol version is left alone even while probing, because nothing this build sends can be read by it");
+        RunSquadProbeScenarios();
+
+        // ---- the budget itself -------------------------------------------------------------------------
+        // The half of G22's old rule that the field evidence retired: the probe used to be the first packet of an
+        // endless stream. It is now a fixed number of packets for the whole session.
+        var budgeted = new SquadCapability();
+        budgeted.SetBroadcast(true);
+        int probeSpent = 0;
+        while (budgeted.MaySend(9450UL) && probeSpent < 50) { budgeted.NoteProbeSent(9450UL); probeSpent++; }
+        Check(probeSpent == SquadCapability.ProbeBudget && !budgeted.MaySend(9450UL),
+            "G28: an unproven peer costs ProbeBudget (" + SquadCapability.ProbeBudget
+            + ") packets and is then answered with silence, which is what stops a probe from becoming the 10225-line broadcast");
+        Check(!budgeted.NoteProbeSent(9450UL) && budgeted.ProbesSent(9450UL) == SquadCapability.ProbeBudget,
+            "G29: the budget cannot be exceeded however often the caller asks, and the count it reports stops at the budget");
+        Check(budgeted.Describe(9450UL).Contains("spent"),
+            "G30: and the diagnostic names the spent budget instead of pretending there was never any evidence");
+        budgeted.Forget(9450UL);
+        Check(budgeted.MaySend(9450UL) && budgeted.ProbesSent(9450UL) == 0,
+            "G31: a seat that changes hands gets its own budget rather than the previous occupant's spent one");
+        budgeted.NoteProbeSent(9450UL);
+        budgeted.ResetEvidence();
+        Check(budgeted.MaySend(9450UL) && budgeted.ProbesSent(9450UL) == 0,
+            "G32: a new lobby (ResetEvidence) puts the probe budget back, so a peer whose plugin only loaded later is still found");
+        budgeted.SetAllowlist(new List<ulong> { 9460UL });
+        Check(budgeted.MaySend(9460UL, out SquadEvidence whyNamedProbed) && whyNamedProbed == SquadEvidence.Allowlisted,
+            "G33: a named peer is decided by the list, never by the probe, so naming costs that peer no budget at all");
         sharing.SetBroadcast(false);
-        Check(!sharing.MaySend(9500UL), "G27: turning sharing off restores the older rule without a restart");
+        Check(!sharing.MaySend(9500UL), "G27: turning probing off restores the older rule without a restart");
+        Check(!sharing.MaySend(9500UL) && sharing.ProbesSent(9500UL) == 0,
+            "G34: with probing off not one packet is spent on an unproven peer - a greeting included");
 
         SquadNet.MaySend = null;
 
@@ -193,5 +228,29 @@ internal static partial class Program
             "B3: the host folds in the aim only that client could count");
         Check(Near(Row(hRows, 0x72UL)?.Impact.HealthLost, 40),
             "B3: and the life that client lost travels with its row, so a host can print blood loss for a player it never applied a blow to");
+    }
+
+    // 1.19.38: what the sharing default now produces between machines that all run this build. Every node here is
+    // `Isolated`, so nothing is named anywhere and the *probe* is the only thing that can start the conversation:
+    // each machine spends one of its three greetings on each peer, the hello is answered, and the pair is proven
+    // from that point on. The rows then flow exactly as they always did - which is why B3's figures still hold,
+    // while a peer that never answers stops after `SquadCapability.ProbeBudget` packets instead of forever.
+    private static void RunSquadProbeScenarios()
+    {
+        var wire = new Wire();
+        var host = new Node(0x74UL, 0) { IsMaster = true, Isolated = true };
+        var silent = new Node(0x75UL, 1) { Isolated = true, Modded = false };   // in the lobby, runs no mod, never answers
+        wire.Add(host); wire.Add(silent);
+        host.Exchange.Capability.SetBroadcast(true);
+        host.Row(0x74UL).Total.AddEnemyDamage(300);
+        for (int tick = 0; tick < 600; tick++) wire.Tick(tick * 1f);            // ten simulated minutes
+        int toSilent = silent.HellosSeen + silent.SnapshotsSeen;
+        Console.WriteLine("PROBE-BUDGET-WIRE: the transport handed 1 unmodded peer " + toSilent
+            + " packet(s) in ten simulated minutes (baseline 10225 CombatPanelSquad error lines)");
+        Check(toSilent == SquadCapability.ProbeBudget,
+            "P1: over the wire a peer that runs no mod is handed exactly ProbeBudget (" + SquadCapability.ProbeBudget
+            + ") packets in ten simulated minutes, all of them greetings, and nothing afterwards (got " + toSilent + ")");
+        Check(silent.HellosSeen == SquadCapability.ProbeBudget && silent.SnapshotsSeen == 0,
+            "P2: and not one of them is a row - the bounded probe carries greetings only");
     }
 }

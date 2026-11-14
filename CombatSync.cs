@@ -18,10 +18,11 @@ namespace HawChow.GTFOCombatPanel;
 //            the host sends it.
 //   either - greets a peer on a cadence once that peer is known to run this build: either its lookup is
 //            named in this machine's own configuration, or it has itself sent this machine one of these
-//            packets. Nothing - a greeting included - is sent to a machine there is no evidence about, so
-//            a host that runs no mod, a bot and a stranger in the lobby are never handed bytes they have
-//            no handler for. This machine therefore does not promise to pair two modded clients behind a
-//            vanilla host on its own: one of them has to name the other.
+//            packets. Nothing - a greeting included - is sent to a machine there is no evidence about. The
+//            one exception is the bounded probe the `ShareWithEveryPlayer` default buys: at most
+//            `SquadCapability.ProbeBudget` greetings over an expedition, no rows, because a machine that
+//            runs no mod does not ignore these bytes - GTFO-API answers each unregistered event with one
+//            `[Error]` line in that machine's own log (10225 of them for this event in one recorded run).
 //
 // Nothing a packet carries is ever written into the capture ledger. `CombatTracker.Store` holds only what
 // this machine measured; a received snapshot is cached raw and a row is *projected* for display by cloning
@@ -120,9 +121,13 @@ internal static class CombatSync
             SquadNet.OnHello = OnHello;
             SquadNet.OnSnapshot = OnSnapshot;
             SquadNet.OnProtocolMismatch = OnProtocolMismatch;
-            // The transport's own gate. It answers from the same evidence the exchange does, so a packet the
-            // exchange should never have asked for cannot reach the wire by any other route; before the
-            // configuration is read the gate refuses everything, which is the safe answer.
+            // 1.19.34: the pack kinds that ride beside a row. A peer that does not send them leaves that row's kinds
+            // unknown - this handler is never needed to keep reading the rows that peer does send.
+            SquadNet.OnSupplyKinds = OnSupplyKinds;
+            // The transport's own gate. It answers from the same evidence the exchange does and hands over the
+            // greeting the exchange reserved, so a packet the exchange should never have asked for cannot reach
+            // the wire by any other route; before the configuration is read the gate refuses everything, which is
+            // the safe answer.
             SquadNet.MaySend = MayBeSpokenTo;
             BindDiscoveryConfig();
             // GTFO-API is the transport this build prefers: its free-sized event already carries a fixed
@@ -131,12 +136,15 @@ internal static class CombatSync
             // run that API, so a squad is never silent merely because one half of it lacks the library.
             bool api = SquadNet.TryBindApi();
             Plugin.Logger.LogInfo("[DIAG] squad sync armed: sharing with "
-                + (ShareMode ? "every player in the slot list" : "named and proven players only")
+                + (ShareMode
+                    ? "every unproven player in the slot list through a bounded probe of "
+                        + SquadCapability.ProbeBudget + " greeting(s) per expedition, and with named and proven players in full"
+                    : "named and proven players only")
                 + "; transport=" + (api ? "GTFO-API free-sized event" : "SNet.Core.SendBytes with a key+magic gate")
-                + ". The greeting runs at its usual cadence (2s burst, 10s keep-alive), the host sends its squad rows"
-                + " each second and a client sends only its own measurements. Received rows are queued for main-thread"
-                + " authority checks and display projection; snapshot Owner identifies the player described, not the"
-                + " sender.");
+                + ". The greeting runs at its usual cadence (2s burst, 10s keep-alive) for a peer that may be greeted,"
+                + " the host sends its squad rows each second and a client sends only its own measurements. Received"
+                + " rows are queued for main-thread authority checks and display projection; snapshot Owner identifies"
+                + " the player described, not the sender.");
         }
         catch (Exception error)
         {
@@ -161,33 +169,35 @@ internal static class CombatSync
             if (config == null)
             {
                 Plugin.Logger.LogWarning("[DIAG] squad sync discovery: the configuration file is not reachable yet, so this"
-                    + " machine shares with every player in its slot list and keeps no allowlist. A configuration failure must"
-                    + " never be able to silence sharing, so the default is applied here rather than waited for.");
+                    + " machine shares with every player in its slot list through the bounded probe ("
+                    + SquadCapability.ProbeBudget + " greeting(s) per expedition, no rows until a peer answers) and keeps no"
+                    + " allowlist. A configuration failure must never be able to silence sharing, so the default is applied"
+                    + " here rather than waited for.");
                 _share = true;
                 _shareApplied = true;
                 Exchange.Capability.SetBroadcast(true);
                 return;
             }
-            // Sharing with the whole slot list is the default. The bytes ride GTFO-API's own free-sized event,
-            // which is the transport StatDisplay and AccuracyTracker share on: every machine that does not run
-            // this build drops the packet without a handler being involved, so a broadcast is not a probe of a
-            // machine that cannot answer. Off restores the previous rule, for a lobby the operator wants to keep
-            // to named machines only.
+            // Sharing with the slot list is the default, and it is a *bounded probe*, not an open channel. The
+            // bytes ride GTFO-API's own free-sized event, which is the transport StatDisplay and AccuracyTracker
+            // share on - and a machine that does not run this build is not silent about receiving one: GTFO-API
+            // looks the event name up in its own registry, finds nothing, and writes
+            // `[Error : GTFO-API] [NetworkAPI]: <id> invoked an event <name> which isn't registered` into that
+            // machine's BepInEx log once per packet. A recorded run beside such a machine produced 10225 of those
+            // for this event. So the default buys an unproven peer `SquadCapability.ProbeBudget` greetings for the
+            // whole expedition - never a row - and stops as soon as that is spent. Off restores the previous rule,
+            // for a lobby the operator wants to keep to named machines only.
             _shareEntry = config.Bind("Squad Sync", "ShareWithEveryPlayer", true,
-                "Share this machine's rows with every player in the squad by default. The packets ride GTFO-API's own"
-                + " network event, which every other mod on that transport already uses in lobbies that hold unmodded"
-                + " players: a machine that runs no mod has no handler for it and drops the bytes, exactly as it drops"
-                + " every other mod packet it receives. Set this to false to share only with players named in"
-                + " AllowlistedPeers, or with those that have themselves sent this machine a packet of this build's"
-                + " protocol - that pair works, but two machines that both wait for the other to speak first share"
-                + " nothing, which is what this build repairs.");
+                "默认对本队每一名未证明身份的玩家做一次有上限的探测：每局最多 3 个问候包，之后在对方主动开口、换局或换座位之前一个包都不再发。"
+                + " 数据包走 GTFO-API 自己的网络事件；实测表明没装本模组的机器并不会静默丢弃它，GTFO-API 每收到一个未注册事件就在对方机器的日志里打一行 Error"
+                + "（一次实测中同一事件累积 10225 行），所以探测必须有上限，且行数据只发给已证明或 AllowlistedPeers 点名的玩家。"
+                + " 设为 false 则完全不探测：只分享给 AllowlistedPeers 中点名的玩家，或主动向本机发过本模组协议数据包的玩家。");
             ApplyShareMode(true);
             _allowlistEntry = config.Bind("Squad Sync", "AllowlistedPeers", string.Empty,
-                "SteamID64 lookups of players known to run CombatPanel, separated by commas. Only consulted when"
-                + " ShareWithEveryPlayer is false: then nothing is sent to a player who is not named here until that"
-                + " player has itself sent this machine a packet of this mod's protocol, and a greeting counts as one."
-                + " The number is the one the game's own lobby associates with the player; a value that is not a plain"
-                + " decimal number is ignored rather than guessed at.");
+                "已知运行 CombatPanel 的玩家的 SteamID64，逗号分隔。这里点名的玩家始终会被直接发送行数据，无论 ShareWithEveryPlayer 是什么："
+                + " 未点名的玩家只有在 ShareWithEveryPlayer 为 true 时才会收到那几个有上限的问候包（每局最多 3 个），"
+                + " 或者它自己主动向本机发过本模组协议数据包（一次问候也算一个）。"
+                + " 数字必须是游戏大厅自己与该玩家关联的那个；不是纯十进制数的值会被忽略，而不是被乱猜。");
             ApplyAllowlist(true);
         }
         catch (Exception error)
@@ -212,9 +222,10 @@ internal static class CombatSync
         int accepted = SquadCapability.ParseAllowlist(text, Allowlist);
         Exchange.SetAllowlist(Allowlist);
         Plugin.Logger.LogInfo("[DIAG] squad sync discovery: " + accepted + " peer lookup(s) named in this machine's"
-            + " configuration. They are only consulted when ShareWithEveryPlayer is false: with it on, every player in the slot"
-            + " list is shared with, and with it off every other peer is sent nothing until it has itself sent this machine a"
-            + " packet of this build's protocol. Nothing here proves who is online, and no packet is sent to find out.");
+            + " configuration. A named peer is always sent this machine's rows. Every other peer is sent nothing until it"
+            + " has itself sent this machine a packet of this build's protocol - except that ShareWithEveryPlayer buys an"
+            + " unproven peer a bounded probe of " + SquadCapability.ProbeBudget + " greeting(s) per expedition, never a row."
+            + " Nothing here proves who is online.");
     }
 
     // The share switch, re-read every tick for the same reason the allowlist is: the file can be edited
@@ -235,25 +246,39 @@ internal static class CombatSync
         _share = share;
         _shareApplied = true;
         Exchange.Capability.SetBroadcast(share);
+        // The one place the switch's meaning is written down, and it is the honest one: on is a bounded probe,
+        // not a broadcast. A peer that runs no mod is not silent - GTFO-API writes one `[Error]` line into that
+        // peer's own log for every packet of this event it is handed (10225 of them in one recorded run) - so the
+        // probe is capped at `SquadCapability.ProbeBudget` greetings per expedition and carries no row at all.
         Plugin.Logger.LogInfo(share
-            ? "[DIAG] squad sync discovery: sharing with every player in this machine's slot list. The greeting and the rows ride"
-                + " GTFO-API's free-sized event, so a player who runs no mod drops them without a handler; nothing here proves who is"
-                + " online and no packet is sent to find out."
+            ? "[DIAG] squad sync discovery: sharing with every player in this machine's slot list through a bounded probe of "
+                + SquadCapability.ProbeBudget + " greeting(s) per expedition. An unproven peer receives no row, and after those"
+                + " greetings it receives nothing at all until it answers, a new expedition starts or its seat changes hands."
+                + " Named and proven players are always sent the rows. The probe is bounded because a machine that runs no mod"
+                + " is not silent about these packets: GTFO-API writes one error line into its log for each one."
             : "[DIAG] squad sync discovery: sharing is restricted to players named in AllowlistedPeers, and to those that have"
-                + " themselves sent this machine a packet of this build's protocol. Two machines that both restrict share nothing"
-                + " until one of them is named.");
+                + " themselves sent this machine a packet of this build's protocol. Nothing at all - not a greeting and not a"
+                + " row - is sent to an unproven peer, so no machine is handed a packet it has no handler for.");
     }
 
-    // Whether this machine greets and sends to the whole slot list. Read by the arm diagnostic.
+    // Whether this machine probes the slot list it shares with. Read by the arm diagnostic.
     internal static bool ShareMode => _shareApplied && _share;
 
     // The transport's gate. Read from the main thread only, where every send of this mod is decided.
-    private static bool MayBeSpokenTo(ulong lookup)
+    //
+    // It is `SquadCapability.MayPutOnWire` rather than the evidence question, because the greeting that spends a
+    // peer's bounded probe is decided a moment before it is put on the wire: asking only "is there evidence" made
+    // the transport refuse that very packet (the budget was already reserved out, so the evidence answered
+    // "nothing"), and an unproven peer was handed one packet fewer than `ProbeBudget` while the exchange counted it
+    // as sent. The packet's kind travels with the question, so the gate hands over the reserved greeting and still
+    // refuses a row or a pack-kind block for a peer that has only been probed. The answer is that evidence, because
+    // the transport then has to spend a probe credit on exactly one physical packet - `ProbeBudget` is what the other
+    // machine's log pays for, and it pays per packet, not per logical send.
+    private static SquadEvidence MayBeSpokenTo(ulong lookup, SquadPacketKind kind)
     {
-        try { return Exchange.Capability.MaySend(lookup); }
-        catch (Exception) { return false; }
+        try { return Exchange.Capability.MayPutOnWire(lookup, kind); }
+        catch (Exception) { return SquadEvidence.Nothing; }
     }
-
     // A new expedition starts from zero everywhere, so the figures held for other players describe the
     // previous run and must go, and the run counter moves so that a straggler from the old run is refused.
     internal static void ResetExpedition()
@@ -351,6 +376,7 @@ internal static class CombatSync
                 if (!TryPlayer(send.Target, out SNet_Player target) || target == null) continue;
                 SentTo.Add(send.Target);
                 if (send.Kind == SquadSendKind.Hello) { SquadNet.SendHello(target, local, send.Generation); continue; }
+                if (send.Kind == SquadSendKind.SupplyKinds) { SquadNet.SendSupplyKinds(target, send.Kinds, send.Generation); continue; }
                 SquadNet.SendSnapshot(target, send.Snapshot, send.Generation);
                 rows++;
                 if (firstRowPeer == 0UL) firstRowPeer = send.Target;
@@ -358,11 +384,11 @@ internal static class CombatSync
             if (rows > 0 && LevelClock.OutboundOwed)
             {
                 LevelClock.OutboundWritten();
-                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build, {Exchange.WithheldPeers} are being sent nothing, sharing={(ShareMode ? "every player in the slot list" : "named and proven players only")}, receivedButUnusable={SquadNet.UnusablePackets}. This send receipt alone does not prove remote acceptance.");
+                Plugin.Logger.LogInfo($"[DIAG] squad sync outbound: {rows} row(s) put on the wire; firstTarget={firstRowPeer}; {Exchange.EverAnsweredPeers} of {Exchange.HumanPeers} human peer(s) have proved they run this build, {Exchange.WithheldPeers} are being sent nothing at all, sharing={(ShareMode ? "a bounded probe of " + SquadCapability.ProbeBudget + " greeting(s) per expedition for every unproven player, plus full rows to named and proven players" : "named and proven players only")}, receivedButUnusable={SquadNet.UnusablePackets}. This send receipt alone does not prove remote acceptance.");
             }
             if (LevelClock.NoInboundOwed(now, Exchange.HumanPeers, Heard.Count))
             {
-                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {LevelClock.Seconds(now):0}s since this level began, with {Exchange.HumanPeers} human peer(s) in the roster and not one packet from any of them handled in this level, so no other player's row can appear on this screen. Outbound sharing is {(ShareMode ? "on for the whole slot list" : "restricted to named and proven players")} and {Exchange.WithheldPeers} peer(s) are being sent nothing; receivedButUnusable={SquadNet.UnusablePackets} counts packets of this build's protocol that reached this machine and could not be decoded - it counts nothing else, so a zero there says no packet was undecodable, never that none arrived, and this line is decided by the per-level count above. If this machine is broadcasting and still hears nothing, the two builds are not reaching each other's transport - read the armed line above for which transport this machine uses - or a peer answered with another protocol version and was then left alone on purpose. Greetings keep going on the keep-alive cadence either way.");
+                Plugin.Logger.LogWarning($"[DIAG] squad sync inbound: {LevelClock.Seconds(now):0}s since this level began, with {Exchange.HumanPeers} human peer(s) in the roster and not one packet from any of them handled in this level, so no other player's row can appear on this screen. Outbound sharing is {(ShareMode ? "on for the whole slot list, but bounded: an unproven peer gets at most " + SquadCapability.ProbeBudget + " greeting(s) per expedition and no row" : "restricted to named and proven players")} and {Exchange.WithheldPeers} peer(s) are being sent nothing; receivedButUnusable={SquadNet.UnusablePackets} counts packets of this build's protocol that reached this machine and could not be decoded - it counts nothing else, so a zero there says no packet was undecodable, never that none arrived, and this line is decided by the per-level count above. If this machine is probing and still hears nothing, the two builds are not reaching each other's transport - read the armed line above for which transport this machine uses - or a peer answered with another protocol version and was then left alone on purpose, or the peer's probe budget is spent and it is silent until it answers or a new expedition starts. A peer that runs no mod answers each of those few packets with one GTFO-API error line in its own log, which is why the probe is bounded rather than open.");
             }
         }
         catch (Exception error)
@@ -455,6 +481,26 @@ internal static class CombatSync
         catch (Exception error)
         {
             Plugin.Logger.LogWarning("squad sync snapshot could not be applied: " + error.Message);
+        }
+    }
+
+
+    // 1.19.34: the pack kinds a peer sent for its own row. Nothing is measured here and nothing is credited: the block is
+    // handed to the exchange, which stores it against that player and applies it only where it describes the pair the row
+    // already carries.
+    private static void OnSupplyKinds(ulong sender, uint generation, SyncProtocol.SupplyKinds kinds)
+    {
+        try
+        {
+            SquadDecision decision = Exchange.OnSupplyKinds(sender, generation, kinds, Now);
+            if (decision.Accepted) Note(sender);
+            Line($"[DIAG] squad sync supply kinds: accepted={decision.Accepted}; peer={sender}; owner={kinds.Owner}; total={kinds.Total}; "
+                + $"ammo={kinds.Ammo}; tool={kinds.Tool}; medical={kinds.Medical}; reason={decision.Reason}; peerGeneration={generation}; "
+                + $"localGeneration={Exchange.Generation};");
+        }
+        catch (Exception error)
+        {
+            Plugin.Logger.LogWarning("squad sync supply kinds could not be applied: " + error.Message);
         }
     }
 

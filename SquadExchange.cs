@@ -22,7 +22,9 @@ public readonly struct SquadPeer
     public bool IsHuman => !IsBot && Lookup != 0UL;
 }
 
-public enum SquadSendKind { Hello, Snapshot }
+// 1.19.34: `SupplyKinds` carries the split of a row's own pack use, which travels beside the row rather than inside it so
+// that a peer on the v8 protocol keeps reading every row this build sends.
+public enum SquadSendKind { Hello, Snapshot, SupplyKinds }
 
 // One packet the exchange wants put on the wire this tick. The exchange never touches SNet itself, which
 // is what lets the whole exchange be driven in memory by the headless suite.
@@ -31,12 +33,24 @@ public readonly struct SquadSend
     public readonly SquadSendKind Kind;
     public readonly ulong Target;
     public readonly SyncSnapshot Snapshot;
+    // 1.19.34: set for `SupplyKinds` only, where the snapshot is default.
+    public readonly SyncProtocol.SupplyKinds Kinds;
     public readonly uint Generation;
 
     public SquadSend(SquadSendKind kind, ulong target, in SyncSnapshot snapshot, uint generation)
     {
-        Kind = kind; Target = target; Snapshot = snapshot; Generation = generation;
+        Kind = kind; Target = target; Snapshot = snapshot; Kinds = default; Generation = generation;
     }
+
+    private SquadSend(SquadSendKind kind, ulong target, in SyncSnapshot snapshot, in SyncProtocol.SupplyKinds kinds, uint generation)
+    {
+        Kind = kind; Target = target; Snapshot = snapshot; Kinds = kinds; Generation = generation;
+    }
+
+    // 1.19.34: the kinds packet. A factory rather than an overload, so a caller that passes `default` for a body keeps
+    // resolving to the snapshot constructor instead of becoming ambiguous.
+    public static SquadSend OfSupplyKinds(ulong target, in SyncProtocol.SupplyKinds kinds, uint generation)
+        => new SquadSend(SquadSendKind.SupplyKinds, target, default, kinds, generation);
 }
 
 // What the exchange decided about one received packet, with everything the diagnostic line needs: who it
@@ -65,21 +79,26 @@ public readonly struct SquadDecision
 // rows are projected for display.
 //
 // Nothing is put on the wire for a peer this machine has no evidence about - a hello included, because a
-// hello is already a packet only this build can read. The evidence is `SquadCapability`: either the
-// operator named that player's lookup in the configuration, or the peer itself sent this machine a packet
-// of this build's protocol, which nothing but this build can produce and which is therefore the only
-// discovery route that has to send nothing to find out. A machine that runs no mod, a bot, a stranger in
-// the lobby and a peer on another protocol version are all met with silence.
+// hello is already a packet only this build can read, and because a machine that runs no mod is *not* silent
+// about receiving one: GTFO-API answers every unregistered event with one `[Error]` line in that machine's own
+// log, and a recorded run beside such a machine collected 10225 of them for this event. The evidence is
+// `SquadCapability`: the operator named that player's lookup in the configuration, the peer itself sent this
+// machine a packet of this build's protocol - which nothing but this build can produce, and which is therefore
+// the discovery route that has to send nothing to find out - or, when this machine shares with its slot list,
+// the `ProbeBudget` greetings an unproven peer is allowed and not one packet more. A bot, a stranger in the
+// lobby and a peer on another protocol version are all met with silence.
 //
 // What the exchange does with a peer that *is* speaking to it:
 //
 //   * a host that runs this mod reads every player's fire, damage and backpack itself, so it sends one row
-//     per slotted player to every peer it may speak to. Its rows are authoritative for damage.
-//   * a client sends its own row - and only its own row - to every peer it may speak to. That row is
-//     authoritative for its aim, its supplies and its scans, which no other machine can count.
+//     per slotted player to every peer that has proved it can read one - or that the operator named. Its rows
+//     are authoritative for damage.
+//   * a client sends its own row - and only its own row - to the same peers. That row is authoritative for
+//     its aim, its supplies and its scans, which no other machine can count. The bounded probe state carries no
+//     row at all: a peer that has not proved it runs this build has no handler for one.
 //   * a lobby whose host runs no mod of its own exchanges between the clients only when one of them has
-//     the other in its configuration or has already been spoken to by it. The vanilla host is never sent
-//     anything and is never given a row.
+//     the other in its configuration or has already been spoken to by it. The vanilla host is probed a bounded
+//     number of times and then left alone; it is never sent a row.
 //
 // Authority is decided by the roster, not by trust in the packet: a machine may describe any player if it
 // is the host, and otherwise only the player whose identity it actually is. A row about somebody else from
@@ -222,6 +241,9 @@ internal sealed class SquadExchange
         Cache.Clear();
         _squadTotal = null; _squadTotalPartial = false;
         Handshake.Reset();
+        // A peer that never answered is probed again: the machine on the other end may only now have finished
+        // loading this build, and `ProbeBudget` packets per expedition is still bounded.
+        Discovery.ResetProbes();
         // A hello that was waiting to be re-judged describes the run that just ended: the roster is rebuilt for the
         // new one, so a packet kept from before it must never be re-judged against that new roster - the peer may not
         // even be in this expedition, and a hello is answered only for the session that received it.
@@ -334,31 +356,52 @@ internal sealed class SquadExchange
 
     // ---------------------------------------------------------------- what goes out
 
-    // The packets this machine wants sent right now: a hello to every peer it may speak to and has not heard
-    // from, and one row per player (as host) or this machine's own row (as client) to every peer it may
-    // speak to. A peer this machine holds no evidence about appears in neither list - not even for a hello,
-    // because a hello is already a packet only this build can read and a vanilla machine has no handler for
-    // it. The evidence is `SquadCapability`; the greeting cadence is only asked about peers that pass it,
-    // so the retry budget is spent on machines that can answer rather than on strangers.
+    // The packets this machine wants sent right now: a greeting to every peer it may greet and has not heard
+    // from, and rows only to the peers that proved they can read them. A peer this machine holds no evidence
+    // about appears in neither list - not even for a hello, because a hello is already a packet only this build
+    // can read and a machine that runs no mod answers each one with an `[Error]` line in its own log. An
+    // unproven peer that this machine shares with gets exactly its bounded probe: `ProbeBudget` greetings, no
+    // rows, and then silence. The greeting cadence is only asked about peers that pass the gate, so the retry
+    // budget is spent on machines that can answer rather than on a stranger.
     internal List<SquadSend> Tick(float now, IReadOnlyList<CombatPlayer> measured)
     {
         var sends = new List<SquadSend>();
-        int withheld = 0;
+        int withheld = 0, probing = 0;
         foreach (SquadPeer peer in Peers)
         {
             if (!peer.IsHuman || peer.IsLocal) continue;
-            if (!Discovery.MaySend(peer.Lookup)) { withheld++; continue; }
-            if (Handshake.ShouldGreet(peer.Lookup, now))
-                sends.Add(new SquadSend(SquadSendKind.Hello, peer.Lookup, default, _generation));
+            SquadEvidence evidence = Discovery.EvidenceOf(peer.Lookup);
+            if (evidence == SquadEvidence.Nothing) { withheld++; continue; }
+            if (evidence == SquadEvidence.Probe) probing++;
+            if (!Handshake.ShouldGreet(peer.Lookup, now)) continue;
+            // A greeting for an unproven peer costs one of the few packets that peer will ever be handed, and the
+            // cost is charged *here*, where the packet is asked for: this is what bounds the queue itself, so a
+            // decider that never reaches the transport still cannot probe a peer forever. The transport's gate
+            // (`SquadCapability.MayPutOnWire`) then hands the reserved packet over - a gate that asked the
+            // evidence alone refused exactly the greeting that had spent the last reservation, which is how an
+            // unproven peer came to be handed two of the three. The line is written once, on the packet that
+            // spends the last one, so a level's log carries one line per silent peer instead of one per frame.
+            if (evidence == SquadEvidence.Probe && Discovery.NoteProbeSent(peer.Lookup))
+                Report("[DIAG] squad sync discovery: peer=" + peer.Lookup + " has now been sent all "
+                    + SquadCapability.ProbeBudget + " greeting packet(s) this machine sends it without proof; it is"
+                    + " sent nothing more - no greeting and no row - until it answers, a new expedition starts or its"
+                    + " seat changes hands. Each of those packets is one error line in that machine's own GTFO-API log"
+                    + " when it runs no mod, which is why the probe is bounded.");
+            sends.Add(new SquadSend(SquadSendKind.Hello, peer.Lookup, default(SyncSnapshot), _generation));
         }
         if (withheld != _withheldPeers)
         {
             _withheldPeers = withheld;
-            Report("[DIAG] squad sync discovery: " + withheld + " of " + HumanPeers
-                + " human peer(s) are being sent nothing at all - no hello, no row - because this machine holds no evidence"
-                + " that they run this build. A peer is spoken to when its lookup is named in AllowlistedPeers, or after it has"
-                + " itself sent this machine a packet of this build's protocol; a machine that runs no mod never produces one, and"
-                + " nothing is sent to find out.");
+            // Written only when the roster holds a human peer: "0 of 0 human peer(s)" described nobody and read
+            // like a fault of this machine's own, which is exactly the misleading line this replaces.
+            if (HumanPeers > 0)
+                Report("[DIAG] squad sync discovery: " + withheld + " of " + HumanPeers
+                    + " human peer(s) are being sent nothing at all - no hello, no row - while " + probing
+                    + " are inside the bounded probe of " + SquadCapability.ProbeBudget + " greeting packet(s) each and"
+                    + " receive no row until they answer. A peer is spoken to when its lookup is named in"
+                    + " AllowlistedPeers, or after it has itself sent this machine a packet of this build's protocol; a"
+                    + " machine that runs no mod never produces one, and answers every packet it does receive with one"
+                    + " GTFO-API error line in its own log, which is why the probe is bounded rather than open.");
         }
         if (now < _nextSnapshot) return sends;
         _nextSnapshot = now + SnapshotSeconds;
@@ -366,10 +409,11 @@ internal sealed class SquadExchange
         foreach (SquadPeer peer in Peers)
         {
             if (!peer.IsHuman || peer.IsLocal) continue;
-            // The same gate as the greeting. A row goes only to a machine that has already said it can read
-            // this protocol, one way or the other; the receiver still decides what it will take (the sender
-            // must be in its roster, and a row about somebody else is only taken from its host).
-            if (!Discovery.MaySend(peer.Lookup)) continue;
+            // Rows go only to a machine that has already said it can read this protocol: proof from the peer
+            // itself, or the operator's own list. The bounded probe never carries a row - an unproven peer has no
+            // handler for one. The receiver still decides what it will take (the sender must be in its roster, and
+            // a row about somebody else is only taken from its host).
+            if (!CarriesRows(Discovery.EvidenceOf(peer.Lookup))) continue;
             if (_localIsMaster)
             {
                 HostRows(measured, peer.Lookup, sends);
@@ -380,9 +424,18 @@ internal sealed class SquadExchange
             // total this machine guessed at would be a lie printed as a percentage.
             sends.Add(new SquadSend(SquadSendKind.Snapshot, peer.Lookup,
                 SyncProtocol.Capture(own, _primarySlot, _specialSlot, _classSlot, _meleeSlot, 0, false), _generation));
+            // 1.19.34: the split of this row's own pack use, beside it. Only the machine that owns the backpack can say
+            // which kind a pack was, so this is the one packet a peer may send for its own row and no other.
+            if (SyncProtocol.TryCaptureSupplyKinds(own, out SyncProtocol.SupplyKinds kinds))
+                sends.Add(SquadSend.OfSupplyKinds(peer.Lookup, kinds, _generation));
         }
         return sends;
     }
+
+    // Whether a peer in this state may be handed a row. Only a peer that proved it runs this build, or one the
+    // operator named, has a handler for these bytes; the bounded probe state has none by definition.
+    private static bool CarriesRows(SquadEvidence evidence)
+        => evidence == SquadEvidence.Proven || evidence == SquadEvidence.Allowlisted;
 
     // For the diagnostic lines only: how many human peers the roster holds, and how many of them have
     // proved they run this mod. A machine that is in a level with human peers and has never heard from one
@@ -428,6 +481,14 @@ internal sealed class SquadExchange
             if (Cache.TryGet(peer.Lookup, out SyncSnapshot fromPeer))
                 snapshot = CombatMerge.PreferClientOwned(snapshot, fromPeer);
             sends.Add(new SquadSend(SquadSendKind.Snapshot, target, snapshot, _generation));
+            // 1.19.34: the split of the row's own pack use, beside the row. 1.19.35: this is sent for *every* row the host forwards,
+            // not only its own. The host counts each slotted player's packs itself - it is the machine that applies the give and the
+            // heal to that player's receiver - so `TryCaptureSupplyKinds` answers for their rows as well, and a client that is not
+            // connected to that player has no other way to show their kinds (review C2). The block keeps the described player as its
+            // owner; the receiver accepts it from the host only for a player on its own roster, keeps the owner's own block as the
+            // authority if that ever arrives, and applies it only to the exact pair the row already holds.
+            if (SyncProtocol.TryCaptureSupplyKinds(row, out SyncProtocol.SupplyKinds kinds))
+                sends.Add(SquadSend.OfSupplyKinds(target, kinds, _generation));
         }
     }
 
@@ -480,32 +541,44 @@ internal sealed class SquadExchange
         Handshake.Heard(sender, now);
         if (!Handshake.AcceptsFrom(sender, generation, now, out bool recovered))
             return Refuse("hello", Handshake.DescribeStale(sender), sender, generation);
-        if (recovered)
-        {
-            bool remoteHostRestarted = sender == _master && sender != _local;
-            if (remoteHostRestarted)
-            {
-                Cache.Clear();
-                _squadTotal = null; _squadTotalPartial = false;
-            }
-            else
-            {
-                Cache.Remove(sender);
-                if (Cache.TryGetSquadTotal(out double remainingTotal, out bool remainingPartial))
-                {
-                    _squadTotal = remainingTotal;
-                    _squadTotalPartial = remainingPartial;
-                }
-                else _squadTotal = null;
-            }
-            Report("[DIAG] squad sync cache cleared before accepting Hello-first run recovery: peer=" + sender
-                + "; hostRestart=" + remoteHostRestarted.ToString().ToLowerInvariant() + "; affectedRow="
-                + (remoteHostRestarted ? "all host snapshots" : "the restarted peer") + ".");
-        }
+        // 1.19.35: one place does the cleanup a restart needs, because three packets can consume that recovery and all three must
+        // leave the cache in the same state (`ForgetRestartedRun`).
+        if (recovered) ForgetRestartedRun(sender);
         answer = Handshake.ShouldAnswer(sender, now);
         return Accept("hello", recovered
             ? "the sender restarted, its stale cached row was cleared, and its run counter is adopted"
             : "the peer speaks this protocol and is answered", sender, generation);
+    }
+
+    // 1.19.35: a peer restarted, so the run counter this machine held for it began again and every figure the *previous* run left
+    // behind has to go with the counter. The recovery itself is granted once by `Handshake.AcceptsFrom`, and three packet kinds can be
+    // the one that consumes it - a hello, a row, and the split packet. A hello did this inline and a row does it inside
+    // `SnapshotCache.Store`; the split packet did not, and that is the defect review C1 found: the counter was adopted while the old
+    // rows stayed cached, so the restarted peer's rows were then refused as "older than the one already held" for as long as its
+    // counter stayed below the old one - a whole run of rows from that player, silenced by one split packet.
+    //
+    // The host's restart invalidates every row (they were all described by it); any other peer's restart invalidates only its own.
+    private void ForgetRestartedRun(ulong sender)
+    {
+        bool remoteHostRestarted = sender == _master && sender != _local;
+        if (remoteHostRestarted)
+        {
+            Cache.Clear();
+            _squadTotal = null; _squadTotalPartial = false;
+        }
+        else
+        {
+            Cache.Remove(sender);
+            if (Cache.TryGetSquadTotal(out double remainingTotal, out bool remainingPartial))
+            {
+                _squadTotal = remainingTotal;
+                _squadTotalPartial = remainingPartial;
+            }
+            else _squadTotal = null;
+        }
+        Report("[DIAG] squad sync cache cleared before accepting run recovery: peer=" + sender
+            + "; hostRestart=" + remoteHostRestarted.ToString().ToLowerInvariant() + "; affectedRow="
+            + (remoteHostRestarted ? "all host snapshots" : "the restarted peer") + ".");
     }
 
     // A row from a peer. Who may speak for whom is decided from the roster and nothing else.
@@ -554,6 +627,53 @@ internal sealed class SquadExchange
     // stranger - but nothing this machine sends can be read by it, so every packet to it stops. Without
     // this, a mixed lobby kept putting both a hello and a row per second on the wire for a machine that
     // had already said it could not decode either.
+    // 1.19.34: one player's split of their own pack use, sent beside that player's row. It is accepted from the machine that owns
+    // the row, and - 1.19.35 - from the host relaying the split it counted as that player's receiver, which is the only way a client
+    // that is not connected to that player can show their kinds (`HostRows` sends it, and a block about another player is only taken
+    // from the host, exactly like a row about another player). Only this run is accepted, it is kept against the described owner,
+    // and it is applied only where it describes the pair the row already holds.
+    //
+    // 1.19.35 (review C1): this is a third way into the handshake, and a recovery consumed here has to clean up exactly like a
+    // recovery consumed by a hello. `AcceptsFrom` adopts the restarted peer's counter once, and while the old run's rows stayed in
+    // the cache, every new row from that peer was refused as "older than the one already held" for as long as its counter stayed
+    // below the old one - a split packet that happened to be the third stale packet could therefore silence the peer for a whole run.
+    internal SquadDecision OnSupplyKinds(ulong sender, uint generation, in SyncProtocol.SupplyKinds kinds, float now)
+    {
+        if (sender == 0UL || sender == _local)
+            return Refuse("supply kinds", "a split from nobody, or an echo of this machine's own packet", sender, generation);
+        if (!TryPeer(sender, out SquadPeer peer))
+            return Refuse("supply kinds", "the sender is not in this squad's roster", sender, generation);
+        // A block about this machine's own row is refused: this machine counts its own packs, and `ApplySupplyKinds` would never
+        // accept one for it anyway - refusing at the door keeps the diagnostic honest instead of reporting a cache write that does
+        // nothing.
+        if (kinds.Owner == _local)
+            return Refuse("supply kinds", "the split describes this machine's own row, which this machine measures itself", sender, generation);
+        bool fromOwner = kinds.Owner == sender;
+        // Who may describe whose packs: the owner, or the machine this roster names as the host - the same authority rule a row
+        // about another player already goes through (`OnSnapshot`). A non-host peer can never speak for somebody else.
+        // The same predicate `OnSnapshot` uses for this sender's rows, and it is passed on with the block: the row a split
+        // describes is the row this sender's own packets were written into, which is the host slot when the sender *is* the host
+        // (1.19.35 fix - an owner that is also the host was filling in a peer slot that never held its row).
+        bool fromHost = peer.IsMaster || (sender == _master && sender != _local);
+        if (!fromOwner && !fromHost)
+            return Refuse("supply kinds", "a split of another player's packs from a peer that does not own them", sender, generation);
+        if (!TryPeer(kinds.Owner, out _))
+            return Refuse("supply kinds", "the split describes a player outside the current squad roster", sender, generation);
+        if (!kinds.IsUsable)
+            return Refuse("supply kinds", "the split does not add up to the total it claims", sender, generation);
+        if (Discovery.NoteInbound(sender))
+            Report("[DIAG] squad sync discovery: peer=" + sender + " proved it runs this build by sending this machine a split of a pack use.");
+        Handshake.Heard(sender, now);
+        if (!Handshake.AcceptsFrom(sender, generation, now, out bool recovered))
+            return Refuse("supply kinds", Handshake.DescribeStale(sender), sender, generation);
+        if (recovered) ForgetRestartedRun(sender);
+        if (!Cache.StoreSupplyKinds(kinds.Owner, generation, kinds, recovered, fromOwner, fromHost))
+            return Refuse("supply kinds", "a split from an older run than the one already held for that player", sender, generation);
+        return Accept("supply kinds", fromOwner
+            ? "the split is cached and fills in that row's pack kinds"
+            : "the host's split for that player is cached; the player's own block replaces it when it arrives", sender, generation);
+    }
+
     internal void OnPeerIncompatible(ulong sender)
     {
         if (sender == 0UL) return;
@@ -596,8 +716,14 @@ internal sealed class SquadExchange
         }
         foreach (CombatPlayer row in rows)
         {
-            if (!Cache.TryGet(row.Lookup, out SyncSnapshot snapshot)) continue;
-            CombatMerge.ApplyRemote(row, snapshot, _primarySlot, _specialSlot, _classSlot, _meleeSlot, local);
+            if (Cache.TryGet(row.Lookup, out SyncSnapshot snapshot))
+                CombatMerge.ApplyRemote(row, snapshot, _primarySlot, _specialSlot, _classSlot, _meleeSlot, local);
+            // 1.19.34: the split sent beside that row. It fills in the kinds only where the pair the row now holds is exactly the
+            // pair the split describes, so a row is never assembled out of two machines' counts; a row whose pair came from
+            // somewhere else keeps its kinds unknown, which is what the cell prints as `?`. 1.19.35: the cache also checks that the
+            // block describes the *run* that row came from, so a split left over from the previous expedition cannot attach its
+            // kinds to a new row that happens to hold the same total/ammo pair (review C4).
+            Cache.TryApplySupplyKinds(row.Lookup, row.Impact, row.Lookup == local);
         }
         return rows;
     }

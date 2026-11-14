@@ -371,10 +371,14 @@ public static class ImpactBoard
             case ImpactMetric.Revives: return Single(Count(counters.Revives));
             case ImpactMetric.WeakspotRate: return Single(RateText(entry.Input, true));
             case ImpactMetric.Accuracy: return Single(RateText(entry.Input, false));
-            // The utilization the score was built from, then this player's own pack use: `补给效率 / 本人 / 弹药`.
+            // 1.19.34: the utilization the score was built from, then this player's own pack use split by the pack
+            // it was - `补给效率 / 弹药包 / 工具包 / 血包`, all in the one cell this row has always had.
             case ImpactMetric.SupplyEfficiency:
                 return Single(counters.SupplyUses > 0 || counters.SelfSupplyUses > 0
-                    ? CombatStrings.SupplyCell(counters.SupplyUses > 0 ? Percent(counters.SupplyEfficiency, 1) : CombatStrings.Placeholder, counters.SelfSupplyUses, counters.SelfAmmoUses)
+                        || counters.SelfToolUses > 0 || counters.SelfMedicalUses > 0
+                    ? CombatStrings.SupplyCell(counters.SupplyUses > 0 ? Percent(counters.SupplyEfficiency, 1) : CombatStrings.Placeholder,
+                        counters.SelfSupplyUses, counters.SelfAmmoUses, counters.SelfToolUses, counters.SelfMedicalUses,
+                        counters.SelfSupplyKindsKnown)
                     : CombatStrings.Placeholder);
             case ImpactMetric.ToolEfficiency: return Single(ToolEfficiencyText(entry));
             case ImpactMetric.LoneSurvivor: return Single(expeditionSucceeded ? Count(counters.LoneSurvivor) : CombatStrings.Placeholder);

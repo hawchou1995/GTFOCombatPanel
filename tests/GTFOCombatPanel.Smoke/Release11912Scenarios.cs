@@ -15,18 +15,23 @@ using HawChow.GTFOCombatPanel;
 // What is asserted here is the rule that replaced it, and it is deliberately unforgiving:
 //
 //   * the failure page's own title has to be *fully drawn* - its alpha (multiplied by every canvas group above it) at
-//     `ResultTitleGate.OpaqueAlpha` - and its measured bottom edge has to have been read at the same value twice. A
-//     rectangle that has stopped moving while the text is still fading in is not an anchor: that is the reported
-//     shape, and geometry alone must never be enough.
+//     `ResultTitleGate.OpaqueAlpha` - and its measured bottom edge has to have been read at the same value twice for
+//     the *drawn-text route* to count. 1.19.21 keeps every one of those gate semantics; what changed is who waits for
+//     them: the gate is the drawn-pixel route's measurement, and the placement is satisfied by the title's laid-out
+//     screen rectangle (`FailureTitleAnchorKind.MissionTitleLayout`) on the first frame it is laid out - a rectangle
+//     that has stopped moving while the text is still fading in is an anchor now, from its layout, and geometry alone
+//     is exactly what must be enough.
 //   * an edge the page has not handed over - a footer button that was never drawn, a completion section nobody could
 //     read - is never turned into "ready" by the passage of frames. The budget only tells the caller to retry at a
 //     bounded cadence; it never buys a placement.
 //   * a page without a real stable anchor therefore keeps the game's own screen: nothing is drawn, nothing is hidden.
-//     The moment a real anchor is measurable and still, the board is placed without an F8 toggle.
+//     The moment a real anchor is measurable, the board is placed without an F8 toggle - and "real" now means
+//     laid-out geometry, which is measurable before the reveal has drawn anything.
 //
 // Everything below runs against the real `ResultTitleGate`, `ResultEdgeGate`, `ResultRetryCadence`,
 // `ResultAnchorDrift`, `FailureAlignment`, `ResultBoardHold` and `ResultAnchorRecovery` of this build, plus a managed
 // replay of one page's frames. The one section that reads source text instead is at the end and says so.
+//
 internal static class Release11912Scenarios
 {
     public static int Run()
@@ -65,7 +70,10 @@ internal static class Release11912Scenarios
     // ------------------------------------------------------- the failure page's own title, reading by reading
     //
     // The reported shape is a title whose rectangle is already in its final place while the text is still fading in.
-    // Every one of those readings used to be a legal measurement of "the title is here"; none of them is now.
+    // 1.19.21 keeps every reading rule below - the drawn-text route still needs full opacity over a still edge, and a
+    // title that never gets there still never *draws* as an anchor; what changed is that the placement no longer waits
+    // for this gate at all, because the title's laid-out rectangle answers it from the first frame (see the
+    // `FailureTitleAnchorKind.MissionTitleLayout` assertions below and the 1.19.21 suite).
     private static void FailureTitleNeedsFullOpacityOverASettledEdge(Action<bool, string> check)
     {
         var gate = new ResultTitleGate();
@@ -73,7 +81,7 @@ internal static class Release11912Scenarios
         for (int reading = 0; reading < 30; reading++)
             settledWhileFadingIn |= gate.Observe(true, reading * 0.02f, true, 612f); // 0% .. 58%, rock-steady edge
         check(!settledWhileFadingIn,
-            "a title whose rectangle has stopped moving but whose text is still fading in is never an anchor");
+            "a title whose rectangle has stopped moving but whose text is still fading in never counts as the *drawn-text* anchor - the 1.19.21 layout anchor answers instead, from the first laid-out frame");
         check(gate.Misses == 30 && Math.Abs(gate.Edge - 612f) <= 0.01f,
             $"and the edge it did read is kept for a later measurement rather than thrown away: {gate.Edge:0} after {gate.Misses} readings");
         check(gate.OpaqueFrames == 0, "none of those readings was at full opacity");
@@ -117,18 +125,24 @@ internal static class Release11912Scenarios
         for (int reading = 0; reading < 10; reading++) settledWhileMoving |= moving.Observe(true, 1f, true, 600f + 4f * reading);
         check(!settledWhileMoving, "full opacity over an edge that is still moving is not settled");
 
-        // A title the page has switched off, and a title whose rectangle cannot be read, are both not anchors.
+        // A title the page has switched off, and a title whose rectangle cannot be read: both still fail the
+        // *drawn-text* route this gate measures (the 1.19.21 layout route needs only the laid-out rectangle, see
+        // `FailureTitleAnchorKind` in the 1.19.21 suite).
         var inactive = new ResultTitleGate();
-        check(!inactive.Observe(false, 1f, true, 612f), "a title switched off by the page is not an anchor");
+        check(!inactive.Observe(false, 1f, true, 612f), "a title switched off by the page is never the drawn-text anchor");
         var blind = new ResultTitleGate();
-        check(!blind.Observe(true, 1f, false, float.NaN), "a title whose rectangle cannot be read is not an anchor");
+        check(!blind.Observe(true, 1f, false, float.NaN), "a title whose rectangle cannot be read is never the drawn-text anchor either");
     }
 
     // ------------------------------------------------------- one failure page, replayed reading by reading
     //
     // 1920x1440: the title's rectangle settles at 460 early on but its text keeps fading in, then it reaches full
-    // opacity, and the footer's lobby button only appears at reading 41 at 1200 with a height of 96. The placement used
-    // to happen on reading 1; it must now happen on the first reading on which *both* of the page's own edges are real.
+    // opacity, and the footer's lobby button only appears at reading 41 at 1200 with a height of 96. This replay
+    // drives the two *gates* exactly as the old build composed them, and 1.19.21 re-points its claims: the gates
+    // still answer the same way (reading 42 is still the first on which the drawn-text route and the settle
+    // counters both agree), but the placement itself no longer waits for them - the title's laid-out rectangle and
+    // the button's laid-out rectangle answer it from the first frame they are readable, which the 1.19.21 suite
+    // asserts with the real policies.
     private static void FailurePageWaitsForThePagesOwnTwoEdges(Action<bool, string> check)
     {
         var page = new FailurePage();
@@ -156,10 +170,10 @@ internal static class Release11912Scenarios
             }
         }
 
-        check(firstPlaced > 0, "the failure page still gets its board once both of its edges are real");
-        check(!placedWhileFadingIn, "nothing is placed while the title's text is still fading in, however still its rectangle is");
-        check(!placedWithoutTheFooter, "and nothing is placed before the footer button has been drawn");
-        check(settledTitleWithoutBoard, "the title alone is not enough: the board waits for the button it has to clear");
+        check(firstPlaced > 0, "the gates are intact: the drawn-text route still answers once both of its edges agree");
+        check(!placedWhileFadingIn, "and nothing counts as drawn-text agreement while the title's text is still fading in, however still its rectangle is");
+        check(!placedWithoutTheFooter, "and nothing counts as drawn-text agreement before the footer button has been read twice - the placement itself no longer waits on either (1.19.21)");
+        check(settledTitleWithoutBoard, "the title alone was never enough for the drawn-text route: the button settle was part of the old answer it no longer gates");
         check(firstPlaced == 42,
             $"the board lands on the second reading of a still button, after a full-opacity title: reading {firstPlaced}");
 
@@ -201,7 +215,7 @@ internal static class Release11912Scenarios
             everPlaced |= settled;
             everHid |= ResultBoardLatch.HidesVanilla(settled);
         }
-        check(!everPlaced, "400 readings without a footer button never place a board");
+        check(!everPlaced, "400 readings without a footer button never answer the footer gate ready - and a page whose only missing edge is a footer still keeps the vanilla screen until the bounded fail-open path answers instead");
         check(!everHid, "and the game's own failure screen is never hidden for a board nobody can draw");
         check(footer.Exhausted, "the gate reports its budget spent, so the caller throttles instead of placing");
 
@@ -363,20 +377,25 @@ internal static class Release11912Scenarios
             $"one page may be re-measured {ResultAnchorDrift.MaximumRecoveries} times and no more: {granted}");
     }
 
-    // ------------------------------------------------------- the success page's two edges
+    // ------------------------------------------------------- the success page's two settle gates
+    //
+    // 1.19.21 re-point: every assertion below still holds for the gates themselves - two agreeing readings are the
+    // only settled answer, a missing edge is never one, and the budget never is. What the gates no longer do is
+    // decide the placement: the completion section's final layout and the button's laid-out rectangle answer it on
+    // the first frame they are readable (the 1.19.21 suite asserts that with the real policies).
     private static void SuccessPageWaitsForSettledEdges(Action<bool, string> check)
     {
-        // The completion section's own bottom edge: the native BlinkIn has finished, but the pages lay their own
-        // layout out for a reading or two after that, and this board is measured once and then kept.
+        // The completion section's own bottom edge, as the drawn-pixel route records it: the native BlinkIn has
+        // finished, the pages still lay their own layout out for a reading or two, and the settle latch follows it.
         var upper = new ResultEdgeGate();
         check(!upper.Observe(true, 410f),
-            "the first reading of the completion section is a reading, not a settled upper bound");
-        check(upper.Observe(true, 410f), "the same edge on the next reading settles it");
+            "the first reading of the completion section is a reading, not a settled reading");
+        check(upper.Observe(true, 410f), "the same edge on the next reading settles the latch");
         upper.Forget();
         var jitter = new ResultEdgeGate();
         bool settledWhileMoving = false;
         for (int reading = 0; reading < 400; reading++) settledWhileMoving |= jitter.Observe(true, 410f + (reading % 2) * 6f);
-        check(!settledWhileMoving, "a completion section whose own edge never holds still is never an anchor");
+        check(!settledWhileMoving, "a completion section whose drawn edge never holds still is never settled, and the board no longer waits on that answer either way");
 
         // The footer: a button the page never draws is waited for, and the budget is never a placement.
         var footer = new ResultEdgeGate();
@@ -459,21 +478,24 @@ internal static class Release11912Scenarios
     {
         check(FailureTitleAnchorPolicy.Select(true, false, true, true, true, true, false)
                 == FailureTitleAnchorKind.MissionFailed,
-            "a nonempty active mission-failed title is the only immediate native title candidate");
+            "a nonempty active mission-failed title is still the first candidate");
         check(FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, true)
                 == FailureTitleAnchorKind.MissionTitleLayoutAfterSequence,
-            "an inactive client mission-title layout is eligible only after the native failure sequence completes");
+            "an inactive client mission-title layout with the native sequence complete keeps its own named source");
         check(FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, false)
-                == FailureTitleAnchorKind.None
-            && FailureTitleAnchorPolicy.Select(true, false, true, false, true, false, true)
-                == FailureTitleAnchorKind.None
+                == FailureTitleAnchorKind.MissionTitleLayout
             && FailureTitleAnchorPolicy.Select(false, false, true, false, true, true, true)
-                == FailureTitleAnchorKind.None
+                == FailureTitleAnchorKind.MissionTitleLayout
             && FailureTitleAnchorPolicy.Select(true, true, true, false, true, true, true)
-                == FailureTitleAnchorKind.None
+                == FailureTitleAnchorKind.MissionTitleLayout
             && FailureTitleAnchorPolicy.Select(true, false, true, false, false, true, true)
+                == FailureTitleAnchorKind.MissionTitleLayout,
+            "1.19.21: any laid-out title rectangle is the layout anchor immediately - before the sequence, for the host, with the lobby visible and with no text yet - no alpha, text or active test stands in front of it");
+        check(FailureTitleAnchorPolicy.Select(true, false, true, false, true, false, true)
+                == FailureTitleAnchorKind.None
+            && FailureTitleAnchorPolicy.Select(true, false, false, true, true, true, true)
                 == FailureTitleAnchorKind.None,
-            "a guest waiting-status alone, an incomplete layout/sequence, a host, or visible lobby state cannot supply an upper anchor");
+            "only a title that hands over no geometry at all still has no upper anchor: an unreadable rectangle and a missing title are not anchors");
 
         var inactiveTitle = new ResultTitleGate();
         check(!inactiveTitle.Observe(41, false, 1f, true, 580f)
@@ -604,18 +626,18 @@ internal static class Release11912Scenarios
         IntPtr page = new IntPtr(11), sequence = new IntPtr(21);
         readiness.BeginPage(page);
         check(FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, readiness.IsFinished(page))
-                == FailureTitleAnchorKind.None
+                == FailureTitleAnchorKind.MissionTitleLayout
             && !readiness.BindSequence(new IntPtr(12), sequence)
             && readiness.BindSequence(page, sequence)
             && !readiness.MarkFinished(page, new IntPtr(22)) && !readiness.IsFinished(page),
-            "a late native sequence, stale page or wrong iterator cannot make the inactive mission-title layout ready");
+            "1.19.21: a laid-out inactive client title is the layout anchor even before the sequence binds, and a late native sequence, stale page or wrong iterator still cannot claim the *post-sequence* source the layout anchor makes unnecessary");
         check(readiness.MarkFinished(page, sequence)
             && FailureTitleAnchorPolicy.Select(true, false, true, false, true, true, readiness.IsFinished(page))
                 == FailureTitleAnchorKind.MissionTitleLayoutAfterSequence,
-            "only the bound native failure iterator's terminal completion enables the measured mission-title layout path");
+            "the bound native failure iterator's terminal completion still names the measured post-sequence source, checked before the general layout anchor");
         var layoutEdge = new ResultEdgeGate();
         check(!layoutEdge.Observe(51, true, 600f) && layoutEdge.Observe(52, true, 600f),
-            "the post-sequence title layout still needs two distinct stable geometry samples");
+            "the settle gate the post-sequence source feeds still needs two distinct stable geometry samples - for the log's drawn-pixel route, not for the placement");
         readiness.BeginPage(new IntPtr(12));
         check(!readiness.IsFinished(page), "a subsequent failure page cannot inherit the prior sequence completion");
 
@@ -630,11 +652,12 @@ internal static class Release11912Scenarios
                 0f, out _, 0f),
             "when even the six-pixel minimum exceeds the measured strip, placement is reasonably refused");
 
-        // P1-B: a title that is still fading in is a title that has not been seen, whatever its geometry says.
+        // P1-B: the title gate's own answer is unchanged - a title still fading in never *draws* an anchor whatever
+        // its geometry says (1.19.21: the laid-out rectangle meanwhile anchors the board, see the layout kind above).
         var fading = new ResultTitleGate();
         check(!fading.Observe(60, true, 0.5f, true, 620f) && !fading.Observe(61, true, 0.5f, true, 620f)
             && fading.OpaqueFrames == 0,
-            "a title still fading in never places the board early, even with two identical measured edges");
+            "the drawn-text route never counts a title still fading in, even with two identical measured edges");
         check(fading.Observe(62, true, 1f, true, 620f) && fading.Observe(63, true, 1f, true, 620f),
             "the same title places as soon as it is fully drawn over the same settled edge, without an F8 toggle");
 
@@ -832,8 +855,9 @@ internal static class Release11912Scenarios
             "the strip a placed board was measured into is recorded in the one place that really places a board");
 
         check(visibility.Contains("public readonly bool AnchorMeasured;")
-              && visibility.Contains("bool anchorMeasured = true, ResultFooterSource footerSource = ResultFooterSource.None)"),
-            "the strip carries whether its upper edge was measured in its settled state, defaulting to the old answer");
+              && visibility.Contains("bool anchorMeasured = true, ResultFooterSource footerSource = ResultFooterSource.None,")
+              && visibility.Contains("float fillCeiling = ResultsFontGrowth.StripFillCeiling)"),
+            "the strip carries whether its upper edge was measured in its settled state, and the share of itself the board may use, both defaulting to the old answer");
 
         check(results.Contains("internal static void BeginFailurePage(CM_PageExpeditionFail page)")
               && results.Contains("private static void Prefix(CM_PageExpeditionFail __instance) => ResultsDisplay.BeginFailurePage(__instance);"),

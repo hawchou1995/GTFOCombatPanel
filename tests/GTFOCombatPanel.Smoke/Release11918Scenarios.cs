@@ -304,7 +304,9 @@ internal static class Release11918Scenarios
         check(near(ResultFallbackOpacity.Resolve(1f, 900f, float.NaN, float.NaN), 1f),
             "an unmeasurable band leaves the opacity alone rather than inventing a fade");
 
-        // (c) A fail-open board may not be lifted above its band's top edge by the per-repaint button check.
+        // (c) A fail-open board may not be lifted above its band's top edge by the per-repaint button check - and 1.19.21's
+        // code-review fix goes one step further: both edges bind, and a board whose height cannot sit between the band's
+        // top and the button's clearance line is refused (with the real numbers) instead of being drawn over either edge.
         var held = new LayoutRect(100f, 500f, 800f, 200f);
         bool kept = ResultBoardHold.TryHold(new BoardStrip(500f, 700f, true, 640f), held, 1440f, out LayoutRect lifted);
         check(kept && lifted.Bottom <= 640f - ResultBoardHold.ButtonClearance + 0.5f,
@@ -313,10 +315,8 @@ internal static class Release11918Scenarios
             $"which does move it up from where it was: y={lifted.Y:0.#}");
         bool bounded = ResultBoardHold.TryHold(new BoardStrip(500f, 700f, true, 640f), held, 1440f,
             out LayoutRect clamped, 500f);
-        check(bounded && clamped.Y >= 500f - 0.5f,
-            $"but a fail-open board's band top is a wall too: y={clamped.Y:0.#} bandTop=500");
-        check(bounded && near(clamped.Y, 500f),
-            $"so it stays on the band's edge instead of climbing over it: y={clamped.Y:0.#}");
+        check(!bounded,
+            $"1.19.22 re-point: TryHold's own answer is unchanged - a board whose height cannot fit between its band's top (500) and the button's clearance wall ({640f - ResultBoardHold.ButtonClearance:0}) is refused rather than climbing over the band or reaching over the button - and the caller now keeps the standing rectangle, draws it faint and reports instead of deferring it away (the no-defer branch is asserted by the 1.19.22 suite)");
 
         // (d) The fail-open floor ladder: a page that cannot hold the measured floor is answered with a smaller board on
         //     the next frame, and the ladder stops at the shortest grid this build can draw.
@@ -348,10 +348,19 @@ internal static class Release11918Scenarios
             "and only that answer clears the refusal count");
         check(!results.Contains("if (Placement(page, succeeded, out _"),
             "the placement's own answer no longer clears anything by itself");
-        check(results.Contains("ResultFallbackTier.AcceptsPageBand(band.Height, FallbackFloor())"),
-            "the fail-open band is gated on the board's own floor");
-        check(results.Contains("_fallbackOpacity = Math.Min(_fallbackOpacity, ResultFallbackLayout.OverlapOpacity);"),
-            "a fail-open board taller than its band is drawn fainter instead of being slid over the page above it");
+        // 1.19.40 re-point: the floor gate and the page's own band were extracted into one policy that both paths call
+        // (`ResultFallbackBandPolicy`, FallbackLayout.cs), so the assertion follows them there instead of pinning a line
+        // that no longer lives in the display. Its own order is asserted below.
+        string bandPolicy = File.ReadAllText(Path.Combine(root, "FallbackLayout.cs"));
+        check(bandPolicy.Contains("ResultFallbackTier.AcceptsPageBand(room, boardFloor)")
+              && results.Contains("if (!ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,"),
+            "the fail-open band is gated on the board's own floor - a band that cannot hold it is refused inside the one policy this path calls, where the fallback board's floor is asked rather than assumed");
+        check(!results.Contains("_fallbackOpacity = Math.Min(_fallbackOpacity, ResultFallbackLayout.OverlapOpacity);")
+              && results.Contains("grid.Height <= strip.Bottom - strip.Top + 0.5f"),
+            "1.19.22 re-point: a board taller than the *page's own* band is refused and reported with need/have, never placed and merely faded - the fit's fallback placement is reached only for a board that really fits that band; the invented fail-open band is instead sized from the board, which the 1.19.22 suite drives");
+        string fallback = File.ReadAllText(Path.Combine(root, "FallbackLayout.cs"));
+        check(fallback.Contains("band=extended"),
+            "and the invented band reports itself as extended when it grows past the measured wall");
         Console.WriteLine("REVIEW: RESULT_PLACEMENT_AND_BAND_EDGES (runtime policy + static source checks)");
     }
     private static void TheFailOpenBoardObeysTheSameBand(Action<bool, string> check)
@@ -382,11 +391,15 @@ internal static class Release11918Scenarios
         check(bounds.Contains("public static bool TryResolve(float screenHeight, float upperAnchor, ResultBoundSource upperSource")
               && bounds.Contains("public static class ResultsBandFit"),
             "the band policy and the band-to-glyph mapping are one file, driven by this suite");
-        // The fail-open placement resolves the band itself, before it falls back to the window's safe area.
+        // The fail-open placement resolves the band itself, through the policy that keeps the page's band first and the
+        // invented tiers after it. 1.19.40 re-point: that order now lives in `ResultFallbackBandPolicy` beside the tier
+        // arithmetic, so the check reads both files instead of one line of the display.
         int fallback = results.IndexOf("private static bool FallbackPlacement(Component page", StringComparison.Ordinal);
-        int bandCall = results.IndexOf("ResultsBounds.TryResolve(Screen.height, anchorBottom, anchorSource", StringComparison.Ordinal);
-        int screenTier = results.IndexOf("ResultFallbackLayout.TryResolve(Screen.height, anchorBottom, controls.FooterTop", StringComparison.Ordinal);
-        check(fallback >= 0 && bandCall > fallback && screenTier > bandCall,
+        int bandCall = results.IndexOf("ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource", StringComparison.Ordinal);
+        string bandFile = File.ReadAllText(Path.Combine(root, "FallbackLayout.cs"));
+        int pageBand = bandFile.IndexOf("ResultsBounds.TryResolve(screenHeight, anchorBottom, anchorSource", StringComparison.Ordinal);
+        int screenTier = bandFile.IndexOf("ResultFallbackLayout.TryResolve(screenHeight, anchorBottom, walls.PressableTop", StringComparison.Ordinal);
+        check(fallback >= 0 && bandCall > fallback && pageBand > 0 && screenTier > pageBand,
             "the fail-open path asks the page's own band first and the window's safe area only after it");
         // The board is hung from the band's top edge, not centred in it.
         check(results.Contains("top = band.Top; room = band.Height;"),
@@ -414,8 +427,10 @@ internal static class Release11918Scenarios
         // Every early exit that used to leave the page blank keeps its line; the band adds one of its own per page.
         check(results.Contains("private static void ReportBand(string where, ResultsBand band"),
             "the band reports itself once per page, with both edges and the fact that produced each");
-        check(results.Contains("IconRowBottom(page)") && results.Contains("FooterTextTop(page, out"),
-            "the fail-open placement measures the icon row and the waiting block through the same two helpers");
+        // 1.19.41: the fail-open band passes the same reveal latch the strict placement does, so both paths measure the
+        // row from the same reading (`CompletionFinalBounds.Placed`).
+        check(results.Contains("IconRowBottom(page, RevealFinished)") && results.Contains("FooterTextTop(page, out"),
+            "the fail-open placement measures the icon row and the waiting block through the same two helpers, and reads the row against the same reveal state the strict placement used");
         // The waiting block is a world-space TextMeshPro, measured through the menu camera like the icons.
         check(results.Contains("GetComponentsInChildren<TextMeshPro>(true)"),
             "the client's waiting block is measured as the TextMeshPro it is");
@@ -426,7 +441,10 @@ internal static class Release11918Scenarios
     // some 400 px down its page.
     private static bool IconRowReadsThePlate(string source)
     {
-        int start = source.IndexOf("private static float IconRowBottom(Component page)", StringComparison.Ordinal);
+        // 1.19.41: the signature gained the reveal flag (`Placed` chooses between the laid-out slot and the deeper of
+        // that slot and the drawn captions), so the anchor names the method rather than one argument list. What it
+        // pins is unchanged: the plate behind the row is not one of the parts.
+        int start = source.IndexOf("private static float IconRowBottom(", StringComparison.Ordinal);
         if (start < 0) return true;
         int end = source.IndexOf("private static float FooterTextTop(", start, StringComparison.Ordinal);
         if (end < 0) end = Math.Min(source.Length, start + 900);

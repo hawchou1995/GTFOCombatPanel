@@ -966,7 +966,23 @@ internal static class CombatTracker
                 if (!_loggedReviveUnmatched)
                 {
                     _loggedReviveUnmatched = true;
-                    Plugin.Logger.LogWarning($"[DIAG] successful revive completion observed for target={target.GetName()}, but no matching replicated reviver state was available; not assigning the credit to a guessed player.");
+                    // 1.19.38: the line names which machine owns this row, because that is what decides whether the
+                    // missing state is a defect or the design. On a client `ShouldTrack` is `isInSlot && (isMaster ||
+                    // isLocal)` (`ReviveAttributionLedger.CanTrackOwner`), so no remote reviver is ever recorded here:
+                    // `ObserveReviveState` returns before the ledger (`CombatTracker.cs:949`), and a revive a remote
+                    // player performed on this machine's own body reaches this machine only as a completion. The
+                    // reviver's row is the host's on a client (`SyncProtocol` ships `Revives` and its copy wins in
+                    // `CombineCount`), so the credit is not lost - it is not this machine's to assign.
+                    // The game offers no local substitute either, so the refusal stands instead of naming the nearest
+                    // human player: `Interact_Revive` keeps no source field (its only reviver channel is the broadcast
+                    // `s_actionReviverState`), and `PLOC_Downed.OnPlayerRevived` carries `pSetHealthData`, whose one
+                    // field is `health` (both read from `Modules-ASM.dll`).
+                    bool hostRow = SNet.IsMaster;
+                    string unmatched = $"[DIAG] successful revive completion observed for target={target.GetName()}, but no matching replicated reviver state was available; not assigning the credit to a guessed player. "
+                        + $"role={(hostRow ? "host" : "client")}; reviverStateRecordedLocally=false; rowOwner={(hostRow ? "this-machine" : "host-snapshot")}; "
+                        + "reviverReadableLocally=false: Interact_Revive keeps no source field and pSetHealthData carries health only; "
+                        + $"creditPath={(hostRow ? "reviver-state" : "host snapshot Revives")}.";
+                    if (hostRow) Plugin.Logger.LogWarning(unmatched); else Plugin.Logger.LogInfo(unmatched);
                 }
                 return;
             }

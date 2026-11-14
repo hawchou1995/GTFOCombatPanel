@@ -419,11 +419,16 @@ public readonly struct ResultInteractionStrip
 {
     public readonly float BoardTop;
     public readonly float FooterTop;
+    // The highest edge among the controls the player can *press* - the protected page text the scan also measured
+    // (`FooterTop` may come from it) is left out. 1.19.38: a client failure page's waiting-status line is not a
+    // control, so the strip a client band is tightened against must be built from this figure and never from
+    // `FooterTop`; on every other page the two are the same number whenever the text is not the highest wall.
+    public readonly float PressableTop;
     public readonly int FooterActionCount;
     public bool HasFooter { get { return float.IsFinite(FooterTop); } }
 
-    public ResultInteractionStrip(float boardTop, float footerTop, int footerActionCount)
-    { BoardTop = boardTop; FooterTop = footerTop; FooterActionCount = footerActionCount; }
+    public ResultInteractionStrip(float boardTop, float footerTop, int footerActionCount, float pressableTop = float.NaN)
+    { BoardTop = boardTop; FooterTop = footerTop; FooterActionCount = footerActionCount; PressableTop = pressableTop; }
 }
 
 // The trusted title/completion edge divides unrelated controls from the strip the board may use. Controls
@@ -454,7 +459,7 @@ public static class ResultInteractionStripPolicy
             if (!raised) break;
         }
 
-        float footerTop = float.NaN;
+        float footerTop = float.NaN, pressableTop = float.NaN;
         int footerActionCount = 0;
         for (int index = 0; index < controls.Count; index++)
         {
@@ -462,9 +467,13 @@ public static class ResultInteractionStripPolicy
             LayoutRect rect = action.Bounds;
             if (rect.Y < top - 0.5f || rect.Bottom <= top) continue;
             footerTop = ResultsRegion.HighestTop(rect.Y, footerTop);
-            if (!action.IsProtectedPageText) footerActionCount++;
+            if (!action.IsProtectedPageText)
+            {
+                footerActionCount++;
+                pressableTop = ResultsRegion.HighestTop(rect.Y, pressableTop);
+            }
         }
-        strip = new ResultInteractionStrip(top, footerTop, footerActionCount);
+        strip = new ResultInteractionStrip(top, footerTop, footerActionCount, pressableTop);
         return float.IsFinite(top);
     }
 
@@ -771,19 +780,25 @@ public static class ResultsRegion
 //
 // `OwnBottom` is the element's own container rectangle, and it is exactly the figure that may not be trusted
 // on its own: a padded container is laid out to hold its children and can end tens of pixels below the last
-// thing it draws, which is how the board came to be pushed away from a section that had already ended higher
-// up. `VisualBottom` is the deepest renderer that is really drawing under the element, its captions included,
-// and it is the figure the strip is built from whenever the element draws anything measurable.
+// thing it draws. `VisualBottom` is the deepest renderer that is really drawing under the element, its captions
+// included, and it is the figure drawn-rule measurements are built from whenever the element draws anything
+// measurable.
+//
+// `Scheduled` is whether this page's completion ledger saw the element's reveal scheduled (`BlinkIn`/`SetActiveBlink`).
+// It is what tells a laid-out-but-not-yet-switched-on slot of the reveal apart from a slot this page never schedules
+// (an unused sector icon of a short run): the first must contribute its laid-out slot to the final edge, the second
+// must contribute nothing - `activeInHierarchy` alone cannot tell them apart, because the reveal legitimately
+// switches slots on one after another.
 public readonly struct CompletionPart
 {
-    public readonly bool Present, Active;
+    public readonly bool Present, Active, Scheduled;
     public readonly float Alpha;
     public readonly float OwnBottom;
     public readonly float VisualBottom;
 
-    public CompletionPart(bool present, bool active, float alpha, float ownBottom, float visualBottom)
+    public CompletionPart(bool present, bool active, float alpha, float ownBottom, float visualBottom, bool scheduled = false)
     {
-        Present = present; Active = active; Alpha = alpha;
+        Present = present; Active = active; Scheduled = scheduled; Alpha = alpha;
         OwnBottom = ownBottom; VisualBottom = visualBottom;
     }
 
@@ -1038,6 +1053,29 @@ public static class ResultsFontGrowth
     // above the ceiling it would be pressed against the button the player has to press.
     public const float StripFillFloor = 0.92f;
     public const float StripFillCeiling = 0.96f;
+    // The ceiling a band that is its own promise gets: a client settlement page has no control under the
+    // band's foot - its lower wall is the waiting-status block, and the band already stops a design
+    // clearance above it - so nothing is protected by leaving part of the band unused. It is not a
+    // cosmetic difference: one glyph step is `rows x 1.5 em`, i.e. 45 px over the settlement board's 30
+    // rows, so on a 316 px client band the 96% ceiling answered 6 px / 270 px (85% of the band) while the
+    // same band could really hold 7 px / 315 px. That is the "first small board" a live client failure
+    // page drew, one frame before the animated waiting line settled 31 px lower and the table stepped up.
+    public const float BandFillCeiling = 1f;
+    // Whether the foot a band really ended at is a wall the page measured - a control the player must be able to press,
+    // or the client settlement page's waiting-status block - and not the page's own edge. `bandBottom` is the band's
+    // final foot, `wallTop` the top of that wall and `gap` the design clearance the band keeps above it; a band that
+    // stops a clearance above a measured wall protects it by construction, and only such a band may be filled to its
+    // own foot. A band that still runs to the page edge has nothing under it that was measured, so filling it to 100%
+    // would be a claim about a wall nobody read.
+    public static bool FootIsTheWall(float bandBottom, float wallTop, float gap)
+        => float.IsFinite(bandBottom) && float.IsFinite(wallTop) && float.IsFinite(gap) && gap >= 0f
+           && bandBottom <= wallTop - gap + 0.5f;
+    // The share of the strip a settlement board may use, from the page role its foot belongs to and from the fact the
+    // page proved about that foot. Only a client band that ends above a *measured* lower wall is its own promise; every
+    // other band - a host band bounded by a pressable button, the fail-open strip this build invented, a client band
+    // that still reaches the page edge - keeps the historical comfort ceiling, so no placement loses room it had.
+    public static float FillCeiling(ResultFooterSource source, bool footIsMeasuredWall)
+        => source == ResultFooterSource.ClientNoFooterSafeArea && footIsMeasuredWall ? BandFillCeiling : StripFillCeiling;
     // The width counts as used once the table is this close to the width the page offers.
     public const float WidthFillRatio = 0.98f;
     // A measured width is text plus padding, so a table can come back a fraction of a pixel over the box
@@ -1197,9 +1235,15 @@ public static class ResultsFontGrowth
     // returned and the caller's own shrink decides - the same degradation this had before. `measure`
     // answers with the table's natural extents at a candidate size; a measure that is missing, throws or
     // reports no extent, and a strip or width that could not be measured, all keep the seed.
+    // `fillCeiling` is the share of the strip the table may use. The in-level table and every caller that does not
+    // name one keep `StripFillCeiling`; a band that is its own promise - a client settlement page's, which ends at the
+    // waiting-status block minus the design clearance - passes `BandFillCeiling` and the search answers the largest
+    // size that is really inside the band.
     public static int FitIntoStrip(int seedPixels, int floorPixels, int maximumPixels, float stripHeight,
-        float boardWidth, Func<int, ResultTableSize> measure)
+        float boardWidth, Func<int, ResultTableSize> measure, float fillCeiling = StripFillCeiling)
     {
+        if (!float.IsFinite(fillCeiling) || fillCeiling <= 0f) fillCeiling = StripFillCeiling;
+        if (fillCeiling > BandFillCeiling) fillCeiling = BandFillCeiling;
         int seed = seedPixels < 1 ? 1 : seedPixels;
         if (measure == null) return seed;
         if (!float.IsFinite(stripHeight) || stripHeight <= 0f) return seed;
@@ -1213,9 +1257,9 @@ public static class ResultsFontGrowth
         if (ceiling > seed)
         {
             ResultTableSize top = Measured(measure, ceiling);
-            if (top.Usable && Fits(top, stripHeight, boardWidth)) return ceiling;
+            if (top.Usable && Fits(top, stripHeight, boardWidth, fillCeiling)) return ceiling;
         }
-        else if (Fits(seedSize, stripHeight, boardWidth)) return seed;
+        else if (Fits(seedSize, stripHeight, boardWidth, fillCeiling)) return seed;
 
         // The ceiling has been refused (or is the seed itself), so the answer - if there is one - lies
         // between the readable floor and that refused size. A floor that does not fit either means the strip
@@ -1223,13 +1267,17 @@ public static class ResultsFontGrowth
         int low = floor;
         int high = ceiling;
         ResultTableSize smallest = low == seed ? seedSize : Measured(measure, low);
-        if (!smallest.Usable || !Fits(smallest, stripHeight, boardWidth)) return seed;
+        if (!smallest.Usable || !Fits(smallest, stripHeight, boardWidth, fillCeiling)) return seed;
         int guard = 0;
         while (high - low > 1 && guard++ < MaximumMeasurements)
         {
             int middle = low + (high - low) / 2;
             ResultTableSize probe = Measured(measure, middle);
-            if (!probe.Usable || !Fits(probe, stripHeight, boardWidth)) { high = middle; continue; }
+            if (!probe.Usable || !Fits(probe, stripHeight, boardWidth, fillCeiling)) { high = middle; continue; }
+            // No early stop on `Filled` here. This loop answers one question - the largest size the box really holds -
+            // and a comfort stop at 92% of it answered 41px for a 800px strip whose largest fitting table was 42px, i.e.
+            // it changed the size every page had already been drawn at. `Fits` is the only bound this search spends,
+            // which is also what makes a 100% band reach its own last fitting glyph instead of stopping a step early.
             low = middle;
         }
         return low;
@@ -1250,17 +1298,18 @@ public static class ResultsFontGrowth
     // A measurement that reports nothing is not evidence that anything overruns, so the first pass stands as
     // it is; a floor already at the absolute minimum leaves nothing lower to fall back to.
     public static int FitBoardIntoStrip(int seedPixels, int floorPixels, int maximumPixels, float stripHeight,
-        float boardWidth, Func<int, ResultTableSize> measure, out int usedFloor)
+        float boardWidth, Func<int, ResultTableSize> measure, out int usedFloor,
+        float fillCeiling = StripFillCeiling)
     {
         int floor = floorPixels < MinimumReadablePixels ? MinimumReadablePixels : floorPixels;
         usedFloor = floor;
-        int size = FitIntoStrip(seedPixels, floor, maximumPixels, stripHeight, boardWidth, measure);
+        int size = FitIntoStrip(seedPixels, floor, maximumPixels, stripHeight, boardWidth, measure, fillCeiling);
         if (measure == null) return size;
         ResultTableSize table = Measured(measure, size);
         if (!table.Usable || Inside(table, stripHeight, boardWidth)) return size;
         if (floor <= MinimumReadablePixels) return size;
         usedFloor = MinimumReadablePixels;
-        return FitIntoStrip(seedPixels, MinimumReadablePixels, maximumPixels, stripHeight, boardWidth, measure);
+        return FitIntoStrip(seedPixels, MinimumReadablePixels, maximumPixels, stripHeight, boardWidth, measure, fillCeiling);
     }
 
     // The table the answer produces really lands in the box it was measured against. The height is the figure
@@ -1271,13 +1320,22 @@ public static class ResultsFontGrowth
 
     // The table is inside the box it was given: tall enough to be the point of the page, short enough to
     // stay clear of the button, and never wider than the width the page offers.
-    private static bool Fits(ResultTableSize size, float stripHeight, float boardWidth)
-        => size.Height <= stripHeight * StripFillCeiling + 0.5f && size.Width <= boardWidth + WidthSlack;
+    //
+    // `fillCeiling` is the share of the strip the box reaches: `StripFillCeiling` keeps the historical comfort band
+    // above the button, and `BandFillCeiling` makes the strip itself the bound for a page that has no control under it.
+    private static bool Fits(ResultTableSize size, float stripHeight, float boardWidth, float fillCeiling = StripFillCeiling)
+        => size.Height <= stripHeight * fillCeiling + 0.5f && size.Width <= boardWidth + WidthSlack;
 
     // The strip is already being used: either the table has reached the band's floor, or it has used the
     // width, in which case growing further would only cost height for nothing.
-    private static bool Filled(ResultTableSize size, float stripHeight, float boardWidth)
-        => size.Height >= stripHeight * StripFillFloor || size.Width >= boardWidth * WidthFillRatio;
+    //
+    // The height half is a comfort rule and is switched off when the band itself is the bound: a table that has
+    // reached 92% of a strip it may fill to 100% is not "done", and stopping there would leave a whole glyph step
+    // unused - the defect `BandFillCeiling` exists to answer. The width half stays: growing past the page's width
+    // is refused by `Fits` anyway.
+    private static bool Filled(ResultTableSize size, float stripHeight, float boardWidth, float fillCeiling = StripFillCeiling)
+        => (fillCeiling < BandFillCeiling && size.Height >= stripHeight * StripFillFloor)
+           || size.Width >= boardWidth * WidthFillRatio;
 
     private static ResultTableSize Measured(Func<int, ResultTableSize> measure, int fontSize)
     {

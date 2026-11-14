@@ -184,12 +184,15 @@ internal static class Release11917Scenarios
             "the F8 branch is not conditional on a board being attached or a gate being ready");
     }
 
-    // The safety half of the rule: a fallback board yields to the page - it moves, it shrinks into the band the fit
-    // was given, it is drawn fainter - and a board taller than its band is still a board.
+    // The safety half of the rule: a fallback board yields to the page - it moves, or stands over the page at the
+    // reduced opacity - and a page whose bands are all shorter than the board's floor is still answered. 1.19.22
+    // answers that page with a band *extended from the board* (past the highest measured wall, reported as
+    // `band=extended`), with the board drawn faint over what it now crosses.
     private static void AFallbackBoardYieldsToThePageInsteadOfVanishing(Action<bool, string> check)
     {
         // The page's controls leave only a 50 px band and the strip above the wall is 159 px: neither can hold the
-        // 270 px floor, so the board takes the whole lower safe area and is drawn faint. It is not dropped.
+        // 270 px floor, so (1.19.22) the invented band grows from the board past the wall and the board is drawn
+        // faint over it. It is not dropped.
         bool resolved = ResultFallbackLayout.TryResolve(1440f, 519f, 700f, 710f, 760f, BoardFloor(),
             out ResultFallbackPlan plan);
         check(resolved && plan.Reason == ResultFallbackReason.OverlapsControls,
@@ -199,9 +202,9 @@ internal static class Release11917Scenarios
         check(resolved && plan.Placed && plan.Height > 0f,
             "the answer is a band, never an empty one");
 
-        // A grid taller than the band it was fitted into keeps the band's *top* edge and runs past its lower one. It is
-        // never slid up over the page above it: that is what put a real client board on top of the sector-icon row. The
-        // opacity of such a board is the reduced one (`ResultFallbackLayout.OverlapOpacity`, applied by the fit).
+        // The placement arithmetic keeps a board on the band's *top* edge and inside the window; 1.19.21's fit never
+        // hands this helper a board taller than the band it was fitted into, so the old over-band fade in `Fit` is gone
+        // with it. The assertions below pin the helper's own top-aligned, in-window contract.
         bool tall = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 800f, 900f, 1200f, 540f, 0f, out LayoutRect rect);
         check(tall, "a board taller than its fallback band is still placed");
         check(tall && rect.Y >= 800f - 0.5f,
@@ -318,14 +321,17 @@ internal static class Release11917Scenarios
         check(results.Contains("FallbackPlacement(page, succeeded"),
             "and the fail-open placement is a real call in the same method");
         check(results.Contains("ResultFallbackLayout.TryPlaceInBand(Screen.width, Screen.height, strip.Top, strip.Bottom"),
-            "the fit places a fallback board that is a fraction over its band instead of refusing it");
+            "1.19.22 re-point: the fit still keeps the fallback placement on the band's own top edge - for the page's own band a taller-than-band board is refused and reported, while the invented band is sized from the board, so a forced board is never refused for room (see the 1.19.22 suite)");
         check(results.Contains("|| Forced;") && results.Contains("ResultFooterSource.ScreenSafeArea"),
             "the F8 override outranks the visibility switches and the fail-open band names its own source");
 
-        // Every early return that used to leave the page blank now has a line of its own. These are the four that had
-        // none: the two client safe-area resolutions, the unready completion section and the page that is not there.
-        check(results.Contains("ReportHeldBack(\"success-anchor\", \"completion-not-ready\""),
-            "an unready completion section is reported instead of being a silent refusal");
+        // Every early return that used to leave the page blank now has a line of its own. 1.19.21 keeps the three that
+        // still exist - the two client safe-area resolutions and the page that is not there - and the one that no
+        // longer exists, the unready completion section, is gone with the reveal-based refusal itself: the reveal is
+        // watched (`CompletionReady(page);` below `NoteFinalGeometry`) but no longer withholds the board.
+        check(!results.Contains("ReportHeldBack(\"success-anchor\", \"completion-not-ready\"")
+              && results.Contains("CompletionReady(page);"),
+            "1.19.21: an unready completion section no longer reports a refusal because it no longer refuses - readable final layout places the board with the reveal merely watched");
         check(results.Contains("ReportHeldBack(\"failure-client-safe-area\", \"safe-area-unusable\"")
               && results.Contains("ReportHeldBack(\"success-client-safe-area\", \"safe-area-unusable\""),
             "both client safe-area refusals say why they refused");

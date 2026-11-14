@@ -175,16 +175,57 @@ try {
         throw 'The tool cell and the tool slot row must both be decided by recorded figures and the most specific real row.'
     }
     Write-Host 'SETTLEMENT_TOOL_DATA_FIRST: PASS'
-    # The parasite-damage crash mitigation is one exclusion and nothing else: the target set is decided by
-    # `HealthLossTargets`, the patch class adds no prefix and no re-entry guard, and the host gate on the sentry
-    # ledger is untouched.
+    # The parasite-damage crash mitigation is one exclusion and nothing else: `HealthLossTargets.Accepts` is the only
+    # observation list, it leaves `ReceiveParasiteDamage` out and names no other method, and the host gate on the sentry
+    # ledger is untouched. 1.19.33 adds exactly one prefix and 1.19.35 restricts what it may seed; neither moves the credit.
+    # The prefix calls the one seed entry point, that entry point fills the watermark from the game's own pre-call health,
+    # and the *only* place `HealthLost` grows is the postfix, behind the level gate. The seed list
+    # (`HealthLossTargets.Seedable`) is the accepted calls that report a hit, which is why `ReceiveTentacleGrabStop` is
+    # named there: it carries damage and is therefore seeded - it is not a second exclusion, and `Accepts` still observes it.
     $healthSource = Get-Content (Join-Path $projectRoot 'HealthLossPatches.cs') -Raw
     $targetsSource = Get-Content (Join-Path $projectRoot 'HealthLossLedger.cs') -Raw
-    $usesTargetPolicy = $healthSource.Contains('HealthLossTargets.Accepts(') -and -not $healthSource.Contains('[HarmonyPrefix')
-    $oneExclusion = ([regex]::Matches($targetsSource, '"Receive[A-Za-z]+"')).Count -eq 1 -and $targetsSource.Contains('"ReceiveParasiteDamage"')
-    $sentryHostGate = (Get-Content (Join-Path $projectRoot 'ToolStatsTracker.cs') -Raw).Contains('!SNet.IsMaster')
-    if (-not $usesTargetPolicy -or -not $oneExclusion -or -not $sentryHostGate) {
-        throw 'The blood-loss observation must exclude exactly ReceiveParasiteDamage, add no prefix, and leave the sentry host gate in place.'
+    # Comments are stripped before any rule is read: both files document the names they exclude, and a rule read from a
+    # comment is not a rule.
+    $healthCode = (($healthSource -split "`n") | ForEach-Object { ($_ -split '//')[0] }) -join "`n"
+    $targetsCode = (($targetsSource -split "`n") | ForEach-Object { ($_ -split '//')[0] }) -join "`n"
+    $acceptsBody = ([regex]::Match($targetsCode, 'public static bool Accepts\(string name\)\s*\{(?<body>.*?)\n    \}', 'Singleline')).Groups['body'].Value
+    $seedableBody = ([regex]::Match($targetsCode, 'public static bool Seedable\(string name\)\s*\{(?<body>.*?)\n    \}', 'Singleline')).Groups['body'].Value
+    $seedBody = ([regex]::Match($healthCode, 'internal static void SeedBefore\(Dam_PlayerDamageBase instance\)\s*\{(?<body>.*?)\n    \}', 'Singleline')).Groups['body'].Value
+    $usesTargetPolicy = $healthCode.Contains('DamageBaseMethods(HealthLossTargets.Accepts)') -and `
+        $healthCode.Contains('HealthLossPatches.DamageBaseMethods(HealthLossTargets.Seedable)')
+    $oneExclusion = $acceptsBody.Contains('if (name == ParasiteDamage) return false;') -and `
+        ([regex]::Matches($acceptsBody, 'return false;')).Count -eq 2 -and `
+        ([regex]::Matches($acceptsBody, 'Receive')).Count -eq 1 -and `
+        $targetsCode.Contains('public const string ParasiteDamage = "ReceiveParasiteDamage";') -and `
+        ([regex]::Matches($targetsCode, '"Receive[A-Za-z]+"')).Count -eq 2 -and `
+        $seedableBody.Contains('if (!Accepts(name)) return false;') -and `
+        $seedableBody.Contains('if (name.EndsWith("Damage", StringComparison.Ordinal)) return true;') -and `
+        $seedableBody.Contains('return name == "ReceiveTentacleGrabStop";')
+    # Both slices are taken from the stripped text as well: a prefix body read out of a commented-out call would make
+    # `Contains` below true with no call in the code, which is exactly the regression this rule has to catch.
+    $prefixBody = (($healthCode -split '\[HarmonyPrefix\]')[1] -split '\[HarmonyPostfix\]')[0]
+    $oneSeedPrefix = ([regex]::Matches($healthSource, '\[HarmonyPrefix\]')).Count -eq 1 -and `
+        ([regex]::Matches($healthSource, '\[HarmonyPostfix\]')).Count -eq 1 -and `
+        $prefixBody.Contains('HealthLossPatches.SeedBefore(__instance)') -and `
+        $seedBody.Contains('Ledger.Seed(instance.Pointer, lookup, instance.Health, instance.HealthMax);') -and `
+        ([regex]::Matches($healthCode, 'Ledger\.Seed\(')).Count -eq 1 -and `
+        ([regex]::Matches($healthCode, 'Ledger\.Observe\(')).Count -eq 1
+    $seedCreditsNothing = $prefixBody.Length -gt 0 -and -not $prefixBody.Contains('HealthLost') -and -not $prefixBody.Contains('InLevel') -and `
+        $seedBody.Length -gt 0 -and -not $seedBody.Contains('HealthLost') -and -not $seedBody.Contains('InLevel') -and `
+        ([regex]::Matches($healthCode, 'HealthLost = Math\.Min')).Count -eq 1 -and `
+        $healthCode.Contains('GameStateManager.CurrentStateName != eGameStateName.InLevel')
+    $observed = $healthCode.IndexOf('Ledger.Observe(__instance.Pointer', [StringComparison]::Ordinal)
+    $gate = $healthCode.IndexOf('GameStateManager.CurrentStateName != eGameStateName.InLevel', [StringComparison]::Ordinal)
+    $credit = $healthCode.IndexOf('counters.HealthLost = Math.Min', [StringComparison]::Ordinal)
+    $creditOnlyInTheGatedPostfix = $observed -ge 0 -and $gate -gt $observed -and $credit -gt $gate
+    # The sentry host gate is read from the stripped text too, and the stripped text must hold it in exactly one place:
+    # the file also prints `SNet.IsMaster` in two diagnostic strings, and a gate named in a comment is not a gate.
+    $toolStatsSource = Get-Content (Join-Path $projectRoot 'ToolStatsTracker.cs') -Raw
+    $toolStatsCode = (($toolStatsSource -split "`n") | ForEach-Object { ($_ -split '//')[0] }) -join "`n"
+    $sentryHostGate = ([regex]::Matches($toolStatsCode, [regex]::Escape('!SNet.IsMaster'))).Count -eq 1
+    if (-not $usesTargetPolicy -or -not $oneExclusion -or -not $oneSeedPrefix -or -not $seedCreditsNothing -or `
+        -not $creditOnlyInTheGatedPostfix -or -not $sentryHostGate) {
+        throw 'The blood-loss observation must exclude exactly ReceiveParasiteDamage (and name no other method), seed the watermark only from the calls that report a hit and only through the one SeedBefore entry point, credit nothing in the seed path, credit in the level-gated postfix alone, observe every accepted method through the one postfix, and leave the sentry host gate in place.'
     }
     Write-Host 'HEALTH_LOSS_TARGET_WIRING: PASS'
     # A hello that arrives before the roster holds its sender is kept and re-judged, never accepted early.
@@ -199,6 +240,20 @@ try {
         throw 'A hello refused for an older roster must be re-judged against the refreshed roster instead of being dropped, and the kept hellos must be dropped on the expedition reset.'
     }
     Write-Host 'SQUAD_HELLO_ROSTER_RACE: PASS'
+    # Static source gate for the rule 1.19.38 replaced: `SquadCapability.EvidenceOf` used to end in
+    # `if (_broadcast) return SquadEvidence.Broadcast;`, so every unproven peer in the slot list was spoken to for the
+    # whole session - an unmodded machine's GTFO-API wrote one `[Error ...] which isn't registered` line per packet
+    # (10225 of them in one 13051-line log). The rule now is a bounded probe, and it must not drift back.
+    # This is a static source check, not a runtime behaviour proof: it reads the file, it never runs the gate.
+    $capabilitySource = Get-Content (Join-Path $projectRoot 'SquadCapability.cs') -Raw
+    $noUnprovenPass = -not $capabilitySource.Contains('return SquadEvidence.Broadcast;') -and `
+        -not $capabilitySource.Contains('Broadcast = 3')
+    $keepsBoundedProbe = $capabilitySource.Contains('ProbesSent(peer) < ProbeBudget') -and `
+        $capabilitySource.Contains('if (_allowlist.Contains(peer)) return SquadEvidence.Allowlisted;')
+    if (-not $noUnprovenPass -or -not $keepsBoundedProbe) {
+        throw 'Static source check: EvidenceOf must not contain an unproven-pass branch (no `return SquadEvidence.Broadcast;`, no `Broadcast = 3`), and must keep the bounded probe (`ProbesSent(peer) < ProbeBudget`) behind the allowlist. A peer that has not proved itself is probed a bounded number of times, never broadcast to.'
+    }
+    Write-Host 'SQUAD_PROBE_BUDGET_STATIC: PASS (static source check; not a runtime behaviour proof)'
     $fontSource = Get-Content (Join-Path $projectRoot 'HudTable.cs') -Raw
     $hasTmpDefault = $fontSource.Contains('TMP_Settings.defaultFontAsset')
     $reusesTmpSourceFont = $fontSource.Contains('sourceFontFile')

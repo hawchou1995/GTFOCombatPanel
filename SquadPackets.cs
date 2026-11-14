@@ -14,6 +14,8 @@ public enum SquadPacketKind
     VersionMismatch,
     Hello,
     Snapshot,
+    // 1.19.34: the pack kinds that ride beside a snapshot (see `SyncProtocol.SupplyKinds`).
+    SupplyKinds,
     Unknown
 }
 
@@ -25,10 +27,18 @@ public readonly struct SquadPacket
     public readonly uint Generation;
     public readonly uint Version;
     public readonly SyncSnapshot Snapshot;
+    // Set only for `SupplyKinds`; zero everywhere else.
+    public readonly SyncProtocol.SupplyKinds Kinds;
 
     internal SquadPacket(SquadPacketKind kind, ulong sender, uint generation, uint version, in SyncSnapshot snapshot)
-    { Kind = kind; Sender = sender; Generation = generation; Version = version; Snapshot = snapshot; }
+    {
+        Kind = kind; Sender = sender; Generation = generation; Version = version; Snapshot = snapshot; Kinds = default;
+    }
 
+    internal SquadPacket(SquadPacketKind kind, ulong sender, uint generation, uint version, in SyncSnapshot snapshot, in SyncProtocol.SupplyKinds kinds)
+    {
+        Kind = kind; Sender = sender; Generation = generation; Version = version; Snapshot = snapshot; Kinds = kinds;
+    }
     public bool IsOurs { get { return Kind != SquadPacketKind.Foreign; } }
 }
 
@@ -54,6 +64,9 @@ public static class SquadPackets
     public static int HelloBytes { get { return HeaderBytes + HelloBodyBytes; } }
     public static int SnapshotBytes { get { return HeaderBytes + SyncProtocol.SnapshotSize; } }
 
+    // 1.19.34: `ulong owner + four counts`, one packet of its own (see `SyncProtocol.SupplyKinds`).
+    public static int SupplyKindsBytes { get { return HeaderBytes + SyncProtocol.SupplyKindsSize; } }
+
     public static byte[] Hello(ulong sender, uint generation, uint version)
     {
         var packet = new byte[HelloBytes];
@@ -67,6 +80,17 @@ public static class SquadPackets
         byte[] body = SyncProtocol.Encode(snapshot);
         var packet = new byte[HeaderBytes + body.Length];
         WriteHeader(packet, SyncProtocol.KindSnapshot, generation, version);
+        Buffer.BlockCopy(body, 0, packet, HeaderBytes, body.Length);
+        return packet;
+    }
+
+    // 1.19.34: the pack kinds, one packet beside the snapshot. Same envelope, same key and magic, same protocol
+    // version - a v8 peer reads the header, does not know the kind, answers `Unknown` and consumes it.
+    public static byte[] SupplyKinds(in SyncProtocol.SupplyKinds kinds, uint generation, uint version)
+    {
+        byte[] body = SyncProtocol.EncodeSupplyKinds(kinds);
+        var packet = new byte[HeaderBytes + body.Length];
+        WriteHeader(packet, SyncProtocol.KindSupplyKinds, generation, version);
         Buffer.BlockCopy(body, 0, packet, HeaderBytes, body.Length);
         return packet;
     }
@@ -105,6 +129,14 @@ public static class SquadPackets
                 return SyncProtocol.Decode(buffer, HeaderBytes, length - HeaderBytes, out SyncSnapshot snapshot)
                     ? new SquadPacket(SquadPacketKind.Snapshot, 0, generation, protocol, snapshot)
                     : new SquadPacket(SquadPacketKind.Malformed, 0, generation, protocol, default);
+            case SyncProtocol.KindSupplyKinds:
+                // The same exact-length rule as the snapshot: one body, and a body that does not decode into a block
+                // which adds up is a build that disagrees with itself. Either way the packet is consumed.
+                if (length - HeaderBytes != SyncProtocol.SupplyKindsSize)
+                    return new SquadPacket(SquadPacketKind.Malformed, 0, generation, protocol, default);
+                return SyncProtocol.DecodeSupplyKinds(buffer, HeaderBytes, length - HeaderBytes, out SyncProtocol.SupplyKinds kinds)
+                    ? new SquadPacket(SquadPacketKind.SupplyKinds, 0, generation, protocol, default, kinds)
+                    : new SquadPacket(SquadPacketKind.Malformed, 0, generation, protocol, default);
             default:
                 return new SquadPacket(SquadPacketKind.Unknown, 0, generation, protocol, default);
         }
@@ -140,6 +172,9 @@ public static class SquadPackets
         {
             case SyncProtocol.KindHello: framed = HelloBytes; break;
             case SyncProtocol.KindSnapshot: framed = SnapshotBytes; break;
+            // 1.19.34: the pack kinds ride in their own packet, so a build that does not know the kind still frames it
+            // when it can, and one that does not know it at all answers `Unknown` and consumes it (see `Parse`).
+            case SyncProtocol.KindSupplyKinds: framed = SupplyKindsBytes; break;
             default: return 0;
         }
         return available >= framed ? framed : 0;

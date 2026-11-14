@@ -70,6 +70,58 @@ public sealed class ToolImpactLedger
     public static bool MineBelongsToSlot(uint equippedGearCategory, uint mineGearCategory)
         => mineGearCategory != 0u && (equippedGearCategory == 0u || equippedGearCategory == mineGearCategory);
 
+    // 1.19.38: how a mine instance the slot reader found may be described, as facts that cannot contradict each
+    // other. `consumable` is tri-state on purpose: a face this peer cannot read (a bot exposes no
+    // `MineDeployerFirstPerson`) is *unreadable*, not "not consumable", and printing `carriedIn=true` for it
+    // asserts something nothing observed. `CarriedIn` is therefore true only when the face itself said
+    // consumable - the one shape that proves the mine came in from the level rather than out of this tool.
+    public enum MineConsumableReading
+    {
+        Unreadable = 0,
+        Equipment = 1,
+        Consumable = 2,
+    }
+
+    public readonly struct MineInstanceEvidence
+    {
+        public readonly bool FaceReadable;
+        public readonly MineConsumableReading Consumption;
+        public readonly bool SlotToolMatchesMine;
+        public readonly bool Counted;
+        public readonly bool CarriedIn;
+
+        public MineInstanceEvidence(bool faceReadable, MineConsumableReading consumption, bool slotToolMatchesMine,
+            bool counted, bool carriedIn)
+        {
+            FaceReadable = faceReadable;
+            Consumption = consumption;
+            SlotToolMatchesMine = slotToolMatchesMine;
+            Counted = counted;
+            CarriedIn = carriedIn;
+        }
+    }
+
+    // The whole judgement for one mine instance, as plain booleans. The counting rule is exactly the one
+    // `CreditMineInstanceSpawn` applies (`!consumable && MineBelongsToSlot(...)`), and the two claims the log
+    // makes are derived from those same inputs instead of being written by hand beside them.
+    public static MineInstanceEvidence DescribeInstance(bool faceReadable, bool faceConsumable,
+        uint equippedGearCategory, uint mineGearCategory)
+    {
+        bool slotToolMatchesMine = MineBelongsToSlot(equippedGearCategory, mineGearCategory);
+        MineConsumableReading consumption = !faceReadable
+            ? MineConsumableReading.Unreadable
+            : faceConsumable ? MineConsumableReading.Consumable : MineConsumableReading.Equipment;
+        bool consumable = consumption == MineConsumableReading.Consumable;
+        return new MineInstanceEvidence(faceReadable, consumption, slotToolMatchesMine,
+            !consumable && slotToolMatchesMine, consumable);
+    }
+
+    // The word the diagnostic prints for the tri-state above.
+    public static string Name(MineConsumableReading reading)
+        => reading == MineConsumableReading.Consumable ? "true"
+            : reading == MineConsumableReading.Equipment ? "false"
+            : "unreadable";
+
     public bool TryDeployMine(IntPtr mine, ulong owner, bool isConsumable)
         => TryDeployMine(mine, IntPtr.Zero, owner, isConsumable);
 

@@ -39,6 +39,9 @@ internal static class SupplyTracker
     internal sealed class HealthChange
     {
         internal SNet_Player Giver;
+        // 1.19.39: whether `pAddHealthData.source` resolved to a player agent at all. That is the fact that names the
+        // kind; whether this machine tracks that player's row is what decides only where the efficiency is credited.
+        internal bool SourceIsPlayer;
         internal SNet_Player Receiver;
         internal double Before, Intended;
     }
@@ -210,8 +213,11 @@ internal static class SupplyTracker
         try
         {
             Record(scope.Giver, scope.Use, scope.Tool ? "tool" : "ammo");
+            // 1.19.34: the pack kind the scope observed is the kind the receiver is credited for - a pack that
+            // touched the class channel is a tool pack, one that touched only Standard/Special is an ammo pack.
             if (CombatTracker.ShouldTrack(scope.ReceiverOwner))
-                scope.Use.RecordConsumption(CombatTracker.ObservePlayer(scope.ReceiverOwner).Impact, !scope.Tool);
+                scope.Use.RecordConsumption(CombatTracker.ObservePlayer(scope.ReceiverOwner).Impact,
+                    scope.Tool ? SupplyPackKind.Tool : SupplyPackKind.Ammo);
         }
         catch (Exception captureError) { Note("ammo-record", "supply result skipped: " + captureError.Message); }
     }
@@ -224,13 +230,16 @@ internal static class SupplyTracker
             if (GameStateManager.CurrentStateName != eGameStateName.InLevel || receiver == null) return null;
             if (!data.source.TryGet(out var agent)) return null;
             var giver = agent?.TryCast<PlayerAgent>()?.Owner;
+            // 1.19.39: the pack's kind is decided here, once, off the packet - a source that resolved to a player agent
+            // is a health pack given by a player, and no later tracking test may overwrite that answer.
+            bool sourceIsPlayer = giver != null;
             if (!CombatTracker.ShouldTrack(giver) && !CombatTracker.ShouldTrack(receiver.Owner?.Owner)) return null;
             // The game's health packet decodes absolute health units with a 100-unit range, and unlike the
             // ammo packet it carries the giver's agent in `source`, so the medical path needs no recovery.
             // Source-less regeneration and revive/set-health events do not enter this callback.
             double intended = data.health.Get(100f);
             if (!(intended > 0) || !double.IsFinite(intended)) return null;
-            return new HealthChange { Giver = giver, Receiver = receiver.Owner?.Owner, Before = receiver.Health, Intended = intended };
+            return new HealthChange { Giver = giver, SourceIsPlayer = sourceIsPlayer, Receiver = receiver.Owner?.Owner, Before = receiver.Health, Intended = intended };
         }
         catch (Exception error) { Note("health-before", "medical supply skipped: " + error.Message); return null; }
     }
@@ -243,8 +252,16 @@ internal static class SupplyTracker
             var use = new SupplyUse();
             use.AddChange(change.Before, receiver.Health, change.Intended);
             Record(change.Giver, use, "medical");
-            if (CombatTracker.ShouldTrack(change.Receiver))
-                use.RecordConsumption(CombatTracker.ObservePlayer(change.Receiver).Impact, false);
+            if (!CombatTracker.ShouldTrack(change.Receiver)) return;
+            // 1.19.39: the kind of this heal is what the packet's `source` said, not who is measuring it. 1.19.35 read
+            // "a player this machine tracks" into the kind, and that conflation is provable: `ShouldTrack` is
+            // `isInSlot && (isMaster || isLocal)`, so on a client it is true for its own row only - a teammate's pack
+            // really does resolve to a `PlayerAgent`, and was still counted as a pack of no name there while the host
+            // called the same heal a 血包. One event had two answers. `SourceIsPlayer` is decided where the source is
+            // read, so the kind now travels with the event; the tracked-player test keeps its own job - where the
+            // efficiency is credited, which is `Record` above, and whose row this machine may touch at all.
+            var counters = CombatTracker.ObservePlayer(change.Receiver).Impact;
+            use.RecordHealthConsumption(counters, change.SourceIsPlayer);
         }
         catch (Exception error) { Note("health-after", "medical supply skipped: " + error.Message); }
     }
@@ -255,7 +272,13 @@ internal static class SupplyTracker
         var player = CombatTracker.ObservePlayer(giver);
         if (!use.Record(player.Impact))
         {
-            Note(kind + "-unobserved", kind + " supply use was not measured completely; no efficiency was fabricated.");
+            // 1.19.38: the refusal names the half of the measurement that is missing, and refuses to invent the
+            // other one. `missing=` is `SupplyUse.UnmeasuredFields`: a before-read that threw (`before`), an
+            // after-read that threw or went backwards (`after`), a share that never arrived (`intended`), and a
+            // scope that closed without one applied change (`applied`) are four different lines now, where the
+            // recorded expedition printed the same sentence for all of them. No number is filled in either way.
+            Note(kind + "-unobserved", kind + " supply use was not measured completely; missing=" + use.UnmeasuredFields
+                + "; changes=" + use.Changes + "; invalid=" + use.Invalid + "; no efficiency was fabricated.");
             return;
         }
         Note(kind + "-credited", $"supply utilization: {kind}, giver={player.Name}, effective={use.Effective:0.###}, intended={use.Intended:0.###}, uses={player.Impact.SupplyUses}, mean={player.Impact.SupplyEfficiency:P1}; packet pickups excluded.");

@@ -146,6 +146,12 @@ public sealed class ImpactCounters
     // This player's own resupply: every pack they actually consumed, and how many of those were ammo
     // packs. Attribution is the player who benefited, never the one who opened the pack for them.
     public long SelfSupplyUses, SelfAmmoUses;
+    // 1.19.34: the split of the non-ammo packs. `SelfSupplyUses` stays the total and `SelfAmmoUses` the ammo
+    // part, so `SelfSupplyUses == SelfAmmoUses + SelfToolUses + SelfMedicalUses` holds for every row this
+    // machine counted itself. `SelfSupplyKindsKnown` is the difference between "this machine split it" and
+    // "only the v8 pair arrived from a peer": a row nobody split prints its two kinds as unknown, never as 0.
+    public long SelfToolUses, SelfMedicalUses;
+    public bool SelfSupplyKindsKnown;
     // Lifetime actually lost this expedition. Healing does not offset it and a max-health change is not a
     // loss, so this figure only ever grows.
     public double HealthLost;
@@ -299,11 +305,33 @@ public sealed class ImpactCounters
         }
         if (sleeping == true && SleepingScoutKills < ScoutKills) SleepingScoutKills++;
     }
-    // One resupply this player actually consumed; `ammo` marks an ammo pack rather than a tool refill.
-    public void CreditSelfSupply(bool ammo)
+    // One resupply this player actually consumed, in the kind of pack it was (1.19.34). The total and the ammo
+    // part keep their released meaning; the tool and medical counts split what is left of that total, so the
+    // three kinds always add up to it and no pack is counted twice.
+    public void CreditSelfSupply(SupplyPackKind kind)
     {
         if (SelfSupplyUses < long.MaxValue) SelfSupplyUses++;
-        if (ammo && SelfAmmoUses < long.MaxValue) SelfAmmoUses++;
+        switch (kind)
+        {
+            case SupplyPackKind.Ammo: if (SelfAmmoUses < long.MaxValue) SelfAmmoUses++; break;
+            case SupplyPackKind.Medical: if (SelfMedicalUses < long.MaxValue) SelfMedicalUses++; break;
+            default: if (SelfToolUses < long.MaxValue) SelfToolUses++; break;
+        }
+        // 1.19.35: `true` only while the split really describes the total. A row that also counted a pack whose kind it could
+        // not name (`CreditSelfSupplyUnknown`) can never add up again in this run, so the split stays withdrawn and the cell
+        // keeps printing `?` rather than a set of parts that do not sum to the figure beside them.
+        SelfSupplyKindsKnown = SelfAmmoUses + SelfToolUses + SelfMedicalUses == SelfSupplyUses;
+    }
+    // 1.19.35 (review fix): the released one-bit form (`true` = ammo, `false` = "not ammo") is gone. It could only ever
+    // credit a tool pack for `false`, while the medical path used `false` as well, so a medical pack was counted as a
+    // tool pack. A kind is named at the call site now; nothing here has to guess which pack a bit meant.
+    // 1.19.35: a pack this machine counted but could not classify. The total keeps it - the row has always meant "packs this
+    // player consumed" - and the split is withdrawn (`SelfSupplyKindsKnown` back to false), so the two kind fields print `?`
+    // instead of a zero that would claim "no tool pack, no medical pack". This is never used to *guess* a kind.
+    public void CreditSelfSupplyUnknown()
+    {
+        if (SelfSupplyUses < long.MaxValue) SelfSupplyUses++;
+        SelfSupplyKindsKnown = false;
     }
     // Lifetime lost. Healing never subtracts from it and a max-health change is not a loss.
     public void AddHealthLost(double amount)
@@ -331,7 +359,8 @@ public sealed class ImpactCounters
         SentryDamage = MineDamage = 0;
         SleepingMinorKills = SleepingEliteKills = SleepingBossKills = SleepingMeleeKills = SleepingScoutKills = 0;
         UnknownStateMinorKills = UnknownStateEliteKills = UnknownStateBossKills = UnknownStateMeleeKills = UnknownStateScoutKills = 0;
-        SelfSupplyUses = SelfAmmoUses = 0;
+        SelfSupplyUses = SelfAmmoUses = SelfToolUses = SelfMedicalUses = 0;
+        SelfSupplyKindsKnown = false;
         HealthLost = 0;
         ScoutDamage = 0; ScoutDamageObserved = ScoutDamageEstimated = false;
     }
@@ -352,7 +381,9 @@ public sealed class ImpactCounters
         UnknownStateMinorKills = other.UnknownStateMinorKills; UnknownStateEliteKills = other.UnknownStateEliteKills;
         UnknownStateBossKills = other.UnknownStateBossKills; UnknownStateMeleeKills = other.UnknownStateMeleeKills;
         UnknownStateScoutKills = other.UnknownStateScoutKills;
-        SelfSupplyUses = other.SelfSupplyUses; SelfAmmoUses = other.SelfAmmoUses; HealthLost = other.HealthLost;
+        SelfSupplyUses = other.SelfSupplyUses; SelfAmmoUses = other.SelfAmmoUses;
+        SelfToolUses = other.SelfToolUses; SelfMedicalUses = other.SelfMedicalUses;
+        SelfSupplyKindsKnown = other.SelfSupplyKindsKnown; HealthLost = other.HealthLost;
         ScoutDamage = other.ScoutDamage; ScoutDamageObserved = other.ScoutDamageObserved; ScoutDamageEstimated = other.ScoutDamageEstimated;
     }
     private static double Clamp01(double value) { return !double.IsFinite(value) || value < 0 ? 0 : value > 1 ? 1 : value; }

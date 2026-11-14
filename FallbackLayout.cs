@@ -43,6 +43,10 @@ public enum ResultFallbackReason
     // No band could hold the board's own floor at all: the whole lower safe area is used and the board is drawn
     // faint over the page rather than not at all.
     OverlapsControls = 3,
+    // 页面自己的条带（锚点 → 最高的一堵墙 / 这一页真实的下沿）就装得下板子的自有高度：这是与严格路径同一个
+    // `ResultsBounds` 算术，1.19.40 起客机失败页也走它（`ResultFallbackBandPolicy`），所以兜底板与严格板落在
+    // 同一条条带上，而不是被一行不可交互的状态文字压成小板。
+    PageBand = 4,
 }
 
 // One fallback band, in window pixels with y counted from the top of the window.
@@ -51,16 +55,37 @@ public readonly struct ResultFallbackPlan
     public readonly float Top, Bottom;
     public readonly float Opacity;
     public readonly ResultFallbackReason Reason;
-
+    // 1.19.22: an invented band that had to grow past a measured wall to hold the board's own floor, and which wall
+    // it now crosses. `Crosses` carries the few words a live log can afford and is only filled when `Extended` is
+    // true: the band is then sized from the board, never the board squeezed into the band.
+    public readonly bool Extended;
+    public readonly string Crosses;
+    // 采纳 `PageBand` 时这一页自己的条带读数（两个边界和各自的来源），好让日志用和严格路径同一套名字说出它。
+    public readonly ResultsBand Band;
     public ResultFallbackPlan(float top, float bottom, float opacity, ResultFallbackReason reason)
+        : this(top, bottom, opacity, reason, false, string.Empty)
+    {
+    }
+
+    public ResultFallbackPlan(float top, float bottom, float opacity, ResultFallbackReason reason, bool extended, string crosses)
     {
         Top = top; Bottom = bottom; Opacity = opacity; Reason = reason;
+        Extended = extended; Crosses = crosses ?? string.Empty; Band = ResultsBand.None;
+    }
+
+    // The page's own band, carried with the plan so one log line can name both edges and the fact each came from.
+    public ResultFallbackPlan(float top, float bottom, float opacity, ResultFallbackReason reason, ResultsBand band)
+    {
+        Top = top; Bottom = bottom; Opacity = opacity; Reason = reason;
+        Extended = false; Crosses = string.Empty; Band = band;
     }
 
     public float Height { get { return Bottom > Top ? Bottom - Top : 0f; } }
     public bool Placed { get { return Height > 0f; } }
     public bool BelowControls { get { return Reason == ResultFallbackReason.BelowControls; } }
     public bool OverlapsControls { get { return Reason == ResultFallbackReason.OverlapsControls; } }
+    // The page's own band answered, not an invented one: the plan carries the page's band and its sources.
+    public bool PageBand { get { return Reason == ResultFallbackReason.PageBand; } }
 
     public static ResultFallbackPlan None { get { return default; } }
 }
@@ -78,6 +103,33 @@ public static class ResultFallbackPolicy
     public const int MissBudget = 60;
 
     public static bool ShouldFallback(int misses, bool forced) => forced || misses >= MissBudget;
+
+    // The same budget, asked the safety question the budget itself cannot answer.
+    //
+    // `ShouldFallback` says the page has been refused often enough to be worth a board drawn where its own geometry
+    // could not be proven. That is a statement about *waiting*, never about what stands under the band: the fail-open
+    // band is invented from the window and from the controls the scan did read, so a control the scan could not see
+    // (structure incomplete, action parents uncovered) or could not place (an active control whose rectangle was the
+    // zero box) is a hole the invented band can land on. Sixty refusals are not evidence that the page has nothing
+    // interactive left to protect.
+    //
+    // `pageReadable` is that evidence, and it comes from the page's own measurement, not from a count:
+    // `controls.Complete && controls.ParentCoverageComplete && controls.Unmeasurable == 0`. When it is false, the
+    // page keeps the vanilla screen, one line per page says why, and the page is re-measured at `ResultRetryCadence`'s
+    // existing bounded cadence - a refusal that never becomes a board, rather than a board that may cover a control
+    // nobody could read. The player's own F8 (`forced`) is still answered: that press is the request this path exists
+    // for, and it is not a budget deciding anything.
+    // The marker the fail-open placement prefixes its refusal with when the page's own scan could not read it, so the
+    // single line a page prints can name that fault instead of the generic "no band available".
+    public const string UnreadablePage = "page-unreadable";
+
+    // 这一页被扫描看全了吗：结构完整、action 父节点覆盖完整、没有任何 active 却量不到矩形的控件。
+    // inactive 控件不进这里——它们被扫描记为 hidden，`Complete` 照旧为真，那才是「页面把控件关掉了」。
+    public static bool PageReadable(bool scanComplete, bool parentCoverageComplete, int unmeasurableControls)
+        => scanComplete && parentCoverageComplete && unmeasurableControls == 0;
+
+    public static bool MayAnswer(int misses, bool forced, bool pageReadable)
+        => forced || (pageReadable && misses >= MissBudget);
 }
 
 // The arithmetic of the fallback band, and the placement of a board inside it.
@@ -130,10 +182,23 @@ public static class ResultFallbackLayout
     // path. Only when neither wall could be measured does the band reach the window's foot.
     public static bool TryResolve(float screenHeight, float anchorBottom, float footerTop, float footerTextTop,
         float bandTop, float bandBottom, float boardFloor, out ResultFallbackPlan plan)
+        => TryResolve(screenHeight, anchorBottom, footerTop, footerTextTop, bandTop, bandBottom, boardFloor, float.NaN,
+            out plan);
+
+    // The same rule, with the page's own lower edge as the band's foot.
+    //
+    // `pageFloor` is where the page itself stops drawing (`ResultsGuestPageGeometry.PageFloor`: the 1080p
+    // reference foot scaled by height, 1429.33 on a 2560x1440 window). A client failure page reads its lower bound
+    // from that geometry and from nothing else (`ResultClientFailureBand`), so the fail-open arithmetic has to end at
+    // the same edge; otherwise the same page gets two bands - the page's 593 px under the strict rule and the
+    // window's own 1432 px under this one. NaN - every other page - keeps the window's foot and changes nothing.
+    public static bool TryResolve(float screenHeight, float anchorBottom, float footerTop, float footerTextTop,
+        float bandTop, float bandBottom, float boardFloor, float pageFloor, out ResultFallbackPlan plan)
     {
         plan = ResultFallbackPlan.None;
         if (!float.IsFinite(screenHeight) || screenHeight <= ScreenMargin * 2f) return false;
         float limit = screenHeight - ScreenMargin;
+        if (float.IsFinite(pageFloor) && pageFloor > ScreenMargin && pageFloor < limit) limit = pageFloor;
         float floor = float.IsFinite(boardFloor) && boardFloor > 0f ? boardFloor : 0f;
 
         float top = float.IsFinite(anchorBottom) ? Math.Max(0f, anchorBottom) + AnchorGap : SafeTop(screenHeight);
@@ -171,12 +236,38 @@ public static class ResultFallbackLayout
             return plan.Placed;
         }
 
-        // 3. Nothing left that can hold the board's own floor. The band still stops at the highest wall the page drew -
-        //    the board is drawn faint inside it, never over the waiting line - and only a page that measured no wall at all
-        //    falls back to the window's foot.
+        // 3. Nothing left that can hold the board's own floor. The invented band is sized from the board, never the
+        //    board squeezed into the band: it reserves the board's floor plus the clearance, so when that reaches past
+        //    the highest measured wall the band is *extended* across it and the board is drawn faint over whatever it
+        //    now crosses - reported as such (`band=extended, covers=...`), never produced silently. Only a page that
+        //    measured no wall at all (and therefore keeps the window's foot) already stops past enough of the window
+        //    for the board to stand full-height. 1.19.22: this is what makes a forced F8 end in a drawn board - the
+        //    old tier answered a shorter-than-floor band with a band of the same height, and the fit then refused it
+        //    for ever.
+        float need = floor + ControlClearance;
+        float span = top + need;
         float covered = wall > top + 0.5f ? wall : limit;
-        plan = new ResultFallbackPlan(top, covered, OverlapOpacity, ResultFallbackReason.OverlapsControls);
+        bool extended = covered < span;
+        string crosses = extended ? WallName(wall, footerTop, footerTextTop, pageFloor) : string.Empty;
+        if (extended) covered = span;
+        plan = new ResultFallbackPlan(top, covered, OverlapOpacity, ResultFallbackReason.OverlapsControls, extended, crosses);
         return plan.Placed;
+    }
+
+    // Which lower edge produced the band's wall, in the few words the extension line prints when the band grows past it.
+    private static string WallName(float wall, float footerTop, float footerTextTop, float pageFloor)
+    {
+        // A page floor the band really used to win the name when it is the edge the band was given: on a client failure
+        // page that is the 1429 the strict path uses, and calling it "the window's foot" would be the same kind of
+        // half-truth this release is fixing. NaN - every other page - cannot match and keeps the old words.
+        if (float.IsFinite(pageFloor) && Math.Abs(wall - pageFloor) <= 0.5f) return "this page's own lower edge";
+        // The clearance the wall was pulled up by is part of the comparison, so the name describes the wall the band
+        // really stopped at before the extension and never a half-figure.
+        if (float.IsFinite(footerTextTop) && Math.Abs(wall - (footerTextTop - ControlClearance)) <= 0.5f)
+            return "the waiting-status text";
+        if (float.IsFinite(footerTop) && Math.Abs(wall - (footerTop - ControlClearance)) <= 0.5f)
+            return "the measured footer control";
+        return "the window's foot";
     }
 
     // The board inside a band. It hangs from the band's *top* edge, always: a board taller than the band keeps the band's
@@ -207,22 +298,95 @@ public static class ResultFallbackLayout
         return true;
     }
 
-    // Why this band was used, in the few words a live log can afford, with the readings that produced it.
+    // Why this band was used, in the few words a live log can afford, with the readings that produced it. An extended
+    // band says so in the words the next log has to carry: `band=extended, covers=<what it now crosses>` next to
+    // `need=` (the grid height the board requires at its floor) and the band the board was really given.
     public static string Describe(ResultFallbackPlan plan, float screenHeight, float boardFloor)
     {
         string reason = plan.Reason == ResultFallbackReason.BelowControls ? "below-controls"
             : plan.Reason == ResultFallbackReason.ScreenSafeArea ? "screen-safe-area"
             : plan.Reason == ResultFallbackReason.OverlapsControls ? "overlaps-controls"
+            : plan.Reason == ResultFallbackReason.PageBand ? "page-band"
             : "none";
+        string need = (float.IsFinite(boardFloor) ? boardFloor.ToString("0") : "unmeasured") + "px";
+        if (plan.Extended)
+        {
+            return "reason=" + reason
+                + ", band=extended, covers=" + (plan.Crosses.Length > 0 ? plan.Crosses : "a measured wall")
+                + ", need=" + need
+                + ", band=(" + plan.Top.ToString("0") + ".." + plan.Bottom.ToString("0") + ")"
+                + ", room=" + plan.Height.ToString("0") + "px"
+                + ", opacity=" + plan.Opacity.ToString("0.00")
+                + ", boardFloor=" + need
+                + ", screen=" + Screen0(screenHeight);
+        }
         return "reason=" + reason
             + ", band=(" + plan.Top.ToString("0") + ".." + plan.Bottom.ToString("0") + "), room=" + plan.Height.ToString("0") + "px"
             + ", opacity=" + plan.Opacity.ToString("0.00")
-            + ", boardFloor=" + (float.IsFinite(boardFloor) ? boardFloor.ToString("0") : "unmeasured") + "px"
+            + ", boardFloor=" + need
             + ", screen=" + Screen0(screenHeight);
     }
 
     private static string Screen0(float screenHeight)
         => float.IsFinite(screenHeight) ? "height " + screenHeight.ToString("0") : "unmeasured";
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// Where the fail-open board stands: the page's own band first, the invented ones only after it
+// ---------------------------------------------------------------------------------------------------
+//
+// The defect this file answers, found by an independent review: `ResultsDisplay.FallbackPlacement` handed the
+// measured "waiting for the host" line's top edge (1228 on the recorded 2560x1440 client page) to the band arithmetic
+// as a lower wall, and handed the interaction scan's `FooterTop` - which includes that same line - as a footer
+// control. The page's own rule had already stopped doing that (`ResultClientFailureBand`: the line is a fact, the wall
+// is a control the player can press, the foot is the fixed page geometry at 1429), so one page carried two bands:
+// 593 px under the strict rule and 370 px under the fail-open one. At 370 px thirty rows fit an 8 px glyph, so the
+// fallback board was drawn small, re-fitted when the line animated, or stayed small for the whole page - while the
+// strict path would have drawn a 12 px table in the same place.
+//
+// The rule, in one place, for both paths:
+//
+//   * `ResultPageWalls` says which readings of a page may bound a board at all (`ResultPageLowerBoundPolicy`): on a
+//     client failure page the status text is not one of them and the page's fixed foot is the floor; on every other
+//     page nothing changes.
+//   * The page's own band is asked first - the same `ResultsBounds` arithmetic the strict path uses, so both paths
+//     answer the same numbers for the same page - and it is only accepted when it can hold the board's own floor
+//     (`ResultFallbackTier`), which is what keeps a board from being squeezed into a strip nobody could read.
+//   * Only then do the invented tiers answer (`ResultFallbackLayout`), with the page's own floor as their foot, so a
+//     page that cannot hold the board still gets one instead of nothing.
+//
+// Nothing here relaxes what the fail-open path may cover: every control the scan measured is still a wall
+// (`ResultPageWalls.PressableTop`) and the free band it carved is still offered when the page's own strip is too
+// short, so a button the player has to press is stepped around exactly as before. The one reading that stops bounding
+// a board is the line the page draws and the player only reads.
+public static class ResultFallbackBandPolicy
+{
+    public static bool TryResolve(float screenHeight, float anchorBottom, ResultBoundSource anchorSource,
+        ResultPageWalls walls, float measuredControlTop, float bandTop, float bandBottom, float boardFloor,
+        out ResultFallbackPlan plan)
+    {
+        plan = ResultFallbackPlan.None;
+        // 1. The page's own band, with the same two edges and the same clearance the strict path uses.
+        if (ResultsBounds.TryResolve(screenHeight, anchorBottom, anchorSource, walls.PressableTop, walls.FooterTextTop,
+                walls.FooterTextSource, measuredControlTop, out ResultsBand pageBand) && pageBand.Fits)
+        {
+            float bottom = walls.CapBottom(pageBand.Bottom);
+            float room = bottom - pageBand.Top;
+            if (room > 0.5f && ResultFallbackTier.AcceptsPageBand(room, boardFloor))
+            {
+                pageBand = new ResultsBand(pageBand.Top, bottom, pageBand.TopSource, pageBand.BottomSource, pageBand.Clamped);
+                plan = new ResultFallbackPlan(pageBand.Top, pageBand.Bottom, 1f, ResultFallbackReason.PageBand, pageBand);
+                return true;
+            }
+        }
+        // 2. The page's band cannot hold the board's own floor (or it could not be resolved at all): the invented
+        //    tiers answer, stepping around every control the scan measured and stopping at the page's own foot.
+        if (!ResultFallbackLayout.TryResolve(screenHeight, anchorBottom, walls.PressableTop, walls.FooterTextTop,
+                bandTop, bandBottom, boardFloor, walls.PageFloor, out ResultFallbackPlan invented)) return false;
+        plan = invented;
+        return true;
+    }
 }
 
 // What one measurement of a result page ended in.

@@ -176,8 +176,24 @@ public static class ResultAnchorRecovery
     // one measured through the button's own layout rectangle - is not a guess and is never re-measured; and a
     // page that already spent its retry does not get another, however it was placed afterwards.
     public static bool LatchFallback(int recoveries, bool stripMeasured) => !stripMeasured && recoveries == 0;
-}
 
+    // Whether the page's own strip has really come back, as opposed to merely having a rectangle somewhere.
+    //
+    // The second look is a promise that the strict placement can now take what the page offers, so it may only be
+    // taken on the same two facts the placement is judged by: a strip this frame could measure at all
+    // (`stripOfferable`), and the footer that bounds it - measured (`footerMeasured`), or proven absent by the
+    // page's own no-footer proof (`noFooterProven`).
+    //
+    // 1.19.26: the failure page answered this with "the title rectangle and *a* button rectangle are finite", which
+    // a page whose leave button is switched off, re-laid out by another mod or never read by the strip still
+    // satisfies. The retry it spent re-placed the board strictly, the next repaint could not measure that footer,
+    // `BoardStillSafe` withdrew the board on `no-footer-unproofed`, and the refunded budget armed the second look
+    // again - fail-open, second look, withdraw, for ever. A layout rectangle is not a footer, and an unmeasurable
+    // footer is not a recovery.
+    public static bool Recovered(bool stripOfferable, bool footerMeasured, bool noFooterProven)
+        => stripOfferable && (footerMeasured || noFooterProven);
+
+}
 // ---------------------------------------------------------------------------------------------------
 // When a result page's own anchors are ready to be measured.
 // ---------------------------------------------------------------------------------------------------
@@ -254,8 +270,19 @@ public sealed class FailureSequenceReadiness
     public void Forget() { _page = _sequence = IntPtr.Zero; _finished = false; }
 }
 
-public enum FailureTitleAnchorKind { None = 0, MissionFailed = 1, MissionTitleLayoutAfterSequence = 2 }
+public enum FailureTitleAnchorKind { None = 0, MissionFailed = 1, MissionTitleLayoutAfterSequence = 2, MissionTitleLayout = 3 }
 
+// Which native fact supplies the failure page's upper edge.
+//
+// 1.19.21: the title's laid-out screen rectangle (`ResultsDisplay.TryScreenRect`, a pure projection that asks neither
+// alpha, text nor active state) is an anchor source of its own. A title the page has laid out but not finished
+// drawing - the reported shape of the real failure page, whose finished text produced `rawTextAlpha=1.00` while every
+// earlier frame was refused - contributes its final edge from the very first frame it is laid out. `ResultTitleGate`
+// (full opacity over a still edge) is no longer a placement precondition: it remains the *drawn-text route's*
+// measurement, and the log line says which of the two routes produced the edge. The old rules are unchanged wherever
+// they are not superseded: the active, non-empty mission title is still the first candidate, a client whose title the
+// page switched off is still only answered after its native failure sequence has completed, and a page whose title
+// hands over no geometry at all still has no upper anchor.
 public static class FailureTitleAnchorPolicy
 {
     public static FailureTitleAnchorKind Select(bool client, bool nativeLobbyVisible, bool missionPresent,
@@ -265,10 +292,22 @@ public static class FailureTitleAnchorPolicy
         if (client && !nativeLobbyVisible && !missionActive && missionPresent && missionTextPresent
             && missionGeometryMeasured && failureSequenceFinished)
             return FailureTitleAnchorKind.MissionTitleLayoutAfterSequence;
+        // The layout route: the title's own rectangle, readable even while its text has not arrived and even while the
+        // native sequence is still running. It is the final geometry, so nothing about the draw state may hold it back.
+        if (missionPresent && missionGeometryMeasured) return FailureTitleAnchorKind.MissionTitleLayout;
         return FailureTitleAnchorKind.None;
     }
 }
 
+// The mission-failed title's *drawn-text* measurement: full opacity (`OpaqueAlpha`) over an edge read twice
+// (`EdgeFrames`).
+//
+// 1.19.21: this gate is diagnostics and the drawn-pixel route's recorder, no longer a placement precondition. The
+// failure page's upper edge is the title's laid-out screen rectangle (see `FailureTitleAnchorPolicy`); whenever that
+// layout geometry is readable the board may be placed on it at once, at alpha 0 or mid-fade, and the log line
+// distinguishes the route its `titleSource` came from. The gate's own answer still means exactly what it says - the
+// *text* has been read at full opacity over a still edge - and it stays in the placement path so a live log can
+// always tell which route an edge came from.
 public sealed class ResultTitleGate
 {
     public const float OpaqueAlpha = 0.99f;
@@ -339,8 +378,12 @@ public sealed class ResultTitleGate
         _sameFrameInvalidations = 0;
     }
 }
-
 // One measured edge of a result page, followed across frames.
+// 1.19.21: like every settle latch on these pages this is diagnostics now - the placement is satisfied by readable
+// final layout geometry on the first frame it exists, and the `Observe` calls stay in the placement path purely so a
+// live log keeps its settle counters. `SettleAttempts` keeps its one real job: telling the caller when to stop
+// measuring every frame and fall back to the bounded cadence, never a timeout that turns an unmeasured edge into a
+// placement.
 //
 // It answers one question and only one: has this edge been read at the same value twice in a row? An edge the page has
 // not handed over yet - a footer button that has not been drawn, a completion section whose pixels cannot be read -
@@ -439,6 +482,245 @@ public sealed class ResultNoFooterGate
     public void Forget() { _samples = 0; _lastFrame = int.MinValue; }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// The band a host's own failure page measured, and when it is proof enough for the board to stand in it
+// ---------------------------------------------------------------------------------------------------
+//
+// The recorded host failure page (`LogOutput.log`, the 2026-11-13 21:57:56 run, 2560x1440, one failed expedition,
+// four players downed) had exactly one strict release: the leave button's own rectangle. A few lines after the
+// fail-open board had been placed, and one line after `failure region re-measured: both of this page's own edges ...
+// are readable now`, the repaint printed
+//
+//   failure-strip board not drawn: reason=no-footer-unproofed, heldStrip=381..1145 (764px), need=270px,
+//   detail=buttonMeasured=false,noFooterReady=False,nativeVisible=True,count=0,complete=True
+//
+// - the board had just been placed strictly, the page's own two edges were measured (the mission-failed title at
+// 381 above, the waiting line at 1164 below: `fail-open band: top=381 (source=title-anchor), bottom=1142
+// (source=footer-text, waitingText=1164), room=762px`), all five of the page's controls were switched off
+// (`hidden=5`), the complete scan found nothing to press (`count=0, complete=true`), and the native page itself
+// reported its footer visible (`nativeVisible=True`, `fail.m_lobbyButtonVisible`). The one fact missing was the
+// button's own `activeInHierarchy`: `ResultsDisplay.ButtonActive` answers false for a button the page switched off,
+// so `buttonMeasured` is false - and it is the only thing the strict path accepted.
+//
+// `FailureNoFooter.Ready` cannot stand in for it on a host: its `absent` term is gated on `client`
+// (`ResultNoFooterGate.Observe`), and `ResultPageRolePolicy.UsesNoFooterSafeArea` is true for a client alone. So
+// before this release a host failure page had exactly one release - this frame's button rectangle - and a board
+// was withdrawn on the next frame that could not read it. That withdrawal, one frame after the second look had
+// promoted the fail-open board to a strict one, is what left the player ten presses of which four were forced.
+//
+// The rule stated here: a control the page has switched off cannot be pressed, so the leave button being inactive
+// is not evidence that the board stands over something the player needs. What *is* evidence is the page's own two
+// measured edges (its title anchor above, the waiting/footer text it measured below) together with a complete scan
+// that found nothing switched on. That is a policy rather than a condition inside the display, so the shape the
+// recorded page really had can be asserted headlessly.
+//
+// Nothing is relaxed: an active control whose rectangle reaches the board is still the one fact that defers the
+// frame - `BoardStillSafe` asks `failureControls.OverlapsBoard` before it asks this class, and the answer here
+// names it too - and a scan that could not see the whole page still refuses, because `complete` is a fact about
+// the page's structure that no amount of waiting repairs.
+
+// One frame of evidence about a host's failure page: what the interaction scan found, what the native page says
+// about its own footer, whether the leave button's rectangle was read this frame, and which of the page's own
+// measurements produced the two edges of the strip the board would stand in.
+public readonly struct FailureBandEvidence
+{
+    public readonly ResultPageRole Role;
+    public readonly bool ScanComplete, ParentCoverageComplete;
+    public readonly int ActiveControls, Unmeasurable;
+    public readonly bool NativeFooterVisible, ButtonMeasured, OverlapsControls;
+    public readonly ResultBoundSource BandTopSource, BandBottomSource;
+
+    public FailureBandEvidence(ResultPageRole role, bool scanComplete, bool parentCoverageComplete,
+        int activeControls, int unmeasurable, bool nativeFooterVisible, bool buttonMeasured, bool overlapsControls,
+        ResultBoundSource bandTopSource, ResultBoundSource bandBottomSource)
+    {
+        Role = role; ScanComplete = scanComplete; ParentCoverageComplete = parentCoverageComplete;
+        ActiveControls = activeControls; Unmeasurable = unmeasurable;
+        NativeFooterVisible = nativeFooterVisible; ButtonMeasured = buttonMeasured; OverlapsControls = overlapsControls;
+        BandTopSource = bandTopSource; BandBottomSource = bandBottomSource;
+    }
+}
+
+// What one frame's evidence proves about the strip a host failure page offers.
+public enum FailureBandProofState
+{
+    // The page's own two edges bound the strip, the scan was complete and found nothing switched on, and the page
+    // itself says its footer is there: a board may stand in it, and the button it could not read is not a reason
+    // to refuse or to withdraw one.
+    Proven = 0,
+    // A client's strip is its fixed page geometry; this proof is the host's way out and never the client's.
+    ClientOwned = 1,
+    // An active control's rectangle really reaches the board: defer, unchanged, whatever else was measured.
+    OverlapsControls = 2,
+    // The scan could not see the whole page, so it cannot claim the page has nothing on it.
+    ScanIncomplete = 3,
+    // The scan saw something switched on, or something it could not place: both may take the pointer.
+    ActiveControls = 4,
+    // The page reports no footer of its own, so there is nothing to say the strip ends where the player is not.
+    NativeFooterAbsent = 5,
+    // The strip's edges are not the page's own measurements (its title anchor and a text/wall it laid out): a
+    // band that starts from a fraction of the window or ends at the window's foot proves nothing about the page.
+    BandNotPageMeasured = 6,
+}
+
+public static class ResultFailureBandProofPolicy
+{
+    // Which fact produced the answer, in the few words a live log can afford.
+    public static string Name(FailureBandProofState state)
+    {
+        switch (state)
+        {
+            case FailureBandProofState.Proven: return "page-band-proven";
+            case FailureBandProofState.ClientOwned: return "client-owned-strip";
+            case FailureBandProofState.OverlapsControls: return "overlaps-controls";
+            case FailureBandProofState.ScanIncomplete: return "scan-incomplete";
+            case FailureBandProofState.ActiveControls: return "active-controls";
+            case FailureBandProofState.NativeFooterAbsent: return "native-footer-absent";
+            case FailureBandProofState.BandNotPageMeasured: return "band-not-page-measured";
+            default: return "unknown";
+        }
+    }
+
+    // The upper edge has to be the failure page's own mission-failed title, which `FailureStrip` reads from the
+    // title's laid-out rectangle whether or not the page has drawn it yet.
+    public static bool PageMeasuredTop(ResultBoundSource source)
+        => source == ResultBoundSource.TitleAnchor;
+
+    // The lower edge has to be a wall or a block the page itself laid out: the waiting-status text the player reads,
+    // the leave-expedition control's own rectangle standing in for it, or another control the scan measured. The
+    // window's own foot is not one of them - a board that ends there has nothing under it that was read.
+    public static bool PageMeasuredBottom(ResultBoundSource source)
+        => source == ResultBoundSource.FooterText || source == ResultBoundSource.FooterTextControl
+            || source == ResultBoundSource.FooterControl || source == ResultBoundSource.MeasuredControl;
+
+    // The whole answer, in the order the facts are asked. Overlap first, because an active control that reaches the
+    // board is a deferral whatever else is true; structure next, because a scan that could not see the page cannot
+    // claim anything about it; then the two ways a strip is released - the button the page did hand over this frame,
+    // or the page's own two measured edges.
+    public static FailureBandProofState Decide(in FailureBandEvidence evidence)
+    {
+        if (evidence.Role != ResultPageRole.Host) return FailureBandProofState.ClientOwned;
+        if (evidence.OverlapsControls) return FailureBandProofState.OverlapsControls;
+        if (!evidence.ScanComplete || !evidence.ParentCoverageComplete) return FailureBandProofState.ScanIncomplete;
+        if (evidence.ActiveControls != 0 || evidence.Unmeasurable != 0) return FailureBandProofState.ActiveControls;
+        if (evidence.ButtonMeasured) return FailureBandProofState.Proven;
+        if (!evidence.NativeFooterVisible) return FailureBandProofState.NativeFooterAbsent;
+        if (!PageMeasuredTop(evidence.BandTopSource) || !PageMeasuredBottom(evidence.BandBottomSource))
+            return FailureBandProofState.BandNotPageMeasured;
+        return FailureBandProofState.Proven;
+    }
+
+    // Whether a board may stand in this frame's strip and stay there, which is the one question both the placement
+    // and the per-repaint check ask.
+    public static bool Proven(in FailureBandEvidence evidence) => Decide(evidence) == FailureBandProofState.Proven;
+
+    // The same answer for the failure page's own strip measurement, so a caller cannot pass the fields in the wrong
+    // order: `band` is the `ResultsBand` the strip was built from, whose sources name the facts that produced it.
+    public static FailureBandProofState Decide(ResultPageRole role, bool scanComplete, bool parentCoverageComplete,
+        int activeControls, int unmeasurable, bool nativeFooterVisible, bool buttonMeasured, bool overlapsControls,
+        ResultsBand band)
+        => Decide(new FailureBandEvidence(role, scanComplete, parentCoverageComplete, activeControls, unmeasurable,
+            nativeFooterVisible, buttonMeasured, overlapsControls, band.TopSource, band.BottomSource));
+
+    // The same answer, as the one yes/no the display needs.
+    public static bool Proven(ResultPageRole role, bool scanComplete, bool parentCoverageComplete,
+        int activeControls, int unmeasurable, bool nativeFooterVisible, bool buttonMeasured, bool overlapsControls,
+        ResultsBand band)
+        => Proven(new FailureBandEvidence(role, scanComplete, parentCoverageComplete, activeControls, unmeasurable,
+            nativeFooterVisible, buttonMeasured, overlapsControls, band.TopSource, band.BottomSource));
+
+    // The strip's two provenances in one string, for the one line a refusal prints: a band that was not proven has
+    // to say which edge it could not measure, or the next reader is back to guessing.
+    public static string Describe(FailureBandProofState state, ResultsBand band)
+        => "bandProof=" + Name(state)
+           + ",bandTop=" + ResultsBounds.Name(band.TopSource) + ",bandBottom=" + ResultsBounds.Name(band.BottomSource);
+}
+
+// A success page can prove the host's strip from its own icon row and measured footer, even when the
+// lobby button is not active/readable on this frame. The native-visible flag is recorded as evidence,
+// but it cannot replace either measured edge; unlike the client no-footer route, a host does not need
+// to claim that the page has no footer when the page has measured the band it offers.
+public readonly struct SuccessBandEvidence
+{
+    public readonly ResultPageRole Role;
+    public readonly bool ScanComplete, ParentCoverageComplete;
+    public readonly int ActiveControls, Unmeasurable;
+    public readonly bool NativeFooterVisible, ButtonMeasured, OverlapsControls;
+    public readonly ResultBoundSource BandTopSource, BandBottomSource;
+
+    public SuccessBandEvidence(ResultPageRole role, bool scanComplete, bool parentCoverageComplete,
+        int activeControls, int unmeasurable, bool nativeFooterVisible, bool buttonMeasured, bool overlapsControls,
+        ResultBoundSource bandTopSource, ResultBoundSource bandBottomSource)
+    {
+        Role = role; ScanComplete = scanComplete; ParentCoverageComplete = parentCoverageComplete;
+        ActiveControls = activeControls; Unmeasurable = unmeasurable;
+        NativeFooterVisible = nativeFooterVisible; ButtonMeasured = buttonMeasured; OverlapsControls = overlapsControls;
+        BandTopSource = bandTopSource; BandBottomSource = bandBottomSource;
+    }
+}
+
+public enum SuccessBandProofState
+{
+    Proven = 0,
+    ClientOwned = 1,
+    OverlapsControls = 2,
+    ScanIncomplete = 3,
+    ActiveControls = 4,
+    BandNotPageMeasured = 5,
+}
+
+public static class ResultSuccessBandProofPolicy
+{
+    public static string Name(SuccessBandProofState state)
+    {
+        switch (state)
+        {
+            case SuccessBandProofState.Proven: return "page-band-proven";
+            case SuccessBandProofState.ClientOwned: return "client-owned-strip";
+            case SuccessBandProofState.OverlapsControls: return "overlaps-controls";
+            case SuccessBandProofState.ScanIncomplete: return "scan-incomplete";
+            case SuccessBandProofState.ActiveControls: return "active-controls";
+            case SuccessBandProofState.BandNotPageMeasured: return "band-not-page-measured";
+            default: return "unknown";
+        }
+    }
+
+    public static bool PageMeasuredTop(ResultBoundSource source)
+        => source == ResultBoundSource.IconRow || source == ResultBoundSource.LastTrustedIconRow;
+
+    public static bool PageMeasuredBottom(ResultBoundSource source)
+        => source == ResultBoundSource.FooterText || source == ResultBoundSource.FooterTextControl
+            || source == ResultBoundSource.FooterControl || source == ResultBoundSource.MeasuredControl;
+
+    // Overlap is the first answer: even perfect page geometry cannot release a control under the board.
+    // The old measured-button path remains valid after the same scan/role gates; only an unmeasured
+    // button needs the success page's own icon-row-to-footer band as its alternative proof.
+    public static SuccessBandProofState Decide(in SuccessBandEvidence evidence)
+    {
+        if (evidence.OverlapsControls) return SuccessBandProofState.OverlapsControls;
+        if (evidence.Role != ResultPageRole.Host) return SuccessBandProofState.ClientOwned;
+        if (!evidence.ScanComplete || !evidence.ParentCoverageComplete) return SuccessBandProofState.ScanIncomplete;
+        if (evidence.ActiveControls != 0 || evidence.Unmeasurable != 0) return SuccessBandProofState.ActiveControls;
+        if (evidence.ButtonMeasured) return SuccessBandProofState.Proven;
+        if (!PageMeasuredTop(evidence.BandTopSource) || !PageMeasuredBottom(evidence.BandBottomSource))
+            return SuccessBandProofState.BandNotPageMeasured;
+        return SuccessBandProofState.Proven;
+    }
+
+    public static SuccessBandProofState Decide(ResultPageRole role, bool scanComplete, bool parentCoverageComplete,
+        int activeControls, int unmeasurable, bool nativeFooterVisible, bool buttonMeasured, bool overlapsControls,
+        ResultsBand band)
+        => Decide(new SuccessBandEvidence(role, scanComplete, parentCoverageComplete, activeControls, unmeasurable,
+            nativeFooterVisible, buttonMeasured, overlapsControls, band.TopSource, band.BottomSource));
+
+    public static bool Proven(in SuccessBandEvidence evidence) => Decide(evidence) == SuccessBandProofState.Proven;
+
+    public static string Describe(SuccessBandProofState state, ResultsBand band)
+        => "bandProof=" + Name(state)
+           + ",bandTop=" + ResultsBounds.Name(band.TopSource) + ",bandBottom=" + ResultsBounds.Name(band.BottomSource);
+}
+
+
 // An explicitly sourced viewport strip for a client page whose native footer is absent. A measured protected
 // lower wall (for example, the native host-wait status text) shortens the strip; it is never an upper anchor.
 // Placement still requires ResultNoFooterGate.Ready from page state and a complete control/tree scan.
@@ -535,6 +817,19 @@ public sealed class ResultAnchorDrift
     {
         _top = _room = float.NaN; _frames = 0; _recoveries = 0;
         _lastFrame = int.MinValue; _syntheticFrame = 0;
+    }
+
+    // The board this drift was recorded against is gone - a deferral threw the placement away - so the recorded strip has to go
+    // with it: it describes a board that is no longer on the page, and re-measuring against it would compare a fresh placement
+    // with a stale one. What must *not* go is the budget (independent review F2): `MaximumRecoveries` is the only thing that stops
+    // a page whose edges keep moving from costing a re-measure for ever, and deferrals are per-repaint events, so refunding it
+    // there would have made the bound meaningless - place, drift, defer, refund, place again, without end. `Forget` is therefore
+    // kept for a new page (and for a frame counter that restarted); a deferral calls `Clear`.
+    public void Clear()
+    {
+        _top = _room = float.NaN;
+        _frames = 0;
+        _lastFrame = int.MinValue;
     }
 
     public bool Due(float top, float room) => Due(_syntheticFrame++, top, room);

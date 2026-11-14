@@ -44,6 +44,19 @@ public static class ResultsLog
                 string label = Label(board, row);
                 if (string.IsNullOrEmpty(label)) continue;
                 text.Append("      \"").Append(Escape(label)).Append("\": \"").Append(Escape(board.Joined(row, column))).Append("\",\n");
+                // 1.19.34: the released label is written beside the new one, with the same figures in the released
+                // three-field form, so a reader of these archived files keeps finding the key it has always parsed. The new
+                // cell's first field is the efficiency and the pair behind it is in `counters`, so the legacy value is the
+                // released cell rebuilt from the same numbers rather than a second measurement.
+                if (string.Equals(label, CombatStrings.SupplyRowLabel, StringComparison.Ordinal)
+                    && entry.Input != null && entry.Input.Counters != null)
+                {
+                    string cell = board.Joined(row, column);
+                    string efficiency = cell.Split(new[] { CombatStrings.CellSeparator }, StringSplitOptions.None)[0];
+                    text.Append("      \"").Append(Escape(CombatStrings.SupplyRowLabelLegacy)).Append("\": \"")
+                        .Append(Escape(CombatStrings.SupplyCell(efficiency, entry.Input.Counters.SelfSupplyUses, entry.Input.Counters.SelfAmmoUses)))
+                        .Append("\",\n");
+                }
             }
             text.Append("      \"nameCell\": \"").Append(Escape(board.Joined(0, column))).Append("\"\n");
             text.Append(index + 1 == report.Entries.Count ? "    }\n" : "    },\n");
@@ -70,6 +83,12 @@ public static class ResultsLog
         text.Append("        \"unknownStateScoutKills\": ").Append(Count(counters.UnknownStateScoutKills)).Append(",\n");
         text.Append("        \"selfSupplyUses\": ").Append(Count(counters.SelfSupplyUses)).Append(",\n");
         text.Append("        \"selfAmmoUses\": ").Append(Count(counters.SelfAmmoUses)).Append(",\n");
+        // 1.19.34: the split of those packs, and whether it was ever split at all. A row restored from a v8 peer writes the two
+        // kinds as 0 with `selfSupplyKindsKnown` false: the pair above is that peer's, and the split is an absence the reader can
+        // see rather than a zero it has to guess at.
+        text.Append("        \"selfToolUses\": ").Append(Count(counters.SelfToolUses)).Append(",\n");
+        text.Append("        \"selfMedicalUses\": ").Append(Count(counters.SelfMedicalUses)).Append(",\n");
+        text.Append("        \"selfSupplyKindsKnown\": ").Append(counters.SelfSupplyKindsKnown ? "true" : "false").Append(",\n");
         text.Append("        \"healthLost\": ").Append(Decimal(counters.HealthLost)).Append("\n");
         text.Append("      },\n");
     }

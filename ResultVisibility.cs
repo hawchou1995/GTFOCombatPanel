@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace HawChow.GTFOCombatPanel;
 
@@ -45,6 +46,29 @@ public static class ResultVisibility
         => current != IntPtr.Zero && cached == current;
 
     public static bool PageChanged(IntPtr cached, IntPtr current) => cached != current;
+}
+
+// The one bounded line per page and per reason, and the one-line-per-F8-press exception (1.19.22, corrected in
+// 1.19.25).
+//
+// The ordinary answer is once per page per reason, which is what keeps per-frame repaints from turning a diagnostic
+// into a flood. The forced exception is bounded by the press itself, not by the frame: while a forced press still
+// owes its answer (`_forcedOutcomePending` is set) the very same reason prints once more - the press must end its
+// frame with either a "board drawn" line or a refusal line naming the real missing fact, even when the per-page
+// latch has already fired for that reason. The refusal that prints spends the flag, so the *next* forced repaint
+// falls back on the ordinary latch and stays silent until the next F8 press re-arms the flag: one line per press,
+// never one line per frame (a held F8 no longer floods the log). The latch is not deleted; the frame that owes an
+// answer simply prints again for it.
+public static class ResultReportPolicy
+{
+    // `forcedPressPending` is the press's own "not answered yet" flag (ResultsDisplay._forcedOutcomePending).
+    // It widens the gate for exactly one refusal - the one that spends it - and never for a later repaint.
+    public static bool OncePerPage(HashSet<string> reports, string key, bool forced, bool forcedPressPending)
+    {
+        if (reports != null && reports.Contains(key) && !(forced && forcedPressPending)) return false;
+        if (reports != null) reports.Add(key);
+        return true;
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -209,12 +233,21 @@ public readonly struct BoardStrip
     public readonly float ButtonHeight;
     public readonly bool AnchorMeasured;
     public readonly ResultFooterSource FooterSource;
+    // The share of this strip the board may use, decided where the strip is measured: `BandFillCeiling` for a client
+    // band that ends above a wall the page really measured (its waiting-status block), `StripFillCeiling` for every
+    // other strip, including one whose foot is only the page's own edge. The fit spends it, so a band that may be
+    // filled to its foot is not answered with a table two thirds of it and a blank row under the board.
+    public readonly float FillCeiling;
 
     public BoardStrip(float top, float bottom, bool buttonMeasured, float buttonTop, float buttonHeight = float.NaN,
-        bool anchorMeasured = true, ResultFooterSource footerSource = ResultFooterSource.None)
+        bool anchorMeasured = true, ResultFooterSource footerSource = ResultFooterSource.None,
+        float fillCeiling = ResultsFontGrowth.StripFillCeiling)
     {
         Top = top; Bottom = bottom; ButtonMeasured = buttonMeasured; ButtonTop = buttonTop; ButtonHeight = buttonHeight;
         AnchorMeasured = anchorMeasured; FooterSource = footerSource;
+        FillCeiling = float.IsFinite(fillCeiling) && fillCeiling > 0f
+            ? (fillCeiling > ResultsFontGrowth.BandFillCeiling ? ResultsFontGrowth.BandFillCeiling : fillCeiling)
+            : ResultsFontGrowth.StripFillCeiling;
     }
 }
 
@@ -253,14 +286,14 @@ public static class ResultBoardHold
 
     // A board that is already up. It keeps the rectangle it was measured into; a strip that comes back a
     // little shorter than the one it was measured against - which is what the pages' own button animation
-    // does - does not take it away, and the board is never moved down. The button is still a wall: a board
-    // that really would reach it is lifted onto the clearance line, and only if even that would leave the
-    // page is it left where it is, because there is nothing else to do with it that keeps both promises.
+    // does - does not take it away. The button is still a wall: a board that really would reach it is lifted
+    // onto the clearance line, never moved down.
     //
-    // `topBound` is the fall-open board's other wall: its upper edge is the band's own top, and lifting must never carry it
-    // above that - a board that cannot clear the footer without crossing its band is left on the band's edge and drawn
-    // fainter by its caller, which is the trade the fail-open rule makes. It is NaN for a strict board, whose upper edge is
-    // the page's own anchor and never moves.
+    // Both edges bind. `topBound` is the board's own band top - `_holdStrip.Top`, now passed for the strict
+    // board too, so a late button reading can no longer lift a strict board to the top of the window over the
+    // failure title. A board whose own height cannot sit between the band's top and the button's clearance
+    // line cannot be held inside its band by lifting it, so `TryHold` refuses (false) and the caller reports
+    // the real numbers instead of drawing the board outside its band.
     public static bool TryHold(BoardStrip strip, LayoutRect placed, float screenHeight, out LayoutRect rect,
         float topBound = float.NaN)
     {
@@ -273,6 +306,9 @@ public static class ResultBoardHold
         if (placed.Bottom <= wall) return true;
         float lifted = Math.Max(0f, wall - placed.Height);
         if (float.IsFinite(topBound)) lifted = Math.Max(lifted, Math.Max(0f, topBound));
+        // The same half-pixel tolerance the placement and the fade checks use: a board that would end within
+        // half a pixel of the wall is still held on the line.
+        if (lifted + placed.Height > wall + 0.5f) return false;
         rect = new LayoutRect(placed.X, lifted, placed.Width, placed.Height);
         return true;
     }

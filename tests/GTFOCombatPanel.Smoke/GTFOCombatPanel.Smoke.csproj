@@ -49,7 +49,10 @@
     <Compile Include="..\..\SentryShotLedger.cs" Link="SentryShotLedger.cs" />
     <Compile Include="..\..\SquadDiagnostics.cs" Link="SquadDiagnostics.cs" />
     <Compile Include="..\..\AnchorSamplePolicy.cs" Link="AnchorSamplePolicy.cs" />
+    <Compile Include="..\..\AnchorCameraLadder.cs" Link="AnchorCameraLadder.cs" />
+    <Compile Include="..\..\ResultFinalLayout.cs" Link="ResultFinalLayout.cs" />
     <Compile Include="..\..\FallbackLayout.cs" Link="FallbackLayout.cs" />
     <Compile Include="..\..\ResultsBounds.cs" Link="ResultsBounds.cs" />
+    <Compile Include="..\..\SettlementStorage.cs" Link="SettlementStorage.cs" />
   </ItemGroup>
 </Project>
