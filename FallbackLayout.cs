@@ -429,6 +429,40 @@ public static class ResultFallbackTier
         => float.IsFinite(bandHeight) && float.IsFinite(boardFloor) && boardFloor > 0f && bandHeight + 0.5f >= boardFloor;
 }
 
+// Whether a failure page's lower bound has been observed at all.
+//
+// The recorded failure page (`LogOutput.log` 31794-31809, 2560x1440, client) is the reason this exists: a band of
+// 890..1429 - the screen's own foot - was answered while the page's own button had not been measured yet, a 1385-tall
+// board was drawn into it, and the button then appeared at 1240. Two complete scans that found no pressable control are
+// not evidence that the page has no wall (`TIP-20261114-8bd8fe92`: a later control can still arrive); they are evidence
+// that the wall has not been seen. This policy says so for *any* failure page, not only the client one - the client
+// branch already had its own voice (`ResultClientPageActionPolicy`), which is what left the host path able to invent a
+// band from the window.
+//
+// It never becomes a permanent wait: after `UnobservedBudget` frames the band is answered anyway, and the line that
+// answers it says the wall was never observed - the bounded give-up `ResultFinalPolicy.MaximumWaitFrames` this build
+// already has, never a claim that the page was final.
+public static class ResultFailureWallPolicy
+{
+    public const string Unobserved = "wall-not-observed";
+    public const int UnobservedBudget = ResultFinalPolicy.MaximumWaitFrames;
+
+    // Withhold the invented band while the page has shown no lower bound at all, but not for ever.
+    public static bool Waits(bool wallMeasured, int framesWithoutWall)
+        => !wallMeasured && framesWithoutWall < UnobservedBudget;
+
+    public static bool Answer(bool wallMeasured, int framesWithoutWall)
+        => wallMeasured || framesWithoutWall >= UnobservedBudget;
+
+    // F5: the note that rides on a line which answers a band without a measured lower bound. The give-up is bounded, and
+    // a successful fallback is not proof that the page has a wall: the line has to keep saying which one it was, so a
+    // reader of the log can tell an answered page from a page whose geometry was proven. Empty whenever the wall was seen.
+    public static string AnswerNote(bool wallMeasured, int framesWithoutWall)
+        => wallMeasured || framesWithoutWall < UnobservedBudget
+            ? string.Empty
+            : ", wallUnobserved=true (answered after " + framesWithoutWall + " frames without a measured lower bound: a bounded give-up, not the page's proven geometry)";
+}
+
 // Whether one text of a result page's footer subtree is the waiting block the board must stay above.
 //
 // The block is only a wall while the page is really drawing it: a TextMeshPro that is switched off, or one at zero alpha

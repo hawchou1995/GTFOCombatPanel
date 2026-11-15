@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using CellMenu;
 using HarmonyLib;
 using Il2CppSystem.Collections;
@@ -13,10 +14,19 @@ internal static class CompletionTargets
     // 1.19.42（独立评审 F2）：这一页已经为「某个可选持有者没有出现」打印过一次诊断。
     private static bool _skipReported;
 
+    // 1.19.43：这一页已经为「交给 BlinkIn 却没有拿到协程的目标」打印过一次诊断。
+    private static bool _scheduleReported;
+
+    // 这一次 `BlinkIn` 调用登记下来的全部目标。`BlinkIn` 在**调用内部**就排出它的 `SetActiveBlink` 协程，所以它返回时
+    // 这次排程的窗口已经关闭：调用里没拿到协程的目标不是「还没轮到」，而是「这份构建的这次调用根本不会展示它」。
+    private static readonly List<long> Window = new List<long>(8);
+
     internal static void BeginPage()
     {
         Ledger.Clear();
         _skipReported = false;
+        _scheduleReported = false;
+        Window.Clear();
     }
 
     // 一个目标只在这份构建真的把它交给这一页时才进入必需集合。
@@ -29,8 +39,13 @@ internal static class CompletionTargets
     internal static void Require(GameObject target, bool name)
     {
         if (target == null) return;
-        Ledger.Require(target.Pointer.ToInt64(), name);
+        long pointer = target.Pointer.ToInt64();
+        Ledger.Require(pointer, name);
+        Window.Add(pointer);
     }
+
+    // 一次原生调用开始登记自己的目标。
+    internal static void BeginCall() => Window.Clear();
 
     internal static void Require(CM_ExpeditionSectorIcon icon)
     {
@@ -45,7 +60,7 @@ internal static class CompletionTargets
     {
         if (target != null)
         {
-            Ledger.Require(target.Pointer.ToInt64(), name);
+            Require(target, name);
             return;
         }
         if (_skipReported) return;
@@ -56,6 +71,26 @@ internal static class CompletionTargets
             + "; this build's sector icon hands over no such holder, so this target is not part of the page's reveal. It is skipped rather than "
             + "marking the ledger impossible: 'this build has no such object' is not 'this page's reveal can never finish'.");
     }
+
+    // 一次 `BlinkIn` 调用排完它自己的协程之后关窗：调用里没拿到协程的目标不计入这一页等待的 reveal。
+    //
+    // 1.19.43：此前只有 `Require`，没有任何东西能关闭这个窗口。一个没有对应回调的持有者（例如这份构建里
+    // `BlinkIn` 并不交给 `SetActiveBlink` 的 m_skullHolder）因此永远 `Done=false`，`Ready` 永远为假、
+    // `MayStillComplete` 永远为真 —— 成功页的首次落板被永久挡住，只有 F8 能出来。现在按**原生事实**关窗：
+    // 不是帧数、不是 alpha、不是空扫描。之后若真来了协程，`BlinkCompletionLedger.Start` 会把目标重新计入，
+    // 所以迟到的原生控件既不会被忽略，也不会被当成「已经完成」。
+    internal static void SchedulesClosed()
+    {
+        int skipped = Ledger.CloseSchedule(Window);
+        Window.Clear();
+        if (skipped <= 0 || _scheduleReported) return;
+        _scheduleReported = true;
+        Plugin.Logger?.LogInfo("[DIAG] completion target not scheduled: " + skipped
+            + " target(s) a sector BlinkIn handed over received no SetActiveBlink routine inside that same call (required="
+            + Ledger.Required + ", counted=" + Ledger.Count + ", unscheduled=" + Ledger.Unscheduled + "); they are left out of the reveal this "
+            + "page waits on, because a routine that was never scheduled has no completion to observe and waiting for it would never answer. "
+            + "A routine that arrives later re-admits its own target.");
+    }
 }
 
 [HarmonyPatch(typeof(CM_ExpeditionSectorIcon), nameof(CM_ExpeditionSectorIcon.BlinkIn))]
@@ -64,10 +99,19 @@ internal static class SectorRevealStartedPatch
     [HarmonyPrefix, HarmonyWrapSafe]
     private static void Prefix(CM_ExpeditionSectorIcon __instance)
     {
+        // Every registration below belongs to this one native call, so the roster starts empty here.
+        CompletionTargets.BeginCall();
         // Only icons belonging to this success page enter the required set; inactive optional
         // prefab instances that the game never schedules cannot hold the board forever.
         if (ResultsDisplay.Success != null && __instance.transform.IsChildOf(ResultsDisplay.Success.transform))
             CompletionTargets.Require(__instance);
+    }
+
+    // The call is over: whatever it did not hand a routine to is not part of this page's reveal.
+    [HarmonyPostfix, HarmonyWrapSafe]
+    private static void Postfix()
+    {
+        CompletionTargets.SchedulesClosed();
     }
 }
 
@@ -90,11 +134,18 @@ internal static class SectorBlinkFinishedPatch
     {
         if (__result) return;
         GameObject go = __instance.go;
-        if (go == null) return;
         // MoveNext also returns false on an aborted/destroyed target. The native loop's t
         // must have reached BlinkDuration and the final state must actually be active.
-        bool finished = __instance.endActive && !__instance.destroyOnEnd && go.activeInHierarchy
+        bool finished = go != null && __instance.endActive && !__instance.destroyOnEnd && go.activeInHierarchy
             && float.IsFinite(__instance._t_5__2) && __instance._t_5__2 >= CoroutineManager.BlinkDuration;
-        CompletionTargets.Ledger.Finish(go.Pointer.ToInt64(), __instance.Pointer.ToInt64(), finished);
+        if (go != null)
+        {
+            CompletionTargets.Ledger.Finish(go.Pointer.ToInt64(), __instance.Pointer.ToInt64(), finished);
+            return;
+        }
+        // The target this routine was revealing is already gone, so it can no longer be named by it. The routine
+        // pointer still names the row: a routine that ended has ended, and leaving that row "in flight" is how a
+        // destroyed icon used to keep the success page waiting for a callback that will never come again.
+        CompletionTargets.Ledger.FinishRoutine(__instance.Pointer.ToInt64(), finished);
     }
 }

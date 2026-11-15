@@ -544,35 +544,46 @@ internal static class ResultSettlementPlacementScenarios
         // per-repaint safety checks do not ask it at all.
         int revealAsked = display.IndexOf("bool revealDone = CompletionReady(page);", StringComparison.Ordinal);
         int regionAt = display.IndexOf("bool completionMeasured = SuccessRegion(page, out ResultsSafeArea area", StringComparison.Ordinal);
-        int gateAt = display.IndexOf("if (ResultRevealGate.BlocksPlacement(revealDone, CompletionTargets.Ledger.MayStillComplete, Forced))", StringComparison.Ordinal);
+        int gateAt = display.IndexOf("if (ResultRevealGate.BlocksPlacement(revealDone, CompletionTargets.Ledger.MayStillComplete,", StringComparison.Ordinal);
         check(revealAsked >= 0 && regionAt > revealAsked && gateAt > regionAt
+              && display.Contains("CompletionTargets.Ledger.InFlight, Forced)")
               && display.Contains("HeadingReports.Add(\"success-reveal-pending\")"),
-            "the success placement asks the native ledger first, measures the section second and refuses the frame on the gate third - once per page, under its own reason");
+            "the success placement asks the native ledger first, measures the section second and refuses the frame on the gate third - once per page, under its own reason - and the gate is asked with the in-flight count (F1), so one aborted target cannot release the board while the rest of the reveal still runs");
         check(!Body(display, "private static bool BoardStillSafe()").Contains("ResultRevealGate")
               && !Body(display, "private static bool BoardStillSafe()").Contains("MayStillComplete"),
             "`BoardStillSafe` does not ask the reveal gate: a board that is already standing is never taken away because the page's reveal moved on");
-        check(ledger.Contains("public bool RevealImpossible => _missing;")
-              && ledger.Contains("public bool MayStillComplete => !_missing;")
+        // 1.19.43: the ledger's "no further reveal can arrive" answer now has a third source - a native routine that
+        // really ended without revealing its target - and a target whose BlinkIn call never scheduled a routine is not
+        // counted at all. Both are facts about the ledger, never a frame count, and `Ready` is still never faked.
+        check(ledger.Contains("public bool RevealImpossible => _missing || Aborted > 0;")
+              && ledger.Contains("public bool MayStillComplete => !RevealImpossible;")
+              && ledger.Contains("private static bool Counted(Entry entry) => !entry.Excluded;")
+              && ledger.Contains("public int CloseSchedule(IEnumerable<long> required)")
+              && ledger.Contains("public bool FinishRoutine(long routine, bool naturallyRevealed)")
               && !Body(ledger, "public void Finish(").Contains("RevealImpossible")
-              && !Body(ledger, "public void Require(").Contains("MayStillComplete"),
-            "the ledger gained only the two read-only answers this gate needs; `Require`, `Start`, `Finish` and `Ready` are untouched");
+              && !Body(ledger, "public void Require(").Contains("MayStillComplete")
+              && !Body(ledger, "public void Finish(").Contains("Done = true")
+              && !Body(ledger, "public void Clear(").Contains("Scheduled"),
+            "the ledger gained the read-only answers this gate needs plus two native facts about its own targets; `Finish` still never fakes a completion, and `Require`/`Clear` are untouched");
         check(final.Contains("public static class ResultRevealGate")
-              && Body(final, "public static class ResultRevealGate").Contains("!forced && !revealFinished && mayStillComplete")
+              && Body(final, "public static class ResultRevealGate").Contains("!forced && !revealFinished && (mayStillComplete || inFlight > 0)")
+              && Body(final, "public static class ResultRevealGate").Contains("BlocksPlacement(revealFinished, mayStillComplete, inFlight: 0, forced)")
               && !Body(final, "public static class ResultRevealGate").Contains("MissBudget")
               && !Body(final, "public static class ResultRevealGate").Contains("MaximumWaitFrames"),
-            "the gate itself is three facts and no budget: not forced, not finished, and still able to finish - there is no frame count anywhere in it");
+            "the gate itself is facts about the ledger and no budget: not forced, not finished, and still able to finish or still running (F1) - the three-argument form delegates to it with no in-flight work, and there is no frame count anywhere in it");
 
         // B2: the fail-open decision asks the reveal too, through one pure function, and `Prepare` really calls it.
         int settlementAt = display.IndexOf("ResultSettlementGate.Decision settlement = ResultSettlementGate.Decide(Forced, succeeded, RevealFinished,", StringComparison.Ordinal);
         int fallbackAt = display.IndexOf("if (!FallbackPlacement(page, succeeded, out _, out room, out strip, out string fallbackWhy))", StringComparison.Ordinal);
         int revealLogAt = display.IndexOf("HeadingReports.Add(\"fail-open-reveal-unobservable\")", StringComparison.Ordinal);
         string prepare = Body(display, "private static void Prepare(Component page, bool succeeded)");
-        string revealWait = Body(display, "private static int RevealWaitFrames()");
+        string revealStall = Body(display, "private static bool RevealStalled(out float stalledSeconds, out float limitSeconds)");
         check(settlementAt >= 0 && fallbackAt > settlementAt && revealLogAt > settlementAt && prepare.Contains("ResultSettlementGate.Decide("),
             "the fail-open path in `Prepare` asks the settlement gate before it invents a band, and its reveal-unobservable answer has its own once-per-page line");
-        check(revealWait.Contains("CompletionTargets.Ledger.Count > 0") && !revealWait.Contains("MissBudget")
-              && !revealWait.Contains("MaximumWaitFrames"),
-            "the reveal wait clock only runs while the ledger is empty and carries no budget of its own: the one number that releases it is `ResultFinalPolicy.MaximumWaitFrames`, read in the settlement gate - never a second, shorter count here or the 60 refusals there");
+        check(revealStall.Length > 0
+              && revealStall.Contains("RevealClock.Observe(now, ledger.Completed, ledger.InFlight, ledger.Count);")
+              && !revealStall.Contains("MissBudget") && !revealStall.Contains("MaximumWaitFrames"),
+            "the reveal clock is fed with the ledger's own facts - completed, in flight, scheduled - so any native movement defers it, and it carries no budget of its own: the only number that answers it is the stall bound in real seconds, read from the page's own blink duration (F1-STALL)");
         string completion = File.ReadAllText(Path.Combine(root, "CompletionTargets.cs"));
         check(completion.Contains("RequireOptional(icon, icon.m_bgHolder, false, \"m_bgHolder\")")
               && completion.Contains("RequireOptional(icon, icon.m_skullHolder, false, \"m_skullHolder\")")
@@ -587,16 +598,23 @@ internal static class ResultSettlementPlacementScenarios
             "the settlement gate uses the give-up budget and never the 60-refusal fail-open budget: sixty refused frames are not evidence that a page's reveal finished");
 
         // C: the section's edge and the icon row are one call, and the TMP text is measured in its own right.
-        check(display.Contains("CompletionFinalBounds.Placed(parts, RevealFinished, out int finalDeepest, out _finalUndrawn)")
-              && display.Contains("IconRowBottom(success, RevealFinished)")
-              && display.Contains("IconRowBottom(page, RevealFinished)"),
+        check(display.Contains("CompletionFinalBounds.Placed(parts, RevealFinished, contentSettled, out int finalDeepest, out _finalUndrawn)")
+              && display.Contains("IconRowBottom(success, RevealFinished, ContentSettled)")
+              && display.Contains("IconRowBottom(page, RevealFinished, ContentSettled)"),
             "the section's edge and the icon row the band hangs from read the same reveal state, so the two cannot disagree about which reading the board was placed from");
         check(display.Contains("var texts = element.GetComponentsInChildren<TMP_Text>(true);")
-              && display.Contains("if (TryTextRect(text, out LayoutRect drawn))")
+              && display.Contains("if (TryTextRect(text, out LayoutRect caption))")
               && display.Contains("private static bool TryTextRect(TMP_Text text, out LayoutRect rect)")
               && Body(display, "private static bool TryTextRect(").Contains("text.textBounds")
               && display.Contains("private static Camera PageCamera(Component component, out bool overlay)"),
             "the completion parts are measured through Renderer bounds and through every TextMeshPro text under them, projected through one camera ladder: a TextMeshProUGUI caption carries no bounds-carrying renderer, and its own laid-out extent is what the band must clear");
+        // F2: a visible `Graphic` (Image/RawImage/TextMeshProUGUI) carries a CanvasRenderer, not a Renderer, and a child
+        // that cannot be projected must leave the part *incomplete* rather than silently out of the reading.
+        check(display.Contains("var graphics = element.GetComponentsInChildren<Graphic>(true);")
+              && display.Contains("CompletionCandidatePolicy.Classify(")
+              && display.Contains("else unmeasured++;")
+              && Body(display, "private static CompletionPart Read(").Contains("unmeasured, drawn)"),
+            "every visible Graphic is a candidate too, a candidate that cannot be projected is counted as unmeasured, and the part is built with that count so `ContentComplete` can refuse a reading taken without it");
         check(!Body(display, "private static float IconRowBottom(").Contains("m_sectorsWhiteBox"),
             "and the plate behind the row is still not one of the parts the edge is computed from");
     }

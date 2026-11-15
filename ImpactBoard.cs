@@ -548,7 +548,14 @@ public static class ImpactBoard
         if (tones != null && tones[row] != null && column >= 0 && column < tones[row].Length) tones[row][column] = tone;
     }
 
-    private static string Name(string name) => string.IsNullOrEmpty(name) ? CombatStrings.Placeholder : name;
+    // A gear name is displayed through the one cleaner this build already has (`CombatStatsFormatter.VisibleName`):
+    // the game's own names carry markup, and a name that travelled the wire can carry the cut tail of a tag. The
+    // string returned here is the string the column is measured with, so what is measured is what is drawn.
+    private static string Name(string name)
+    {
+        string visible = CombatStatsFormatter.VisibleName(name);
+        return string.IsNullOrEmpty(visible) ? CombatStrings.Placeholder : visible;
+    }
 
     private static string Count(long value) => value > 0 ? value.ToString(CultureInfo.InvariantCulture) : "0";
 

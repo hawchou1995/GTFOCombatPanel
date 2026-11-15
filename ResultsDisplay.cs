@@ -363,7 +363,18 @@ internal static class ResultsDisplay
     // 过（`CompletionTargets.Ledger.Count == 0`，这次访问游戏根本没排 BlinkIn）时它才走，用尽
     // `ResultFinalPolicy.MaximumWaitFrames` 之后 fail-open 并把这一页记成 reveal-unobservable、而不是 settled。
     // 被观察到的 reveal 永远不由帧数放行——那正是这一轮要消灭的「先画再变」。
-    private static int _revealFirstFrame = -1;
+    // 1.19.43 F1-STALL: 无进展停滞改用真实秒（`RevealProgressClock`），任何新的原生事实都会重置它。
+    private static readonly RevealProgressClock RevealClock = new RevealProgressClock();
+    // The per-part completion reading is printed as one line per part, at most `CompletionPartReportLines` times per
+    // page, and only when the reading it would describe really changed: a live log has to say which part produced the
+    // band and from which reading, without printing anything per frame.
+    internal const int CompletionPartReportLines = 3;
+    private static string _completionPartSignature = string.Empty;
+    private static int _completionPartLines;
+    // The frame a failure page was first seen with no lower bound at all (`ResultFailureWallPolicy`); -1 while it has
+    // one. It belongs to the page, resets with it, and is only read to decide whether the bounded give-up has been
+    // reached - never to turn "not measured" into "measured".
+    private static int _failureWallFirstFrame = -1;
     // 1.19.21: whether a laid-out part counts as part of the section's final edge is decided by the part's own
     // state - present and laid out - and never by how far the native reveal has drawn. The switch the previous
     // builds kept here (`_finalIncludeLaidOut`) is gone with it: a part the reveal has not reached still knows
@@ -454,8 +465,13 @@ internal static class ResultsDisplay
         // The page's final geometry is a property of the page: the latch, whether the last frame could read it, how many
         // of the section's parts were still waiting to be drawn and the frame the wait started on all go with it.
         FinalLayout.Forget(); _finalMeasurable = false; _finalEverMeasurable = false; _finalUndrawn = 0; _finalFirstFrame = -1;
-        // The reveal-unobservable clock belongs to the page too: the next result screen waits through its own reveal.
-        _revealFirstFrame = -1;
+        // The reveal's stall clock belongs to the page too: the next result screen starts from zero progress.
+        RevealClock.Forget();
+        // The per-part completion diagnostic is a statement about this page's own parts: its signature and its line
+        // budget go with the page, so the next screen prints its own reading.
+        _completionPartSignature = string.Empty; _completionPartLines = 0;
+        // The failure page's own wall clock goes with the page as well: the next result screen waits through its own.
+        _failureWallFirstFrame = -1;
         // A different screen is a different fail-open decision: the refusal count and the fallback placement belong to
         // the page they were measured on. `Forced` deliberately survives it - it is the player's answer, given with F8,
         // and it lasts until the player takes it back.
@@ -486,7 +502,7 @@ internal static class ResultsDisplay
     // row ends where the deeper of the slot and the pixels really drawn under it ends (`Placed`), which is the caption
     // row the panel's top used to press on. The two callers pass the same latch, so the section's edge and the band
     // cannot disagree about which reveal state they describe.
-    private static float IconRowBottom(Component page, bool revealFinished)
+    private static float IconRowBottom(Component page, bool revealFinished, bool contentSettled)
     {
         try
         {
@@ -504,9 +520,42 @@ internal static class ResultsDisplay
             // parts' laid-out slots and nothing drawn (the recording's band walked 250 -> 292 only because the drawn
             // edge was mixed in there), and once it has finished it is the deeper of the slot and the pixels really
             // drawn under it - the caption row (`CompletionFinalBounds.Placed`).
-            return CompletionFinalBounds.Placed(parts, revealFinished, out _, out _);
+            return CompletionFinalBounds.Placed(parts, revealFinished, contentSettled, out _, out _);
         }
         catch { return float.NaN; }
+    }
+
+    // The per-part reading of the success page's completion section, as one log line.
+    //
+    // It is printed when the reading changes (a part switching on, the reveal finishing, the band moving) and at most
+    // `CompletionPartReportLines` times per page, so a live log carries the evidence without a per-frame line: which
+    // parts are present, switched on, scheduled, drawn, whether their content was completely enumerated, how many of
+    // their children are switched off, and which reading the band was taken from (`source=content` vs `container`).
+    // That is the line a future run needs to settle the 692-vs-417 question this build answers conservatively today.
+    private static void ReportCompletionParts(List<CompletionPart> parts, float completion, int deepest, bool contentSettled)
+    {
+        if (parts == null || parts.Count == 0) return;
+        string signature = (float.IsFinite(completion) ? completion.ToString("0") : "unmeasured")
+            + "#" + deepest + "#" + RevealFinished + "#" + _finalUndrawn;
+        if (signature == _completionPartSignature) return;
+        _completionPartSignature = signature;
+        if (_completionPartLines >= CompletionPartReportLines) return;
+        _completionPartLines++;
+        var text = new System.Text.StringBuilder(256);
+        for (int index = 0; index < parts.Count; index++)
+        {
+            string name = index < CompletionNames.Length ? CompletionNames[index] : "part" + index;
+            if (text.Length > 0) text.Append(" | ");
+            text.Append(CompletionFinalBounds.Describe(parts[index], name, RevealFinished, contentSettled));
+        }
+        Plugin.Logger?.LogInfo("[DIAG] success completion parts (" + _completionPartLines + " of at most "
+            + CompletionPartReportLines + " this page): " + text
+            + " ; band=" + (float.IsFinite(completion) ? completion.ToString("0") : "unmeasured")
+            + ", deepest=" + (deepest >= 0 && deepest < CompletionNames.Length ? CompletionNames[deepest] : "none")
+            + ", laidOut=" + _finalUndrawn + ", revealFinished=" + RevealFinished.ToString().ToLowerInvariant()
+            + "; source=content means every child of that part was enumerated, nothing under it is switched off and at "
+            + "least one child really drew, so the band uses the pixels it draws instead of a container rectangle that "
+            + "may reserve blank space.");
     }
 
     // The waiting-status block a client's success page draws where the host's button would be.
@@ -1045,7 +1094,7 @@ internal static class ResultsDisplay
                 // the last trusted icon row stands in for a frame in which the reveal has not drawn it yet.
                 // The fail-open band reads the same latch the placement does, so a page whose reveal finished gets the
                 // same section edge from both paths (`CompletionFinalBounds.Placed`).
-                float iconRow = IconRowBottom(page, RevealFinished);
+                float iconRow = IconRowBottom(page, RevealFinished, ContentSettled);
                 if (float.IsFinite(iconRow))
                 {
                     _iconRowBottom = iconRow;
@@ -1098,6 +1147,31 @@ internal static class ResultsDisplay
         LobbyButtonTop(page, out float pageButtonTop);
         ResultPageWalls walls = ResultPageLowerBoundPolicy.Resolve(GuestClient() && !succeeded, Screen.height,
             pageButtonTop, controls.PressableTop, footerText, footerTextSource);
+        // The failure page's own lower bound: any of the readings that really bound a board there. When none of them
+        // exists the page has shown no wall yet - not "no wall" - and the invented band is withheld (see
+        // `ResultFailureWallPolicy`) instead of being hung from the window's foot, which is how the recorded page drew a
+        // 1385-tall board where its button (1240) later appeared.
+        //
+        // F5: when that budget is finally spent and a band *is* answered without any measured lower bound, the line has
+        // to keep saying so (`wallUnobserved=true` below) - a successful fallback is not proof that the page has a wall.
+        bool wallUnproven = false;
+        int wallWait = 0;
+        if (!succeeded)
+        {
+            bool wallMeasured = float.IsFinite(walls.PressableTop) || float.IsFinite(walls.FooterTextTop)
+                || float.IsFinite(walls.PageFloor) || FailureWallObserved(pageButtonTop, controls.PressableTop, controls.FooterTop);
+            wallWait = FailureWallWaitFrames(wallMeasured);
+            wallUnproven = !wallMeasured;
+            if (ResultFailureWallPolicy.Waits(wallMeasured, wallWait))
+            {
+                why = ResultFailureWallPolicy.Unobserved + ": pressable=" + WallText(walls.PressableTop)
+                    + ",footerText=" + WallText(walls.FooterTextTop) + ",pageFloor=" + WallText(walls.PageFloor)
+                    + ",button=" + WallText(pageButtonTop) + ",controls=" + controls.Count + ",hidden=" + controls.Hidden
+                    + ",waited=" + wallWait + " of " + ResultFailureWallPolicy.UnobservedBudget + " frames"
+                    + "; two complete scans that found no pressable control are not a page with no wall, so the fail-open band is not invented from the window";
+                return false;
+            }
+        }
         // 客机失败页上那行字不进墙，也不进「量到的控件」这一路：`controls.FooterTop` 含它，`PressableTop` 不含。
         float measuredWall = walls.GuestFailure ? float.NaN : controls.FooterTop;
         if (!ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,
@@ -1126,7 +1200,8 @@ internal static class ResultsDisplay
             + ", footerTop=" + WallText(walls.PressableTop)
             + ", pageFloor=" + WallText(walls.PageFloor)
             + ", controls=" + controls.Count + ", hidden=" + controls.Hidden + ", unmeasurable=" + controls.Unmeasurable
-            + ", scanComplete=" + controls.Complete.ToString().ToLowerInvariant();
+            + ", scanComplete=" + controls.Complete.ToString().ToLowerInvariant()
+            + ResultFailureWallPolicy.AnswerNote(!wallUnproven, wallWait);
         return room > 0f;
     }
 
@@ -1601,15 +1676,16 @@ internal static class ResultsDisplay
         // Sixty refused frames are not evidence that a page has finished drawing its reveal, which is why the fail-open
         // budget is not what answers a success page whose reveal is still running.
         int finalWait = FinalWaitFrames();
-        int revealWait = RevealWaitFrames();
+        bool revealStalled = RevealStalled(out float stallSeconds, out float stallLimit);
         ResultSettlementGate.Decision settlement = ResultSettlementGate.Decide(Forced, succeeded, RevealFinished,
-            CompletionTargets.Ledger.RevealImpossible, CompletionTargets.Ledger.Count, revealWait,
-            _finalEverMeasurable, _finalMeasurable, FinalLayout.Ready, finalWait);
+            CompletionTargets.Ledger.RevealImpossible, CompletionTargets.Ledger.InFlight, CompletionTargets.Ledger.Count,
+            revealStalled, _finalEverMeasurable, _finalMeasurable, FinalLayout.Ready, finalWait);
         if (!settlement.MayFailOpen)
         {
             if (settlement.Why == ResultSettlementGate.Answer.RevealPending)
                 ReportHeldBack("prepare", "reveal-pending",
-                    ResultSettlementGate.Why(settlement.Why, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count, revealWait)
+                    ResultSettlementGate.Why(settlement.Why, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,
+                        CompletionTargets.Ledger.InFlight, stallSeconds, stallLimit)
                     + ",role=" + ResultPageRolePolicy.Name(Role()));
             else
                 ReportHeldBack("prepare", "final-geometry-pending",
@@ -1619,10 +1695,13 @@ internal static class ResultsDisplay
         }
         if (settlement.Unobservable && HeadingReports.Add("fail-open-reveal-unobservable"))
             Plugin.Logger?.LogWarning("[DIAG] settlement board: "
-                + ResultSettlementGate.Why(settlement.Why, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count, revealWait)
+                + ResultSettlementGate.Why(settlement.Why, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,
+                    CompletionTargets.Ledger.InFlight, stallSeconds, stallLimit)
                 + ", role=" + ResultPageRolePolicy.Name(Role())
                 + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
-                + "; this is the only claim made about this page: it is fail-open because no reveal was ever observed, not because anything settled, "
+                + "; this is the only claim made about this page: it is fail-open because the reveal made no progress for the whole "
+                + "stall bound (never observed, aborted with routines still running, or scheduled and simply never finishing), "
+                + "not because anything settled, "
                 + "and the board is measured again at the bounded cadence while every control the page measures is still stepped around.");
         if (settlement.Why == ResultSettlementGate.Answer.GivenUp && HeadingReports.Add("final-geometry-given-up"))
             Plugin.Logger?.LogWarning("[DIAG] settlement board: " + ResultFinalPolicy.WhyGivenUp(FinalLayout.Top, FinalLayout.Bottom, finalWait, _finalMeasurable)
@@ -1635,7 +1714,11 @@ internal static class ResultsDisplay
             // page; the floor ladder must not keep asking the same impossible question.
             _fallbackMisses = ResultPlacementPolicy.Spend(_fallbackMisses);
             bool pageReadable = !fallbackWhy.StartsWith(ResultFallbackPolicy.UnreadablePage, StringComparison.Ordinal);
-            ReportHeldBack("prepare", pageReadable ? "fallback-unavailable" : "fail-open-page-unreadable",
+            // A failure page whose own lower bound has not been observed yet is a third, separate fault: the scan was
+            // complete and the band was still not invented from the window (`ResultFailureWallPolicy`).
+            bool wallUnobserved = fallbackWhy.StartsWith(ResultFailureWallPolicy.Unobserved, StringComparison.Ordinal);
+            ReportHeldBack("prepare", wallUnobserved ? "fail-open-wall-unobserved"
+                    : pageReadable ? "fallback-unavailable" : "fail-open-page-unreadable",
                 fallbackWhy + ", misses=" + _fallbackMisses + ",floor=" + FallbackFloor().ToString("0") + "px");
             return;
         }
@@ -1685,22 +1768,72 @@ internal static class ResultsDisplay
         return Math.Max(0, Time.frameCount - _finalFirstFrame);
     }
 
-    // How many frames this page has been waiting on a reveal that was never observed at all.
+    // How many frames this failure page has shown no lower bound at all.
     //
-    // The clock only runs while the completion ledger is empty: a page whose reveal *is* being observed is never released by
-    // a frame count (`ResultSettlementGate`), so the one place a bound may release the fail-open path is a page the game
-    // handed no BlinkIn target at all this visit - no frame will ever complete that ledger, and the reveal-unobservable
-    // fail-open exists so that page is still drawn. The budget is `ResultFinalPolicy.MaximumWaitFrames`, the give-up this
-    // file already has; nothing new is counted, and the answer is logged as unobservable rather than as settled.
-    private static int RevealWaitFrames()
+    // `ResultFailureWallPolicy` withholds the invented band while this is zero-ish, and answers after
+    // `UnobservedBudget` - the same bounded give-up this file already uses (`ResultFinalPolicy.MaximumWaitFrames`), and
+    // the answer is logged as a wall that was never observed rather than as a settled page. A page that does hand over a
+    // bound clears the clock, so nothing is ever released early on account of a reading that has since arrived.
+    private static int FailureWallWaitFrames(bool wallMeasured)
     {
-        if (RevealFinished || CompletionTargets.Ledger.Count > 0)
+        if (wallMeasured)
         {
-            _revealFirstFrame = -1;
+            _failureWallFirstFrame = -1;
             return 0;
         }
-        if (_revealFirstFrame < 0) _revealFirstFrame = Time.frameCount;
-        return Math.Max(0, Time.frameCount - _revealFirstFrame);
+        if (_failureWallFirstFrame < 0) _failureWallFirstFrame = Time.frameCount;
+        return Math.Max(0, Time.frameCount - _failureWallFirstFrame);
+    }
+
+    // The page's own lower bound, from the readings each path actually has. One definition, so the strict path that
+    // *starts* the clock (F5) and the fail-open path that reads it cannot disagree about what "a wall was seen" means.
+    // A reading that is not finite is not a wall; a control the page has switched off is not one either (the scan
+    // records those as hidden, and `PressableTop`/`FooterTop` only carry controls that really answered).
+    private static bool FailureWallObserved(float namedButton, float scanPressable, float scanFooter)
+        => float.IsFinite(namedButton) || float.IsFinite(scanPressable) || float.IsFinite(scanFooter);
+
+    // How long this page's reveal has made no progress, in real seconds (F1-STALL), and whether that is the whole bound.
+    //
+    // Every call feeds the clock with the ledger's own facts - completed, in flight, scheduled - so *any* native movement
+    // (a routine starting, a routine finishing, a target entering the ledger) restarts it: a reveal that is really
+    // running is never released by time. The bound comes from the page's own blink duration (`CoroutineManager.
+    // BlinkDuration`), never from a frame count, so the answer is the same at 60 and at 134 FPS.
+    private static bool RevealStalled(out float stalledSeconds, out float limitSeconds)
+    {
+        var ledger = CompletionTargets.Ledger;
+        float now = Time.realtimeSinceStartup;
+        RevealClock.Observe(now, ledger.Completed, ledger.InFlight, ledger.Count);
+        limitSeconds = RevealProgressClock.LimitFor(BlinkSeconds());
+        stalledSeconds = RevealClock.StalledSeconds(now);
+        // A reveal the ledger has finished is not stalled; a page whose clock was never fed is not stalled either.
+        return !RevealFinished && RevealClock.Exhausted(now, limitSeconds);
+    }
+
+    // One blink's native length, from the game itself; a build that cannot answer it falls back to the clock's own
+    // documented assumption, so the bound never depends on a number this file invents.
+    private static float BlinkSeconds()
+    {
+        try { return CoroutineManager.BlinkDuration; } catch { return float.NaN; }
+    }
+
+    // F3: whether the measured content may already stand in for the section's final edge, before the native reveal
+    // finishes.
+    //
+    // Only when the ledger has itself proved that no reveal is coming: every target it was handed was proven
+    // unscheduled (so nothing will ever blink on this page), or the ledger can no longer read `Ready` and nothing of its
+    // own is still running. The page's own geometry latch must also have read the same twice (`FinalLayout.Ready`), so
+    // a frame taken while the page is still laying itself out cannot be used. A page whose reveal was never even
+    // observed (`Required == 0`) is deliberately **not** covered: nothing proves an animation will not start later, so
+    // the container stands and the per-part line says `source=container(reveal-running)`.
+    private static bool ContentSettled
+    {
+        get
+        {
+            var ledger = CompletionTargets.Ledger;
+            bool noRevealComing = (ledger.Required > 0 && ledger.Count == 0)
+                || (!ledger.MayStillComplete && ledger.Settled);
+            return noRevealComing && FinalLayout.Ready;
+        }
     }
 
     // One frame's answer about the page's own final geometry: whether it could be read now, and whether this page has
@@ -2098,6 +2231,12 @@ internal static class ResultsDisplay
             if (!FailureStrip(page, out top, out float failureBottom, out _, out bool failureButtonMeasured, out float failureButtonTop,
                 out float failureButtonHeight, out bool failureTitleSettled, out FooterControls failureControls, out bool failureNativeFooterVisible,
                 out ResultFooterSource failureFooterSource, out bool failureFootIsWall, out ResultsBand failureBand)) return false;
+            // F5 (independent review): the failure page's own wall clock starts on the first frame this page is *looked
+            // at*, not after the fail-open path has spent its sixty refusals - otherwise a page that never shows a lower
+            // bound waited 60 + 180 frames before the labelled give-up. The same predicate the fail-open path uses
+            // decides it here, and a page that hands over any bound clears the clock on that very frame.
+            FailureWallWaitFrames(FailureWallObserved(failureButtonMeasured ? failureButtonTop : float.NaN,
+                failureControls.PressableTop, failureControls.FooterTop));
             // 客机：完整扫描证明只约束主机；客机放行只看锚点布局可读 + 固定页面几何。
             if (!GuestClient() && !failureControls.Complete)
             {
@@ -2235,12 +2374,13 @@ internal static class ResultsDisplay
         // budget) answers at once, and F8 is the player's own answer and never waits (`ResultRevealGate`). The
         // per-repaint safety checks (`BoardStillSafe`, `HeldGridFits`) deliberately do not ask this question: a board
         // that is already standing is never taken away because the page's reveal moved on.
-        if (ResultRevealGate.BlocksPlacement(revealDone, CompletionTargets.Ledger.MayStillComplete, Forced))
+        if (ResultRevealGate.BlocksPlacement(revealDone, CompletionTargets.Ledger.MayStillComplete,
+                CompletionTargets.Ledger.InFlight, Forced))
         {
             if (HeadingReports.Add("success-reveal-pending"))
                 Plugin.Logger?.LogInfo("[DIAG] success board held back: "
                     + ResultRevealGate.Why(CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,
-                        CompletionTargets.Ledger.Names, CompletionTargets.Ledger.Artwork)
+                        CompletionTargets.Ledger.Names, CompletionTargets.Ledger.Artwork, CompletionTargets.Ledger.InFlight)
                     + ", completion=" + WallText(Completion.Edge)
                     + ", boardTop=" + (area.Fits ? area.Top.ToString("0") : "unmeasurable")
                     + ", role=" + ResultPageRolePolicy.Name(Role())
@@ -2248,6 +2388,23 @@ internal static class ResultsDisplay
                     + "; vanilla is retained, and the section is measured again on the frame the ledger completes.");
             return false;
         }
+
+        // The ledger answered "no further reveal can arrive" rather than "finished" (`RevealImpossible`: a routine that
+        // really ended without revealing its target, a target with no object, or a target count past the budget).
+        // Nothing is claimed about the page having settled: the section is placed from the slots the page laid out
+        // (`CompletionFinalBounds.Placed` with `revealFinished: false`), the drawn pixels stay out of the band, and the
+        // line says exactly that - once per page, because this is a state, not a frame. F1: this line can only print
+        // once nothing of the ledger's own is still running, because the gate above waits for that.
+        if (!revealDone && CompletionTargets.Ledger.RevealImpossible && CompletionTargets.Ledger.Settled
+            && HeadingReports.Add("success-reveal-released"))
+            Plugin.Logger?.LogWarning("[DIAG] success board released while the page's own reveal can no longer complete: "
+                + ResultRevealGate.WhyReleased(CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,
+                    CompletionTargets.Ledger.Aborted, CompletionTargets.Ledger.Unscheduled, CompletionTargets.Ledger.InFlight)
+                + ", completion=" + WallText(Completion.Edge)
+                + ", boardTop=" + (area.Fits ? area.Top.ToString("0") : "unmeasurable")
+                + ", role=" + ResultPageRolePolicy.Name(Role())
+                + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
+                + "; vanilla was retained for the frames the reveal was still legible, and the board is placed from the layout edge alone.");
         // The completion settle gate is fed for the drawn-pixel route's diagnostics and counters only: the layout edge
         // above has already satisfied the placement for this frame, and the gate cannot hold it back any more.
         Completion.Observe(Time.frameCount, true, area.Top);
@@ -2449,7 +2606,10 @@ internal static class ResultsDisplay
         var evidence = new CompletionEvidence(ledger.Artwork > 0, ledger.NamesReady,
             ledger.Artwork > 0, ledger.ArtworkReady, ledger.Artwork > 0);
         bool ready = Readiness.Observe(evidence);
-        string state = $"completed={ledger.Completed}/{ledger.Count}, names={ledger.Names}, artwork={ledger.Artwork}, ready={ready}";
+        // `required` and `unscheduled` are the ledger's own account of what it was handed versus what the page's native
+        // reveal really took over, and `aborted` counts routines that ended without revealing: without them a page whose
+        // reveal can no longer finish looks exactly like one that is merely slow.
+        string state = $"completed={ledger.Completed}/{ledger.Count}, names={ledger.Names}, artwork={ledger.Artwork}, required={ledger.Required}, unscheduled={ledger.Unscheduled}, aborted={ledger.Aborted}, ready={ready}";
         if (state != _completionState)
         {
             _completionState = state;
@@ -2515,11 +2675,18 @@ internal static class ResultsDisplay
             // and the drawn depth stays out of the band entirely: however far the reveal has come, the strip does
             // not move - which is the whole of the defect this answers.
             // 1.19.41: the section's edge is the parts' laid-out slots while the page's own reveal is still running, and
-            // the deeper of that slot and the pixels really drawn under it once the reveal has finished
-            // (`CompletionFinalBounds.Placed` -> `Bound`). A padded container can end above the captions its partition
-            // icon draws, and a board hung from the container was this panel's own top edge pressing on the native
-            // sector icons and their 主要/精英 captions. Before the reveal finishes the old reading stands unchanged.
-            completion = CompletionFinalBounds.Placed(parts, RevealFinished, out int finalDeepest, out _finalUndrawn);
+            // once it has finished every part contributes the pixels it really draws when those are a *complete*
+            // measurement of it, its container rectangle otherwise (`CompletionFinalBounds.Placed` -> `FinalEdge`).
+            // That answers both directions: a container that ends above the captions its icon draws no longer presses
+            // the board on them, and a container that reserves a large blank slot below everything it draws no longer
+            // shortens the strip for a board the player reported as too small. Before the reveal finishes the old
+            // reading stands unchanged.
+            // F3: `ContentSettled` decides whether the content reading may already be the band on a page whose ledger
+            // cannot answer (every target unscheduled, or an aborted one and nothing still running) *and* whose geometry
+            // has read the same twice. Otherwise the container stands, exactly as before.
+            bool contentSettled = ContentSettled;
+            completion = CompletionFinalBounds.Placed(parts, RevealFinished, contentSettled, out int finalDeepest, out _finalUndrawn);
+            ReportCompletionParts(parts, completion, finalDeepest, contentSettled);
             drawnEdge = CompletionBounds.Deepest(parts, out int drawnDeepest); // diagnostics only
             int named = float.IsFinite(completion) ? finalDeepest : drawnDeepest;
             completionSource = named >= 0 && named < CompletionNames.Length ? CompletionNames[named] : "none";
@@ -2662,7 +2829,7 @@ internal static class ResultsDisplay
         // The board hangs from the top edge, so a taller band is a taller table and never a table further down; the
         // measured free band under the page's actions (1.19.16) is left exactly as it was measured, because its own two
         // edges are the whole contract.
-        float iconRow = IconRowBottom(success, RevealFinished);
+        float iconRow = IconRowBottom(success, RevealFinished, ContentSettled);
         if (float.IsFinite(iconRow)) _iconRowBottom = iconRow;
         float waitingText = FooterTextTop(success, out ResultBoundSource waitingTextSource);
         float bandAnchor = float.IsFinite(iconRow) ? iconRow : _iconRowBottom;
@@ -2797,35 +2964,71 @@ internal static class ResultsDisplay
         float alpha = ControlAlpha(element);
         float own = TryScreenRect(element, out LayoutRect rect) ? rect.Bottom : float.NaN;
         float visual = float.NaN;
+        // Completeness of the content reading (F2). Three counts, and the part is only "complete" when all three agree
+        // with the pixels on the screen:
+        //   * `drawn`      visible candidates whose rectangle really answered;
+        //   * `unmeasured` visible candidates that could not be projected this frame - the part must keep its container
+        //                  until they can, or the band would be taken from a shallower reading than the screen shows;
+        //   * `hidden`     children that draw nothing (switched off, disabled, faded): not candidates, but they still
+        //                  keep the container, because one of them may be switched on later.
+        bool measured = false;
+        int hidden = 0, unmeasured = 0, drawn = 0;
         try
         {
             var renderers = element.GetComponentsInChildren<Renderer>(true);
             if (renderers != null)
                 foreach (Renderer child in renderers)
                 {
-                    if (child == null || !child.enabled) continue;
-                    if (!child.gameObject.activeInHierarchy) continue;
-                    if (TryScreenRect(child, out LayoutRect nested)) visual = ResultsRegion.LowestBottom(nested.Bottom, visual);
+                    CompletionCandidateKind kind = CompletionCandidatePolicy.Classify(child != null,
+                        child != null && child.gameObject.activeInHierarchy, child != null && child.enabled,
+                        child != null ? ControlAlpha(child) : float.NaN);
+                    if (kind == CompletionCandidateKind.Missing) continue;
+                    if (kind == CompletionCandidateKind.Hidden) { hidden++; continue; }
+                    if (TryScreenRect(child, out LayoutRect nested)) { visual = ResultsRegion.LowestBottom(nested.Bottom, visual); drawn++; }
+                    else unmeasured++;
                 }
-            // TextMeshPro is measured in its own right, because the renderer route above misses half of it: a
-            // world-space text carries a MeshRenderer (and its bounds are the generated glyph quads, so that route
-            // already answers for it), while a `TextMeshProUGUI` carries a `CanvasRenderer` instead - and a
-            // CanvasRenderer has no bounds at all. An element whose 主要/精英 caption is a UI text therefore used to
-            // contribute only its padded container rectangle, and the caption's own pixels never entered the
-            // measurement. `TryTextRect` reads the text's own laid-out extent for both flavours, and the deepest one
-            // joins the same figure. Only text that is switched on is read: a caption inside a slot the page has not
-            // revealed yet is not part of what the player sees.
+            // A visible `Graphic` - an `Image`, a `RawImage`, a `TextMeshProUGUI` - carries a `CanvasRenderer`, which is
+            // not a `Renderer` at all: the route above cannot see it, and skipping it is how a part could report
+            // `complete` while a picture or a caption under it was never measured. Each visible graphic is measured in
+            // its own right, and one that cannot be projected makes the part incomplete rather than invisible.
+            var graphics = element.GetComponentsInChildren<Graphic>(true);
+            if (graphics != null)
+                foreach (Graphic graphic in graphics)
+                {
+                    CompletionCandidateKind kind = CompletionCandidatePolicy.Classify(graphic != null,
+                        graphic != null && graphic.gameObject.activeInHierarchy, graphic != null && graphic.enabled,
+                        graphic != null && float.IsFinite(graphic.color.a) ? graphic.color.a : float.NaN);
+                    if (kind == CompletionCandidateKind.Missing) continue;
+                    if (kind == CompletionCandidateKind.Hidden) { hidden++; continue; }
+                    // A `TextMeshProUGUI` has no renderer bounds but does have a laid-out text extent; the text route
+                    // below reads it, and this route only needs to know the graphic is accounted for.
+                    if (graphic is TMP_Text) { drawn++; continue; }
+                    if (TryScreenRect(graphic, out LayoutRect picture)) { visual = ResultsRegion.LowestBottom(picture.Bottom, visual); drawn++; }
+                    else unmeasured++;
+                }
+            // TextMeshPro is measured in its own right, because the renderer route misses half of it: a world-space text
+            // carries a MeshRenderer (and its bounds are the generated glyph quads, so that route already answers for
+            // it), while a `TextMeshProUGUI` carries a `CanvasRenderer` instead - and a CanvasRenderer has no bounds at
+            // all. `TryTextRect` reads the text's own laid-out extent for both flavours, and the deepest one joins the
+            // same figure. Only text that is switched on is read: a caption inside a slot the page has not revealed yet
+            // is not part of what the player sees - and while one is switched off the part is not *completely* measured,
+            // so the band cannot be tightened past it.
             var texts = element.GetComponentsInChildren<TMP_Text>(true);
             if (texts != null)
                 foreach (TMP_Text text in texts)
                 {
-                    if (text == null) continue;
-                    if (!text.gameObject.activeInHierarchy) continue;
-                    if (TryTextRect(text, out LayoutRect drawn)) visual = ResultsRegion.LowestBottom(drawn.Bottom, visual);
+                    CompletionCandidateKind kind = CompletionCandidatePolicy.Classify(text != null,
+                        text != null && text.gameObject.activeInHierarchy, text != null && text.enabled,
+                        text != null ? ControlAlpha(text) : float.NaN);
+                    if (kind == CompletionCandidateKind.Missing) continue;
+                    if (kind == CompletionCandidateKind.Hidden) { hidden++; continue; }
+                    if (TryTextRect(text, out LayoutRect caption)) { visual = ResultsRegion.LowestBottom(caption.Bottom, visual); drawn++; }
+                    else unmeasured++;
                 }
+            measured = true;
         }
-        catch { }
-        return new CompletionPart(true, active, alpha, own, visual, scheduled);
+        catch { measured = false; }
+        return new CompletionPart(true, active, alpha, own, visual, scheduled, measured, hidden, unmeasured, drawn);
     }
     private static CompletionPart Read(GameObject host) => host == null ? CompletionPart.Missing : Read(host.transform);
     private static float Top(Component element) => TryScreenRect(element, out LayoutRect rect) ? rect.Y : float.NaN;

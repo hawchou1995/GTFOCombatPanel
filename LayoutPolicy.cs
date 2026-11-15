@@ -795,11 +795,26 @@ public readonly struct CompletionPart
     public readonly float Alpha;
     public readonly float OwnBottom;
     public readonly float VisualBottom;
+    // Whether the child enumeration that produced `VisualBottom` really ran to the end, and how many children were
+    // skipped because they are switched off or faded out. A part whose enumeration failed, or that has a hidden child,
+    // is *not* completely measured: the band keeps its container rectangle instead of trusting the pixels it happens to
+    // draw right now (`CompletionFinalBounds.ContentComplete`).
+    public readonly bool Measured;
+    public readonly int Hidden;
+    // Visible candidates whose rectangle could *not* be measured this frame, and visible candidates that really drew.
+    // F2 (independent review): one successful child used to make the whole part "complete", so a visible Image/Graphic
+    // that could not be projected - or a whole category the reader never enumerated (a `Graphic` carries a
+    // `CanvasRenderer`, not a `Renderer`) - was silently left out and the band could be taken from a shallower reading
+    // than what is on the screen. A part is complete only when every visible candidate answered and at least one drew.
+    public readonly int Unmeasured;
+    public readonly int Drawn;
 
-    public CompletionPart(bool present, bool active, float alpha, float ownBottom, float visualBottom, bool scheduled = false)
+    public CompletionPart(bool present, bool active, float alpha, float ownBottom, float visualBottom, bool scheduled = false,
+        bool measured = true, int hidden = 0, int unmeasured = 0, int drawn = 1)
     {
         Present = present; Active = active; Scheduled = scheduled; Alpha = alpha;
-        OwnBottom = ownBottom; VisualBottom = visualBottom;
+        OwnBottom = ownBottom; VisualBottom = visualBottom; Measured = measured; Hidden = hidden;
+        Unmeasured = unmeasured; Drawn = drawn;
     }
 
     // An element this build does not have on the page at all.
@@ -813,6 +828,33 @@ public readonly struct CompletionPart
 // reached, a part whose canvas group is still at zero alpha, a part that hands over a padded rectangle but
 // draws nothing inside it. Each of those used to add height to the "completion section" and pushed the table
 // away from the section the player is looking at - the empty band reported under the sector name and icons.
+// Whether one child of a completion part is a candidate the content measurement has to cover.
+//
+// F2 (independent review): the reader used to skip a child it could not project and still call the part measured, and a
+// `Graphic` (an `Image`, a `RawImage`, a `TextMeshProUGUI`) carries a `CanvasRenderer` rather than a `Renderer`, so a
+// whole category of visible pixels could be missing from `VisualBottom` while `ContentComplete` said yes. This policy is
+// the one place that decides what a candidate is, so the reader and the band cannot disagree:
+//
+//   * a component that is not there, or a child that is switched off / disabled / faded out, is **not** a candidate: it
+//     draws nothing the player can see, and treating it as a real control would either inflate the part (it contributes
+//     no pixels) or - if it were counted as an error - refuse the content reading for ever;
+//   * every other child is a candidate: if it cannot be projected, the part is *not* completely measured and the band
+//     keeps the container rectangle until it can be (`CompletionPart.Unmeasured`).
+public enum CompletionCandidateKind { Missing = 0, Hidden = 1, Visible = 2 }
+
+public static class CompletionCandidatePolicy
+{
+    public const float VisibleAlpha = CompletionBounds.VisibleAlpha;
+
+    public static CompletionCandidateKind Classify(bool present, bool activeInHierarchy, bool enabled, float alpha)
+    {
+        if (!present) return CompletionCandidateKind.Missing;
+        if (!activeInHierarchy || !enabled) return CompletionCandidateKind.Hidden;
+        if (float.IsFinite(alpha) && alpha <= VisibleAlpha) return CompletionCandidateKind.Hidden;
+        return CompletionCandidateKind.Visible;
+    }
+}
+
 public static class CompletionBounds
 {
     // The same floor `ResultsButtonPolicy` uses: what the page has faded to nothing is not part of the frame

@@ -755,8 +755,11 @@ internal static class ResultsPageScenarios
               && pageBandAt > 0 && inventedAt > pageBandAt
               && results.Contains("why = ResultFallbackPolicy.UnreadablePage +"),
             "the escape's own scan is asked before it invents a band from the window, and its refusal names that fault");
-        check(results.Contains("ReportHeldBack(\"prepare\", pageReadable ? \"fallback-unavailable\" : \"fail-open-page-unreadable\","),
-            "the refusal is reported through the once-per-page helper, under its own reason, so it cannot flood a live log");
+        // 1.19.43: the same helper now carries a third reason - a failure page whose own lower bound has not been
+        // observed yet - so the assertion names the helper and all three reasons instead of one string.
+        check(results.Contains("ReportHeldBack(\"prepare\", wallUnobserved ? \"fail-open-wall-unobserved\"")
+              && results.Contains(": pageReadable ? \"fallback-unavailable\" : \"fail-open-page-unreadable\","),
+            "the refusal is reported through the once-per-page helper, under its own reason (including the failure page's unobserved wall), so it cannot flood a live log");
         check(!results.Contains("_failureInventoryKnown"),
             "no cached copy of that fact exists beside the scan: the escape reads it where it measures it, so no caller order can bypass it");
         // Why the final-geometry gate could never have been the answer here: the page's "ever measured" latch is only

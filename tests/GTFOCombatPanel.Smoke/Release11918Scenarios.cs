@@ -428,9 +428,9 @@ internal static class Release11918Scenarios
         check(results.Contains("private static void ReportBand(string where, ResultsBand band"),
             "the band reports itself once per page, with both edges and the fact that produced each");
         // 1.19.41: the fail-open band passes the same reveal latch the strict placement does, so both paths measure the
-        // row from the same reading (`CompletionFinalBounds.Placed`).
-        check(results.Contains("IconRowBottom(page, RevealFinished)") && results.Contains("FooterTextTop(page, out"),
-            "the fail-open placement measures the icon row and the waiting block through the same two helpers, and reads the row against the same reveal state the strict placement used");
+        // row from the same reading (`CompletionFinalBounds.Placed`); 1.19.43 adds the F3 settled flag to the same call.
+        check(results.Contains("IconRowBottom(page, RevealFinished, ContentSettled)") && results.Contains("FooterTextTop(page, out"),
+            "the fail-open placement measures the icon row and the waiting block through the same two helpers, and reads the row against the same reveal state and settled flag the strict placement used");
         // The waiting block is a world-space TextMeshPro, measured through the menu camera like the icons.
         check(results.Contains("GetComponentsInChildren<TextMeshPro>(true)"),
             "the client's waiting block is measured as the TextMeshPro it is");

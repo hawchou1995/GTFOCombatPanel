@@ -613,8 +613,8 @@ internal static class AnchorAndFinalGeometryScenarios
 
         check(ladder.Contains("public static AnchorCameraChoice Select(") && final.Contains("public sealed class ResultFinalGate"),
             "the two policies this round adds are their own files, so both can be asserted without Unity");
-        check(info.Contains("Version = \"1.19.38\""),
-            "the version carrier says 1.19.38: the round that closes the survival log's revive/mine/supply/page-active diagnostics and the bounded squad probe, with the anchor contract asserted above unchanged");
+        check(info.Contains("Version = \"1.19.39\""),
+            "the version carrier says 1.19.39: the settlement board is sized by what the page really draws, with the anchor contract asserted above unchanged");
 
         // 1.19.20's own increment, untouched: the split kill tiers and the drawable floor.
         check(board.Contains("public static bool SplitKillTiersFor(float room, float emPerGlyph)") && board.Contains("private static int GlyphFor("),
@@ -648,10 +648,11 @@ internal static class AnchorAndFinalGeometryScenarios
         int revealAsked = display.IndexOf("bool revealDone = CompletionReady(page);", StringComparison.Ordinal);
         int sectionMeasured = display.IndexOf("bool completionMeasured = SuccessRegion(page, out ResultsSafeArea area", StringComparison.Ordinal);
         check(revealAsked >= 0 && sectionMeasured > revealAsked
-            && display.Contains("ResultRevealGate.BlocksPlacement(revealDone, CompletionTargets.Ledger.MayStillComplete, Forced)")
+            && display.Contains("ResultRevealGate.BlocksPlacement(revealDone, CompletionTargets.Ledger.MayStillComplete,")
+            && display.Contains("CompletionTargets.Ledger.InFlight, Forced)")
             && !display.Contains("bool revealReady = CompletionReady(page);")
             && !display.Contains("ReportHeldBack(\"success-anchor\", \"completion-not-ready\""),
-            "1.19.41: the success placement asks the native reveal before it measures the section, so the frame the ledger completes is the frame the section is measured as final; the gate is a policy call with an explicit escape, not a frame count and not an alpha test");
+            "1.19.41: the success placement asks the native reveal before it measures the section, so the frame the ledger completes is the frame the section is measured as final; 1.19.43 adds the in-flight count (F1), so one aborted target cannot release the board while the rest of the reveal still runs; the gate is a policy call with an explicit escape, not a frame count and not an alpha test");
         check(display.Contains("NoteFinalGeometry(completionMeasured && area.Fits);")
               && display.Contains("if (area.Fits) FinalLayout.Observe(area.Top, area.Bottom);"),
             "that strip is what the final-geometry latch is fed, once per measurement");
@@ -659,9 +660,9 @@ internal static class AnchorAndFinalGeometryScenarios
               && display.Contains("if (measurable) _finalEverMeasurable = true;")
               && display.Contains("if (!_finalEverMeasurable || FinalLayout.Ready)"),
             "the latch remembers that this page measured once, and the wait clock follows the latch rather than one frame");
-        check(display.Contains("CompletionFinalBounds.Placed(parts, RevealFinished, out int finalDeepest, out _finalUndrawn)")
+        check(display.Contains("CompletionFinalBounds.Placed(parts, RevealFinished, contentSettled, out int finalDeepest, out _finalUndrawn)")
               && !display.Contains("CompletionFinalBounds.Bound(finalParts"),
-            "1.19.41: the success page's strip is the parts' own layout slots while the native reveal runs, and the deeper of that slot and the pixels really drawn under it once the reveal has finished (`CompletionFinalBounds.Placed` -> `Bound`) - the container's own edge alone was what let the panel's top press on the sector icons and their captions");
+            "1.19.41: the success page's strip is the parts' own layout slots while the native reveal runs, and once it has finished (or the ledger has proved no reveal is coming, F3) the pixels each part really draws (`CompletionFinalBounds.Placed` -> `FinalEdge`) - the container's own edge alone was what let the panel's top press on the sector icons and their captions");
         check(display.Contains(", final edge") && display.Contains("laidOutParts="),
             "and the region line names the part it measured and how many parts are still only laid out");
         // 1.19.42: the fail-open decision is one policy call (`ResultSettlementGate`), which asks the page's own reveal
@@ -669,8 +670,9 @@ internal static class AnchorAndFinalGeometryScenarios
         int gate = display.IndexOf("ResultSettlementGate.Decision settlement = ResultSettlementGate.Decide(Forced, succeeded, RevealFinished,", StringComparison.Ordinal);
         int fallback = display.IndexOf("if (!FallbackPlacement(page, succeeded, out _, out room, out strip, out string fallbackWhy))", StringComparison.Ordinal);
         check(gate >= 0 && fallback > gate
-              && display.Contains("ResultSettlementGate.Why(settlement.Why, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count, revealWait)"),
-            "the fail-open path asks the settlement gate - the reveal's ledger and the final-geometry latch in one call - before it answers, and both a withheld frame and an unobservable one are explained in the log rather than silently drawn");
+              && display.Contains("ResultSettlementGate.Why(settlement.Why, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,")
+              && display.Contains("CompletionTargets.Ledger.InFlight, stallSeconds, stallLimit)"),
+            "the fail-open path asks the settlement gate - the reveal's ledger (with its in-flight count, F1, and its stall clock, F1-STALL) and the final-geometry latch in one call - before it answers, and both a withheld frame and an unobservable one are explained in the log rather than silently drawn");
         check(display.Contains("ResultFinalPolicy.WhyWaiting(") && display.Contains("\"final-geometry-pending\"")
               && display.Contains("settlement.Why == ResultSettlementGate.Answer.GivenUp") && display.Contains("ResultFinalPolicy.WhyGivenUp("),
             "a waiting frame and a given-up frame are both explained in the log, neither pretends to be the other, and the given-up line is now chosen by the settlement gate's own answer rather than by a second, independent call to the policy");

@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Collections.Generic;
 using BepInEx.Configuration;
 using Player;
@@ -46,6 +47,10 @@ internal static class CombatSync
     // rest, so a lobby where every peer was on an older build read as though only one of them was.
     private static readonly HashSet<ulong> Mismatched = new HashSet<ulong>();
     private static readonly HashSet<string> ReportedSync = new HashSet<string>();
+    // Per-packet diagnostics are bounded per peer and per kind of packet (`SyncLogPolicy`): the recorded survival
+    // session spent 243 of this mod's 634 lines on three shapes that repeat every couple of seconds for the whole
+    // expedition (supply kinds 161, row 49, snapshot 33). Nothing about the wire changes; only the rate it is spoken at.
+    private static readonly SyncLogPolicy Packets = new SyncLogPolicy();
     private static eGameStateName _lastState = eGameStateName.Lobby;
     // The level clock for the inbound diagnostic, and the two once-per-level lines it guards. A squad that
     // exchanges nothing looks identical, from either screen, to a build that cannot exchange anything, so
@@ -117,7 +122,9 @@ internal static class CombatSync
         _armed = true;
         try
         {
-            Exchange.Report = Line;
+            // `Exchange.Report` is an `Action<string>`; the per-packet policy needs the bool `Line` returns, so the
+            // exchange's own lines keep their existing exactly-once behaviour through a discard wrapper.
+            Exchange.Report = text => { Line(text); };
             SquadNet.OnHello = OnHello;
             SquadNet.OnSnapshot = OnSnapshot;
             SquadNet.OnProtocolMismatch = OnProtocolMismatch;
@@ -283,6 +290,7 @@ internal static class CombatSync
     // previous run and must go, and the run counter moves so that a straggler from the old run is refused.
     internal static void ResetExpedition()
     {
+        FlushPacketSummary("expedition reset");
         Heard.Clear(); SentTo.Clear(); Confirmed.Clear(); Mismatched.Clear(); ReportedSync.Clear();
         // The level clock and its two latches describe the expedition that just ended, so they go with the
         // evidence: the next level starts its own clock whether or not a lobby and a generation ran between.
@@ -333,6 +341,9 @@ internal static class CombatSync
                 _lastState = state;
                 if (state == eGameStateName.Lobby || state == eGameStateName.NoLobby)
                 {
+                    // The lobby that just ended owns the packet lines printed inside it, so its counts are said here,
+                    // before the peers and their states are dropped with the rest of that lobby's evidence.
+                    FlushPacketSummary("new lobby");
                     Heard.Clear(); SentTo.Clear(); Confirmed.Clear();
                     // Which transport each peer answered on described the lobby that just ended, so every peer is
                     // back to "unknown" and the next packet goes out both ways until it answers again.
@@ -476,11 +487,19 @@ internal static class CombatSync
         {
             SquadDecision decision = Exchange.OnSnapshot(sender, generation, snapshot, Now);
             if (decision.Accepted) Note(sender);
-            Line($"[DIAG] squad sync row: accepted={decision.Accepted}; peer={sender}; owner={snapshot.Owner}; peerGeneration={generation}; localGeneration={Exchange.Generation};");
+            // One line per peer, per owner and per state, not one per packet (`SyncLogPolicy`). N3: the row's *owner* is
+            // the line's own object key, never part of the state - the state is normalised (digits collapse, because a
+            // reason quotes generations and packet counts), so an identity kept there would fold four players behind one
+            // peer into one line. With the owner as the object, the first row of a second player keeps its own line.
+            PacketLine("row", sender, ObjectKey(snapshot.Owner), decision.Accepted + ";" + decision.Reason, !decision.Accepted,
+                $"[DIAG] squad sync row: accepted={decision.Accepted}; peer={sender}; owner={snapshot.Owner}; peerGeneration={generation}; localGeneration={Exchange.Generation};");
         }
         catch (Exception error)
         {
-            Plugin.Logger.LogWarning("squad sync snapshot could not be applied: " + error.Message);
+            // N4: an exception that repeats for every packet used to print itself per packet. First occurrence always
+            // prints, then every doubling of the count, and the total is in the packet summary as well.
+            if (Packets.Error("row", error.Message, out int occurrences))
+                Plugin.Logger.LogWarning("squad sync snapshot could not be applied (" + occurrences + " time(s) so far): " + Short(error.Message));
         }
     }
 
@@ -494,13 +513,19 @@ internal static class CombatSync
         {
             SquadDecision decision = Exchange.OnSupplyKinds(sender, generation, kinds, Now);
             if (decision.Accepted) Note(sender);
-            Line($"[DIAG] squad sync supply kinds: accepted={decision.Accepted}; peer={sender}; owner={kinds.Owner}; total={kinds.Total}; "
-                + $"ammo={kinds.Ammo}; tool={kinds.Tool}; medical={kinds.Medical}; reason={decision.Reason}; peerGeneration={generation}; "
-                + $"localGeneration={Exchange.Generation};");
+            // The pack's own split is not a per-packet event: one line per peer, per owner and per state, the counts in
+            // it, and a counted-then-summarised repeat (`SyncLogPolicy`). N3: the pack's owner is the object key, not
+            // part of the normalised state, so the first split of a second player behind the same peer keeps its own
+            // line. Totals, counters and the reason are unchanged.
+            PacketLine("supply kinds", sender, ObjectKey(kinds.Owner), decision.Accepted + ";" + decision.Reason, !decision.Accepted,
+                $"[DIAG] squad sync supply kinds: accepted={decision.Accepted}; peer={sender}; owner={kinds.Owner}; total={kinds.Total}; "
+                    + $"ammo={kinds.Ammo}; tool={kinds.Tool}; medical={kinds.Medical}; reason={decision.Reason}; peerGeneration={generation}; "
+                    + $"localGeneration={Exchange.Generation};");
         }
         catch (Exception error)
         {
-            Plugin.Logger.LogWarning("squad sync supply kinds could not be applied: " + error.Message);
+            if (Packets.Error("supply kinds", error.Message, out int occurrences))
+                Plugin.Logger.LogWarning("squad sync supply kinds could not be applied (" + occurrences + " time(s) so far): " + Short(error.Message));
         }
     }
 
@@ -605,10 +630,50 @@ internal static class CombatSync
         return LevelPhase.Outside;
     }
 
-    private static void Line(string text)
+    // Answers whether the line really reached the log: `false` when this session's own exact-text set already holds it
+    // or its 256-line cap is spent. N2: the per-packet policy counts a line only after this answer is `true`.
+    private static bool Line(string text)
     {
-        if (ReportedSync.Count >= 256 || !ReportedSync.Add(text)) return;
+        if (ReportedSync.Count >= 256 || !ReportedSync.Add(text)) return false;
         try { Plugin.Logger.LogInfo(text); }
+        catch (Exception error) { if (!_loggedSendError) { _loggedSendError = true; Plugin.Logger?.LogWarning("a squad diagnostic line could not be written: " + error.Message); } }
+        return true;
+    }
+
+    // One per-packet diagnostic, decided by `SyncLogPolicy` and counted only when it was really written (N2).
+    //
+    // `objectKey` is the identity the line is about (the row's owner, the pack's owner) and `state` is what it says about
+    // that object (accepted or refused, and the reason). The two are kept apart (`N3`): the policy normalises `state` -
+    // digits collapse, because a reason quotes generations and packet counts - and folding an identity into that would
+    // merge every player behind one peer into a single line. `Reserve` gives the policy's answer, `Line` says whether the
+    // log accepted the text, and only then is the line committed: the summary can never claim a line this session's own
+    // dedupe or cap dropped.
+    private static void PacketLine(string kind, ulong peer, string objectKey, string state, bool anomaly, string text)
+    {
+        SyncLogPolicy.Ticket ticket = Packets.Reserve(kind, peer, objectKey, state, anomaly);
+        if (!ticket.Valid) return;
+        if (Line(text)) Packets.Commit(ticket);
+        else Packets.Cancel(ticket);
+    }
+
+    // The stable, un-normalised identity a line is about. Decimal and invariant, because this is a key rather than a
+    // number a reader compares: two owners that differ at all are two objects, whatever the surrounding culture is.
+    private static string ObjectKey(ulong owner) => "owner:" + owner.ToString(CultureInfo.InvariantCulture);
+
+    // An exception message in the few words a log line can afford, with its variable parts collapsed: two failures of the
+    // same kind read the same even when the text they carry has changed (`N4`).
+    private static string Short(string message)
+        => SyncLogPolicy.Normalize(message ?? string.Empty);
+
+    // What the per-packet throttle held back, as one line, and the state that produced it dropped with the run it
+    // belonged to. The totals stay recomputable from the log alone: every suppressed line is one counted packet, and
+    // this line is where the count is spent rather than a packet that never arrived.
+    private static void FlushPacketSummary(string where)
+    {
+        string summary = Packets.Summary();
+        Packets.Reset();
+        if (string.IsNullOrEmpty(summary)) return;
+        try { Plugin.Logger.LogInfo("[DIAG] squad sync packet log summary (" + where + "): " + summary + "; each suppressed line is one packet of this build's protocol, so packet counts are unchanged."); }
         catch (Exception error) { if (!_loggedSendError) { _loggedSendError = true; Plugin.Logger?.LogWarning("a squad diagnostic line could not be written: " + error.Message); } }
     }
 

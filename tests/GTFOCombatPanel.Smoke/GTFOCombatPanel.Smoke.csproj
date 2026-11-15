@@ -39,6 +39,7 @@
     <Compile Include="..\..\OverlayPolicy.cs" Link="OverlayPolicy.cs" />
     <Compile Include="..\..\ResultVisibility.cs" Link="ResultVisibility.cs" />
     <Compile Include="..\..\BlinkCompletionLedger.cs" Link="BlinkCompletionLedger.cs" />
+    <Compile Include="..\..\SyncLogPolicy.cs" Link="SyncLogPolicy.cs" />
     <Compile Include="..\..\ReloadGate.cs" Link="ReloadGate.cs" />
     <Compile Include="..\..\SquadExchange.cs" Link="SquadExchange.cs" />
     <Compile Include="..\..\ReviveAttributionLedger.cs" Link="ReviveAttributionLedger.cs" />

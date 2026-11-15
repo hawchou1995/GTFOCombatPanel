@@ -1916,6 +1916,16 @@ internal static partial class Program
         //      container and the captions it really draws once the reveal has finished ---------------------------
         Console.WriteLine("---- settlement placement gates: page actions, native reveal ledger, drawn caption edge ----");
         ResultSettlementPlacementScenarios.RunInto(Check);
+        // ---- reveal that could never finish / gear name the wire cut / packet lines that repeated -----------
+        // A ledger that was handed targets but where one received no routine at all, or a routine that really ended
+        // without revealing its target, kept `MayStillComplete` true for the whole visit: only F8 could answer. The
+        // wire's 24-byte gear name can cut a markup tag and leave `Long Gun<` on a table that draws rich text off, and
+        // three per-packet diagnostics were 243 of this mod's 634 lines in the recorded session.
+        Console.WriteLine("---- reveal permanent wait, gear name residue, packet log bound ----");
+        RevealNameAndLogPolicyScenarios.RunInto(Check);
+        // ---- measured content edge / failure wall unobserved / schedule window order -------------------------
+        Console.WriteLine("---- measured completion content, failure wall not invented, schedule window order ----");
+        MeasuredContentAndWallScenarios.RunInto(Check);
         // ---- EWC accuracy: its cumulative totals, never its deltas --------------------------------
         // EWC announces a shot when the weapon fires and a hit when the pellet lands, in two separate
         // updates; the second one carries hits with a count of zero. Reading each update as one complete

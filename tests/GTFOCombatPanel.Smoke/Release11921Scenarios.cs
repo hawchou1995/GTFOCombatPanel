@@ -374,11 +374,11 @@ internal static class Release11921Scenarios
         // 1.19.41 re-point: while the page's own reveal is running the band's upper bound is the parts' layout slots and
         // nothing drawn (exactly what 1.19.21 pinned); once that reveal has finished it is the deeper of those slots and
         // the pixels really drawn under them, which is the caption row the panel's top used to press on.
-        check(display.Contains("CompletionFinalBounds.Placed(parts, RevealFinished, out int finalDeepest, out _finalUndrawn)")
+        check(display.Contains("CompletionFinalBounds.Placed(parts, RevealFinished, contentSettled, out int finalDeepest, out _finalUndrawn)")
               && !display.Contains("CompletionFinalBounds.Bound(finalParts")
               && !display.Contains("_finalIncludeLaidOut ="),
-            "the band's upper bound is the parts' own layout slots while the reveal runs, and the deeper of that slot and the drawn pixels once it has finished - both readings from one call, so the display cannot mix them by hand");
-        string iconRow = Between(display, "private static float IconRowBottom(Component page, bool revealFinished)", "    // The waiting-status block a client's success page draws where the host's button would be.");
+            "the band's upper bound is the parts' own layout slots while the reveal runs, and once it has finished - or the ledger has proved no reveal is coming (F3) - the pixels each part really draws; both readings from one call, so the display cannot mix them by hand");
+        string iconRow = Between(display, "private static float IconRowBottom(Component page, bool revealFinished, bool contentSettled)", "    // The waiting-status block a client's success page draws where the host's button would be.");
         check(iconRow.Length > 0 && iconRow.Contains("Read(success.m_sectorHeader)")
               && !iconRow.Contains("Read(success.m_sectorsWhiteBox)"),
             "the icon row's own band excludes the white plate - the part list the band is computed from is the label and the four icon slots only");

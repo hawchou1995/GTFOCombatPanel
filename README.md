@@ -2,7 +2,7 @@
 
 独立 GTFO 战斗统计面板：局内看战斗数据，成功或失败结算看队伍贡献。表格由 IMGUI 画在窗口像素里，不写入任何原版文字对象。
 
-- **当前状态**：源码版本为 1.19.38；Thunderstore 的实际发布状态以商店页面为准。本工程构建非确定性：同源不同输出目录会得到**同尺寸但不同 SHA-256** 的 DLL（MVID 含源绝对路径），跨目录 hash 不能当作一致性判据，一致性与验证只用「同一输出目录原地重编，hash 与字节均不变」证明。近期变更见 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；包内 `Thunderstore/README.md` 保留功能、配置与安装文档。
+- **当前状态**：源码版本为 1.19.39，已于 2026-11-15 发布到 Thunderstore GTFO 社区（`HawChow-CombatPanel-1.19.39`）。本工程构建非确定性：同源不同输出目录会得到**同尺寸但不同 SHA-256** 的 DLL（MVID 含源绝对路径），跨目录 hash 不能当作一致性判据，一致性与验证只用「同一输出目录原地重编，hash 与字节均不变」证明。近期变更见 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；包内 `Thunderstore/README.md` 保留功能、配置与安装文档。
 - **安装**：模组包管理器（Thunderstore Mod Manager 等）搜索 `CombatPanel`（自动带上 BepInEx 依赖）；或手动把包内 `BepInEx/plugins/GTFOCombatPanel/` 整个目录放进 GTFO 目录下的同一路径。`CombatPanel-config/scoring.json` 放在**游戏持久数据目录**下（GTFO 即 `…\AppData\LocalLow\10 Chambers Collective\GTFO\`）并只在缺失时创建一次；插件目录里的旧副本会在首次使用时自动导入、此后以持久目录为准，手改过的配置不会被覆盖，也不会被升级包替换。已有 `.cfg` 在升级时保留，新配置项下次加载自动补齐。
 - **兼容**：仅依赖 **BepInEx-BepInExPack_GTFO-3.2.4**；EWC（ExtraWeaponCustomization）是可选集成，公共 DLL 不带它的程序集引用。多人快照协议为 **v8**，与旧协议不兼容（旧协议包会被明确拒收）。需要共享统计的每台机器装同一版本。
 - **反馈**：<https://qingju.me>；开黑语音频道（小黑盒语音）<https://chat.xiaoheihe.cn/in1wpsjd>。

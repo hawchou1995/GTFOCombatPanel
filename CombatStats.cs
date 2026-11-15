@@ -428,6 +428,86 @@ public static class CombatStatsFormatter
         }
         return plain.ToString();
     }
+    // The name as it may be *displayed*, which is the name above plus the one thing the wire can do to it: a name
+    // travels in a fixed number of bytes, so a cut can land inside a markup tag and leave the opening '<' - or
+    // `<co`, or `<color=#FF40` - of a tag that was never closed behind. The table draws with rich text switched off,
+    // so that residue would be printed literally: the archived run4 settlement board shows exactly that, `Long Gun<`
+    // where the game's own name was `<color=#FF4005>Long Gun</color>`.
+    //
+    // Two different kinds of evidence decide a fragment, and a bare '<' or a `</` is only removed on one of them:
+    //
+    //   * the fragment after '<' is itself a real prefix of a tag this game interprets (`<co`, `<color=#FF40`): no
+    //     ordinary name contains that, so the cut is proved by what is left;
+    //   * the name is at the wire's own capacity (`SyncSnapshot.NameCapacity` bytes of UTF-8), which is what a cut
+    //     *is*, and/or the name still carries a complete opening tag, so a closing tag demonstrably was open. Only
+    //     then is a bare '<' or a `</`-fragment removed - the residue of a closing tag whose every other character
+    //     the field dropped. A short name that ends in '<' or in a literal `</` (`1 <`, `A</`, `Gun</c`) is left
+    //     exactly as it is, and nothing here invents the characters the wire already dropped: what is left is what
+    //     is measured and drawn (`N1`).
+    // The wire's own name field, in UTF-8 bytes: `SyncSnapshot.NameWords` (6) * 4. It is repeated here because this
+    // file is compiled into the supply-attribution test project as well, which does not link `SyncProtocol.cs`; the
+    // smoke suite asserts the two are the same number, so the two cannot drift apart silently.
+    public const int NameCapacityBytes = 24;
+    public static string VisibleName(string name)
+    {
+        string plain = FullPlayerName(name);
+        if (string.IsNullOrEmpty(plain)) return plain;
+        bool atCapacity = false;
+        try { atCapacity = Encoding.UTF8.GetByteCount(name) >= NameCapacityBytes; } catch { }
+        bool hadOpenTag = HasOpenTag(name);
+        for (int i = 0; i < plain.Length; i++)
+        {
+            if (plain[i] != '<' || !IsDanglingTagFragment(plain, i, atCapacity, hadOpenTag)) continue;
+            return plain.Substring(0, i).TrimEnd();
+        }
+        return plain;
+    }
+    // Whether the name still carries a complete opening tag this game would interpret (`<color=#FF4005>`). That is the
+    // proof that a closing tag was open, so a `</`-residue left behind can be recognised as markup (`N1`).
+    private static bool HasOpenTag(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return false;
+        for (int i = 0; i + 2 < name.Length; i++)
+        {
+            if (name[i] != '<' || name[i + 1] == '/') continue;
+            if (LooksLikeRichTextTag(name, i, out _) && IsRichTextTag(name.Substring(i + 1, name.IndexOf('>', i + 1) - i - 1))) return true;
+        }
+        return false;
+    }
+    // `atCapacity` is the proof that the field really cut this name, and `hadOpenTag` that a closing tag was open: a
+    // bare '<' or a `</`-fragment is only a fragment with one of them. A literal `A</` or `Gun</c` in a short name is
+    // ordinary text and stays exactly as it is (`N1`).
+    private static bool IsDanglingTagFragment(string text, int start, bool atCapacity, bool hadOpenTag)
+    {
+        if (text.IndexOf('>', start + 1) >= 0) return false;
+        string body = text.Substring(start + 1);
+        if (body.Length > 24 || body.IndexOf('<') >= 0 || body.IndexOf(' ') >= 0) return false;
+        bool closing = body.Length > 0 && body[0] == '/';
+        if (closing) body = body.Substring(1);
+        // A closing fragment without either proof is not treated as markup: the '/' alone is not evidence.
+        if (closing && !atCapacity && !hadOpenTag) return false;
+        // A closing tag can be cut after a single letter: `</c` is what a 24-byte cut of `<color=#FF4005>大锤</color>`
+        // leaves behind. An *opening* fragment still needs two letters, so a literal `A<c` stays exactly as it is.
+        if (body.Length == 0) return atCapacity || closing;
+        if (body[0] == '#') return IsColourPrefix(body.Substring(1));
+        int equals = body.IndexOf('=');
+        string word = equals >= 0 ? body.Substring(0, equals) : body;
+        if (word.Length < (closing ? 1 : 2)) return false;
+        foreach (string tag in RichTextTags)
+        {
+            if (tag.StartsWith(word, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
+    }
+    private static bool IsColourPrefix(string body)
+    {
+        if (body.Length == 0) return true;
+        foreach (char glyph in body)
+        {
+            if ("0123456789abcdefABCDEF".IndexOf(glyph) < 0) return false;
+        }
+        return true;
+    }
     // Kept for the places that still want a fixed budget, and used by the smoke suite to pin the cut.
     public static string TruncatePlayerName(string name, int maximumTextElements = 6)
     {

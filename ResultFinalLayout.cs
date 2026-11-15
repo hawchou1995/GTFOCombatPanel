@@ -61,12 +61,42 @@ namespace HawChow.GTFOCombatPanel;
 // The completion section's final edge, and how much of it is only laid out so far.
 public static class CompletionFinalBounds
 {
-    // The bottom edge of one part as the section will end up: the element's own laid-out container rectangle,
-    // always. The drawn pixels (`VisualBottom`) never enter the band - the reveal's drawn edge is a diagnostic
-    // (`CompletionBounds.Deepest`) telling how far the reveal has come, and a part that starts drawing must not
-    // change where the board hangs from: a padded container can end tens of pixels below its last drawn pixel,
-    // and switching the band from the container to the first drawn pixel is exactly the upward jump that
-    // re-measured a correctly placed board mid-reveal.
+    // Whether this part's *visible content* is a complete measurement of it: every child renderer and every caption
+    // under it was enumerated (no exception), nothing under it is switched off or faded out (so nothing deeper can
+    // still appear), and at least one child really answered with a rectangle. Only then may the band use the pixels
+    // the part draws instead of its container rectangle - the reading that lets a padded container that reserves
+    // 275 px of blank space stop pushing the board down the page.
+    public static bool ContentComplete(in CompletionPart part)
+    {
+        if (!part.Present || !part.Active) return false;
+        if (!part.Measured || part.Hidden > 0 || part.Unmeasured > 0) return false;
+        if (part.Drawn <= 0) return false;
+        if (float.IsFinite(part.Alpha) && part.Alpha <= CompletionBounds.VisibleAlpha) return false;
+        return float.IsFinite(part.VisualBottom);
+    }
+
+    // The bottom edge the board may hang from for one part: the pixels it really draws when those are a *complete*
+    // measurement of it, and its laid-out container rectangle otherwise. The second answer is never tightened: a part
+    // with a hidden child, an unreadable alpha, a failed enumeration or no drawn rectangle keeps the container, so a
+    // caption that has not arrived yet can never be covered by a band that was derived from its absence.
+    public static float FinalEdge(in CompletionPart part, out bool fromContent)
+    {
+        fromContent = false;
+        if (!part.Present || (!part.Active && !part.Scheduled)) return float.NaN;
+        if (ContentComplete(part))
+        {
+            fromContent = true;
+            return part.VisualBottom;
+        }
+        return float.IsFinite(part.OwnBottom) ? part.OwnBottom : float.NaN;
+    }
+
+    // The bottom edge of one part as the section will end up while the reveal is still running: the element's own
+    // laid-out container rectangle, always. The drawn pixels (`VisualBottom`) never enter *this* reading - the reveal
+    // switches parts on one after another, so a drawn edge taken mid-reveal is a progress report and not the page's
+    // layout, and switching the band from the container to the first drawn pixel is exactly the upward jump that
+    // re-measured a correctly placed board mid-reveal. `FinalEdge` below is the reading that may use the pixels, and
+    // only for a part whose content is completely measured (`ContentComplete`).
     //
     // A part contributes when it is on this page and either switched on, or scheduled by the page's own
     // completion ledger (`Scheduled`) but not switched on yet - the reveal's normal in-between state. A part
@@ -124,24 +154,83 @@ public static class CompletionFinalBounds
     // The completion section's edge the *board* is placed from.
     //
     // While the page's own native reveal is still running the answer is the laid-out slot alone (`Bottom`): the reveal
-    // switches slots on one after another, so anything drawn is a progress report and not the page's layout. Once that
-    // reveal has finished, the section's real extent is the deeper of the slot and the pixels it really draws - a
-    // padded container can end above the captions its partition icon draws, and a board hung from the container was
-    // the panel's own top edge pressing on the native sector icons and their 主要/精英 captions. `Bound` is that
-    // deeper-of rule; this is where it is chosen, so the choice is asserted headlessly instead of only in the display.
+    // switches slots on one after another, so anything drawn is a progress report and not the page's layout.
     //
-    // `deepest` names the part that produced the answer, whichever of the two readings won, so the region line stays
-    // true about the number it prints. `laidOut` is `Bottom`'s own count of parts whose pixels have not arrived.
+    // Once that reveal has finished, every part contributes `FinalEdge` - the pixels it really draws when those are a
+    // *complete* measurement of it (`ContentComplete`), its container rectangle otherwise - and the band is the deepest
+    // of those. Both directions matter on the recorded page:
+    //
+    //   * a container can end *above* the captions its icon draws (313 vs 352), and a band hung from the container
+    //     pressed the panel's own top edge on the native sector icons and their 主要/精英 captions;
+    //   * a container can also end *far below* everything it draws - the recorded success page's icon container read
+    //     692 while the icons and captions on the screenshot end around 417, some 275 px of blank slot - and a band
+    //     hung from that reading shortened the strip for no visible reason, which is the small board the player
+    //     reported. `max(container, pixels)` could never answer that case; `FinalEdge` can, and only for a part whose
+    //     content is complete: every child enumerated, nothing under it switched off or faded out, at least one child
+    //     drawn. A part with a hidden child (a caption the reveal has not shown yet, an unused icon of a short run)
+    //     keeps its container, so nothing that can still appear is covered.
+    //
+    // `deepest` names the part that produced the answer, whichever reading won, so the region line stays true about the
+    // number it prints. `laidOut` is `Bottom`'s own count of parts whose pixels have not arrived.
     public static float Placed(IReadOnlyList<CompletionPart> parts, bool revealFinished, out int deepest, out int laidOut)
+        => Placed(parts, revealFinished, contentSettled: false, out deepest, out laidOut);
+
+    // F3 (independent review): a page whose ledger will never answer - every target excluded, or one aborted - kept the
+    // *container* edge for the whole visit, so the extra 275 px of blank slot never came back on exactly the pages the
+    // ledger cannot finish. The content reading may be used before the reveal finishes when the ledger itself has
+    // proved that no reveal is coming (`contentSettled`, decided by the caller from the ledger *and* the page's own
+    // two-agreeing-readings latch), because at that point the pixels a part draws are not a progress report: nothing is
+    // going to change them. Next to it, every part that is scheduled-but-not-switched-on still contributes its laid-out
+    // slot, so the answer can never be above a slot that may still appear - the one thing a content reading must not do.
+    public static float Placed(IReadOnlyList<CompletionPart> parts, bool revealFinished, bool contentSettled,
+        out int deepest, out int laidOut)
     {
         float layout = Bottom(parts, out deepest, out laidOut);
-        if (!revealFinished) return layout;
-        float drawn = CompletionBounds.Deepest(parts, out int drawnDeepest);
-        if (!float.IsFinite(drawn)) return layout;
-        float band = Bound(parts, drawn, out int boundDeepest, out _);
-        deepest = !float.IsFinite(layout) || drawn > layout ? drawnDeepest : boundDeepest;
+        if (parts == null) return layout;
+        if (!revealFinished && !contentSettled) return layout;
+        float band = float.NaN;
+        int winner = -1;
+        for (int index = 0; index < parts.Count; index++)
+        {
+            float edge = FinalEdge(parts[index], out bool fromContent);
+            if (!float.IsFinite(edge)) continue;
+            if (float.IsFinite(band) && edge <= band) continue;
+            band = edge;
+            winner = index;
+        }
+        if (!float.IsFinite(band)) return layout;
+        deepest = winner;
         return band;
     }
+
+    // The per-part reading the page prints once, so a live log alone can say which part produced the band and why:
+    // its container, the pixels it draws, whether those were a complete measurement, how many children were switched
+    // off, and the edge that was used. `[DIAG] success completion part: ...`
+    //
+    // F4 (independent review): the `source` word must describe the edge `Placed` really used on this frame, so the same
+    // `revealFinished`/`contentSettled` pair is passed in. A reveal still running therefore prints `container` and the
+    // container's number, not a content figure the placement never read.
+    public static string Describe(in CompletionPart part, string name, bool revealFinished, bool contentSettled = false)
+    {
+        bool usesContent = revealFinished || contentSettled;
+        float edge = usesContent ? FinalEdge(part, out _) : PartBottom(part, out _);
+        return name
+            + ": present=" + part.Present.ToString().ToLowerInvariant()
+            + ", active=" + part.Active.ToString().ToLowerInvariant()
+            + ", scheduled=" + part.Scheduled.ToString().ToLowerInvariant()
+            + ", alpha=" + (float.IsFinite(part.Alpha) ? part.Alpha.ToString("0.00") : "unreadable")
+            + ", own=" + Edge(part.OwnBottom)
+            + ", visual=" + Edge(part.VisualBottom)
+            + ", measured=" + part.Measured.ToString().ToLowerInvariant()
+            + ", hidden=" + part.Hidden
+            + ", unmeasured=" + part.Unmeasured
+            + ", drawn=" + part.Drawn
+            + ", complete=" + ContentComplete(part).ToString().ToLowerInvariant()
+            + ", edge=" + Edge(edge)
+            + ", source=" + (usesContent ? (ContentComplete(part) ? "content" : "container(incomplete)")
+                : "container(reveal-running)");
+    }
+    private static string Edge(float value) => float.IsFinite(value) ? value.ToString("0") : "unmeasured";
 }
 
 
@@ -268,8 +357,14 @@ public static class ResultFinalPolicy
 //
 //   * it is a statement about the ledger this page built, never about elapsed frames: nothing here counts frames, and
 //     there is no `ready || dead || forced` short circuit anywhere above it;
-//   * a ledger that can no longer finish - a target the page handed over with no object, a target count past the
-//     ledger's budget - answers immediately (`RevealImpossible`), exactly as every earlier build did;
+//   * a ledger that can no longer finish answers immediately (`RevealImpossible`), exactly as every earlier build did.
+//     That is now three facts about the ledger, never about time: a target the page handed over with no object, a
+//     target count past the ledger's budget, and a native routine that really ended without revealing its target
+//     (`1.19.43`). A routine that ended is not a routine that is still coming, and waiting for it was the one
+//     permanent wait this gate still had: the success page stayed on its vanilla screen for the whole visit and only
+//     F8 could release it. A target whose BlinkIn call handed it over but never scheduled a routine for it is not
+//     counted as pending at all (`CompletionTargets.SchedulesClosed`), so a holder this build never blinks cannot
+//     keep the gate shut either;
 //   * F8 is the player's own answer and never waits (`Forced`).
 //
 // A page whose reveal never finishes at all is answered by the paths that already exist for it: the strict fit spends
@@ -278,15 +373,102 @@ public static class ResultFinalPolicy
 public static class ResultRevealGate
 {
     public static bool BlocksPlacement(bool revealFinished, bool mayStillComplete, bool forced)
-        => !forced && !revealFinished && mayStillComplete;
+        => BlocksPlacement(revealFinished, mayStillComplete, inFlight: 0, forced);
+
+    // `inFlight` is `BlinkCompletionLedger.InFlight`: the native routines that are still running right now.
+    //
+    // F1 (independent review): one aborted target makes `mayStillComplete` false, and the three-argument rule above
+    // then released the board *on that frame* while five of the recorded page's six sector icons were still blinking -
+    // "this ledger will never read `Ready`" is not "the page has stopped animating". A ledger that can no longer
+    // complete but still has routines in flight therefore keeps the gate shut until they end, and the release that
+    // follows is the explicitly labelled one (`WhyReleased`: placed from the laid-out slots, never from pixels a reveal
+    // that ended did not draw). Nothing about that release claims the animation completed.
+    public static bool BlocksPlacement(bool revealFinished, bool mayStillComplete, int inFlight, bool forced)
+        => !forced && !revealFinished && (mayStillComplete || inFlight > 0);
 
     // The one line a withheld frame prints: the ledger's own counts, and what releases it.
-    public static string Why(int completed, int count, int names, int artwork)
+    public static string Why(int completed, int count, int names, int artwork, int inFlight = 0)
         => "the page's own sector BlinkIn reveal has not finished (completed=" + completed + "/" + count
-            + ", names=" + names + ", artwork=" + artwork + "), so the completion section is still being switched on; "
+            + ", names=" + names + ", artwork=" + artwork + ", inFlight=" + inFlight + "), so the completion section is still being switched on; "
             + "the board is not placed against a section that is still arriving, and the native ledger itself releases "
             + "it - not a frame count, an alpha threshold or an empty scan. A ledger that can no longer finish is "
-            + "answered at once, and F8 never waits";
+            + "answered once its own routines have ended, and F8 never waits";
+    // The one line the release prints when the ledger could no longer finish: a native routine really ended without
+    // revealing its target, or a target this page handed over never got a routine at all. Neither is a completion, and
+    // neither is a timeout: the section is placed from the slots the page laid out, and the drawn pixels stay out of
+    // the band because the reveal never finished.
+    public static string WhyReleased(int completed, int count, int aborted, int unscheduled, int inFlight = 0)
+        => "the page's own sector BlinkIn reveal can no longer complete (completed=" + completed + "/" + count
+            + ", aborted=" + aborted + ", unscheduled=" + unscheduled + ", inFlight=" + inFlight + "), so the completion section is placed from the "
+            + "slots the page laid out and never from pixels a reveal that ended did not draw; this is not a settled "
+            + "reveal and not a timeout - a routine that ended is not a routine that is still coming, and F8 is untouched";
+}
+
+// How long the success page's own reveal may make **no progress at all** before the fail-open path is allowed to answer.
+//
+// F1-STALL (independent review): a ledger where every target was scheduled, none aborted, and one routine simply never
+// ends leaves `RevealImpossible == false` with `InFlight > 0`. The frame-based wait this replaces only counted the
+// "aborted but still running" shape, so that page waited for F8 for ever. This clock answers the real question - "has
+// this reveal moved at all recently?" - in **real seconds**, never in frames, so it behaves the same at 60 and 134 FPS:
+//
+//   * any new native fact is progress and restarts the clock: a target entering the ledger, a routine starting, a
+//     routine finishing (`Completed`/`InFlight`/counts change);
+//   * the bound is derived from the page's own native length, not a hard number of frames: `BlinkDuration` is what one
+//     blink takes, the recorded page has six of them, and the limit is twice that whole sequence, clamped to
+//     [`MinimumStallSeconds`, `MaximumStallSeconds`];
+//   * exhausting it never says the reveal finished. The only answer it releases is the explicitly labelled
+//     `RevealUnobservable` fail-open, which keeps stepping around every measured control and measuring again.
+//
+// Free of Unity: the caller passes `now` (production passes `Time.realtimeSinceStartup`) and the blink duration, so the
+// whole rule is asserted headlessly instead of re-implemented in a test.
+public sealed class RevealProgressClock
+{
+    // The recorded success page shows six sector targets; six blinks are one whole reveal.
+    public const float BlinksPerReveal = 6f;
+    // Twice that sequence is the stall bound: a page that has moved nothing for two whole native reveals has stopped.
+    public const float StallFactor = 2f;
+    // A blink that cannot be read is about half a second on this build; the floor keeps a very short native duration from
+    // turning the bound into a single frame.
+    public const float AssumeBlinkSeconds = 0.5f;
+    public const float MinimumStallSeconds = 3f;
+    public const float MaximumStallSeconds = 30f;
+
+    public static float LimitFor(float blinkDurationSeconds)
+    {
+        float blink = float.IsFinite(blinkDurationSeconds) && blinkDurationSeconds > 0f ? blinkDurationSeconds : AssumeBlinkSeconds;
+        float limit = blink * BlinksPerReveal * StallFactor;
+        if (!(limit > MinimumStallSeconds)) limit = MinimumStallSeconds;
+        if (limit > MaximumStallSeconds) limit = MaximumStallSeconds;
+        return limit;
+    }
+
+    private float _lastProgress = float.NaN;
+    private int _completed = -1, _inFlight = -1, _scheduled = -1;
+
+    // One observation of the ledger. Answers whether this observation was progress (a new native fact).
+    public bool Observe(float now, int completed, int inFlight, int scheduled)
+    {
+        bool progress = !float.IsFinite(_lastProgress)
+            || completed != _completed || inFlight != _inFlight || scheduled != _scheduled;
+        if (progress) _lastProgress = now;
+        _completed = completed; _inFlight = inFlight; _scheduled = scheduled;
+        return progress;
+    }
+
+    // A different page: nothing of the previous reveal's clock survives it.
+    public void Forget() { _lastProgress = float.NaN; _completed = _inFlight = _scheduled = -1; }
+
+    public float StalledSeconds(float now)
+        => float.IsFinite(_lastProgress) && float.IsFinite(now) ? Math.Max(0f, now - _lastProgress) : 0f;
+
+    // Whether the reveal has made no progress for the whole bound. A clock that was never observed is not exhausted:
+    // "not watched yet" is not "stalled".
+    public bool Exhausted(float now, float limit)
+    {
+        if (!float.IsFinite(_lastProgress) || !float.IsFinite(now)) return false;
+        float bound = limit > 0f ? limit : MinimumStallSeconds;
+        return StalledSeconds(now) >= bound;
+    }
 }
 
 // Whether the *fail-open* path may answer, now that the success page's native reveal is asked of it too.
@@ -351,22 +533,41 @@ public static class ResultSettlementGate
     // `forced`           F8, the player's own press;
     // `revealEnforced`   this page's placement waits on the completion ledger at all (the success page's reveal);
     // `revealFinished`   `ResultsDisplay.CompletionReady` - the native BlinkIn ledger really completed;
-    // `revealImpossible` the ledger can no longer complete (`BlinkCompletionLedger.RevealImpossible`);
+    // `revealImpossible` the ledger can never read `Ready` (`BlinkCompletionLedger.RevealImpossible`);
+    // `revealInFlight`   and the routines that are still running right now: an impossible ledger is only *answered*
+    //                    once this is zero (F1), never on the frame one of its targets aborted;
     // `revealCount`      targets the ledger was handed this visit; zero means the reveal was never observed;
-    // `revealWaitFrames` frames spent waiting on a reveal that has not been observed (never on one that has);
+    // `revealWaitFrames` frames spent waiting on a reveal that cannot answer by itself (never observed, or impossible
+    //                    with routines still in flight - the two cases no callback can end);
     // the rest are `ResultFinalPolicy`'s own facts, unchanged.
     public static Decision Decide(bool forced, bool revealEnforced, bool revealFinished, bool revealImpossible,
         int revealCount, int revealWaitFrames, bool everMeasurable, bool finalMeasurable, bool finalSettled,
         int finalWaitFrames)
+        => Decide(forced, revealEnforced, revealFinished, revealImpossible, revealInFlight: 0, revealCount,
+            revealStalled: revealWaitFrames >= ResultFinalPolicy.MaximumWaitFrames,
+            everMeasurable, finalMeasurable, finalSettled, finalWaitFrames);
+
+    // `revealStalled` is `RevealProgressClock.Exhausted` for this page: the reveal has made **no progress at all** for
+    // the whole bound, measured in real seconds from the page's own native blink duration.
+    //
+    // F1-STALL (independent review): the answer is the same for every shape of "this reveal will not answer by itself" -
+    // never observed, aborted with routines still running, and (the shape the frame count used to miss) all six targets
+    // scheduled, none aborted, one routine that simply never ends. In every one of them the only release is the
+    // explicitly labelled `RevealUnobservable`; a reveal that is still moving is never released by time, because every
+    // new native fact restarts the clock.
+    public static Decision Decide(bool forced, bool revealEnforced, bool revealFinished, bool revealImpossible,
+        int revealInFlight, int revealCount, bool revealStalled, bool everMeasurable, bool finalMeasurable,
+        bool finalSettled, int finalWaitFrames)
     {
         if (forced) return new Decision(true, Answer.Forced);
         if (revealEnforced)
         {
-            if (revealImpossible) return new Decision(true, Answer.RevealImpossible);
+            // An impossible ledger is answered only when nothing of its own is still animating. Until then the page is
+            // still arriving, and this is the same statement `ResultRevealGate` makes for the strict placement.
+            if (revealImpossible && revealInFlight <= 0) return new Decision(true, Answer.RevealImpossible);
             if (!revealFinished)
             {
-                if (revealCount <= 0 && revealWaitFrames >= ResultFinalPolicy.MaximumWaitFrames)
-                    return new Decision(true, Answer.RevealUnobservable);
+                if (revealStalled) return new Decision(true, Answer.RevealUnobservable);
                 return new Decision(false, Answer.RevealPending);
             }
         }
@@ -376,17 +577,47 @@ public static class ResultSettlementGate
         return new Decision(true, finalSettled ? Answer.Settled : Answer.GivenUp);
     }
 
-    // The one line a withheld or unobservable fail-open frame prints: which answer it was, in the ledger's own counts.
-    public static string Why(Answer answer, int completed, int count, int waitFrames)
-        => answer == Answer.RevealUnobservable
+    // The one line an unobservable fail-open prints, in real seconds: which of the three shapes it was, and how long the
+    // reveal has stood still. It never says the animation finished.
+    public static string Why(Answer answer, int completed, int count, int inFlight, float stalledSeconds, float limitSeconds)
+    {
+        string stalled = "no progress for " + (float.IsFinite(stalledSeconds) ? stalledSeconds.ToString("0.0") : "unmeasured")
+            + "s of " + (float.IsFinite(limitSeconds) ? limitSeconds.ToString("0.0") : "unmeasured") + "s";
+        if (answer != Answer.RevealUnobservable)
+            return "the page's own sector BlinkIn reveal has not finished (completed=" + completed + "/" + count
+                + ", " + stalled + "), so the fail-open band may not answer either: the refusal budget answers the page's "
+                + "geometry, never its reveal, and a board drawn at a container edge the reveal has not reached is the board "
+                + "that is re-measured 39 px lower a moment later";
+        string shape = count <= 0
+            ? "was never observed on this visit"
+            : revealShapeInFlight(inFlight)
+                ? "is still running " + inFlight + " routine(s) that have not reported"
+                : "can no longer complete";
+        return "the page's own sector BlinkIn reveal " + shape + " (completed=" + completed + "/" + count
+            + ", inFlight=" + inFlight + ", " + stalled + "), so the board is drawn from the fail-open band - a "
+            + "reveal-unobservable fail-open, not a settled page and not a finished animation: every control the page "
+            + "measures is still stepped around and the page is measured again";
+    }
+    private static bool revealShapeInFlight(int inFlight) => inFlight > 0;
+
+    // The line the older callers ask for, still in frames: kept for the tests that pin the frame-shaped wording.
+    public static string Why(Answer answer, int completed, int count, int waitFrames, int inFlight = 0)
+    {
+        if (answer != Answer.RevealUnobservable)
+            return "the page's own sector BlinkIn reveal has not finished (completed=" + completed + "/" + count
+                + ", waited=" + waitFrames + " of " + ResultFinalPolicy.MaximumWaitFrames + " frames), so the fail-open band may not "
+                + "answer either: the refusal budget answers the page's geometry, never its reveal, and a board drawn at a container "
+                + "edge the reveal has not reached is the board that is re-measured 39 px lower a moment later";
+        return count <= 0
             ? "the page's own sector BlinkIn reveal was never observed on this visit (completed=" + completed + "/" + count
               + ", waited=" + waitFrames + " of " + ResultFinalPolicy.MaximumWaitFrames + " frames), so the board is drawn from the "
               + "fail-open band - a reveal-unobservable fail-open, not a settled page: nothing in this window proves the completion "
               + "section stopped changing"
-            : "the page's own sector BlinkIn reveal has not finished (completed=" + completed + "/" + count
-              + ", waited=" + waitFrames + " of " + ResultFinalPolicy.MaximumWaitFrames + " frames), so the fail-open band may not "
-              + "answer either: the refusal budget answers the page's geometry, never its reveal, and a board drawn at a container "
-              + "edge the reveal has not reached is the board that is re-measured 39 px lower a moment later";
+            : "the page's own sector BlinkIn reveal can no longer complete and its routines are still in flight (completed="
+              + completed + "/" + count + ", inFlight=" + inFlight + ", waited=" + waitFrames + " of "
+              + ResultFinalPolicy.MaximumWaitFrames + " frames), so the board is drawn from the fail-open band - a "
+              + "reveal-unobservable fail-open, not a settled page and not a finished animation";
+    }
 }
 
 // The rules for a board that is already standing on a page that keeps drawing.
