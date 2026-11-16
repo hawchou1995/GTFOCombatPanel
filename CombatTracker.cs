@@ -946,11 +946,12 @@ internal static class CombatTracker
 
             SNet_Player targetOwner = target.Owner;
             SNet_Player sourceOwner = source.Owner;
-            if (!ShouldTrack(sourceOwner)) return;
+            if (!targetOwner.IsInSlot || !sourceOwner.IsInSlot) return;
 
             double now = UnityEngine.Time.realtimeSinceStartup;
             if (!ReviveLedger.Observe(targetOwner.Lookup, sourceOwner.Lookup, state.State, now)) return;
-            Plugin.Logger.LogInfo($"[DIAG] revive state observed: target={targetOwner.GetName()}; reviver={sourceOwner.GetName()}; active={state.State};");
+            if (ShouldTrack(sourceOwner))
+                Plugin.Logger.LogInfo($"[DIAG] revive state observed: target={targetOwner.GetName()}; reviver={sourceOwner.GetName()}; active={state.State};");
         }
         catch (Exception error) { LogImpact("revive-state", error); }
     }
@@ -960,23 +961,14 @@ internal static class CombatTracker
         try
         {
             SNet_Player target = downed?.m_owner?.Owner;
-            if (!ShouldTrack(target)) return;
+            if (target == null || !target.IsInSlot) return;
             if (!ReviveLedger.TryTakeSuccessfulRevive(target.Lookup, UnityEngine.Time.realtimeSinceStartup, out ulong reviverLookup))
             {
                 if (!_loggedReviveUnmatched)
                 {
                     _loggedReviveUnmatched = true;
-                    // 1.19.38: the line names which machine owns this row, because that is what decides whether the
-                    // missing state is a defect or the design. On a client `ShouldTrack` is `isInSlot && (isMaster ||
-                    // isLocal)` (`ReviveAttributionLedger.CanTrackOwner`), so no remote reviver is ever recorded here:
-                    // `ObserveReviveState` returns before the ledger (`CombatTracker.cs:949`), and a revive a remote
-                    // player performed on this machine's own body reaches this machine only as a completion. The
-                    // reviver's row is the host's on a client (`SyncProtocol` ships `Revives` and its copy wins in
-                    // `CombineCount`), so the credit is not lost - it is not this machine's to assign.
-                    // The game offers no local substitute either, so the refusal stands instead of naming the nearest
-                    // human player: `Interact_Revive` keeps no source field (its only reviver channel is the broadcast
-                    // `s_actionReviverState`), and `PLOC_Downed.OnPlayerRevived` carries `pSetHealthData`, whose one
-                    // field is `health` (both read from `Modules-ASM.dll`).
+                    // Both endpoints may be remote: source ownership decides credit only after the replicated pair
+                    // and successful completion match. Missing pairs never name a guessed reviver.
                     bool hostRow = SNet.IsMaster;
                     string unmatched = $"[DIAG] successful revive completion observed for target={target.GetName()}, but no matching replicated reviver state was available; not assigning the credit to a guessed player. "
                         + $"role={(hostRow ? "host" : "client")}; reviverStateRecordedLocally=false; rowOwner={(hostRow ? "this-machine" : "host-snapshot")}; "
@@ -987,11 +979,9 @@ internal static class CombatTracker
                 return;
             }
 
-            if (!SNet.TryGetPlayer(reviverLookup, out SNet_Player reviver) || !ShouldTrack(reviver))
-            {
-                Plugin.Logger.LogWarning($"[DIAG] successful revive target={target.GetName()} had an untracked reviver lookup={reviverLookup}; no rescue credit assigned.");
-                return;
-            }
+            if (!SNet.TryGetPlayer(reviverLookup, out SNet_Player reviver)) return;
+            // A remote candidate can replace a local attempt without giving this client ownership of its row.
+            if (!ShouldTrack(reviver)) return;
             CombatPlayer player = ObservePlayer(reviver);
             player.Impact.CreditRevive();
             Plugin.Logger.LogInfo($"[DIAG] revive credited: reviver={player.Name}; target={target.GetName()}; total={player.Impact.Revives}; source=reviver-state+PLOC_Downed.OnPlayerRevived.");

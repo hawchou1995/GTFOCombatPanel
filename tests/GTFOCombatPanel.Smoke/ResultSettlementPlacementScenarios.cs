@@ -8,11 +8,13 @@ using HawChow.GTFOCombatPanel;
 //
 //   A  the client failure page's first placement.  `LogOutput.snapshot.log` 4426-4441 (2560x1440, client, run 4): two
 //      frames whose scan was complete but which found no pressable control at all were answered as "this page has no
-//      wall", the strip was the whole fixed page (381..1429) and a 1987x990 board was drawn; the next frame found the
+//      wall", the strip was the whole screen foot (381..1429) and a 1987x990 board was drawn; the next frame found the
 //      page's own control at 1175/1181/1189, the strip tightened to 802 px, the standing board really reached that
-//      control and was taken away with the vanilla page restored. The item that was missing is asserted here:
-//      `ResultClientPageActionPolicy.Pending` + `ResultClientWallGate.Observe(..., pageActionsPending)`, through the one
-//      entry point production calls (`ResultClientFailureStrip.Decide` / `Measure`).
+//      control and was taken away with the vanilla page restored. 1.19.45 (user correction) settles what the wall is:
+//      the client's non-clickable "waiting for the host" line - the exact counterpart of the host's pressable button -
+//      and a pressable control only when it reaches higher. `ResultClientPageActionPolicy.Pending` therefore answers
+//      "no wall at all", and `ResultClientWallGate.Observe` is fed that one combined reading through the single entry
+//      point production calls (`ResultClientFailureStrip.Decide` / `Measure`).
 //   B  the success page's first placement.  `LogOutput.snapshot.log` 6657-6674: the native BlinkIn ledger read
 //      `completed=0/6` on the frame the board was placed and `6/6` a few lines later, and the strip was re-measured.
 //      `ResultRevealGate` refuses that first placement while the ledger can still finish, and answers at once when it
@@ -27,12 +29,15 @@ using HawChow.GTFOCombatPanel;
 internal static class ResultSettlementPlacementScenarios
 {
     // The recorded client failure page: 2560x1440, the mission-failed title laid out to 359.5, the client gap of 16 px
-    // scaled by height, the waiting-status line at 1147 (measured, logged, never a wall).
+    // scaled by height, the waiting-status line at 1147 - the page's own non-clickable text, and the wall (1.19.45:
+    // "his lower bound is nothing but the host's clickable button becoming the client's non-clickable hint text").
     private const float Width = 2560f, Height = 1440f;
     private const float TitleBottom = 359.5f;
     private const float Gap = 16f, MinimumStrip = 96f, WaitingText = 1147f;
-    // The pressable control the scan found on that page, in the three readings the log recorded.
-    private const float WallHigh = 1189f, WallMid = 1181f, WallLow = 1175f;
+    // The pressable controls the scan found on that page, in the three readings the log recorded - all *below* the
+    // waiting line, so none of them tightens the band; `ControlAboveText` is a control that reaches higher than the
+    // line and therefore does.
+    private const float WallHigh = 1189f, WallMid = 1181f, WallLow = 1175f, ControlAboveText = 1050f;
     private const int Rows = 30;
 
     public static void RunInto(Action<bool, string> check)
@@ -47,64 +52,49 @@ internal static class ResultSettlementPlacementScenarios
         Console.WriteLine("WIRING: SETTLEMENT_PLACEMENT_GATES (static source check plus the production policies above)");
     }
 
+    // A. 客机失败页：下界 = 那行不可点击的等待文字自己的上沿（或更靠上的可按控件），先稳定两帧再落板
     // ---------------------------------------------------------------------------------------------------
-    // A. 客机失败页：两帧「完整扫描但一个可按控件都没有」不是最终
-    // ---------------------------------------------------------------------------------------------------
+    // 1.19.45（用户纠正，覆盖 1.19.38/1.19.41/1.19.42 的相反口径）：客机失败页没有「返回大厅」按钮，但它有那行
+    // 「正在等待厅主」提示文字的**实际屏幕矩形**——那就是这一页的墙，和主机页那条按钮上沿同一性质。真正可按的
+    // 控件照旧是墙，两者取更靠上的那一堵（更安全的一堵）；页面固定几何（1429.33）只做封顶，永远不是「量到了墙」。
+    // 门仍然是「同一堵墙、两帧、都可回答」，但它现在读的是这个合成后的读数，所以「一个可按控件都没有」的帧不再
+    // 是不可回答——记录下来的那一页本来就有那行字。
     private static void ClientFailureFirstPlacement(Action<bool, string> check)
     {
         // The display's own figure: the design clearance of 16 px at 1080p, scaled to this window.
         float clearance = ResultsBounds.Clearance(Height);
+        float fixedTop = TitleBottom + Gap * (Height / 1080f);
+        float textFoot = WaitingText - clearance;
 
-        // The predicate itself, at the one fact it can honestly read (1.19.42, review F3): a page that has measured no
-        // pressable control is pending whatever its own actions' active states say - those carry no per-frame information
-        // on a client, where the go-to-lobby button is permanently inactive - and the frame a pressable control is really
-        // measured is not pending, because that wall answers for itself.
-        check(ResultClientPageActionPolicy.Pending(float.NaN)
-              && !ResultClientPageActionPolicy.Pending(WallMid)
-              && !ResultClientPageActionPolicy.Pending(WallHigh)
-              && ResultClientPageActionPolicy.Pending(float.NaN),
-            "the page-action item is exactly 'this page has not measured a pressable control': pending without one, not pending with one - the old predicate's four other inputs were a tautology on a client page (HiddenPageActions is always >= 1 there) and could also answer 'not pending' on a frame nobody had measured anything, which was the wrong way round");
+        // 1. 这一页的墙就是那行不可点击的提示文字。
+        check(!ResultClientPageActionPolicy.Pending(WaitingText, float.NaN)
+              && !ResultClientPageActionPolicy.Pending(WaitingText, WallMid)
+              && ResultClientPageActionPolicy.Pending(float.NaN, float.NaN),
+            "the client page's wall question is answered by the waiting-status line's own rectangle: a page with no pressable control at all is not 'pending' while that line is measurable, and only a frame that measures neither the line nor a control is");
 
+        // 2. 门：同一堵墙、两帧、都可回答。
         var gate = new ResultClientWallGate();
-        // f0/f1: complete scans, nothing pressable, the page's own actions still missing. Two identical readings of that
-        // shape are exactly what the recorded page placed a 990 px board from.
-        var pendingEmpty = new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, WaitingText,
-            float.NaN, true, true, 0, pageActionsPending: true);
-        check(ResultClientFailureStrip.Decide(100, gate, pendingEmpty, out ResultClientBandReading noBand, out ResultsSafeArea fixedPage)
+        var textOnly = new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, WaitingText, float.NaN);
+        check(ResultClientFailureStrip.Decide(100, gate, textOnly, out ResultClientBandReading noBand, out ResultsSafeArea fixedPage)
               == ResultClientStripState.WallNotSettled
-              && !gate.Settled && gate.Samples == 1 && !noBand.Fits,
-            "the first frame of the recorded client page - a complete scan, no pressable control, the page's own actions not yet in place - is not a placement frame and hands out no band");
-        check(near(fixedPage.Top, 380.83f) && near(fixedPage.Bottom, 1429.33f),
-            "and the page's fixed geometry is still read on it: the wait is about the page's own actions, not about a page nobody could measure");
-        check(ResultClientFailureStrip.Decide(101, gate, pendingEmpty, out _, out _) == ResultClientStripState.WallNotSettled
-              && !gate.Settled && gate.Samples == 2,
-            "the second identical empty scan is still not final: two agreeing 'nothing pressable' readings on a page whose own result actions are missing are exactly what the recorded board was drawn from, and the sample count authorises nothing");
-
-        // f2: the page's action switched on, its rectangle not readable yet - the activeness changed, the frame still
-        // answers nothing.
-        var actionActiveUnmeasured = new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip,
-            WaitingText, float.NaN, true, true, 1, pageActionsPending: false);
-        check(ResultClientFailureStrip.Decide(102, gate, actionActiveUnmeasured, out _, out _) == ResultClientStripState.WallNotSettled,
-            "the frame on which the page's own action is switched on but cannot be measured yet is not a placement frame either: an active control with no rectangle is not 'this page has no wall'");
-
-        // f3/f4: the real control's own edge, in the recorded coordinates.
-        check(ResultClientFailureStrip.Decide(103, gate, Evidence(WallHigh, 0, false), out ResultClientBandReading first, out _)
-              == ResultClientStripState.WallNotSettled
-              && near(gate.Wall, WallHigh) && !first.Fits,
-            "the first frame on which the page's own control is really measured is a changed reading, not an agreement - the wall is recorded and no band is handed out");
-        check(ResultClientFailureStrip.Decide(104, gate, Evidence(WallHigh, 0, false), out ResultClientBandReading settled, out _)
+              && !gate.Settled && gate.Samples == 1 && !noBand.Fits && near(gate.Wall, WaitingText),
+            "the first frame that measures the waiting line is a reading, not an agreement: the wall is recorded (" + WaitingText
+            + ") and no band is handed out yet");
+        check(near(fixedPage.Top, fixedTop) && near(fixedPage.Bottom, ResultsGuestPageGeometry.PageFloor(Height)),
+            "and the page's fixed geometry is still read on it (" + fixedTop.ToString("0.00") + "..1429.33) - as the band's cap, never as a wall");
+        check(ResultClientFailureStrip.Decide(101, gate, textOnly, out ResultClientBandReading settled, out _)
               == ResultClientStripState.Placed && gate.Settled,
-            "the second identical complete reading of that wall is the placement frame, and `Settled` - not a count of frames - is what released it");
-        check(near(settled.Top, 380.83f) && near(settled.Bottom, WallHigh - clearance)
-              && near(settled.Height, WallHigh - clearance - 380.83f),
-            "the band is the page's fixed top and the control's own edge less the page clearance (380.83.."
-            + (WallHigh - clearance).ToString("0.00") + ", " + (WallHigh - clearance - 380.83f).ToString("0.0")
-            + " px): the ~800 px room of the recorded page, never the 1049 px full-page band the recorded board was drawn in");
-        check(settled.PressableTightened && settled.Height > 750f && settled.Height < 810f,
-            "that band is the recorded page's ~800 px room rather than the whole page, so the board is small from its first visible frame");
+            "the second identical reading of that same wall is the placement frame - `Settled`, never a count of frames, is what released it");
+        check(near(settled.Top, fixedTop) && near(settled.Bottom, textFoot) && near(settled.Height, textFoot - fixedTop),
+            "the band is the page's fixed top down to the line's own top less the page clearance ("
+            + fixedTop.ToString("0.00") + ".." + textFoot.ToString("0.00") + ", " + (textFoot - fixedTop).ToString("0.0")
+            + " px): the recorded page's own geometry, never the 1049 px full-page band the recorded run-3 board was drawn in");
+        check(settled.WaitingTextTightened && !settled.PressableTightened && settled.WallMeasured
+              && near(settled.WallTop, WaitingText) && !settled.WaitingTextCovered,
+            "and it names the wall that produced the foot: the waiting line's own top, so the board never stands on the text the player is reading");
 
         // f5 and on: the same reading, repaint after repaint, and the board does not move.
-        var boardStrip = new BoardStrip(settled.Top, settled.Bottom, true, WallHigh, float.NaN, true,
+        var boardStrip = new BoardStrip(settled.Top, settled.Bottom, true, WaitingText, float.NaN, true,
             ResultFooterSource.ClientNoFooterSafeArea, ResultsFontGrowth.FillCeiling(ResultFooterSource.ClientNoFooterSafeArea, true));
         int font = ResultsBandFit.FontForBand(settled.Height, Rows, PanelDensity.Compact, 0);
         float boardHeight = ResultsBandFit.RowHeight(font, PanelDensity.Compact) * Rows;
@@ -112,7 +102,7 @@ internal static class ResultSettlementPlacementScenarios
         int wobbles = 0, accepted = 0;
         for (int frame = 105; frame < 121; frame++)
         {
-            ResultClientStripState state = ResultClientFailureStrip.Decide(frame, gate, Evidence(WallHigh, 0, false),
+            ResultClientStripState state = ResultClientFailureStrip.Decide(frame, gate, textOnly,
                 out ResultClientBandReading band, out _);
             if (state != ResultClientStripState.Placed || !near(band.Top, settled.Top) || !near(band.Bottom, settled.Bottom)) wobbles++;
             if (ResultBoardHold.TryPlace(Width, Height, boardStrip, 1160f, boardHeight, 0f, out LayoutRect again, 2f)
@@ -123,63 +113,86 @@ internal static class ResultSettlementPlacementScenarios
         }
         check(boardFits && wobbles == 0,
             "sixteen further repaints measure the same band, fit the same rectangle and pass both per-repaint checks: nothing swings back and forth, and the vanilla page never comes back");
-        check(accepted == 16,
-            "and every one of those repaints accepts the board at the very rectangle the first visible frame placed it at");
+        check(accepted == 16 && placed.Bottom <= WaitingText - ResultBoardHold.ButtonClearance + 0.5f,
+            "and every one of those repaints accepts the board at the very rectangle the first visible frame placed it at, clear of the waiting line above it");
 
-        // A later, higher control: the gate keeps the highest wall it has seen, so the band may only tighten - and
-        // `Measure` (a standing board) never withdraws anything.
-        check(ResultClientFailureStrip.Measure(122, gate, Evidence(WallLow, 0, true), out ResultClientBandReading tightened, out _)
-              == ResultClientStripState.Placed && near(tightened.Bottom, WallLow - clearance),
-            "a control that arrives later and higher tightens the band through `Measure` and never takes the standing board away");
+        // 3. 一个更高的可按控件：门记住本页最高的一堵墙，条带只会收紧，`Measure` 从不撤板。
+        check(ResultClientFailureStrip.Measure(122, gate, Evidence(ControlAboveText, 0), out ResultClientBandReading tightened, out _)
+              == ResultClientStripState.Placed && near(tightened.Bottom, ControlAboveText - clearance)
+              && tightened.PressableTightened && !tightened.WaitingTextTightened,
+            "a pressable control that reaches higher than the line tightens the band through `Measure` (" + tightened.Bottom.ToString("0.00")
+            + ") and never takes the standing board away - the higher of the two walls wins, because it is the safer edge");
 
-        // The item added this round belongs to the first placement only: a page that switches its own actions off again
-        // after the board stands is not a reason to withdraw it.
-        ResultClientStripState afterActionsOff = ResultClientFailureStrip.Measure(123, gate,
-            new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, WaitingText, float.NaN,
-                true, true, 0, pageActionsPending: true), out ResultClientBandReading heldBand, out _);
-        check(afterActionsOff == ResultClientStripState.Placed && near(heldBand.Bottom, WallLow - clearance),
-            "a later frame whose page actions are off again - and whose pressable reading is empty - still hands out the tightened band: `Measure` does not read the page-action item, so nothing a page switches off can withdraw a board that is already up");
+        // 4. 更低的控件不改变任何东西：那行字还是更靠上的那一堵墙。
+        check(ResultClientFailureStrip.Measure(123, gate, Evidence(WallLow, 0), out ResultClientBandReading lower, out _)
+              == ResultClientStripState.Placed && near(lower.Bottom, ControlAboveText - clearance),
+            "a control below the waiting line changes nothing at all: the line is still the higher wall, and the highest wall this page ever showed is what the band stands on");
+
+        // 5. 之后那一帧两个读数都量不到：本页见过的最高墙还记得住，板子不会被撤掉。
+        var blind = new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, float.NaN, float.NaN);
+        check(ResultClientFailureStrip.Measure(124, gate, blind, out ResultClientBandReading heldBlind, out _)
+              == ResultClientStripState.Placed && near(heldBlind.Bottom, ControlAboveText - clearance),
+            "a later frame whose line and control are both unmeasurable still hands out the tightened band: `Measure` reads the highest wall this page ever showed, so nothing a page switches off or stops drawing can withdraw a board that is already up");
+
+        // 6. 画面固定下沿只是封顶：没有墙时它不会自己变成一条带宽 1049px 的带。
+        ResultPageWalls floorOnly = ResultPageLowerBoundPolicy.Resolve(guestFailure: true, screenHeight: Height,
+            footerControlTop: float.NaN, scanPressableTop: float.NaN, footerTextTop: float.NaN, footerTextSource: ResultBoundSource.None);
+        check(Math.Abs(floorOnly.PageFloor - 1429.333f) <= 0.01f
+              && !float.IsFinite(floorOnly.PressableTop) && !float.IsFinite(floorOnly.FooterTextTop)
+              && !ResultFailureWallPolicy.WallMeasured(floorOnly, float.NaN, float.NaN, float.NaN),
+            "the page's own screen-derived foot (1429.333) is a cap and not a wall: with nothing measured the fail-open gate is not satisfied by it either - that reading is exactly what drew the run-3 board over the control at 1177");
+        ResultPageWalls textWall = ResultPageLowerBoundPolicy.Resolve(true, Height, float.NaN, float.NaN, WaitingText,
+            ResultBoundSource.None);
+        check(near(textWall.FooterTextTop, WaitingText) && textWall.FooterTextSource == ResultBoundSource.FooterText
+              && ResultFailureWallPolicy.WallMeasured(textWall, float.NaN, float.NaN, float.NaN),
+            "the same page with the waiting line measured hands it over as the footer wall (FooterText, 1147) and that IS a wall - host and client differ in what they draw there, never in whether it bounds the board");
     }
 
     // ---------------------------------------------------------------------------------------------------
-    // A (escape): the existing 60 refusals still answer, and the answer is fail-open
+    // A (escape): 一条墙都量不到的客机失败页不由帧数作答——保留原版；只有玩家自己的 F8 才给出那条带
     // ---------------------------------------------------------------------------------------------------
     private static void ClientFailureEscape(Action<bool, string> check)
     {
-        // A page whose own actions never come and which never shows a pressable control: the strict gate refuses for
-        // ever, which is correct because nothing has been measured. The *existing* budget answers instead. What must not
-        // happen is a page with no board at all, and what must not be claimed is that it settled.
+        // 1.19.45：一页从头到尾量不到任何墙（那行字和可按控件都不可测）。严格门永远不交条带，这是对的；
+        // 而 fail-open 那一边**不能**因为 60 次拒收就把屏幕下界当墙——那正是 run 3 画出 band (488..1429) 的原因。
         float boardFloor = ResultsFontGrowth.MinimumBoardHeight(Rows, PanelGeometry.MinimumRowEm, PanelDensity.Compact);
         var gate = new ResultClientWallGate();
-        int misses = 0, strictPlacements = 0, budgetFrames = 0, answered = 0, committed = 0;
+        var wallLess = new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, float.NaN, float.NaN);
+        int misses = 0, strictPlacements = 0, budgetFrames = 0, answered = 0, refusedByWallPolicy = 0;
         for (int frame = 0; frame < 200; frame++)
         {
-            ResultClientStripState state = ResultClientFailureStrip.Decide(3000 + frame, gate,
-                new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, WaitingText, float.NaN,
-                    true, true, 0, pageActionsPending: true), out ResultClientBandReading band, out _);
-            if (state == ResultClientStripState.Placed && band.Fits) strictPlacements++;
+            if (ResultClientFailureStrip.Decide(3000 + frame, gate, wallLess, out ResultClientBandReading band, out _) == ResultClientStripState.Placed
+                && band.Fits) strictPlacements++;
             misses = ResultPlacementPolicy.Spend(misses);
             if (ResultPlacementPolicy.Decide(false, misses, false) != ResultPlacementOutcome.PlacedFallback) continue;
             budgetFrames++;
-            // The escape's own gate, fed exactly as `FallbackPlacement` feeds it from the page's scan.
+            // The escape's own gates, fed exactly as `FallbackPlacement` feeds them from the page's scan.
             bool pageReadable = ResultFallbackPolicy.PageReadable(true, true, 0);
             if (!ResultFallbackPolicy.MayAnswer(misses, false, pageReadable)) continue;
-            answered++;
             ResultPageWalls walls = ResultPageLowerBoundPolicy.Resolve(true, Height, float.NaN, float.NaN, float.NaN,
                 ResultBoundSource.None);
-            if (ResultFallbackBandPolicy.TryResolve(Height, TitleBottom, ResultBoundSource.TitleAnchor, walls, float.NaN,
-                    float.NaN, float.NaN, boardFloor, out ResultFallbackPlan plan)
-                && ResultFallbackLayout.TryPlaceInBand(Width, Height, plan.Top, plan.Bottom, 900f, boardFloor, 0f,
-                    out LayoutRect _)) committed++;
+            bool wallMeasured = ResultFailureWallPolicy.WallMeasured(walls, float.NaN, float.NaN, float.NaN);
+            if (ResultFailureWallPolicy.Waits(wallMeasured, frame, guestFailure: true)) { refusedByWallPolicy++; continue; }
+            answered++;  // 只有玩家自己的 F8 会走到这里：本过程喂的是一张没有任何墙的页面。
         }
         check(strictPlacements == 0,
-            "two hundred frames of a client page that never shows a control and never finishes its own actions place nothing strictly: this gate is never satisfied by waiting");
-        check(budgetFrames > 0 && answered == budgetFrames && committed == budgetFrames,
-            "and the existing refusal budget answers every one of those frames after " + ResultFallbackPolicy.MissBudget
-            + " refusals - the fail-open band really commits a rectangle (" + answered + " of " + budgetFrames
-            + " windows) - so an extreme page is drawn rather than left empty");
+            "two hundred frames of a client page that measures no wall at all place nothing strictly: this gate is never satisfied by waiting");
+        check(budgetFrames > 0 && refusedByWallPolicy == budgetFrames && answered == 0,
+            "and the refusal budget does not buy a board either: " + refusedByWallPolicy + " of " + budgetFrames
+            + " budget windows reach the fail-open gate and every one of them is refused by `ResultFailureWallPolicy` - no frame count and no timeout turns 'no wall seen' into 'this page has no wall'");
         check(!gate.Settled && !float.IsFinite(gate.Wall),
-            "and none of those frames was called settled: the gate never agreed on a wall (there was none), which is exactly why the answer had to come from the refusal budget and is logged as fail-open rather than as a proven page");
+            "and none of those frames was called settled: the gate never agreed on a wall (there was none)");
+
+        // 玩家自己的 F8 仍然被回答：那一条带会用到屏幕自己的下界，日志必须把它说成「墙没被观测到」。
+        bool waived = ResultFallbackBandPolicy.TryResolve(Height, TitleBottom, ResultBoundSource.TitleAnchor,
+            ResultPageLowerBoundPolicy.Resolve(true, Height, float.NaN, float.NaN, float.NaN, ResultBoundSource.None),
+            float.NaN, float.NaN, float.NaN, boardFloor, out ResultFallbackPlan waivedBand);
+        check(waived && waivedBand.PageBand && waivedBand.Bottom > 1400f
+              && ResultFailureWallPolicy.AnswerNote(false, 0, true).Contains("wallUnobserved=true")
+              && ResultFailureWallPolicy.AnswerNote(false, 0, true).Contains("F8")
+              && ResultFailureWallPolicy.AnswerNote(false, 0, true).Contains("screen-derived geometry"),
+            "the player's own F8 is still answered, and the band it answers with is the page's own screen-derived geometry (bottom="
+            + waivedBand.Bottom.ToString("0") + ") - the log line says the wall was never observed, so a successful fallback is never dressed up as the page's proven geometry");
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -377,7 +390,7 @@ internal static class ResultSettlementPlacementScenarios
             "a failure page (the completion ledger is the success page's, so the reveal is not enforced there) keeps exactly the answer it had: nothing measurable, fail open; readable but still moving, wait");
 
         // 5. F5: the gate object the first placement needs is refused, never dereferenced.
-        check(ResultClientFailureStrip.Decide(600, null, Evidence(WallHigh, 0, false), out ResultClientBandReading noWall, out _)
+        check(ResultClientFailureStrip.Decide(600, null, Evidence(WallHigh, 0), out ResultClientBandReading noWall, out _)
               == ResultClientStripState.WallNotSettled && !noWall.Fits,
             "a missing wall gate is refused by the first placement instead of throwing: no gate means no agreement, and no agreement means no band");
     }
@@ -459,18 +472,20 @@ internal static class ResultSettlementPlacementScenarios
     private static void PageChangeResets(Action<bool, string> check)
     {
         var gate = new ResultClientWallGate();
-        check(ResultClientFailureStrip.Decide(400, gate, Evidence(float.NaN, 0, true), out _, out _) == ResultClientStripState.WallNotSettled
-              && ResultClientFailureStrip.Decide(401, gate, Evidence(float.NaN, 0, true), out _, out _) == ResultClientStripState.WallNotSettled,
-            "a client failure page starts by refusing, exactly as it does everywhere else in this file");
+        // 这一页量不到任何墙：门不回答任何问题（两帧都拒绝）。
+        check(ResultClientFailureStrip.Decide(400, gate, NoWall(), out _, out _) == ResultClientStripState.WallNotSettled
+              && ResultClientFailureStrip.Decide(401, gate, NoWall(), out _, out _) == ResultClientStripState.WallNotSettled,
+            "a client failure page that measures no wall at all starts by refusing, exactly as it does everywhere else in this file");
         gate.Forget();
         check(!gate.Settled && !float.IsFinite(gate.Wall) && gate.Samples == 0,
             "the next result screen inherits neither the previous page's wall nor its agreement");
-        check(ResultClientFailureStrip.Decide(500, gate, Evidence(float.NaN, 0, true), out _, out _) == ResultClientStripState.WallNotSettled,
-            "and the page-action item is asked again on it: the first frame of the second expedition is refused exactly like the first one's");
-        check(ResultClientFailureStrip.Decide(501, gate, Evidence(WallMid, 0, false), out _, out _) == ResultClientStripState.WallNotSettled
-              && ResultClientFailureStrip.Decide(502, gate, Evidence(WallMid, 0, false), out ResultClientBandReading second, out _) == ResultClientStripState.Placed
-              && near(second.Bottom, WallMid - ResultsBounds.Clearance(Height)),
-            "and the same sequence places it on its own wall, never on the previous page's");
+        check(ResultClientFailureStrip.Decide(500, gate, NoWall(), out _, out _) == ResultClientStripState.WallNotSettled,
+            "and the wall question is asked again on it: the first frame of the second expedition is refused exactly like the first one's");
+        // 第二局自己量到那行等待文字：两帧之后它按自己的墙落板，而不是上一局的。
+        check(ResultClientFailureStrip.Decide(501, gate, Evidence(WallMid, 0), out _, out _) == ResultClientStripState.WallNotSettled
+              && ResultClientFailureStrip.Decide(502, gate, Evidence(WallMid, 0), out ResultClientBandReading second, out _) == ResultClientStripState.Placed
+              && near(second.Bottom, Math.Min(WaitingText, WallMid) - ResultsBounds.Clearance(Height)),
+            "and the same sequence places it on its own page's wall (the waiting line at 1147, which is higher than the control at 1181), never on the previous page's");
 
         // The first run's own page: one caption target and one piece of artwork, both really finished.
         var ledger = new BlinkCompletionLedger();
@@ -525,20 +540,21 @@ internal static class ResultSettlementPlacementScenarios
         string final = File.ReadAllText(Path.Combine(root, "ResultFinalLayout.cs"));
         string ledger = File.ReadAllText(Path.Combine(root, "BlinkCompletionLedger.cs"));
 
-        // A: the client branch derives the item from the one fact it can honestly read, prints the rest once for the
-        // record, and only then asks the shared decision; the standing-board path is given the same evidence without it.
-        int pendingAt = display.IndexOf("bool pageActionsPending = ResultClientPageActionPolicy.Pending(", StringComparison.Ordinal);
+        // A: 客机失败页的墙 = 等待文字 / 可按控件里更靠上的那一堵；生产在落板前先算出这个读数、按页打印一次诊断，
+        //    然后再问共享判定；`Measure`（站着的板）喂同一份事实。
+        int pendingAt = display.IndexOf("bool wallPending = ResultClientPageActionPolicy.Pending(", StringComparison.Ordinal);
         int decideAt = display.IndexOf("ResultClientFailureStrip.Decide(Time.frameCount, ClientWall, clientEvidence", StringComparison.Ordinal);
         check(pendingAt >= 0 && decideAt > pendingAt
-              && display.Contains("bool pageActionsPending = ResultClientPageActionPolicy.Pending(pressableTop);")
-              && !display.Contains("ResultClientPageActionPolicy.Pending(\n                    controls.HiddenPageActions,")
-              && display.Contains("hidden={controls.Hidden},") && display.Contains("hiddenPageActions={controls.HiddenPageActions},pressable=")
-              && display.Contains("HeadingReports.Add(\"failure-client-page-actions-pending-to-fail-open\")"),
-            "the client failure branch asks the honest predicate with the only fact it reads (the frame's pressable top), prints hidden/hiddenPageActions/pressable once per page - including the once-per-page line for a page that stays pending until the fail-open budget answers it - and only then asks the shared decision");
-        check(geometry.Contains("public static bool Pending(float pressableTop) => !float.IsFinite(pressableTop);")
-              && geometry.Contains("bool answerable = scanComplete && parentCoverageComplete && !pageActionsPending && (readable || unmeasuredControls == 0)")
-              && geometry.Contains("pageActionsPending: false);"),
-            "the predicate is exactly 'no pressable control measured' (the four inputs that had no per-frame information on a client page are gone), the gate makes a pending frame unanswerable, and `Measure` - the standing board - passes the item as false, so nothing a page switches off later can withdraw a board that is already up");
+              && display.Contains("bool wallPending = ResultClientPageActionPolicy.Pending(waitingTextTop, pressableTop);")
+              && display.Contains("hidden={controls.Hidden}") && display.Contains("hiddenPageActions={controls.HiddenPageActions}")
+              && display.Contains("HeadingReports.Add(\"failure-client-wall-pending-to-fail-open\")"),
+            "the client failure branch feeds the honest predicate the two readings that really are walls (the waiting line's own top and the highest pressable control), prints hidden/hiddenPageActions/waitingText/pressable once per page - including the once-per-page line for a page that stays pending until the fail-open budget answers it - and only then asks the shared decision");
+        check(geometry.Contains("public static bool Pending(float waitingTextTop, float pressableTop)")
+              && geometry.Contains("=> !float.IsFinite(waitingTextTop) && !float.IsFinite(pressableTop);")
+              && geometry.Contains("bool answerable = scanComplete && parentCoverageComplete && readable && unmeasuredControls == 0;")
+              && geometry.Contains("wall.Observe(frame, true, true, evidence.WallTop, evidence.UnmeasurableControls)")
+              && geometry.Contains("evidence.WallTop, evidence.UnmeasurableControls);"),
+            "the predicate is exactly 'this page measured no wall at all' - the waiting line counts, which is the whole correction - the gate makes a frame with no wall unanswerable, and both the first placement and the standing board (`Measure`) are fed the same combined reading");
 
         // B: the reveal is asked before the section is measured, the gate is a policy call with an escape, and the
         // per-repaint safety checks do not ask it at all.
@@ -620,9 +636,13 @@ internal static class ResultSettlementPlacementScenarios
     }
 
     // One frame of the recorded client page, as production's own measurement hands it over.
-    private static ResultClientFailureEvidence Evidence(float pressableTop, int unmeasurable, bool pending)
+    private static ResultClientFailureEvidence Evidence(float pressableTop, int unmeasurable)
         => new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, WaitingText, pressableTop,
-            true, true, unmeasurable, pending);
+            true, true, unmeasurable);
+
+    // 一帧连墙都没有：那行等待文字和可按控件都不可测。这是「墙还没出现」，不是「这一页没有墙」。
+    private static ResultClientFailureEvidence NoWall()
+        => new ResultClientFailureEvidence(TitleBottom, Width, Height, Gap, MinimumStrip, float.NaN, float.NaN);
 
     // One method's or type's body by brace pairing: what belongs to it, never what it means.
     private static string Body(string source, string signature)

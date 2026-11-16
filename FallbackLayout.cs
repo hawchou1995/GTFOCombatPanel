@@ -439,28 +439,81 @@ public static class ResultFallbackTier
 // branch already had its own voice (`ResultClientPageActionPolicy`), which is what left the host path able to invent a
 // band from the window.
 //
-// It never becomes a permanent wait: after `UnobservedBudget` frames the band is answered anyway, and the line that
-// answers it says the wall was never observed - the bounded give-up `ResultFinalPolicy.MaximumWaitFrames` this build
-// already has, never a claim that the page was final.
+// 1.19.44 (the TOA Pure client failure page, `LogOutput` 12642-12676): this policy was **dead on the one page it was
+// written for**. `ResultsDisplay.FallbackPlacement` decided "a wall was measured" from
+// `float.IsFinite(walls.PageFloor)` as well - and `ResultPageLowerBoundPolicy` gives every client failure page a
+// `PageFloor` (the 1080p reference foot scaled by height, 1429.33 on 2560x1440). A reading that is *always* finite
+// therefore made `wallMeasured` always true, the refusal above never happened, and after `MissBudget` (60) refusals the
+// fail-open band was invented from the screen: band (488..1429), a 900-tall board, a real control at 1171 that arrived a
+// frame later and `ResultBoardHold.TryHold` refusing to lift a board that was already at the band's top - so the board
+// spent the rest of the page 217 px over the footer at 0.55 opacity.
+//
+// 1.19.45 (user correction, and it settles what this policy may treat as a wall):
+//
+//   * `WallMeasured` is the one definition of "this page really bounded its board", and the page's own screen-derived
+//     foot is **not** one of the readings it accepts. A client failure page's foot is a fact about the screen, not a
+//     measurement of anything the page draws or the player presses.
+//   * The client failure page's "waiting for the host" line **is** a wall, and it is the ordinary one: it is the thing
+//     the page really draws under the board, exactly as the host's "leave expedition" button is under the host's board
+//     (`ResultPageLowerBoundPolicy` hands it over as `FooterTextTop`). A page whose wall is that line therefore needs no
+//     other evidence, and the first board is fitted above it.
+//   * What no frame count and no timeout may do is turn "no wall seen **at all**" into "this page has no wall". On a
+//     client failure page that is the only honest answer: waiting longer says nothing about what stands under the band,
+//     so the vanilla page is kept and the page is re-measured at the existing bounded cadence (`ResultRetryCadence`)
+//     instead of a board being invented from the screen. F8 is still the player's own answer (`Forced`), and a guest
+//     page it answers is logged as a wall that was never observed, with the band's foot named as the screen's own
+//     geometry.
+//   * The native failure sequence (`FailureSequenceReadiness`) is deliberately **not** an answer here. It says the
+//     page's own script finished laying itself out; it does not say where the wall is, and a band invented from the
+//     screen foot on the strength of it is the very reading this release removes.
 public static class ResultFailureWallPolicy
 {
     public const string Unobserved = "wall-not-observed";
     public const int UnobservedBudget = ResultFinalPolicy.MaximumWaitFrames;
 
-    // Withhold the invented band while the page has shown no lower bound at all, but not for ever.
-    public static bool Waits(bool wallMeasured, int framesWithoutWall)
-        => !wallMeasured && framesWithoutWall < UnobservedBudget;
+    // Which readings of *this* page really bound a board below it.
+    //
+    // `walls` already carries the page's own semantics (`ResultPageLowerBoundPolicy`): on a client failure page
+    // `FooterTextTop` is the waiting-status line's own laid-out top (a wall, and the ordinary one) and `PressableTop` is
+    // the highest control the player can really press, while `PageFloor` is only the band's cap. `namedControlTop` is
+    // the caller's own named-button reading (`ResultsDisplay.LobbyButtonTop`), `scanPressableTop` the scan's pressable
+    // read and `scanFooterTextTop` the scan's footer read - the last one only counts on a page where that footer is a
+    // wall the walls struct does not already carry (a host failure page, a success page). One definition, used by the
+    // production placement and driven directly by the regression suite.
+    public static bool WallMeasured(in ResultPageWalls walls, float namedControlTop, float scanPressableTop,
+        float scanFooterTextTop)
+        => float.IsFinite(walls.PressableTop) || float.IsFinite(walls.FooterTextTop)
+            || float.IsFinite(namedControlTop) || float.IsFinite(scanPressableTop)
+            || (!walls.GuestFailure && float.IsFinite(scanFooterTextTop));
 
-    public static bool Answer(bool wallMeasured, int framesWithoutWall)
-        => wallMeasured || framesWithoutWall >= UnobservedBudget;
+    // Withhold the invented band while the page has shown no lower bound at all.
+    //
+    // A host failure page keeps the bounded give-up it has always had (`UnobservedBudget` frames, and the answer says it
+    // was a give-up). A client failure page is answered by a measured wall - never by a frame count and never by a
+    // timeout: waiting longer is not evidence about what stands under the band. Only the player's own F8 request
+    // (`Forced`, handled by the caller) may answer such a page without one.
+    public static bool Waits(bool wallMeasured, int framesWithoutWall, bool guestFailure)
+        => !wallMeasured && (guestFailure || framesWithoutWall < UnobservedBudget);
+
+    // The same question as `Waits`, answered the other way round, for the callers that ask it positively.
+    public static bool Answer(bool wallMeasured, int framesWithoutWall, bool guestFailure)
+        => !Waits(wallMeasured, framesWithoutWall, guestFailure);
 
     // F5: the note that rides on a line which answers a band without a measured lower bound. The give-up is bounded, and
     // a successful fallback is not proof that the page has a wall: the line has to keep saying which one it was, so a
     // reader of the log can tell an answered page from a page whose geometry was proven. Empty whenever the wall was seen.
-    public static string AnswerNote(bool wallMeasured, int framesWithoutWall)
-        => wallMeasured || framesWithoutWall < UnobservedBudget
+    //
+    // On a client failure page the only answer without a measured wall is the player's own F8 request, so the note says
+    // exactly that and names the band's foot for what it is.
+    public static string AnswerNote(bool wallMeasured, int framesWithoutWall, bool guestFailure)
+    {
+        if (wallMeasured) return string.Empty;
+        if (guestFailure)
+            return ", wallUnobserved=true (answered by the player's own F8 request while this page has measured no wall at all - neither the waiting-status line's own rectangle nor a pressable control: the band's foot is the page's own screen-derived geometry, never a measured wall, and no frame count or timeout may answer this page)";
+        return framesWithoutWall < UnobservedBudget
             ? string.Empty
             : ", wallUnobserved=true (answered after " + framesWithoutWall + " frames without a measured lower bound: a bounded give-up, not the page's proven geometry)";
+    }
 }
 
 // Whether one text of a result page's footer subtree is the waiting block the board must stay above.

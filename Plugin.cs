@@ -26,6 +26,10 @@ public sealed class Plugin : BasePlugin
     // The settlement board's own wheel-controlled glyph scale, one preference per result page: the two pages
     // have strips of different heights, so the same scale means two different tables.
     internal static ConfigEntry<float> SuccessFontScale, FailureFontScale;
+    // （B）固定模式：玩家自己指定字号与「表格底边中点」的位置，作为自适渲染之外的兜底尺子，默认关闭。
+    // 关着的时候三个数值一个字节都不读，自适应行为（成功页/失败页各自的条带与滚轮缩放）完全照旧。
+    internal static ConfigEntry<bool> FixedLayoutConfig;
+    internal static ConfigEntry<float> FixedFontPixelsConfig, FixedAnchorXConfig, FixedAnchorYConfig;
     internal static ConfigEntry<string> WeightsConfig, SupportToolNames;
     // 1.16.0 additions: the result overlay's own switch, the two positive vanilla-block switches (off by
     // default, so the board owns the page), the two support-tool rules, and the user-editable scoring file.
@@ -65,6 +69,35 @@ public sealed class Plugin : BasePlugin
         ShowResultOverlay = Config.Bind("Results", "ShowResultOverlay", true, "把本模组的板子画在结算页之上。设 false 则结算页保持游戏原样：不画板，也不放回旧统计表。");
         ResultsOffsetX = Config.Bind("Results", "OffsetX", 0f, "结算表相对页面默认位置的像素偏移；正数向右移。");
         ResultsOffsetY = Config.Bind("Results", "OffsetY", 0f, "结算表相对页面默认位置的像素偏移；正数向下移。");
+        // 固定模式：把「板子多大、放在哪里」的主动权交给玩家。自适应那条链仍然是默认，这一组只是兜底/覆盖。
+        FixedLayoutConfig = Config.Bind("Results", "FixedLayout", false,
+            "固定模式（兜底，默认关闭）：打开后结算板不再按页面自适应，而由下面三个键指定的字号与「表格底边中点」决定大小和位置，成功页与失败页共用这一组值。"
+            + "关着时这三个键一个都不读，自适应与两页各自的滚轮缩放照旧。固定模式不等待页面的下界墙（那行等待文字/按钮），"
+            + "但每一帧仍会做真实的二维控件相交检查：表格压在一个真可按的控件上时**照样画**（降到 0.55 不透明度降低遮挡，"
+            + "日志写清相交的是哪个控件与 opacity，X 错开就不算冲突）；只有画不出来的输入（非数字、越界、量不出表格、"
+            + "跑出屏幕）才不画板、不改你的数字、保留原版页面并写一行 fixed-layout-* 诊断；扫描证据不足时淡画但保留原版块。"
+            + "固定模式下滚轮不会改字号。例：FixedLayout = true");
+        // 三个数值键都不绑 `AcceptableValueRange<float>`：那层范围会在读配置时把 500 静默夹成 240、把 2 静默夹成 6，
+        // 而玩家看到的是「我设的值生效了」。校验只在生产里做（`ResultFixedLayout.Valid`）：越界就拒绝整块板、
+        // 保留原版页面并写一行 `fixed-layout-input-invalid`，说清是哪一项、有效范围是多少、以及没有被夹过。
+        FixedFontPixelsConfig = Config.Bind("Results", "FixedFontPixels", ResultFixedLayout.DefaultFontPixels,
+            "固定模式的字号，单位是**实际屏幕像素**（1080p 下 18 左右是正文可读尺寸，1440p 可以用 24）。"
+            + "绘制时就是这个像素值：不乘 Density、不乘滚轮缩放、不按页面条带缩小。有效范围 "
+            + ResultFixedLayout.MinimumFontPixels.ToString("0") + "-" + ResultFixedLayout.MaximumFontPixels.ToString("0")
+            + "（IMGUI 的整数像素）：写 5 就是 5px，不会为了「可读」抬到更大的字号、也不会因此整块拒绘；"
+            + "写成非数字、0 或负数、或越界时不夹、不缩，整块保留原版页面并写诊断（日志里 fixed-layout-input-invalid）。"
+            + "小数会四舍五入到整数像素，因为 IMGUI 的字号是整数（日志 actualglyph= 就是真正画出来的那个值）。"
+            + "例：FixedFontPixels = 18");
+        FixedAnchorXConfig = Config.Bind("Results", "FixedAnchorX", ResultFixedLayout.DefaultAnchorX,
+            "固定模式下**表格底边中点**的横向位置：窗口宽度的比例。左上角是 (0,0)，X 向右增大；"
+            + "0 = 窗口左边缘，1 = 右边缘，0.5 = 水平居中（默认）。表格按这个点居中：左边缘 = FixedAnchorX × 窗口宽度 − 表格宽度 ÷ 2。"
+            + "所以表格变宽、玩家变多时，底边中点仍然钉在这条竖线上。允许 0-1；越界或非数字时不夹，保留原版并写诊断。"
+            + "例：FixedAnchorX = 0.5");
+        FixedAnchorYConfig = Config.Bind("Results", "FixedAnchorY", ResultFixedLayout.DefaultAnchorY,
+            "固定模式下**表格底边中点**的纵向位置：窗口高度的比例。左上角是 (0,0)，Y 向下增大；"
+            + "0 = 窗口顶端，1 = 底端，0.80 = 屏幕下方五分之一处（默认）。表格向上生长、底边落在这条横线上："
+            + "上边缘 = FixedAnchorY × 窗口高度 − 表格高度。所以字号或行数变化时，底边中点不动，只有顶边跟着长。"
+            + "允许 0-1；越界或非数字时不夹，保留原版并写诊断。例：FixedAnchorY = 0.80");
         // The wheel's two preferences. Readable keys, the same section as the rest of the result-page settings,
         // and a range the wheel itself steps through - so a hand edit, a re-read and a scroll all agree.
         SuccessFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.SuccessKey, ResultsZoom.Default,

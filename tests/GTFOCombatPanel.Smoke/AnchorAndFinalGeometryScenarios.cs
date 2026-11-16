@@ -613,8 +613,8 @@ internal static class AnchorAndFinalGeometryScenarios
 
         check(ladder.Contains("public static AnchorCameraChoice Select(") && final.Contains("public sealed class ResultFinalGate"),
             "the two policies this round adds are their own files, so both can be asserted without Unity");
-        check(info.Contains("Version = \"1.19.39\""),
-            "the version carrier says 1.19.39: the settlement board is sized by what the page really draws, with the anchor contract asserted above unchanged");
+        check(info.Contains("Version = \"1.19.40\""),
+            "the version carrier says 1.19.40: the settlement board is sized by what the page really draws, with the anchor contract asserted above unchanged");
 
         // 1.19.20's own increment, untouched: the split kill tiers and the drawable floor.
         check(board.Contains("public static bool SplitKillTiersFor(float room, float emPerGlyph)") && board.Contains("private static int GlyphFor("),
@@ -624,7 +624,7 @@ internal static class AnchorAndFinalGeometryScenarios
         check(display.Contains("private static float _readableFloor = float.NaN;")
               && display.Contains("_readableFloor = ResultsFontGrowth.MinimumBoardHeight(rows, rowEm, Plugin.Density);"),
             "both floors are still set for every page visit, so a page is judged by the room it measured");
-        check(display.Contains("bool splitTiers = ImpactBoard.SplitKillTiersFor(strict ? room : float.NaN,")
+        check(display.Contains("bool splitTiers = fixedLayout || ImpactBoard.SplitKillTiersFor(strict ? room : float.NaN,")
               && display.Contains("ImpactBoard.Build(report, splitTiers, succeeded)")
               && CountOf(display, "ImpactBoard.Build(report, true, succeeded)") == 2,
             "the board is still built with the row count the page's own room produced - the two hard-coded split builds are RefreshBoardData's, exactly as 1.19.20 shipped it, and 1.19.23's hidden-screen ArchiveScreen, which mirrors that same split rule so a hidden settlement page archives the same board shape");

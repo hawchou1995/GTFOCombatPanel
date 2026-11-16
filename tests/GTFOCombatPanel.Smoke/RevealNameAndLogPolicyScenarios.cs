@@ -265,19 +265,20 @@ internal static class RevealNameAndLogPolicyScenarios
     private static void FailureWallGiveUpKeepsItsName(Action<bool, string> check)
     {
         check(ResultFailureWallPolicy.Unobserved == "wall-not-observed"
-              && ResultFailureWallPolicy.Waits(false, ResultFailureWallPolicy.UnobservedBudget - 1)
-              && !ResultFailureWallPolicy.Waits(false, ResultFailureWallPolicy.UnobservedBudget)
-              && !ResultFailureWallPolicy.Waits(true, 0)
-              && ResultFailureWallPolicy.Answer(false, ResultFailureWallPolicy.UnobservedBudget),
-            "a failure page with no measured lower bound is withheld for exactly one give-up budget and answered on it");
-        string waiting = ResultFailureWallPolicy.AnswerNote(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget - 1);
-        string answered = ResultFailureWallPolicy.AnswerNote(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget);
+              && ResultFailureWallPolicy.Waits(false, ResultFailureWallPolicy.UnobservedBudget - 1, false)
+              && !ResultFailureWallPolicy.Waits(false, ResultFailureWallPolicy.UnobservedBudget, false)
+              && !ResultFailureWallPolicy.Waits(true, 0, false)
+              && ResultFailureWallPolicy.Answer(false, ResultFailureWallPolicy.UnobservedBudget, false),
+            "a host failure page with no measured lower bound is withheld for exactly one give-up budget and answered on it");
+        string waiting = ResultFailureWallPolicy.AnswerNote(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget - 1, guestFailure: false);
+        string answered = ResultFailureWallPolicy.AnswerNote(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget, guestFailure: false);
         check(waiting.Length == 0 && answered.Contains("wallUnobserved=true")
               && answered.Contains(ResultFailureWallPolicy.UnobservedBudget + " frames")
               && answered.Contains("bounded give-up"),
             "the note on the band that is answered without a measured wall keeps saying the wall was never observed, and that this is a bounded give-up rather than the page's proven geometry (F5)");
-        check(ResultFailureWallPolicy.AnswerNote(wallMeasured: true, framesWithoutWall: 900).Length == 0,
-            "a page that really measured its wall carries no such note, whatever the frame count");
+        check(ResultFailureWallPolicy.AnswerNote(wallMeasured: true, framesWithoutWall: 900, guestFailure: false).Length == 0
+              && ResultFailureWallPolicy.AnswerNote(wallMeasured: true, framesWithoutWall: 900, guestFailure: true).Length == 0,
+            "a page that really measured its wall carries no such note, whatever the frame count and whoever the page belongs to");
     }
 
     // ---------------------------------------------------------------------------------------------------
@@ -701,10 +702,14 @@ internal static class RevealNameAndLogPolicyScenarios
 
         // E: F5 - the line that answers an unproven band keeps saying the wall was never observed.
         string fallback = Body(display, "private static bool FallbackPlacement(Component page, bool succeeded, out float top, out float room,");
-        check(fallback.Length > 0 && fallback.Contains("wallUnproven = !wallMeasured;")
+        // 1.19.45: “墙量到了吗”只剩一个定义（`ResultFailureWallPolicy.WallMeasured`），它接受那一页真正画出来的墙
+        // （客机失败页的等待文字、主机页的按钮/页脚文字），但**不接受**页面自己从屏幕推出来的下沿；那条兜底日志的
+        // 注脚也由同一份证据决定（F8 / 主机的有界放弃）。页面自己的失败协程终点不再是这里的一条证据。
+        check(fallback.Length > 0 && fallback.Contains("wallMeasured = ResultFailureWallPolicy.WallMeasured(walls, pageButtonTop, controls.PressableTop,")
+              && !fallback.Contains("FailureSequence.IsFinished(page.Pointer)")
               && fallback.Contains("wallWait = FailureWallWaitFrames(wallMeasured);")
-              && fallback.Contains("ResultFailureWallPolicy.AnswerNote(!wallUnproven, wallWait)"),
-            "the fail-open band's own line carries the wall-not-observed note through the policy, so an answered page is never reported as a page whose geometry was proven (F5)");
+              && fallback.Contains("ResultFailureWallPolicy.AnswerNote(wallMeasured, wallWait, walls.GuestFailure)"),
+            "the fail-open band's own line carries the wall-not-observed note through the policy, and the wall it was answered from is the one definition that never counts the page's screen-derived foot (F5)");
     }
 
     // ---------------------------------------------------------------------------------------------------

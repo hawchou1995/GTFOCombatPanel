@@ -284,8 +284,8 @@ internal static class Release11922Scenarios
             "the anchor failure line keeps the DueToReport contract and adds the FreshWarning cap");
         check(ladder.Contains("canvasDrawn && mode == AnchorCanvasMode.ScreenSpaceCamera"),
             "the canvas-projection rule for screen-space-camera UI elements is in the ladder");
-        check(info.Contains("Version = \"1.19.39\""),
-            "the version carrier says 1.19.39 (the forced-frame and anchor contracts themselves are unchanged, only the forced refusal is now one line per press)");
+        check(info.Contains("Version = \"1.19.40\""),
+            "the version carrier says 1.19.40 (the forced-frame and anchor contracts themselves are unchanged, only the forced refusal is now one line per press)");
         Console.WriteLine("WIRING: RELEASE_11922_FORCED_FRAME_AND_ANCHOR (static source check; not a runtime behaviour test)");
     }
 

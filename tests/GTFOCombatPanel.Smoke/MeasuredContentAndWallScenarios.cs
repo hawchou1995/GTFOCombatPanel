@@ -333,12 +333,14 @@ internal static class MeasuredContentAndWallScenarios
     // ---------------------------------------------------------------------------------------------------
     private static void FailureWallIsNotInventedFromTheWindow(Action<bool, string> check)
     {
-        check(ResultFailureWallPolicy.Waits(wallMeasured: false, framesWithoutWall: 0)
-              && ResultFailureWallPolicy.Waits(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget - 1)
-              && !ResultFailureWallPolicy.Waits(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget)
-              && ResultFailureWallPolicy.Answer(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget)
-              && ResultFailureWallPolicy.Answer(wallMeasured: true, framesWithoutWall: 0)
-              && !ResultFailureWallPolicy.Answer(wallMeasured: false, framesWithoutWall: 0),
+        // 1.19.45: 主机失败页的答案还是那条有界放弃（预算按帧）；`guestFailure` 只描述客机失败页，而且它现在
+        // 根本不由帧数作答（量不到墙就保留原版并重测，唯一的例外是玩家自己的 F8）。
+        check(ResultFailureWallPolicy.Waits(false, 0, false)
+              && ResultFailureWallPolicy.Waits(false, ResultFailureWallPolicy.UnobservedBudget - 1, false)
+              && !ResultFailureWallPolicy.Waits(false, ResultFailureWallPolicy.UnobservedBudget, false)
+              && ResultFailureWallPolicy.Answer(false, ResultFailureWallPolicy.UnobservedBudget, false)
+              && ResultFailureWallPolicy.Answer(true, 0, false)
+              && !ResultFailureWallPolicy.Answer(false, 0, false),
             "a failure page with no lower bound withholds the invented band, and answers after the bounded give-up ("
             + ResultFailureWallPolicy.UnobservedBudget + " frames) or as soon as one reading exists");
 
@@ -373,7 +375,7 @@ internal static class MeasuredContentAndWallScenarios
         for (int frame = 0; frame < 2; frame++)
         {
             framesWithoutWall++;
-            placed |= ResultFailureWallPolicy.Answer(wallMeasured: false, framesWithoutWall);
+            placed |= ResultFailureWallPolicy.Answer(wallMeasured: false, framesWithoutWall, guestFailure: false);
         }
         check(!placed,
             "two complete scans that found no control never release the fail-open band: empty x2 is not 'this page has no wall'");
@@ -381,7 +383,7 @@ internal static class MeasuredContentAndWallScenarios
         // Frame 2: the page's own control arrives at 1240.
         ResultPageWalls late = ResultPageLowerBoundPolicy.Resolve(guestFailure: false, screenHeight: Height,
             footerControlTop: FailureButton, scanPressableTop: FailureButton, footerTextTop: float.NaN, footerTextSource: ResultBoundSource.None);
-        check(ResultFailureWallPolicy.Answer(wallMeasured: true, framesWithoutWall),
+        check(ResultFailureWallPolicy.Answer(wallMeasured: true, framesWithoutWall, guestFailure: false),
             "the frame the control is measured is the frame the band may answer");
         bool cut = ResultFallbackBandPolicy.TryResolve(Height, FailureTop, ResultBoundSource.TitleAnchor, late, float.NaN,
             float.NaN, float.NaN, 270f, out ResultFallbackPlan plan);
@@ -391,7 +393,7 @@ internal static class MeasuredContentAndWallScenarios
         check(ResultLateControlPolicy.MustMove(plan.Top, OldBoardBottom, plan.Top, plan.Bottom),
             "a board that really was drawn to 1385 is moved out of the control's way by the per-repaint rule");
         // The bounded give-up is honest: after the budget the band is answered, and the caller logs `ResultFailureWallPolicy.Unobserved`.
-        check(ResultFailureWallPolicy.Answer(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget)
+        check(ResultFailureWallPolicy.Answer(wallMeasured: false, framesWithoutWall: ResultFailureWallPolicy.UnobservedBudget, guestFailure: false)
               && ResultFailureWallPolicy.Unobserved == "wall-not-observed",
             "and a page that never shows a bound is answered only after the bounded give-up, under its own reason string");
     }

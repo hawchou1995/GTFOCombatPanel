@@ -2,7 +2,7 @@
 
 独立 GTFO 战斗统计面板：局内看战斗数据，成功或失败结算看队伍贡献。表格由 IMGUI 画在窗口像素里，不写入任何原版文字对象。
 
-- **当前状态**：源码版本为 1.19.39，已于 2026-11-15 发布到 Thunderstore GTFO 社区（`HawChow-CombatPanel-1.19.39`）。本工程构建非确定性：同源不同输出目录会得到**同尺寸但不同 SHA-256** 的 DLL（MVID 含源绝对路径），跨目录 hash 不能当作一致性判据，一致性与验证只用「同一输出目录原地重编，hash 与字节均不变」证明。近期变更见 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；包内 `Thunderstore/README.md` 保留功能、配置与安装文档。
+- **当前状态**：源码版本为 1.19.40。1.19.40 的发布包已在本地生成（`artifacts/GTFOCombatPanel-1.19.40.zip`），**尚未上传 Thunderstore**，由维护者手动发布。上一次公开发布为 1.19.39（2026-11-15，Thunderstore GTFO 社区，`HawChow-CombatPanel-1.19.39`）。实机复核是在**升号前**同一份代码的修复构建（Loader 显示 `1.19.39.0`）上完成的，只覆盖**主机单人失败结算页**；升到 1.19.40 后未再进游戏，成功页与联机结算本次未实测。本工程构建非确定性：同源不同输出目录会得到**同尺寸但不同 SHA-256** 的 DLL（MVID 含源绝对路径），跨目录 hash 不能当作一致性判据，一致性与验证只用「同一输出目录原地重编，hash 与字节均不变」证明。近期变更见 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；包内 `Thunderstore/README.md` 保留功能、配置与安装文档。
 - **安装**：模组包管理器（Thunderstore Mod Manager 等）搜索 `CombatPanel`（自动带上 BepInEx 依赖）；或手动把包内 `BepInEx/plugins/GTFOCombatPanel/` 整个目录放进 GTFO 目录下的同一路径。`CombatPanel-config/scoring.json` 放在**游戏持久数据目录**下（GTFO 即 `…\AppData\LocalLow\10 Chambers Collective\GTFO\`）并只在缺失时创建一次；插件目录里的旧副本会在首次使用时自动导入、此后以持久目录为准，手改过的配置不会被覆盖，也不会被升级包替换。已有 `.cfg` 在升级时保留，新配置项下次加载自动补齐。
 - **兼容**：仅依赖 **BepInEx-BepInExPack_GTFO-3.2.4**；EWC（ExtraWeaponCustomization）是可选集成，公共 DLL 不带它的程序集引用。多人快照协议为 **v8**，与旧协议不兼容（旧协议包会被明确拒收）。需要共享统计的每台机器装同一版本。
 - **反馈**：<https://qingju.me>；开黑语音频道（小黑盒语音）<https://chat.xiaoheihe.cn/in1wpsjd>。
@@ -75,6 +75,7 @@
 - 板子落位后不会因为一两帧的抖动移动；**页面本身在落位后又明显移动或改变尺寸时（别的模组重排页脚、分辨率变化等），板子自动重新测量并按新条带重新拟合**，每页有次数预算，不需要 F8 关开。
 - 结算页仍在持续收快照：数据让表格变大时，会先按落位时真正用到的条带与该帧按钮净空校验；装不下就保留已上板的网格，绝不压按钮或标题。
 - 鼠标滚轮在板子上可缩放字号，两页各存一份（`[Results] SuccessFontScale` / `FailureFontScale`）。缩放只乘在页面自己量出的字号上，往上最多夹回该字号。
+- 上面这一整段都是**自适应**（默认）。想自己定死字号和位置就打开固定模式：`[Results] FixedLayout = true` 加 `FixedFontPixels` / `FixedAnchorX` / `FixedAnchorY`（下文「配置」一节有四个键的完整说明与示例），那时页面条带、下界墙、滚轮缩放和 `OffsetX/OffsetY` 都不再参与。
 
 ## 原版元素
 
@@ -196,6 +197,10 @@ ShowImpactBoard = true
 ShowSuccessArtifacts = false
 ShowSuccessPlayerReports = false
 HideVanillaFailBlocks = true
+FixedLayout = false
+FixedFontPixels = 18
+FixedAnchorX = 0.5
+FixedAnchorY = 0.8
 
 [Scoring]
 ScoringFile = true
@@ -217,6 +222,14 @@ StaggerNeedsAttack = true
 - `[Results] ShowResultOverlay`（默认 true）：关掉后结算页保持游戏原样，**不再回退旧统计表**。`ShowImpactBoard`（默认 true）：影响板整块开关。`ShowSuccessArtifacts`（默认 false = 隐藏成功页红晶/神器栏、总结行、检查点消耗）、`ShowSuccessPlayerReports`（默认 false = 隐藏四张囚犯报告卡及其锚点）、`HideVanillaFailBlocks`（默认 true = 隐藏失败页红晶面板）：打开即精确还原；两条成功页开关的描述里都带提示「建议关闭显示以免影响观感」。
 - `[Results] SuccessFontScale` / `FailureFontScale`（默认 1.0，范围 0.5–2.0，一格 0.1）：结算板字号的滚轮缩放，成功页与失败页各存一份（两页条带高度不同，同一个倍率是两张不同大小的表）。1.0 = 页面条带自己量出来的字号；滚轮只在这个字号上做乘算，往上被夹回 1.0，往下到 0.5 为止，并且仍按真实条带与页面宽度回退到画得下、且不低于可读下限。指针落在板内才吃滚轮；改文件或热重载同样下一帧生效。
 - `ToggleKey`（默认 F8）：局内与结算页同一个 overlay，按下后写回 `ShowPanel` + `ShowResultOverlay` 并 `Config.Save()`，即**永久保存到 `.cfg`**，下一帧生效。结算页的板子跟随同一个开关，不需要额外按键。
+- `[Results] FixedLayout`（默认 `false`）：**固定模式**。自适应那条链（页面条带、下界墙、稳定门、兜底）是默认行为；打开这个开关后，结算板的**字号与位置**改由下面三个键决定，成功页与失败页共用同一组值，且**不受** `Density` 字号系数、滚轮缩放（`SuccessFontScale`/`FailureFontScale`）、`[Results] OffsetX/OffsetY` 或页面条带大小的任何影响。关着时这三个键一个字节都不读。
+  - `FixedFontPixels`（默认 `18`）：字号，单位是**实际屏幕像素**——画出来就是这个像素值，不乘任何系数；小数四舍五入到整数像素（IMGUI 的字号是整数，日志里 `actualglyph=18px` 就是真正画出来的那个值）。1080p 上 18 是正文可读尺寸，1440p 可以用 24。有效范围 `1`–`240`（IMGUI 的整数像素）：写 `5` 就是 5px，不会被抬到某个"可读下限"、也不会因此整块拒绘——小字号是玩家自己的选择，日志里 `actualglyph=5px` 与配置一字不差。非数字、0 与负数、越界仍然明确拒绝。
+  - `FixedAnchorX` / `FixedAnchorY`（默认 `0.5` / `0.8`）：**表格底边中点**的位置，两个值都是窗口尺寸的比例。**左上角是 (0,0)：X 向右增大、Y 向下增大**；`X=0.5` 是水平居中，`Y=0.8` 是从顶部向下 80%（距底边 20%）。算式为 `左边缘 = FixedAnchorX × 窗口宽度 − 表格宽度 ÷ 2`、`上边缘 = FixedAnchorY × 窗口高度 − 表格高度`。表格从底边中点向上生长；人数或内容宽度变化时，保持该比例锚点。有效范围 `0`–`1`。
+  - 示例（1080p 下的常用组合）：`FixedLayout = true`、`FixedFontPixels = 18`、`FixedAnchorX = 0.5`、`FixedAnchorY = 0.8` —— 18px 的正文、水平居中、底边中点落在 y = 864 那条横线上。
+  - **边界与拒绝**：以上三个数字**不会被夹**。真拒绝只有四种，而且都会**不画板、不改你的数字、也不隐藏原版块**，原版可交互页面原样保留，并按页写一行 `fixed-layout-*` 诊断（`input-invalid` / `grid-unmeasurable` / `font-not-honoured` / `offscreen`）：字号不在 `1`–`240`、零或非数字、锚点不在 `0`–`1`、窗口尺寸不可信、那个字号量不出表格、量回来的字号不是你要的那个像素、矩形跑出屏幕。诊断行带着真实字号、算出的矩形、窗口、锚点与原因；同一页同一组数字只写一行，但**改了任何一项就是新的一次尝试**，会重新写一遍（换页、改分辨率、F8 也一样）。注意锚点是**中点/边**：`FixedAnchorX = 1` 表示底边中点在右边缘，表格会有一半跑出屏幕，因此会被拒绝——这不是 bug，把 X 调回接近 0.5 即可。
+  - **不保证任意字体都装得下**：列宽是按当前实际字体（TMP 资产里的 CJK 回退字体；取不到时回退 Windows CJK 字体）**实量**出来的，同一组配置在不同字体/语言/紧凑度下宽度不同，字号越大越容易跑出屏幕。跑出屏幕就是上面那条 `fixed-layout-offscreen`：拒绝，而不是缩字。把 `FixedFontPixels` 调小或把锚点往屏幕中间挪即可。
+  - **真实控件相交不撤板**：固定模式**不等**页面自己的下界墙（失败页标题、客机失败页那行「正在等待厅主」的提示文字都不是它的上/下界），位置完全由你给的数决定；但它每一帧都做**真实二维矩形相交**检查（X 与 Y 都算，按钮上沿留 6px 余量），压在一个真正可按的控件上时**照样画板**，只是降到 0.55 不透明度降低遮挡，并在日志里写清固定矩形、真实字号、锚点、与**哪个控件**（对象名 + 组件类型）的真实矩形相交、以及 opacity；X 错开就不算冲突，无重叠立刻回到 1.0。板下面那颗按钮仍然归它自己——这块 overlay 不接管鼠标点击，只有滚轮被它吃掉且**不改字号**（字号只由 `FixedFontPixels` 决定）。
+  - **扫描证据不足时**（交互扫描看不完整页、或有 active 控件当帧量不到矩形）：仍然画这块板（0.55），但**原版块不隐藏**、日志写明「证据不足、不声称无冲突」，避免未知状态把固定板永久挡在页面外。原版块只在这块 overlay 真的替代它（扫描完整、无重叠）时才让位。
 - `[Scoring] ScoringFile`（默认 true）：是否读取 `CombatPanel-config/scoring.json`；`Weights` 只是回退值（关闭或文件不可读时生效）。
 - 以上全部支持热重载（`.cfg` 与 `scoring.json` 都在主线程重载）。位置不顺手就改 `PositionX/PositionY`，大小不合适就改 `FontSize`，保存即生效。
 

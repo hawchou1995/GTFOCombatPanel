@@ -23,6 +23,10 @@ public static class ResultsGuestPageGeometry
     // 1.19.40: 抽成一个入口，因为这一页的下沿不再只属于严格路径——fail-open 路径也用它（`ResultPageLowerBoundPolicy`
     // → `ResultFallbackLayout`/`ResultFallbackBandPolicy`）。两处算式若各写一遍，就会再次出现「同一张页面上
     // 严格 593px、兜底 370px」这类两个说法。
+    //
+    // 1.19.45（用户纠正口径）：这个数只是**条带的下限封顶**，永远不是「量到了墙」的证据。它是「这块屏幕有多高」
+    // 的事实，不是页面把什么东西画在了哪里；把它当作下界墙正是 run 3 里 band (488..1429)、900 高板压住
+    // 1177 控件的那个错（`LogOutput` L12649–L12657）。
     public static float PageFloor(float screenHeight)
     {
         if (!float.IsFinite(screenHeight) || screenHeight <= 8f) return float.NaN;
@@ -53,39 +57,50 @@ public static class ResultsGuestPageGeometry
     }
 }
 
-// 客机失败页的条带：两个边界都由固定页面几何决定，量到的「正在等待厅主」文字只进日志。
+// 客机失败页的条带：上沿是任务失败标题的实测底边 + gap，下沿是这一页**真的画在下方的那个东西**的上沿减 clearance。
 //
-// 1.19.38: 客机已经拿到固定页面几何（`ResultsGuestPageGeometry`，本机实测 2560x1440 上是 837..1429），
-// 但 `ResultsBounds.TryResolve` 又以原生等待文字块的上沿（1228 减 clearance = 1207）把它二次夹紧成
-// 370px：30 行只能塞进 8px 字号，板子 435x360，而且等待文字跨帧移动（1207→1237）还会触发一次
-// 「result board re-measured」的重新适配——这就是玩家看到的「先小、后变、不是一步到位」。
+// 1.19.45（用户纠正，覆盖 1.19.38 的相反口径）：下界就是 `m_returnToLobby_text` 这行不可点击提示文字的
+// 实际屏幕矩形上沿，和主机页拿「返回大厅」按钮上沿做下界是同一个道理——玩家读得到的那行字就是墙。真正可按
+// 的控件（重开检查点 / 回大厅，客机上通常永久 inactive）照旧是墙，两者取**更靠上**的那一个，也就是更安全的
+// 那一个：宁可板子矮一点，也不压住任何一处页面自己画出来的东西。页面固定几何（`ResultsGuestPageGeometry.PageFloor`，
+// 2560x1440 上 1429.33）只做封顶，绝不充当墙；一行都量不到时不作答，由调用方保留原版页面并节流重测。
 //
-// 结论：等待状态文字不是可交互控件，也不是客机条带的下限墙。它照旧被测量、照旧写进日志
-// （`waitingText=`），但不参与 `Bottom` 的决定。客机条带的下界就是页面固定几何的下界。
-//
-// 条带仍可被**真正可按的控件**（重开检查点 / 回大厅按钮）收紧：那不是文字，是玩家要按的东西，
-// 收紧后仍装得下客机最小板高才采纳（与旧实现的条件完全一致），并且现有的遮挡拒绝逻辑不变。
-// 这条规则在这里做成纯函数，`ResultsDisplay.FailureStrip` 的客机分支只调用它，无头套件可以直接驱动。
+// 记录证据：
+//   run 2（`LogOutput` L3926–L3928，2560x1440，title edge=467）  waitingText=1207 → band (488..1186)：那行字就是
+//     墙，板子从来没有压到它。
+//   run 3（同一份日志 L12649–L12657）  band (488..1429) 是按屏幕下界编出来的，900 高的板压住 1177 的控件，
+//     `TryHold` 不能抬一块已经在带顶的板，只能整页 0.55 不透明度。
+// 两种口径的差别就是这条规则：墙来自页面上量到的几何，不来自屏幕尺寸。
 public readonly struct ResultClientBandReading
 {
     // 板子要装进去的房间。
     public readonly ResultsSafeArea Strip;
-    // 这一帧量到的等待状态文字上沿：只进日志，永远不是墙。不可测时是 NaN。
+    // 这一帧量到的等待状态文字上沿（只用于日志与「墙是哪一堵」的命名）。不可测时是 NaN。
     public readonly float WaitingTextTop;
-    // 条带的下沿已经越过了等待文字的上沿：板子会压在那行字上，这是固定页面几何带来的取舍。
-    public readonly bool WaitingTextCovered;
-    // 真正可按的控件仍然把下沿收上去了。
+    // 条带下沿真正用到的那堵墙的上沿（等待文字与可按控件里更靠上的那一堵，再与门记忆的最高墙取更靠上者）。
+    public readonly float WallTop;
+    // 下沿来自那行等待文字自己的上沿。
+    public readonly bool WaitingTextTightened;
+    // 下沿来自一个真正可按的控件。
     public readonly bool PressableTightened;
 
-    public ResultClientBandReading(ResultsSafeArea strip, float waitingTextTop, bool covered, bool tightened)
+    public ResultClientBandReading(ResultsSafeArea strip, float waitingTextTop, float wallTop,
+        bool waitingTextTightened, bool pressableTightened)
     {
-        Strip = strip; WaitingTextTop = waitingTextTop; WaitingTextCovered = covered; PressableTightened = tightened;
+        Strip = strip; WaitingTextTop = waitingTextTop; WallTop = wallTop;
+        WaitingTextTightened = waitingTextTightened; PressableTightened = pressableTightened;
     }
 
     public float Top { get { return Strip.Top; } }
     public float Bottom { get { return Strip.Bottom; } }
     public float Height { get { return Strip.Height; } }
     public bool Fits { get { return Strip.Fits; } }
+    // 下沿真的来自一堵量到的墙（等待文字或可按控件），而不是屏幕自己推出来的下界。
+    public bool WallMeasured { get { return float.IsFinite(WallTop); } }
+    // 这一版会不会压在那行等待文字上。下沿由「墙减 clearance」算出，而且墙取更靠上的那一堵，
+    // 所以只要那行字量到了，答案永远是 false——这个字段留在日志里，是让下一次真机日志能直接读出它。
+    public bool WaitingTextCovered
+        => float.IsFinite(WaitingTextTop) && Bottom > WaitingTextTop + 0.5f;
     public static ResultClientBandReading None { get { return default; } }
 }
 
@@ -94,41 +109,39 @@ public static class ResultClientFailureBand
     // 客机失败页的条带，从已经解析好的固定页面几何出发：
     //
     //   top     固定页面的上沿（锚点底边 + gap，由 `ResultsGuestPageGeometry` 算）
-    //   bottom  固定页面的下沿（`screenHeight - 8 * scale`）——等待文字不参与
-    //   收紧    只有在 `pressableTop` 有限（页面上真的量到一个可按控件）时才发生，且收紧后仍要装得下
-    //           `minimumHeight`，与旧实现同样的条件；收紧用的是 `ResultsBounds.Clearance`，也就是主机
-    //           那条规则用的同一把尺子，好让两个角色的「墙上方留多少」不会各说各话。
+    //   bottom  min(页面上量到的墙 − clearance, 页面固定下沿)。墙 = `waitingTextTop` 与 `pressableTop` 里更靠上的
+    //           那一堵，再与门记忆下来的最高墙（`wallTop`）取更靠上者，所以条带只会收紧、不会回摆。
+    //   量不到   一条墙都没有（等待文字与可按控件都不可测）：明确回答不可信。**绝不**退回页面固定下沿——
+    //           那正是 run 3 的错。
     //
-    // `waitingTextTop` 只在这里被读一次，用来回答「这一版会压到那行字吗」，进日志与断言，
-    // 不进任何算术。任何一项不可信就明确回答不可信，调用方保留原版页面。
+    // `minimumHeight` 是客机最小板高：一条留不出它的条带同样是不可信，而不是硬塞一块小板进去。
+    // 任何一项不可信就明确回答不可信，调用方保留原版页面、按既有节流重测。
     public static bool TryResolve(ResultsSafeArea fixedPage, float screenHeight, float minimumHeight,
-        float waitingTextTop, float pressableTop, out ResultClientBandReading reading)
+        float waitingTextTop, float pressableTop, float wallTop, out ResultClientBandReading reading)
     {
         reading = ResultClientBandReading.None;
         if (!fixedPage.Fits) return false;
         if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
         if (!float.IsFinite(minimumHeight) || !(minimumHeight > 0f)) return false;
         float top = fixedPage.Top;
-        float bottom = fixedPage.Bottom;
-        if (!float.IsFinite(top) || !float.IsFinite(bottom)) return false;
+        float cap = fixedPage.Bottom;
+        if (!float.IsFinite(top) || !float.IsFinite(cap)) return false;
         if (top < 0f) top = 0f;
-        if (bottom > screenHeight) bottom = screenHeight;
-        if (!(bottom > top)) return false;
-        bool tightened = false;
-        if (float.IsFinite(pressableTop))
-        {
-            float wall = pressableTop - ResultsBounds.Clearance(screenHeight);
-            if (wall < bottom && wall > top && wall - top >= minimumHeight)
-            {
-                bottom = wall;
-                tightened = true;
-            }
-        }
-        if (!(bottom > top)) return false;
-        if (bottom - top < minimumHeight) return false;
-        // 那行字是一个事实，不是一堵墙：读它只为了日志能说清这一版会不会压上去。
-        bool covered = float.IsFinite(waitingTextTop) && bottom > waitingTextTop + 0.5f;
-        reading = new ResultClientBandReading(new ResultsSafeArea(top, bottom), waitingTextTop, covered, tightened);
+        if (top > screenHeight) top = screenHeight;
+        if (cap > screenHeight) cap = screenHeight;
+        if (!(cap > top)) return false;
+        // 这一帧看到的墙，和这一页见过的最高墙，取更靠上的那一堵：一条已经显示过的控件不能因为这一帧又量不到
+        // 就被忘掉，而页面自己后来的动画只能把条带收紧。
+        float wall = ResultsRegion.HighestTop(waitingTextTop, pressableTop);
+        wall = ResultsRegion.HighestTop(wall, wallTop);
+        if (!float.IsFinite(wall)) return false;
+        float foot = wall - ResultsBounds.Clearance(screenHeight);
+        if (foot > cap) foot = cap;
+        if (!(foot > top)) return false;
+        if (foot - top < minimumHeight) return false;
+        bool byWaitingText = float.IsFinite(waitingTextTop) && Math.Abs(wall - waitingTextTop) <= 0.5f;
+        bool byPressable = !byWaitingText && float.IsFinite(pressableTop) && Math.Abs(wall - pressableTop) <= 0.5f;
+        reading = new ResultClientBandReading(new ResultsSafeArea(top, foot), waitingTextTop, wall, byWaitingText, byPressable);
         return true;
     }
 }
@@ -137,18 +150,17 @@ public static class ResultClientFailureBand
 // 一页的下界语义：严格路径与 fail-open 路径读同一份事实
 // ---------------------------------------------------------------------------------------------------
 //
-// 独立评审的具体缺陷：`ResultsDisplay.FallbackPlacement` 把量到的「正在等待厅主」状态文字上沿（真机 1228）
-// 当「页脚文字墙」交给 `ResultsBounds.TryResolve` 和 tier2 的 `ResultFallbackLayout.TryResolve`，还把扫描里
-// 含那行字的 `FooterTop` 当成页脚控件。于是 2560x1440 的同一张客机失败页上：严格路径 836..1429（593px），
-// fail-open 只有 836..1207（370px，= 1228 减 clearance），30 行只塞进 8px 字号，小板随后重排或长驻。
-// `ResultsDisplay.FailureStrip` 的客机分支从 1.19.38 起就写明那行字是事实、不是墙（`ResultClientFailureBand`），
-// 下界是固定页面几何的 1429——fail-open 路径没有跟上，这就是两个说法。
+// 独立评审的具体缺陷：`ResultsDisplay.FallbackPlacement` 把量到的「正在等待厅主」状态文字上沿（真机 1207/1228）
+// 当「页脚文字墙」交给 `ResultsBounds.TryResolve`，而严格路径从 1.19.38 起把它拿掉、只认页面固定几何，
+// 于是 2560x1440 的同一张客机失败页上：严格路径 488..1429（941px），fail-open 488..1186（698px）——
+// 同一张页面两个说法。
 //
-// 这一层把「哪些读数可以当下界墙、这一页真实的下沿在哪」做成纯函数，两条路径读同一个答案：
+// 1.19.45（用户纠正）：反过来才对。那行不可点击的提示文字**就是**下界，和主机页的按钮上沿同一性质；固定页面几何
+// 只是封顶。所以这一层现在把「等待文字 = 这一页的页脚墙」原样交出去，两条路径都从它出发：
 //
-//   * 客机失败页：状态文字既不是墙、也不是页脚（`FooterTextTop` 为 NaN）；真正可按的控件仍是墙
-//     （`PressableTop`，取扫描的 `PressableTop` 与命名按钮里最高的一堵）；页面下沿是固定页面几何
-//     （`ResultsGuestPageGeometry.PageFloor`，2560x1440 上 1429.33）。
+//   * 客机失败页：`FooterTextTop` 就是那行等待文字自己的上沿（`FooterTextSource` 说出它是画出来的文字还是
+//     代替它的控件），`PressableTop` 是真正可按的控件里最高的一堵；页面下沿（`PageFloor`）只用来夹住条带，
+//     永远不被当成「量到了墙」。
 //   * 其余页面（主机失败页、主机/客机成功页）：三个读数原样返回，页面下沿不设限（NaN = 窗口脚），
 //     所以主机路径一个字节都没变。
 //
@@ -156,15 +168,15 @@ public static class ResultClientFailureBand
 // `ResultFallbackPolicy.PageReadable` 说不（预算路线），F8 照旧由玩家自己授权（`MayAnswer`）。
 public readonly struct ResultPageWalls
 {
-    // 这一页是客机失败页：页面自己量到的「正在等待厅主」状态文字不是墙，也不是页脚。
+    // 这一页是客机失败页：它的下界是「等待文字 / 可按控件里更靠上的那一堵」，页面下沿只做封顶。
     public readonly bool GuestFailure;
     // 真正可按控件的最高上沿（`FooterControls.PressableTop` 与命名按钮取最小 y）。NaN = 没有量到可按控件。
     public readonly float PressableTop;
-    // 可以当成「页脚文字墙」交出去的读数：主机页 / 客机成功页是等待或页脚文字，客机失败页永远是 NaN。
+    // 可以当成「页脚文字墙」交出去的读数：客机失败页是那行等待文字自己的上沿，主机页 / 客机成功页是等待或页脚文字。
     public readonly float FooterTextTop;
     // 那堵文字墙的来源，好让日志继续说出「画出来的文字」还是「代替它的控件」。
     public readonly ResultBoundSource FooterTextSource;
-    // 这一页真实的下沿：客机失败页的固定页面几何下界；NaN = 这一页一直用到窗口脚。
+    // 这一页真实的下沿：客机失败页的固定页面几何下界；NaN = 这一页一直用到窗口脚。只做封顶，不是墙。
     public readonly float PageFloor;
 
     public ResultPageWalls(bool guestFailure, float pressableTop, float footerTextTop,
@@ -186,14 +198,17 @@ public static class ResultPageLowerBoundPolicy
     // `guestFailure` 由页面角色和页种共同决定（客机 + 失败页）。`footerControlTop` 是调用方自己量到的
     // 「可按控件」上沿（`ResultsDisplay.LobbyButtonTop`，它的扫描不把等待文字算进 `FooterTop`），
     // `scanPressableTop` 是交互扫描自己排除掉受保护文字之后的那个读数。两者都只描述可按控件。
+    // `footerTextTop` 是那一页真正画在下方的文字墙（客机失败页：`m_returnToLobby_text` 的布局上沿）。
     public static ResultPageWalls Resolve(bool guestFailure, float screenHeight, float footerControlTop,
         float scanPressableTop, float footerTextTop, ResultBoundSource footerTextSource)
     {
         if (!guestFailure)
             return new ResultPageWalls(false, footerControlTop, footerTextTop, footerTextSource, float.NaN);
-        // 客机失败页：可按控件照旧是墙（这是唯一可能收紧下界的读数），状态文字被拿掉，下沿是本页的固定几何。
+        // 客机失败页：文字墙与可按控件都是墙（`ResultsBounds` 会取更靠上的那一堵），页面下沿只做封顶。
         float pressable = ResultsRegion.HighestTop(footerControlTop, scanPressableTop);
-        return new ResultPageWalls(true, pressable, float.NaN, ResultBoundSource.None,
+        return new ResultPageWalls(true, pressable, footerTextTop,
+            float.IsFinite(footerTextTop) && footerTextSource == ResultBoundSource.None
+                ? ResultBoundSource.FooterText : footerTextSource,
             ResultsGuestPageGeometry.PageFloor(screenHeight));
     }
 }
@@ -204,35 +219,26 @@ public static class ResultPageLowerBoundPolicy
 // ---------------------------------------------------------------------------------------------------
 //
 // 记录下来的那一页（`LogOutput.snapshot.log` 4426–4441，客机失败页，2560x1440）是这么错的：头两帧扫描完整、
-// 但页面上一个可按控件都没有（页面自己的「重开检查点」/「回大厅」还没被点亮），两帧一致就被读成「这一页没有
+// 但页面上一个可按控件都没有（页面自己的「重开 checkpoint」/「回大厅」还没被点亮），两帧一致就被读成「这一页没有
 // 墙」，条带按固定页面几何 381..1429 放了一块 1987x990 的板；下一帧真实控件出现（1175/1181/1189），条带收紧到
 // 802px，站着的板真的压在控件上，于是整块板被撤掉、原版页面回来。
-//
-// 这一条补上的就是这个事实：**这一页还没有量到任何可按控件**，所以这一帧不是「页面没有墙」，而是「墙还没出现」，
-// 不能落板。一旦量到可按控件，这一条就不再说话：那堵墙是真的，由它自己回答。
 //
 // 1.19.42（独立评审 F3）：这一段以前收五个入参，其中四个在客机失败页上不携带任何逐帧信息：
 //
 //   * 「回大厅」按钮在客机上**永久** inactive（角色带来的，不随帧而来），扫描于是把它记成 hidden，
 //     `HiddenPageActions` 常 ≥1；
 //   * 于是 `hiddenPageActions > 0` 这一条在客机上恒真——裁掉它之后，整个谓词等价于 `!IsFinite(pressableTop)`，
-//     这就是「一个恒真入参冒充证据」；
-//   * `restartPresent && !restartActive` / `lobbyPresent && !lobbyActive` 两条也几乎与同一件事等价，而它们唯一的
-//     差别（两个按钮都 active、却量不到任何可按控件）给出的是**错的**答案：那一帧同样没有证据说墙存在。
+//     这就是「一个恒真入参冒充证据」。
 //
-// 所以这条策略只问它真正能回答的那一个问题，并且**没有证据时不声称就绪**：
-//
-//   * 量到一个真的可按控件 → 墙的问题由那堵墙回答，不 pending；
-//   * 量不到 → 这一页没有任何证据，不能当成「这一页没有墙」，pending。
-//
-// 它不再假装从本页动作的 active 状态里读出逐帧信息；那些读数（hidden / hiddenPageActions / pressable）只进调用方
-// 按页打印的诊断行。诚实边界：这**不是**「更早知道」——它比旧谓词更保守（多了一类 pending），也没有退回
-// 「两帧空扫描即 settled」；一直等不到控制时由既有的 60 次拒收预算回答（`ResultFallbackPolicy.MayAnswer`），
-// 日志会把它叫成 fail-open 而不是 settled。
+// 1.19.45（用户纠正）：这个谓词要问的不是「有没有可按控件」，而是「这一页有没有量到任何一堵墙」。客机失败页上
+// 那行不可点击的等待文字就是墙，所以「一个可按控件都没有」不再等于「没有证据」——它是这一页最常见、也最正常的
+// 状态。真正没有证据的是「那行字和可按控件都量不到」：那时这一帧既不能说有墙、也不能说没有墙。
 public static class ResultClientPageActionPolicy
 {
-    public static bool Pending(float pressableTop) => !float.IsFinite(pressableTop);
+    public static bool Pending(float waitingTextTop, float pressableTop)
+        => !float.IsFinite(waitingTextTop) && !float.IsFinite(pressableTop);
 }
+
 // ---------------------------------------------------------------------------------------------------
 // 客机失败页的下界墙：先稳定，再落板
 // ---------------------------------------------------------------------------------------------------
@@ -253,24 +259,23 @@ public static class ResultClientPageActionPolicy
 // 根因不是遮挡判断错了——990px 的板确实压在 1176 的控件上——而是**第一帧就把板落在一张还没量完的条带上**。
 // 这个门把那一步补上：本页的下界墙读到和上一帧一样了，才允许落板。
 //
-//   * 两帧**可回答且完整**的读数一致（都不可测且没有 active-but-unmeasurable 控件，或都可测且相差不超过
-//     `Tolerance`）→ 已稳定，可以落板。
+//   * 两帧**可回答且完整**的读数一致（都量到同一堵墙，相差不超过 `Tolerance`）→ 已稳定，可以落板。
 //   * **任何帧数都不能自己授权落板。** `Samples` 只用于诊断和重试节奏，`Settled` 是唯一的放行条件；「等够
 //     多少帧就把没量到的墙当成量到了」在这条链上一个字节都没有。一直不稳定的页面由**已有的**有界逃生口
 //     回答：`ResultFallbackPolicy.MissBudget`（60 帧拒收）之后的 fail-open 板——它让开每一个量到的控件、
 //     跨墙时画淡，并且从不声称这一页被证明过。
 //   * 一个 active、但这一帧量不到矩形的控件不是「没有控件」：它让这一帧**不可回答**，既不算一次一致读数，
-//     也清不掉已经读到的墙（`ResultInteractionTally` 的规则在这一层一个字都没改）。这种页面无论等 30、
-//     120 还是 500 帧，这条门都不会交出条带。
+//     也清不掉已经读到的墙（`ResultInteractionTally` 的规则在这一层一个字都没改）。
 //   * 扫描不完整（`controls.Complete` / `ParentCoverageComplete`）同样不算「这一页没有墙」：客机失败页在
 //     生产里**没有**外层的完整扫描闸门（`Placement`/`BoardStillSafe` 的 `!GuestClient() && !Complete` 只约束
 //     主机），所以这个要求必须落在这条门里，不能靠调用顺序顺带满足。inactive 控件不影响完整性——它们被扫描
 //     记为 hidden，`Complete` 照旧为真，这正是「页面把控件关掉了」与「扫描看不见这一页」的区别。
 //
-// 诚实边界（不声称首显永远最终）：真机没有任何「控件都到齐了」的原生信号可用——`FailureSequenceReadiness`
-// 只在失败协程终点 `MoveNext(false)` 之后才成立，而记录下来的那一页在序列还没播完时控件就已经亮了。所以
-// 「连续两次完整扫描都是空集合」是这条链上能拿到的最强真实就绪证据；若控件在第三帧才亮，站着的板会由既有
-// 的扫描遮挡拒绝被撤下一次，下一帧就按收紧后的几何重新落定（`Wall` 是这一页见过的最高一堵，不会来回摆）。
+// 1.19.45（用户纠正）：门读的墙是「等待文字上沿」与「可按控件上沿」里更靠上的那一堵（`Observe` 只收一个
+// 合成后的读数），所以「一个可按控件都没有」的帧不再是不可回答——记录下来的那两帧本来就有那行字。
+//
+// 文字仍可能随原生动画移动。可信边界收紧立即保留，放宽则需要连续两次可信读数一致；
+// 不完整样本不会写入保留边界。晚到互动控件仍由逐帧碰撞保护处理，不声称两帧稳定能预知未来控件。
 public sealed class ResultClientWallGate
 {
     // 两帧读数之间的容差：页面自己的动画会让一个控件的上沿挪一两个像素，那不是一堵新墙。
@@ -284,33 +289,32 @@ public sealed class ResultClientWallGate
     public int Samples { get { return _samples; } }
     // 最近一次读数和上一帧一致，而且两帧都可回答、都完整：这是唯一的放行答案。
     public bool Settled { get { return _settled; } }
-    // 本页见过的最高那堵墙（y 最小）；NaN 表示这一页从没量到过可按控件。
+    // 最近可信墙：收紧立即更新，放宽等待稳定；NaN 表示从未得到可信墙。
     public float Wall { get { return _wall; } }
 
+    // `wallTop` 是这一帧合成后的下界墙（等待文字与可按控件里更靠上的那一堵，NaN = 一条都没有）；
     // `scanComplete`/`parentCoverageComplete` 是扫描自己的结构性结论；`unmeasuredControls` 是这一帧 active
-    // 但量不到矩形的控件数；`pageActionsPending` 是「这一页还没量到任何可按控件，因此墙的问题没有证据」（见
-    // `ResultClientPageActionPolicy`：它只读 `pressableTop`）。三个事实合起来回答「这一帧的墙问题被回答了吗」。
+    // 但量不到矩形的控件数。三个事实合起来回答「这一帧的墙问题被回答了吗」。
     //
-    // 最后一项只属于**首次落位**：`Measure` 不读它，所以一堵「页面还没有证据」的帧绝不会把已经站住的板
-    // 撤下来——那条规则是玩家看到的撤板，这里一个字节都不碰。
-    public bool Observe(int frame, bool scanComplete, bool parentCoverageComplete, bool measured, float wall,
-        int unmeasuredControls = 0, bool pageActionsPending = false)
+    // `Measure`（已经站着的板）用同一份喂法，但它不过 `Settled`：一堵「还没读到两次」的墙不能把板撤掉。
+    public bool Observe(int frame, bool scanComplete, bool parentCoverageComplete, float wallTop,
+        int unmeasuredControls = 0)
     {
         // IMGUI 一帧里可能 repaint 多次。同一帧的第二次观察不是新读数，答案就是上一次的答案。
         if (frame == _lastFrame) return _settled;
         if (_lastFrame != int.MinValue && frame < _lastFrame) Forget();
         _lastFrame = frame;
         if (_samples < int.MaxValue) _samples++;
-        bool readable = measured && float.IsFinite(wall);
-        // 一个 active 但量不到矩形的控件：墙的问题没有被回答，不能当成「这一帧没有墙」。
-        // 这一页还没量到任何可按控件（`pageActionsPending`）：同样不是「这一页没有墙」，而是「这一页的墙还没出现」。
-        bool answerable = scanComplete && parentCoverageComplete && !pageActionsPending && (readable || unmeasuredControls == 0);
-        if (readable) _wall = ResultsRegion.HighestTop(wall, _wall);
+        bool readable = float.IsFinite(wallTop);
+        // 一条墙都没量到：不是「这一页没有墙」，而是「这一页的墙还没出现」，这一帧不回答任何问题。
+        // 一个 active 但量不到矩形的控件同样如此（它可能就站在墙上方，没人知道）。
+        bool answerable = scanComplete && parentCoverageComplete && readable && unmeasuredControls == 0;
         bool agree = _hasReading && _answerable && answerable
-            && (readable
-                ? float.IsFinite(_reading) && Math.Abs(wall - _reading) <= Tolerance
-                : !float.IsFinite(_reading));
-        _reading = readable ? wall : float.NaN;
+            && readable && float.IsFinite(_reading) && Math.Abs(wallTop - _reading) <= Tolerance;
+        // Blind/incomplete samples cannot poison the retained edge. Tighten immediately for safety;
+        // relax only after two trustworthy readings agree, so an animated early edge is not permanent.
+        if (answerable && (!float.IsFinite(_wall) || wallTop < _wall || agree)) _wall = wallTop;
+        _reading = readable ? wallTop : float.NaN;
         _hasReading = true;
         _answerable = answerable;
         _settled = agree;
@@ -326,12 +330,12 @@ public sealed class ResultClientWallGate
     }
 }
 
-// 一帧的客机失败页证据：固定页面几何的四项输入、两个只进日志的读数，和扫描自己的三个结论。
+// 一帧的客机失败页证据：固定页面几何的四项输入、两个下界读数，和扫描自己的三个结论。
 public readonly struct ResultClientFailureEvidence
 {
     public readonly float AnchorBottom, ScreenWidth, ScreenHeight;
     public readonly float Gap, MinimumStripHeight;
-    // 等待状态文字的上沿：只进日志，永远不是墙（`ResultClientFailureBand`）。
+    // 等待状态文字的上沿：客机失败页的下界墙之一（用户口径，1.19.45）。不可测时是 NaN。
     public readonly float WaitingTextTop;
     // 这一帧真正可按的控件里最高的上沿（`FooterControls.PressableTop` 与命名按钮取最小 y）。
     public readonly float PressableTop;
@@ -339,24 +343,22 @@ public readonly struct ResultClientFailureEvidence
     public readonly bool ScanComplete, ParentCoverageComplete;
     // 这一帧 active 但量不到矩形的控件数：墙的问题没有被回答。
     public readonly int UnmeasurableControls;
-    // 这一页还没有量到任何可按控件（`ResultClientPageActionPolicy.Pending`，只读 `pressableTop`）：这一帧因此不是
-    // 「这一页没有墙」，而是「这一页的墙还没出现」，不能落板。本页动作的 active 状态（「回大厅」按钮在客机上永久
-    // inactive、`HiddenPageActions` 常 ≥1）不携带逐帧信息，不再参与这个判断，只进日志。它只作用于首次落位，
-    // `ResultClientFailureStrip.Measure` 不读它。
-    public readonly bool PageActionsPending;
 
     public ResultClientFailureEvidence(float anchorBottom, float screenWidth, float screenHeight, float gap,
         float minimumStripHeight, float waitingTextTop, float pressableTop,
-        bool scanComplete = true, bool parentCoverageComplete = true, int unmeasurableControls = 0,
-        bool pageActionsPending = false)
+        bool scanComplete = true, bool parentCoverageComplete = true, int unmeasurableControls = 0)
     {
         AnchorBottom = anchorBottom; ScreenWidth = screenWidth; ScreenHeight = screenHeight;
         Gap = gap; MinimumStripHeight = minimumStripHeight;
         WaitingTextTop = waitingTextTop; PressableTop = pressableTop;
         ScanComplete = scanComplete; ParentCoverageComplete = parentCoverageComplete;
         UnmeasurableControls = unmeasurableControls;
-        PageActionsPending = pageActionsPending;
     }
+
+    // 这一帧合成后的下界墙：两个读数里更靠上的那一堵；一条都没有是 NaN。
+    public float WallTop { get { return ResultsRegion.HighestTop(WaitingTextTop, PressableTop); } }
+    // 这一帧连一堵墙都没量到（`ResultClientPageActionPolicy`）：它既不是「有墙」也不是「没有墙」。
+    public bool WallPending { get { return ResultClientPageActionPolicy.Pending(WaitingTextTop, PressableTop); } }
 }
 
 // 客机失败页条带的一次判定。
@@ -364,8 +366,8 @@ public enum ResultClientStripState
 {
     // 条带可用，而且用的墙已经稳定：这是落板的那一帧。
     Placed = 0,
-    // 这一帧的墙问题没有被回答：读法变了、页面还在亮控件，或有 active 控件量不到矩形。再等一帧——没有任何
-    // 上限被当作放行；等不到就交给既有的 fail-open 逃生口。
+    // 这一帧的墙问题没有被回答：读数变了、页面上量不到任何墙，或有 active 控件量不到矩形。再等一帧——没有
+    // 任何上限被当作放行；等不到就交给既有的 fail-open 逃生口。
     WallNotSettled = 1,
     // 页面固定几何这一帧不可用（锚点、屏幕尺寸、间距、最小板高任何一项不可信）。
     GeometryUnusable = 2,
@@ -395,7 +397,7 @@ public static class ResultClientFailureStrip
         }
     }
 
-    // 落板这一问：扫描看得见这一页，这一页量到了可按控件（`PageActionsPending` 为假），而且墙已经稳定。
+    // 落板这一问：扫描看得见这一页，这一页量到了墙，而且墙已经稳定。
     //
     // 1.19.42（独立评审 F5）：`Measure` 对缺失的门是「没有一致性可查」，`Decide` 里那道门**就是答案本身**，
     // 所以缺门时先拒绝（`WallNotSettled`，这一帧没有可以落板的墙），而不是对 null 解引用抛出去。
@@ -406,17 +408,13 @@ public static class ResultClientFailureStrip
         if (!FixedPage(evidence, out fixedPage)) return ResultClientStripState.GeometryUnusable;
         if (!evidence.ScanComplete || !evidence.ParentCoverageComplete) return ResultClientStripState.ScanIncomplete;
         if (wall == null) return ResultClientStripState.WallNotSettled;
-        if (!wall.Observe(frame, true, true, float.IsFinite(evidence.PressableTop), evidence.PressableTop,
-                evidence.UnmeasurableControls, evidence.PageActionsPending))
+        if (!wall.Observe(frame, true, true, evidence.WallTop, evidence.UnmeasurableControls))
             return ResultClientStripState.WallNotSettled;
         return Resolve(wall, evidence, fixedPage, out reading);
     }
 
     // 已经站在页面上的板：**不再过稳定门**——一堵「还没读到两次」的墙不能把站着的板撤掉（那正是玩家看到的
     // 撤板）。其余算术完全相同，门照旧被喂一帧，好让本页「最高的一堵墙」跟上这一帧的读数。
-    //
-    // 1.19.41：这一条**不读** `evidence.PageActionsPending`。那个事实只属于首次落位——「这一页还没量到可按控件」，
-    // 从来不是撤掉一块已经站住的板的理由；把它接到这里，就是把玩家看到的撤板重新做一遍。
     public static ResultClientStripState Measure(int frame, ResultClientWallGate wall, in ResultClientFailureEvidence evidence,
         out ResultClientBandReading reading, out ResultsSafeArea fixedPage)
     {
@@ -424,8 +422,7 @@ public static class ResultClientFailureStrip
         if (!FixedPage(evidence, out fixedPage)) return ResultClientStripState.GeometryUnusable;
         if (wall != null)
             wall.Observe(frame, evidence.ScanComplete, evidence.ParentCoverageComplete,
-                float.IsFinite(evidence.PressableTop), evidence.PressableTop, evidence.UnmeasurableControls,
-                pageActionsPending: false);
+                evidence.WallTop, evidence.UnmeasurableControls);
         return Resolve(wall, evidence, fixedPage, out reading);
     }
 
@@ -436,11 +433,10 @@ public static class ResultClientFailureStrip
     private static ResultClientStripState Resolve(ResultClientWallGate wall, in ResultClientFailureEvidence evidence,
         ResultsSafeArea fixedPage, out ResultClientBandReading reading)
     {
-        // 落板用的墙永远是「本页量到过的最高那一堵」：它只会比这一帧的读数更保守，绝不会把板放到一个这一页
-        // 显示过的控件下面去；一帧都没量到就是 NaN，由固定页面几何作答。
-        float wallTop = wall != null ? wall.Wall : evidence.PressableTop;
+        // 当前可测的文字/控件和门保留的可信墙共同约束条带；未稳定的放宽不能抢先扩板。
+        float wallTop = wall != null ? wall.Wall : evidence.WallTop;
         if (!ResultClientFailureBand.TryResolve(fixedPage, evidence.ScreenHeight, evidence.MinimumStripHeight,
-                evidence.WaitingTextTop, wallTop, out reading))
+                evidence.WaitingTextTop, evidence.PressableTop, wallTop, out reading))
             return ResultClientStripState.BandUnusable;
         return ResultClientStripState.Placed;
     }

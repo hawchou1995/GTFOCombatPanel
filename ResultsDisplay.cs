@@ -89,10 +89,15 @@ internal static class ResultsDisplay
         // the client failure page's strip is tightened against this figure, because its waiting-status line is neither a
         // control nor a wall. On every other page it is the same number `FooterTop` carries unless the text sits higher.
         public readonly float PressableTop;
+        // 固定模式专用：第一个和固定板真实相交的控件（类型、对象名、它自己的矩形），以及相交的控件个数。
+        // 只有 `inspectBoard` 的调用会填它；自适应那条链读都不读，所以这里多存两个值不改变它的任何决定。
+        public readonly ResultFixedBlocker Blocker;
+        public readonly int Blockers;
         public bool ProvenEmpty => ResultInteractionScanPolicy.ProvenEmpty(Complete, ParentCoverageComplete, Tally);
         public FooterControls(float footerTop, float boardTop, int count, int scannedCount, bool complete,
             bool parentCoverageComplete, bool overlapsBoard, int hidden = 0, int hiddenPageActions = 0, string reason = "",
-            int unmeasurable = 0, ResultBoardBand belowActions = default, float pressableTop = float.NaN)
+            int unmeasurable = 0, ResultBoardBand belowActions = default, float pressableTop = float.NaN,
+            ResultFixedBlocker blocker = default, int blockers = 0)
         {
             FooterTop = footerTop; BoardTop = boardTop; Count = count; ScannedCount = scannedCount;
             Complete = complete; ParentCoverageComplete = parentCoverageComplete; OverlapsBoard = overlapsBoard;
@@ -101,6 +106,7 @@ internal static class ResultsDisplay
             Tally = new ResultInteractionTally(count, hidden, hiddenPageActions, unmeasurable);
             BelowActions = belowActions;
             PressableTop = pressableTop;
+            Blocker = blocker; Blockers = blockers;
         }
     }
 
@@ -221,7 +227,15 @@ internal static class ResultsDisplay
         try
         {
             Prepare(page, succeeded);
-            if (ResultBoardLatch.HidesVanilla(_placed)) ApplyVanillaBlocks(page, succeeded);
+            // 预绘制和 `Draw` 必须用**同一份计划**。
+            //
+            // `ResultBoardLatch.HidesVanilla(_placed)` 只回答"这一帧有没有一块真的落到页面上的板"，而在固定模式下 `_placed`
+            // 在有真实相交、或扫描证据不足时也为真（板照画，只是淡画）。如果这里按 `_placed` 就把原版块挪到 6000，而
+            // `FixedLayoutDraw` 按 `_fixedPlan.HidesVanilla`（完整且无相交才让位）又把它放回去，就是每帧隐藏/恢复；更糟的是
+            // 页面在 `Draw` 之前失活（`no-live-page` / `no-placement` 早退），原版块已被挪走而板没画出来，留下一张空洞的页面。
+            // 所以固定模式下这个入口只听 `_fixedPlan`；自适应那条链的条件一个字都没变。
+            if (ResultBoardLatch.HidesVanilla(_placed) && (!FixedLayoutActive() || _fixedPlan.HidesVanilla))
+                ApplyVanillaBlocks(page, succeeded);
         }
         catch (Exception error)
         {
@@ -270,6 +284,9 @@ internal static class ResultsDisplay
     private static void ResetPlacement()
     {
         _grid = null; _content = null; _page = null; _succeeded = false; _placed = false; _placedSucceeded = false;
+        // 固定模式的落位也是这个缓存的一部分：换了页面、改了配置或关了开关，下一帧重新按玩家的数字判定。
+        _fixedPlaced = false;
+        _fixedPlan = ResultFixedDrawPlan.None;
     }
 
     // The rectangle the wheel is judged against, dropped when the board it describes is no longer on the page: a
@@ -336,6 +353,12 @@ internal static class ResultsDisplay
     // never a per-frame rebuild, and it is what makes an F8 toggle unnecessary.
     private static BoardStrip _holdStrip;
     private static readonly ResultAnchorDrift Drift = new ResultAnchorDrift();
+    // 1.19.44：一次真的重测（第二眼 / 页面移动）重新落板之后，把新矩形记一次。`_loggedDraw` 与
+    // `failure board placed` 都是每页一次，所以 run 2 那次 L3928 的重落位在日志里没有任何尺寸可查
+    // （独立报告 §7.2）。这里按页一次，且只由 `ResultAnchorRecovery`（1 次）和 `ResultAnchorDrift`（2 次）
+    // 这两个有界触发器置位，所以一页最多一行，不刷屏。
+    private static bool _relayoutPending;
+    private static string _relayoutReason = string.Empty;
     // ---- the page's final geometry ---------------------------------------------------------------------------
     //
     // The strip a settlement board is measured into has to be the one the page *ends at*, not the one it is passing
@@ -422,6 +445,15 @@ internal static class ResultsDisplay
     // draw, which is the one thing that turns "no band can hold the board" into "a tiny band holds a tiny board".
     private static int _fallbackMisses;
     private static float _fallbackFloorScale = 1f;
+    // ---- 固定模式（1.19.45，[Results] FixedLayout）-----------------------------------------------------------
+    //
+    // 玩家自己指定字号与「表格底边中点」时的落板：位置和字号都来自窗口与玩家自己的数字（`ResultFixedLayout`），
+    // 不来自页面自适应条带的任何一条边。它因此不会被客机失败页的下界墙等待卡住，输入不可信或跑出屏幕时明确
+    // 不画板（**不**隐藏原版块、不改玩家指定的任何数字）；真实相交与扫描证据不足不撤板，按
+    // `ResultFixedOverlayPolicy` 淡画并把证据写进那行诊断。
+    private static bool _fixedPlaced;
+    // 这一帧固定板的可见性决定（相交对象、证明状态、不透明度、理由）：`Draw` 用它决定淡淡和原版块让不让位。
+    private static ResultFixedDrawPlan _fixedPlan;
     // The override the F8 *show* press turns on: a board the player asked for may not be held back by any gate,
     // switch or stale toggle. It says nothing about whether a board is on the page - it defaults to false on a page
     // whose fail-open board is already drawn - so it is never what F8's next answer is read from.
@@ -487,6 +519,11 @@ internal static class ResultsDisplay
         // session. A page pointer is reused across a session's runs, so a once-per-session latch left every
         // result screen after the first without its own line and its own archive entry in the log.
         _loggedDraw = false;
+        // 1.19.44：重落位那一行也是这一页的：下一个结果屏有自己的第一块板。
+        _relayoutPending = false; _relayoutReason = string.Empty;
+        // 固定模式的落位与这一页一起结束。
+        _fixedPlaced = false;
+        _fixedPlan = ResultFixedDrawPlan.None;
     }
 
     // The success page's "sectors cleared" row: its own label and the four icon slots, and *nothing else*. The white
@@ -672,6 +709,12 @@ internal static class ResultsDisplay
             return;
         }
 
+        // 固定模式：位置和字号来自玩家的配置，不来自页面条带，所以这里既不重排也不缩放，只重新验证控件安全。
+        if (_fixedPlaced)
+        {
+            FixedLayoutDraw();
+            return;
+        }
         float opacity = 1f;
         if (!_succeeded && _content.Kinds != null)
         {
@@ -757,7 +800,10 @@ internal static class ResultsDisplay
             RefreshFallbackSafety();
             opacity = _fallbackOpacity;
         }
-        try { ApplyVanillaBlocks(_page, _succeeded); }
+        // 固定模式的第二条隐藏入口也只认 `_fixedPlan`：`_fixedPlaced` 为真时上面已经 `return`，所以这段本来不可达；显式挡一次，
+        // 是为了以后调整顺序时不会再出现"计划说保留原版块、代码却从别处把它挪走"的第二条路。FixedLayout 关着时这一行等价于
+        // 原来的无条件调用，自适应行为一个字都没变。
+        try { if (!FixedLayoutActive() || _fixedPlan.HidesVanilla) ApplyVanillaBlocks(_page, _succeeded); }
         catch (Exception error)
         {
             _page = null;
@@ -823,9 +869,16 @@ internal static class ResultsDisplay
     // One bounded line per page for a frame in which the board was held back for a reason no other line reports: the
     // real numbers, the role, and the reason in the few words a live log can afford. Once per page and per reason -
     // a per-frame repaint must not turn a diagnostic into a flood - and never a player's identity.
-    private static void ReportHeldBack(string where, string reason, string detail)
+    //
+    // `signature` (optional) is the fixed layout's own "which configuration attempt is this" key: the same refusal on
+    // the next repaint stays silent, while a coercion-free retry with a new glyph, a new anchor, a new window or a new
+    // board size is a new attempt and gets its own line. Without it, one `fixed-layout-refused` line per page would
+    // swallow every later parameter change - which is exactly what made a live refusal look like silence.
+    private static void ReportHeldBack(string where, string reason, string detail, string signature = null)
     {
-        if (!ResultReportPolicy.OncePerPage(HeadingReports, "held-back-" + where + "-" + reason, Forced, _forcedOutcomePending)) return;
+        string key = "held-back-" + where + "-" + reason;
+        if (!string.IsNullOrEmpty(signature)) key += "|" + signature;
+        if (!ResultReportPolicy.OncePerPage(HeadingReports, key, Forced, _forcedOutcomePending)) return;
         // A board that was never placed has no strip to report, and printing "0..0" for it would be the same kind of
         // half-truth this helper exists to remove. The figures are named for what they are: the strip this page last
         // gave the board, the height the board cannot be drawn under, and the figures that produced the refusal -
@@ -1040,6 +1093,284 @@ internal static class ResultsDisplay
         }
     }
 
+    // ---- 固定模式（1.19.45，[Results] FixedLayout）：玩家自己指定字号与表格底边中点 ---------------------------
+    //
+    // 三个配置值每一帧现读，所以文件一改、热重载一到，下一帧就生效；`FixedLayout` 关着时这里一个数值都不读，
+    // 自适应（成功页/失败页各自的条带与滚轮缩放）完全照旧。
+    internal static bool FixedLayoutActive()
+        => Plugin.FixedLayoutConfig != null && Plugin.FixedLayoutConfig.Value;
+
+    private static float FixedFontPixels()
+        => Plugin.FixedFontPixelsConfig != null ? Plugin.FixedFontPixelsConfig.Value : ResultFixedLayout.DefaultFontPixels;
+
+    private static float FixedAnchorX()
+        => Plugin.FixedAnchorXConfig != null ? Plugin.FixedAnchorXConfig.Value : ResultFixedLayout.DefaultAnchorX;
+
+    private static float FixedAnchorY()
+        => Plugin.FixedAnchorYConfig != null ? Plugin.FixedAnchorYConfig.Value : ResultFixedLayout.DefaultAnchorY;
+
+    // 固定模式的一次落位：字号 = 玩家指定的像素值（一个字节都不缩），矩形 = 底边中点落在玩家指定的那一点。
+    //
+    // 表格是用无穷大的盒子量出来的，所以量出来的尺寸就是画出来的尺寸：这里没有 `FitBoard` 的条带反算、没有
+    // `ResultsZoom` 的乘算、也没有 `ResultsOffsetX/Y` 的偏移。只有**画不出来**的输入（非有限、越界、量不出表格、
+    // 跑出屏幕）才拒绝，拒绝时不写缓存、不动玩家的数字；真实相交与扫描证据不足都照旧落位——板照玩家的字号与
+    // 锚点画，让不让原版块让位、用多大不透明度由 `ResultFixedOverlayPolicy` 决定。
+    private static bool PlaceFixedLayout(TableContent content, ImpactBoardLayout board, ImpactReport report, bool succeeded,
+        out string refusal)
+    {
+        _fixedPlaced = false;
+        _fixedPlan = ResultFixedDrawPlan.None;
+        float font = FixedFontPixels();
+        float anchorX = FixedAnchorX();
+        float anchorY = FixedAnchorY();
+        if (!ResultFixedLayout.Valid(Screen.width, Screen.height, font, anchorX, anchorY, out refusal))
+        { AbandonFixedLayout(); return false; }
+        int pixels = ResultFixedLayout.RoundFontPixels(font);
+        PanelGrid grid = FixedGrid(content, pixels, out refusal);
+        if (grid == null) { AbandonFixedLayout(); return false; }
+        if (!ResultFixedLayout.TryResolve(Screen.width, Screen.height, anchorX, anchorY, font,
+                grid.Width, grid.Height, out ResultFixedLayoutPlan plan, out refusal))
+        { AbandonFixedLayout(); return false; }
+        _origin = plan.Rect;
+        _grid = grid; _content = content;
+        _fixedPlaced = true;
+        _placed = true;
+        _placedSucceeded = succeeded;
+        // 固定模式的板与自适应/兜底的记录互不相干：那些条带描述的是另一条链的几何。
+        _holdValid = false; _holdBoard = default; _holdStrip = default; _holdOpacity = 0f;
+        _fallbackPlaced = false;
+        // 控件相交与扫描证明在这一帧就判一次：板照画，但这块 overlay 让不让原版块让位、用多大不透明度由它决定。
+        _fixedPlan = FixedLayoutDecision(plan.Rect, out string evidence);
+        ReportFixedPlacement(plan, _fixedPlan, evidence,
+            " rows=" + board.Rows + ",columns=" + board.ColumnCount + ",players=" + report.Entries.Count
+            + ",density=" + Plugin.Density.Name);
+        return true;
+    }
+
+    // 表格在玩家指定的那个字号下自己的尺寸。
+    //
+    // 盒子是无穷大，所以 `PanelGrid.FitFactor` 恒为 1、`HudTable.BuildGrid` 不会再整体缩一次字——这一点**要验**，
+    // 不能假设：量回来的 glyph 不是要的那个像素，就明确拒绝（`fixed-layout-font-not-honoured`），而不是悄悄画小一号。
+    // 尺寸本身每调用一次就重量一次，所以人数变化、内容变宽或字号被热重载改掉之后，下一张表就是新的尺寸。
+    private static PanelGrid FixedGrid(TableContent content, int pixels, out string why)
+    {
+        why = string.Empty;
+        PanelGrid grid = HudTable.BuildGrid(content, pixels, Plugin.Density,
+            float.PositiveInfinity, float.PositiveInfinity, pixels);
+        if (grid == null)
+        {
+            why = ResultFixedLayout.GridUnmeasurable + ": the table could not be measured at a " + pixels
+                + "px glyph (no rows or no columns to measure)";
+            return null;
+        }
+        if (Math.Abs(grid.FontPixels - pixels) > 0.5f)
+        {
+            why = ResultFixedLayout.FontNotHonoured + ": the grid came back at " + grid.FontPixels.ToString("0.#")
+                + "px for the configured " + pixels + "px glyph (nothing here shrinks the table, so this build refuses"
+                + " rather than draw a size the player did not ask for)";
+            return null;
+        }
+        return grid;
+    }
+
+    // 固定模式拒绝之后的共同收尾：把这一帧之前被挪走的原版块按记录放回去，**并且丢掉旧网格**。
+    //
+    // 丢掉旧网格是这个模式自己的契约：人数变了、字号变了、窗口变了，还拿上一帧的尺寸继续落位，画出来的就是一张
+    // 过期的表；`Draw` 也因为 `_grid` 为空而不会落到自适应那条链上去，页面就停在本模组没碰过的原版样子上。
+    private static void AbandonFixedLayout()
+    {
+        _fixedPlaced = false;
+        _fixedPlan = ResultFixedDrawPlan.None;
+        _grid = null; _content = null;
+        _placed = false;
+        Retry.Forget();
+        if (_page != null) RestoreHidden();
+    }
+
+    // 固定模式的控件相交与扫描证明，每一帧都问一次。两个答案彼此独立，而且**都不再是「不画」**：
+    //
+    //   * `overlap`：二维矩形相交（`ResultInteractionStripPolicy.OverlapsBoard`，含
+    //     `ResultBoardHold.ButtonClearance` 的余量）。X 错开就不相交——判定从来不只看 Y 或整条页脚带。
+    //   * `proven`：这一帧的扫描看完了整页（`Complete` + `ParentCoverageComplete`）且没有「active 却量不到
+    //     矩形」的控件。
+    //
+    // 真实相交 → 淡到 0.55 照样画（原版块让位）；证据不足 → 淡到 0.55 画但原版块**保留**，日志写明「证据不足、
+    // 不声称无冲突」；两者都没有 → 不透明度 1.0 并让位。位置和字号一个字都不改：拒绝挪位置、拒绝缩字正是这个
+    // 模式存在的理由。
+    //
+    // 页面自己那段「等待状态文字」按扫描的「受保护文字」交出去（`FixedFooterText`）：它不是可交互控件，成功页的
+    // 文字来自按钮子树，但那不代表该按钮不可点击——真正的按钮仍然经过 `AddControl` 那条没有任何角色判断的路。
+    private static ResultFixedDrawPlan FixedLayoutDecision(LayoutRect rect, out string evidence)
+    {
+        evidence = string.Empty;
+        try
+        {
+            Component waiting = FixedFooterText(_page);
+            FooterControls controls = ScanFooterControls(_page, rect.Y, MessageGap, waiting, rect, inspectBoard: true);
+            bool proven = controls.Complete && controls.ParentCoverageComplete && controls.Unmeasurable == 0;
+            evidence = "complete=" + controls.Complete.ToString().ToLowerInvariant()
+                + ",parentCoverage=" + controls.ParentCoverageComplete.ToString().ToLowerInvariant()
+                + ",unmeasurableControls=" + controls.Unmeasurable
+                + ",scanReason=" + (controls.Reason.Length > 0 ? controls.Reason : "none")
+                + ",pressableTop=" + (float.IsFinite(controls.PressableTop) ? controls.PressableTop.ToString("0") : "unmeasurable")
+                + ",footerTop=" + (float.IsFinite(controls.FooterTop) ? controls.FooterTop.ToString("0") : "unmeasurable")
+                + ",intersectingControls=" + controls.Blockers;
+            return ResultFixedOverlayPolicy.Decide(proven, controls.OverlapsBoard, controls.Blocker, evidence,
+                out _);
+        }
+        catch (Exception error)
+        {
+            // 扫描本身炸了：这也是「证据不足」，不是「这一页有问题」。板照画、原版块保留、日志说清楚。
+            evidence = "scanError=" + error.Message;
+            return ResultFixedOverlayPolicy.Decide(false, false, ResultFixedBlocker.None, evidence, out _);
+        }
+    }
+
+    // 一次配置尝试的签名，日志限频键的一半：窗口 / 字号 / 锚点 / 板自己的矩形，全是玩家这次给的值。
+    private static string FixedSignature(float screenWidth, float screenHeight, float font, float anchorX, float anchorY,
+        float rectWidth, float rectHeight)
+        => ResultFixedLayout.Attempt(font, anchorX, anchorY, screenWidth, screenHeight, rectWidth, rectHeight);
+
+    // 固定模式那行「画了」的诊断：板自己的矩形、真实字号、锚点、窗口、与谁的矩形相交、opacity，证据不足时
+    // 说清证据不足。限频按「这一页 × 这次配置尝试 × 这个相交对象 × 这个证明状态」做键：改字号、改锚点、换分辨率、
+    // 人数/列数变化、相交对象变了都是新的一次尝试，会重新写一遍；同一帧里重复的同一句话只写一次。
+    private static void ReportFixedPlacement(ResultFixedLayoutPlan plan, ResultFixedDrawPlan draw, string evidence,
+        string extras)
+    {
+        string key = "fixed-layout|"
+            + FixedSignature(Screen.width, Screen.height, FixedFontPixels(), FixedAnchorX(), FixedAnchorY(),
+                plan.Rect.Width, plan.Rect.Height)
+            + "|" + draw.Signature;
+        if (!HeadingReports.Add(key)) return;
+        Plugin.Logger?.LogInfo("[DIAG] " + draw.Describe(plan, Screen.width, Screen.height,
+            ResultPageRolePolicy.Name(Role()), _succeeded ? "success" : "failure")
+            + " fixedrect=(" + plan.Rect.X.ToString("0") + "," + plan.Rect.Y.ToString("0") + ","
+            + plan.Rect.Width.ToString("0") + "x" + plan.Rect.Height.ToString("0") + "),actualglyph="
+            + plan.FontPixels + "px,anchor=(" + plan.AnchorX.ToString("0.###") + "," + plan.AnchorY.ToString("0.###")
+            + "),window=" + Screen.width + "x" + Screen.height + ",opacity=" + draw.Opacity.ToString("0.##")
+            + ",evidence=" + evidence + (extras ?? string.Empty)
+            + "; the configured glyph and the bottom-edge midpoint are the ones drawn, nothing was clamped, shrunk or"
+            + " moved, and the vanilla blocks only make way on a frame this board really replaces them.");
+    }
+
+    // 这一页「不是可按控件」的那段页脚文字，按扫描的规则交出去。
+    //
+    // 失败页：`m_returnToLobby_text`——自适应那条链一直用的就是它，固定模式读同一个对象，语义不另开一份。
+    // 成功页：`CM_PageExpeditionSuccess` 没有等待文字的字段（反射只有 `m_btnLeaveExpedition` / `m_lobbyButtonVisible`），
+    // 那行字是 `m_btnLeaveExpedition` 子树里的 TextMeshPro，`FooterTextTop` 量的也正是它——取法照抄：只挑**页面真的在画**
+    // 的（`ResultFooterTextPolicy.Counts`：开着且 alpha 可见），多个候选取最靠上的那个。主机页上那行等待文字没在画，
+    // 于是这一次交出去的是按钮自己的标签；它在按钮自己的矩形里，而按钮本身就是可按键，所以「受保护文字」这个身份
+    // 在这里不会放宽任何决定（遮挡检查对按钮自己照旧生效），也不会让主机页多出一次假拒绝。
+    // 交出去之后，扫描把这个对象记成「受保护文字」：算进 `FooterTop`、不算进 `PressableTop`，也不参与遮挡拒绝。
+    private static Component FixedFooterText(Component page)
+    {
+        try
+        {
+            var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
+            if (fail != null) return fail.m_returnToLobby_text;
+            var success = page != null ? page.TryCast<CM_PageExpeditionSuccess>() : null;
+            if (success == null || success.m_btnLeaveExpedition == null) return null;
+            Component highest = null;
+            float top = float.NaN;
+            foreach (TextMeshPro label in success.m_btnLeaveExpedition.GetComponentsInChildren<TextMeshPro>(true))
+            {
+                if (label == null) continue;
+                bool active;
+                try { active = label.gameObject.activeInHierarchy; } catch { continue; }
+                if (!ResultFooterTextPolicy.Counts(active, HeadingAlpha(label))) continue;
+                if (!TryScreenRect(label, out LayoutRect labelRect)) continue;
+                if (float.IsFinite(top) && labelRect.Y >= top) continue;
+                top = labelRect.Y;
+                highest = label;
+            }
+            return highest;
+        }
+        catch { return null; }
+    }
+
+    // 固定模式真正画出去的那一帧。
+    //
+    // 字号、两个锚点和窗口都是**当场**读的：热重载改了锚点、换了分辨率，这一帧就按新值画，不必等到下一次
+    // `Prepare`；字号变化时重新测量。画不出来的输入丢掉网格并明确说出原因（不再先四舍五入成"能画的值"）；
+    // 控件相交、扫描证据不足都不撤板，而是按 `ResultFixedOverlayPolicy` 淡画——玩家要求的字号与位置就是画出来
+    // 的那个，日志里每行都带着它与这次配置尝试。
+    private static void FixedLayoutDraw()
+    {
+        float configured = FixedFontPixels();
+        float anchorX = FixedAnchorX();
+        float anchorY = FixedAnchorY();
+        string attempt = FixedSignature(Screen.width, Screen.height, configured, anchorX, anchorY, 0f, 0f);
+        // 配置本身也在这一帧校验：热重载写进来的非数字 / 非正数 / 越界在这里同样明确拒绝，而不是先被
+        // `RoundFontPixels` 抬进范围再"合法"地画出来。
+        if (!ResultFixedLayout.Valid(Screen.width, Screen.height, configured, anchorX, anchorY, out string why))
+        {
+            AbandonFixedLayout();
+            ReportHeldBack("fixed", "fixed-layout-input-invalid", why, attempt);
+            return;
+        }
+        int pixels = ResultFixedLayout.RoundFontPixels(configured);
+        PanelGrid grid = _grid;
+        string reglyph = string.Empty;
+        if (grid == null || Math.Abs(grid.FontPixels - pixels) > 0.5f) grid = FixedGrid(_content, pixels, out reglyph);
+        if (grid == null)
+        {
+            AbandonFixedLayout();
+            ReportHeldBack("fixed", "fixed-layout-grid", reglyph, attempt);
+            return;
+        }
+        if (!ResultFixedLayout.TryResolve(Screen.width, Screen.height, anchorX, anchorY, configured,
+                grid.Width, grid.Height, out ResultFixedLayoutPlan plan, out why))
+        {
+            AbandonFixedLayout();
+            ReportHeldBack("fixed", "fixed-layout-offscreen",
+                why, FixedSignature(Screen.width, Screen.height, configured, anchorX, anchorY, grid.Width, grid.Height));
+            return;
+        }
+        LayoutRect rect = plan.Rect;
+        ResultFixedDrawPlan draw = FixedLayoutDecision(rect, out string evidence);
+        // 原版块只在这块 overlay 真的替代它（扫描完整）时才让位；证据不足的这一帧把之前挪走的放回去，页面保持
+        // 原版，板淡画在上面。两者都只改不透明度，不改玩家的字号和位置。
+        try
+        {
+            if (draw.HidesVanilla) ApplyVanillaBlocks(_page, _succeeded);
+            else RestoreHidden();
+        }
+        catch (Exception error)
+        {
+            // 页面在放回原版块的过程中消失了：先按记录把这页上被挪走的东西放回原处，再停止触碰它。
+            if (!_loggedMeasure)
+            {
+                _loggedMeasure = true;
+                Plugin.Logger?.LogWarning("[DIAG] the result page went away while its blocks were being put back, so the fixed board stops touching it: " + error.Message);
+            }
+            _page = null;
+            AbandonFixedLayout();
+            return;
+        }
+        if (_page == null) { AbandonFixedLayout(); return; }
+        _grid = grid; _origin = rect; _fixedPlan = draw;
+        HudTable.Draw(grid, rect.X, rect.Y, _content, draw.Opacity);
+        _boardDrawnFrame = Time.frameCount;
+        ReportFixedPlacement(plan, draw, evidence, string.Empty);
+        ReportForcedDraw(rect);
+        _hitRect = rect;
+        _hitSucceeded = _succeeded;
+        _hitValid = true;
+    }
+
+    // 固定模式下数据刷新（人数变化、内容变宽）重新量表格，但底边中点不动：矩形按同一个锚点重算。
+    private static bool FixedLayoutRefresh(TableContent content, ImpactBoardLayout board, ImpactReport report, bool succeeded)
+    {
+        if (!PlaceFixedLayout(content, board, report, succeeded, out string refusal))
+        {
+            // 这次配置尝试是新的一次，所以要重新说一遍：同一句话在同一页、同一组数字上仍然只写一行。
+            ReportHeldBack("prepare", "fixed-layout-refused", refusal,
+                FixedSignature(Screen.width, Screen.height, FixedFontPixels(), FixedAnchorX(), FixedAnchorY(), 0f, 0f));
+            return false;
+        }
+        return true;
+    }
+
     // ---- the fail-open placement ------------------------------------------------------------------------------
 
     // Where the board stands when the page could not be proven, and why.
@@ -1066,6 +1397,11 @@ internal static class ResultsDisplay
         float anchorBottom = float.NaN;
         ResultBoundSource anchorSource = ResultBoundSource.ScreenSafeArea;
         float footerText = float.NaN;
+        if (GuestClient() && !succeeded && !Forced && !_fallbackPlaced && !ClientWall.Settled)
+        {
+            why = ResultFailureWallPolicy.Unobserved + ": client-wall-not-settled; the first adaptive board waits for two trustworthy lower-bound readings, even after the refusal budget";
+            return false;
+        }
         ResultBoundSource footerTextSource = ResultBoundSource.None;
         Component protectedText = null;
         try
@@ -1145,41 +1481,66 @@ internal static class ResultsDisplay
         //    现在：客机失败页上状态文字不再参与下界，真正可按的控件照旧是墙（`PressableTop`），页脚下沿是页面
         //    自己的固定几何；主机失败页与两个成功页三个读数原样，所以主机路径一个字节都没变。
         LobbyButtonTop(page, out float pageButtonTop);
-        ResultPageWalls walls = ResultPageLowerBoundPolicy.Resolve(GuestClient() && !succeeded, Screen.height,
+        // 客机失败页 = 客机 + 失败页。它的下界语义由 `ResultPageLowerBoundPolicy` 给出，下面的 `walls` 就是那一份。
+        bool guestFailure = GuestClient() && !succeeded;
+        ResultPageWalls walls = ResultPageLowerBoundPolicy.Resolve(guestFailure, Screen.height,
             pageButtonTop, controls.PressableTop, footerText, footerTextSource);
-        // The failure page's own lower bound: any of the readings that really bound a board there. When none of them
-        // exists the page has shown no wall yet - not "no wall" - and the invented band is withheld (see
-        // `ResultFailureWallPolicy`) instead of being hung from the window's foot, which is how the recorded page drew a
-        // 1385-tall board where its button (1240) later appeared.
+        // The failure page's own lower bound: the readings that really bound a board there, and only those.
         //
-        // F5: when that budget is finally spent and a band *is* answered without any measured lower bound, the line has
-        // to keep saying so (`wallUnobserved=true` below) - a successful fallback is not proof that the page has a wall.
-        bool wallUnproven = false;
+        // 1.19.44（TOA Pure 客机失败页，`LogOutput` 12642-12676）：这里以前把 `walls.PageFloor` 也算成「量到了墙」。
+        // 客机失败页的 `PageFloor` 永远是有限数（`ResultsGuestPageGeometry.PageFloor`，2560x1440 上是 1429.33），
+        // 于是 `wallMeasured` 永远为真、`ResultFailureWallPolicy` 在这张页面上一次都没生效过：60 次严格拒收之后
+        // fail-open 直接按屏幕下界编出 band (488..1429)、一块 900 高的板，晚一帧出现的真实控件在 1171，
+        // `ResultBoardHold.TryHold` 拒绝抬起一块已经在带顶的板 → 整页 0.55 不透明度压住页脚 217px。
+        //
+        // 1.19.45（用户纠正）：客机失败页的下界就是那行不可点击的「正在等待厅主」提示文字自己的上沿
+        // （`ResultPageLowerBoundPolicy` 把它作为 `FooterTextTop` 交出来），和主机页的按钮上沿同一性质；真正可按的
+        // 控件照旧是墙，`ResultsBounds` 取更靠上的那一堵。页面自己从屏幕推出来的下沿只做条带的封顶，**不是**墙：
+        // 「这块屏幕有多高」不是页面把什么画在了哪里。一条墙都量不到时，客机失败页不由帧数、也不由超时作答
+        // （见 `ResultFailureWallPolicy.Waits`），保留原版页、按既有节流重测；F8 仍然由玩家自己授权。
+        bool wallMeasured = false;
         int wallWait = 0;
         if (!succeeded)
         {
-            bool wallMeasured = float.IsFinite(walls.PressableTop) || float.IsFinite(walls.FooterTextTop)
-                || float.IsFinite(walls.PageFloor) || FailureWallObserved(pageButtonTop, controls.PressableTop, controls.FooterTop);
+            // 扫描自己的 `FooterTop` 只在「页脚文字真是墙、而 `walls` 还没带着它」的页面上算数：客机失败页上那行
+            // 等待文字已经由 `ResultPageLowerBoundPolicy` 作为 `FooterTextTop` 交出来，不必也不能再算一次。
+            wallMeasured = ResultFailureWallPolicy.WallMeasured(walls, pageButtonTop, controls.PressableTop,
+                walls.GuestFailure ? float.NaN : controls.FooterTop);
             wallWait = FailureWallWaitFrames(wallMeasured);
-            wallUnproven = !wallMeasured;
-            if (ResultFailureWallPolicy.Waits(wallMeasured, wallWait))
+            // F8 在客机上照旧是玩家的答案（预算路线已经由 `MayAnswer` 放行），主机侧一个字节都没变。
+            bool waiving = walls.GuestFailure && Forced;
+            if (!waiving && ResultFailureWallPolicy.Waits(wallMeasured, wallWait, walls.GuestFailure))
             {
                 why = ResultFailureWallPolicy.Unobserved + ": pressable=" + WallText(walls.PressableTop)
-                    + ",footerText=" + WallText(walls.FooterTextTop) + ",pageFloor=" + WallText(walls.PageFloor)
-                    + ",button=" + WallText(pageButtonTop) + ",controls=" + controls.Count + ",hidden=" + controls.Hidden
-                    + ",waited=" + wallWait + " of " + ResultFailureWallPolicy.UnobservedBudget + " frames"
-                    + "; two complete scans that found no pressable control are not a page with no wall, so the fail-open band is not invented from the window";
+                    + ",footerText=" + WallText(walls.FooterTextTop)
+                    + (walls.GuestFailure ? " (this page's waiting-status line, the wall this page draws)"
+                                          : " (" + ResultsBounds.Name(walls.FooterTextSource) + ")")
+                    + ",pageFloor=" + WallText(walls.PageFloor)
+                    + " (this page's own screen-derived foot: the band's cap, never a wall)"
+                    + ",button=" + WallText(pageButtonTop)
+                    + ",scanFooter=" + WallText(walls.GuestFailure ? float.NaN : controls.FooterTop)
+                    + ",controls=" + controls.Count + ",hidden=" + controls.Hidden
+                    + ",wallPending="
+                    + (walls.GuestFailure
+                        ? ResultClientPageActionPolicy.Pending(walls.FooterTextTop, walls.PressableTop).ToString().ToLowerInvariant()
+                        : "not-a-client-page")
+                    + ",waited=" + wallWait + " of " + ResultFailureWallPolicy.UnobservedBudget + " frames (that budget answers no client page by itself)"
+                    + "; this page has shown no lower bound at all, and two complete scans that found nothing are not a page with no wall"
+                    + (walls.GuestFailure
+                        ? " - a client failure page is answered by a wall this page really drew (its waiting-status line or a pressable control) or by the player's own F8, never by a frame count or a timeout, so the fail-open band is not invented from the screen (vanilla page kept, re-measured at the existing cadence)"
+                        : ", so the fail-open band is not invented from the window");
                 return false;
             }
         }
-        // 客机失败页上那行字不进墙，也不进「量到的控件」这一路：`controls.FooterTop` 含它，`PressableTop` 不含。
+        // 客机失败页上那行字已经作为 `walls.FooterTextTop` 进了条带算术（它就是这一页的墙），所以扫描自己的
+        // `FooterTop`（含那行字，也含可按控件）只在不是客机失败页时作为「量到的控件」那一路补一次。
         float measuredWall = walls.GuestFailure ? float.NaN : controls.FooterTop;
         if (!ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,
                 controls.BelowActions.Top, controls.BelowActions.Bottom, FallbackFloor(), out ResultFallbackPlan band))
         {
             why = "no-safe-area: anchorBottom=" + (float.IsFinite(anchorBottom) ? anchorBottom.ToString("0") : "unmeasurable")
                 + ",footerTop=" + WallText(walls.PressableTop)
-                + ",footerText=" + WallText(walls.FooterTextTop) + " (" + (walls.GuestFailure ? "not-a-wall" : ResultsBounds.Name(walls.FooterTextSource)) + ")"
+                + ",footerText=" + WallText(walls.FooterTextTop) + " (" + (walls.GuestFailure ? "the waiting-status line, a wall" : ResultsBounds.Name(walls.FooterTextSource)) + ")"
                 + ",screen=" + Screen.height + ",boardFloor=" + FallbackFloor().ToString("0");
             return false;
         }
@@ -1196,12 +1557,11 @@ internal static class ResultsDisplay
                     + ", boardFloor=" + FallbackFloor().ToString("0")
                 : ResultFallbackLayout.Describe(band, Screen.height, FallbackFloor()))
             + ", anchorBottom=" + (float.IsFinite(anchorBottom) ? anchorBottom.ToString("0") : "unmeasurable")
-            + ", footerText=" + WallText(walls.FooterTextTop) + " (" + (walls.GuestFailure ? "not-a-wall" : ResultsBounds.Name(walls.FooterTextSource)) + ")"
+            + ", footerText=" + WallText(walls.FooterTextTop) + " (" + (walls.GuestFailure ? "the waiting-status line, a wall" : ResultsBounds.Name(walls.FooterTextSource)) + ")"
             + ", footerTop=" + WallText(walls.PressableTop)
-            + ", pageFloor=" + WallText(walls.PageFloor)
+            + ", pageFloor=" + WallText(walls.PageFloor) + " (cap only)"
             + ", controls=" + controls.Count + ", hidden=" + controls.Hidden + ", unmeasurable=" + controls.Unmeasurable
-            + ", scanComplete=" + controls.Complete.ToString().ToLowerInvariant()
-            + ResultFailureWallPolicy.AnswerNote(!wallUnproven, wallWait);
+            + ResultFailureWallPolicy.AnswerNote(wallMeasured, wallWait, walls.GuestFailure);
         return room > 0f;
     }
 
@@ -1318,6 +1678,11 @@ internal static class ResultsDisplay
     {
         if (!Forced || !_forcedOutcomePending) return;
         _forcedOutcomePending = false;
+        if (_fixedPlaced)
+        {
+            Plugin.Logger?.LogInfo($"[DIAG] F8 forced frame: fixed board draw issued, {_grid.Width:0}x{_grid.Height:0}px at ({origin.X:0},{origin.Y:0}), glyph={_grid.FontPixels:0}px, anchor=({FixedAnchorX():0.###},{FixedAnchorY():0.###}), opacity={_fixedPlan.Opacity:0.##}, overlay={_fixedPlan.Reason}, vanillaBlocks={(_fixedPlan.HidesVanilla ? "put away" : "kept")}, forcedByF8=true; configured bottom-edge midpoint, no adaptive band, nothing clamped or shrunk; draw-call receipt, not pixel readback.");
+            return;
+        }
         Plugin.Logger?.LogInfo($"[DIAG] F8 forced frame: board draw issued, {_grid.Width:0}x{_grid.Height:0}px at ({origin.X:0},{origin.Y:0}) of a {Screen.width}x{Screen.height} window, band=({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), bandSource={_holdStrip.FooterSource}, forcedByF8=true; the press is answered on the repaint that issued the board's draw calls (this line reports that call, not a pixel readback of the page).");
     }
     private static bool _placed;             // a placement has been computed for the screen now up
@@ -1347,6 +1712,7 @@ internal static class ResultsDisplay
     private static bool FallbackRecoveryDue(bool succeeded, Component page)
     {
         if (page == null || !_placed) return false;
+        if (_fixedPlaced) return false;
         // The budget is asked first: a page that has already spent its one retry must not pay for the measurement the
         // second look would have needed. 1.19.26 note: `AnchorReadable` is now the placement's own strip measurement,
         // so a recovery can no longer be claimed on a fact the strict placement would refuse one frame later.
@@ -1363,6 +1729,7 @@ internal static class ResultsDisplay
                 Plugin.Logger?.LogInfo($"[DIAG] {(succeeded ? "success" : "failure")} region re-measured: the current anchor-readability probe succeeded ({probe}); this is a recovery-readability check, not the placement's measured-button result or a claim that both band edges were measured. The board standing here was laid out before this probe succeeded, so the page is measured again once - and only once - and the board is re-placed against its current strip instead of the earlier guess.");
             }
             RearmSettle();
+            _relayoutPending = true; _relayoutReason = "second-look";
             return true;
         }
         return AnchorDriftDue(page, succeeded);
@@ -1436,6 +1803,7 @@ internal static class ResultsDisplay
         if (HeadingReports.Add(succeeded ? "success-region-moved" : "failure-region-moved"))
             Plugin.Logger?.LogInfo($"[DIAG] result board re-measured: the {(succeeded ? "success" : "failure")} page's own edges have moved since this board was placed - the strip it was measured into was ({_holdStrip.Top:0}..{_holdStrip.Bottom:0}) and it is ({top:0}..{bottom:0}) now - so the board is fitted again against what the page really offers, once, instead of staying at the size of a page that is no longer there. {Drift.Recoveries}/{ResultAnchorDrift.MaximumRecoveries} re-measures of this page have been spent; no F8 toggle is needed for this.");
         RearmSettle();
+        _relayoutPending = true; _relayoutReason = succeeded ? "success-page-moved" : "page-moved";
         return true;
     }
 
@@ -1585,14 +1953,24 @@ internal static class ResultsDisplay
         // clear the refusal count and then have `Fit` refuse in the very same frame - for ever, with F8 unable to help,
         // because `ShouldFallback` was never evaluated. The count is therefore spent by what really happened: `TryFit`
         // below, never by `Placement` on its own.
-        bool strict = Placement(page, succeeded, out _, out float room, out BoardStrip strip);
+        //
+        // 1.19.45（固定模式，[Results] FixedLayout）：玩家自己指定字号与「表格底边中点」时，这一整条自适应链（页面
+        // 条带、下界墙、稳定门、fail-open）都不参与——它读的是窗口和玩家自己的数字。`Placement` 因此根本不被调用：
+        // 固定模式不会被客机失败页的下界墙等待卡住。控件安全检查没有取消，它在 `PlaceFixedLayout` 里单独做，
+        // 而且是每一帧都做。
+        bool fixedLayout = FixedLayoutActive();
+        bool strict = false;
+        float room = 0f;
+        BoardStrip strip = default;
+        if (!fixedLayout) strict = Placement(page, succeeded, out _, out room, out strip);
         // The row count the board is built with, decided once per frame from the room the page measured. On every
         // page that can hold the split board this is the 30 rows it has always been; on a settlement page whose band
         // `SplitKillTiersFor` keeps the split board for an unmeasured room, for a room too short for either board and
         // for a room where the two rows buy no glyph pixel at all, so a page this rule cannot help keeps exactly the
         // content it had.
         float rowEm = HudTable.RowEm(ResultsFontGrowth.MinimumReadablePixels);
-        bool splitTiers = ImpactBoard.SplitKillTiersFor(strict ? room : float.NaN,
+        // 固定模式没有「条带给的房间」这一说：行数按完整看板固定，好让同一组配置在任何窗口、任何分辨率上都是同一张表。
+        bool splitTiers = fixedLayout || ImpactBoard.SplitKillTiersFor(strict ? room : float.NaN,
             ResultsBandFit.EmPerGlyphPixel(Plugin.Density, rowEm));
         int rows = ImpactBoard.RowCount(splitTiers);
         // The pair is re-derived for the row count this frame really uses, so every figure quoted below - the fit's
@@ -1628,6 +2006,16 @@ internal static class ResultsDisplay
         // The strict attempt is a strict attempt: whatever the previous frame ended in, this one asks the fit to place
         // inside the strip the page itself measured.
         _fallbackPlaced = false;
+        if (fixedLayout)
+        {
+            // 固定模式：字号就是玩家指定的像素值，位置就是玩家指定的底边中点。只有画不出来的输入才拒绝，并在
+            // 那一行里说清是哪一项（字号、锚点、窗口、算出的矩形、原因）；既不改玩家的数字，也不隐藏原版块。
+            // 真实相交与证据不足不拒绝：板照画，淡淡与原版块由 `ResultFixedOverlayPolicy` 决定。
+            if (!PlaceFixedLayout(content, board, report, succeeded, out string fixedRefusal))
+                ReportHeldBack("prepare", "fixed-layout-refused", fixedRefusal,
+                    FixedSignature(Screen.width, Screen.height, FixedFontPixels(), FixedAnchorX(), FixedAnchorY(), 0f, 0f));
+            return;
+        }
         string refusal = "reason=placement-refused,room=unmeasurable,source=" + strip.FooterSource;
         bool placed = strict && TryFit(content, board, report, strip, room, succeeded, out refusal);
         if (ResultPlacementPolicy.Decide(placed, _strictMisses, Forced) == ResultPlacementOutcome.PlacedStrict)
@@ -2006,7 +2394,8 @@ internal static class ResultsDisplay
         if (report.Entries.Count == 0) return true;
         ImpactBoardLayout board = ImpactBoard.Build(report, true, succeeded);
         ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation);
-        if (board.Rows != _grid.Rows || board.ColumnCount != _grid.Columns) return false;
+        // 固定模式：人数或内容变了就是同一张表的新尺寸，底边中点不动，所以这里不按自适应那套「行/列变了就放弃」处理。
+        if (!_fixedPlaced && (board.Rows != _grid.Rows || board.ColumnCount != _grid.Columns)) return false;
         var content = new TableContent
         {
             Columns = board.Columns,
@@ -2016,6 +2405,9 @@ internal static class ResultsDisplay
             Dividers = Dividers(board),
             Kinds = board.Kinds
         };
+        // 固定模式：展开/收起的行数只由完整看板决定（上面 `ImpactBoard.Build(report, true, ...)`），表格在自己指定的
+        // 字号下重量一次，矩形按同一个锚点重算——底边中点因此不随人数变化而移动。
+        if (_fixedPlaced) return FixedLayoutRefresh(content, board, report, succeeded);
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
         PanelGrid measured = HudTable.BuildGrid(content, Mathf.Max(1, Mathf.RoundToInt(_grid.FontPixels)), Plugin.Density, boardWidth, _grid.Height, _fontFloor);
         if (measured != null && !GridCovers(_grid, measured)
@@ -2170,6 +2562,9 @@ internal static class ResultsDisplay
                 // source word - so a log alone settles where a board stands and which measurement put it there.
                 Plugin.Logger.LogInfo($"[DIAG] influence board {board.ColumnCount} columns x {board.Rows} rows ({report.Entries.Count} players), {grid.Width:0}x{grid.Height:0} px at ({x:0},{y:0}) of a {Screen.width}x{Screen.height} window, {(succeeded ? "success" : "failure")} screen, anchorSource={(succeeded ? "completion-section" : "failure-strip")}, blankAbove={blankAbove:0}px, blankBelow={blankBelow:0}px, band=({strip.Top:0}..{strip.Bottom:0}), bandSource={strip.FooterSource}, glyph {grid.FontPixels:0}px filling {grid.Height * 100f / stripHeight:0}% of the {stripHeight:0}px strip between the completion section and the lobby button ({grid.Width * 100f / Math.Max(1f, Screen.width - 48f):0}% of the {Screen.width - 48}x width it was fitted to); drawn by IMGUI, no vanilla report card was modified.");
             }
+            else if (_relayoutPending && HeadingReports.Add("board-relaid"))
+                Plugin.Logger?.LogInfo($"[DIAG] result board re-fitted: the page was measured again ({_relayoutReason}) and the board now stands at {grid.Width:0}x{grid.Height:0} px at ({x:0},{y:0}) of a {Screen.width}x{Screen.height} window, band=({strip.Top:0}..{strip.Bottom:0}), bandSource={strip.FooterSource}, glyph {grid.FontPixels:0}px, role={ResultPageRolePolicy.Name(Role())}; the placement before it was laid out before this page's own wall could be read, so this line is the size and place the player really ends up with (one line per page - the re-measure itself stays inside `ResultAnchorRecovery` and `ResultAnchorDrift`).");
+            _relayoutPending = false;
             // 1.19.26: the drawn half of the 1.19.22 forced-frame contract is *not* answered from here. This is the fit, and a
             // fit says a board was measured and placed - not that one pixel of it was issued; `Draw` can still refuse the very
             // frame that fitted it (`BoardStillSafe`), and a "board drawn" line printed at fit time was an answer about pixels
@@ -2193,10 +2588,12 @@ internal static class ResultsDisplay
             {
                 if (HeadingReports.Add("board-growth-refused"))
                     Plugin.Logger?.LogInfo($"[DIAG] result board kept at its measured size: a refreshed {grid.Width:0}x{grid.Height:0} board would cross the wall the held grid has to stay above (wall={(float.IsFinite(strip.ButtonTop) ? strip.ButtonTop.ToString("0") : "unmeasurable")}, source={DescribeBand(strip.FooterSource)}) or run past the strip it was measured into ({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), so the grid already on the page is kept and the next snapshot asks again.");
+                _relayoutPending = false;
                 return true;
             }
             _origin = _holdBoard;
             _content = content; _grid = grid;
+            _relayoutPending = false;
             if (HeadingReports.Add("board-held"))
                 Plugin.Logger?.LogInfo($"[DIAG] result board kept: the strip measured {strip.Top:0}..{strip.Bottom:0} cannot hold the {grid.Width:0}x{grid.Height:0} board that is already up, so it keeps the place it was measured into at ({_holdBoard.X:0},{_holdBoard.Y:0}), and only the lobby button is read from here on.");
             return true;
@@ -3311,10 +3708,10 @@ internal static class ResultsDisplay
                 : float.IsFinite(namedTop) && (!float.IsFinite(controls.FooterTop) || namedTop <= controls.FooterTop + 0.5f)
                     ? ResultFooterSource.NamedControl : ResultFooterSource.InteractiveBand;
 
-            // 等待状态文字块：照旧测量一次，写进 `waitingText=` 日志字段。
+            // 等待状态文字块：测量一次，既写进 `waitingText=` 日志字段，也是客机失败页的下界墙。
             // 1.19.21: the waiting block's own layout is read as soon as the object exists - active state and text
-            // content are not asked of it, and `TryScreenRect` asks neither. 1.19.38: on a client it is a *fact*
-            // about the page and not a wall - the band below never takes its foot from this figure.
+            // content are not asked of it, and `TryScreenRect` asks neither. A block the page has not laid out yet is
+            // simply not measured this frame, and the strip is not invented without it (1.19.45).
             float waitingTextTop = float.NaN;
             try
             {
@@ -3326,46 +3723,45 @@ internal static class ResultsDisplay
             {
                 // 客机：本页没有「返回大厅」按钮，只有一行等待厅主的状态文字——而它自己会被扫描当成一个
                 // 受保护的下边界控件，所以旧的 buttonMeasured 在客机上几乎恒为真，绝不能拿它当分支条件。
-                // 上界 = 锚点（任务失败标题）实测底边 + 玩家配置的纵向偏移，再按 1080p 等比缩放补一个 gap；
-                // 下界 = 参考分辨率等比缩放的固定页面下界。
+                // 上界 = 锚点（任务失败标题）实测底边 + 玩家配置的纵向偏移，再按 1080p 等比缩放补一个 gap。
                 //
-                // 1.19.38：下界不再被原生等待文字二次夹紧。那行字只作为 `waitingText=` 被量一次，不是墙；
-                // 真正可按的控件（重开检查点 / 回大厅按钮）仍然是墙，收紧条件与旧实现一致（见
-                // `ResultClientFailureBand`）。
+                // 1.19.45（用户纠正，覆盖 1.19.38 的相反口径）：下界就是那行不可点击提示文字自己的上沿，和主机
+                // 页拿按钮上沿做下界是同一个道理——「他的下界不过是从主机的可点击按钮变成了客机的不可点击提示
+                // 文字」。真正可按的控件（重开检查点 / 回大厅）照旧是墙，两者取更靠上的那一堵。页面固定几何只做
+                // 封顶，绝不冒充墙：run 3 里 band (488..1429) 就是这么编出来的，900 高的板压住 1177 的控件，
+                // `TryHold` 不能抬一块已经在带顶的板，只能整页 0.55。
                 //
-                // 1.19.39：墙先稳定，再落板。记录下来的客机失败页第一帧还没有任何可按控件，条带整段是固定页面
-                // 几何（381..1429，1049px），一块 1160x990 的板被画上去；下一帧扫描量到可按控件 1176，条带收紧
-                // 到 381..1179（798px），站着的板真的压在那个控件上，于是整块板被撤掉——玩家看到的就是「先画
-                // 一块大的，再消失」。这一帧的判定现在由 `ResultClientFailureStrip` 完整给出（固定几何 → 墙稳定门
-                // → 条带），落板用的墙永远是本页量到过的最高那一堵：第一帧就把最终几何定下来，之后既不重排也
-                // 不撤板。落板的另一个前提由 `ResultClientFailureStrip` 自己带：扫描必须真的看见这一页
+                // 1.19.39：墙先稳定，再落板。记录下来的客机失败页第一帧还没有任何可按控件，条带整段是屏幕下界
+                // （381..1429，1049px），一块 1160x990 的板被画上去；下一帧扫描量到控件 1176，条带收紧到
+                // 381..1179（798px），站着的板真的压在控件上，于是整块板被撤掉——玩家看到的就是「先画一块大的，
+                // 再消失」。这一帧的判定现在由 `ResultClientFailureStrip` 完整给出（固定几何 → 墙稳定门 → 条带），
+                // 落板用的墙永远是本页量到过的最高那一堵：第一帧就把最终几何定下来，之后既不重排也不撤板。
+                // 落板的另一个前提由 `ResultClientFailureStrip` 自己带：扫描必须真的看见这一页
                 // （`controls.Complete` + `ParentCoverageComplete`）——客机在生产里没有外层的完整扫描闸门，
                 // 而 inactive 控件被扫描记为 hidden，不会让扫描变成「不完整」。
                 // 已经站在页面上的板（`inspectBoard`）不过稳定门：一堵还没读到两次的墙不能把板撤掉。
                 float configuredOffset = Plugin.ResultsOffsetY.Value;
                 if (!float.IsFinite(configuredOffset) || configuredOffset < 0f) configuredOffset = 0f;
                 float guestAnchor = titleBottom + configuredOffset;
-                // 只有真的可按的控件才是收紧用的墙：`controls.PressableTop` 已经排除了扫描量到的等待文字，
-                // 命名按钮（重开检查点 / 回大厅）仍然按自己的布局矩形加进来。
+                // 墙的两路读数：等待文字自己的布局上沿，与真正可按的控件（扫描的 `PressableTop` 已排除受保护文字，
+                // 命名按钮按自己的布局矩形加进来）。两者都是墙，条带取更靠上的那一堵。
                 float pressableTop = ResultsRegion.HighestTop(namedTop, controls.PressableTop);
-                // 1.19.42（独立评审 F3）：这一页量到可按控件了吗？这是这条门**唯一**读的逐帧事实
-                // （`ResultClientPageActionPolicy` 现在只收 `pressableTop`）：量到就由那堵墙自己回答，量不到就是「这一页的墙
-                // 还没出现」而不是「这一页没有墙」。本页动作的 active 状态曾经是入参，但在客机上「回大厅」永久 inactive、
-                // `HiddenPageActions` 常 ≥1，那一条恒真、整体等价于 `!IsFinite(pressableTop)`——所以它只进下面那一行日志。
-                // 记录下来的那一页头两帧就是这个形状：两次一致的「空扫描」让条带按 381..1429 定了一块 990px 的板，下一帧
-                // 控件出现就被撤掉。这一项只作用于首次落位（`Measure` 不读它）。
-                bool pageActionsPending = ResultClientPageActionPolicy.Pending(pressableTop);
-                if (pageActionsPending && ResultFallbackPolicy.ShouldFallback(_strictMisses, Forced)
-                    && HeadingReports.Add("failure-client-page-actions-pending-to-fail-open"))
+                // 1.19.45：这一页一堵墙都还没量到吗（等待文字与可按控件都不可测）？这是这条门唯一读的「没有
+                // 证据」状态。本页动作的 active 状态曾经是入参，但在客机上「回大厅」永久 inactive、
+                // `HiddenPageActions` 常 ≥1，那一条恒真、不携带逐帧信息——所以它只进日志。
+                bool wallPending = ResultClientPageActionPolicy.Pending(waitingTextTop, pressableTop);
+                if (wallPending && ResultFallbackPolicy.ShouldFallback(_strictMisses, Forced)
+                    && HeadingReports.Add("failure-client-wall-pending-to-fail-open"))
                     Plugin.Logger?.LogWarning($"[DIAG] failure board: this client page has stayed pending until the fail-open budget "
                         + $"({ResultFallbackPolicy.MissBudget} refusals, misses={_strictMisses}, forcedByF8={Forced}); hidden={controls.Hidden},"
-                        + $"hiddenPageActions={controls.HiddenPageActions},pressable={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")},"
+                        + $"hiddenPageActions={controls.HiddenPageActions},waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")},"
+                        + $"pressable={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")},"
                         + $"scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},"
-                        + $"unmeasurable={controls.Unmeasurable}; no frame of this page measured a pressable control, so nothing here proves the wall - "
-                        + $"the answer is the fail-open board (every measured control stepped around), never a settled page.");
+                        + $"unmeasurable={controls.Unmeasurable}; no frame of this page measured the waiting-status line's own rectangle or a pressable control, so this page has shown no wall at all - "
+                        + $"the fail-open path's own gate decides from here (`ResultFailureWallPolicy.WallMeasured`): only the player's own F8 can answer a client failure page without a wall, the band's foot is then the screen's own geometry, and no frame count or timeout may do it.");
                 var clientEvidence = new ResultClientFailureEvidence(guestAnchor, Screen.width, Screen.height,
                     MessageGap, MinimumGuestStripHeight, waitingTextTop, pressableTop,
-                    controls.Complete, controls.ParentCoverageComplete, controls.Unmeasurable, pageActionsPending);
+                    controls.Complete, controls.ParentCoverageComplete, controls.Unmeasurable);
                 ResultClientBandReading clientBand;
                 ResultsSafeArea guestArea;
                 ResultClientStripState clientState = inspectBoard
@@ -3373,12 +3769,12 @@ internal static class ResultsDisplay
                     : ResultClientFailureStrip.Decide(Time.frameCount, ClientWall, clientEvidence, out clientBand, out guestArea);
                 if (clientState == ResultClientStripState.WallNotSettled)
                 {
-                    // 不是超时，也不是有界放行：这一帧的墙问题没有被回答（读法变了 / 页面还在亮控件 / 有 active
+                    // 不是超时，也不是有界放行：这一帧的墙问题没有被回答（读数变了 / 一堵墙都没量到 / 有 active
                     // 控件量不到矩形），所以这一帧不是可以落板的那一帧。放行的唯一条件是「同一堵墙、两帧、都可
                     // 回答」；等不到就交给既有的 60 帧拒收预算与 fail-open 板，那一条从不声称这一页被证明过。
                     // 这一行走 `HeadingReports`，每页一次：一次诊断，不刷屏。
                     if (HeadingReports.Add("failure-client-wall-not-settled"))
-                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: this client page's lower wall has not been answered the same way on two complete scans yet (wallSoFar={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")}, thisFrame={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")}, samples={ClientWall.Samples} seen, state={ResultClientFailureStrip.Name(clientState)}, scanComplete={controls.Complete.ToString().ToLowerInvariant()}, parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()}, hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},unmeasurable={controls.Unmeasurable},pageActionsPending={pageActionsPending.ToString().ToLowerInvariant()}); no frame count authorises this placement, so the board is not fitted against a wall the page is still revealing and is never withdrawn a frame later. pageActionsPending=true means this page has not measured a single pressable control yet, so this frame is not a page without a wall - hidden/hiddenPageActions are printed for the record only (the go-to-lobby button is permanently inactive on a client). If it never settles the existing refusal budget answers with the fail-open board, which steps around every measured control instead of claiming the page was proven.");
+                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: this client page's lower wall has not read the same value on two complete scans yet (wallSoFar={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")}, thisFrame={(float.IsFinite(clientEvidence.WallTop) ? clientEvidence.WallTop.ToString("0") : "unmeasurable")}, waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")}, pressable={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")}, samples={ClientWall.Samples} seen, state={ResultClientFailureStrip.Name(clientState)}, scanComplete={controls.Complete.ToString().ToLowerInvariant()}, parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()}, hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},unmeasurable={controls.Unmeasurable},wallPending={wallPending.ToString().ToLowerInvariant()}); no frame count authorises this placement, so the board is not fitted against a wall the page is still revealing and is never withdrawn a frame later. wallPending=true means neither the waiting-status line nor a pressable control was measurable this frame, so this is not a page without a wall - hidden/hiddenPageActions are printed for the record only (the go-to-lobby button is permanently inactive on a client). If it never settles the existing refusal budget answers with the fail-open board, which steps around every measured control instead of claiming the page was proven.");
                     return false;
                 }
                 if (clientState == ResultClientStripState.GeometryUnusable)
@@ -3389,8 +3785,9 @@ internal static class ResultsDisplay
                 }
                 if (clientState == ResultClientStripState.BandUnusable)
                 {
+                    // 量到了墙，但那堵墙上方留不出客机最小板高：这是「保留原版 + 重测」，不是把板压在墙上面。
                     if (HeadingReports.Add("failure-guest-band-unusable"))
-                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: the client page's fixed band cannot hold the minimum board this frame (fixedPage=({guestArea.Top:0}..{guestArea.Bottom:0}), waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")}, pressableTop={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")}, wall={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")}) on a {Screen.height} window; vanilla is retained and the page is measured again.");
+                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: the client page's band cannot hold the minimum board above the wall this frame (fixedPage=({guestArea.Top:0}..{guestArea.Bottom:0}), waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")}, pressableTop={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")}, wall={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")}, minimum={MinimumGuestStripHeight:0}px) on a {Screen.height} window; vanilla is retained and the page is measured again.");
                     return false;
                 }
                 // 扫描看不见这一页：它不能断言「这一页没有墙」，也不是「页面把控件关掉了」。客机失败页在生产里
@@ -3404,20 +3801,22 @@ internal static class ResultsDisplay
                 top = clientBand.Top;
                 bottom = clientBand.Bottom;
                 footerSource = ResultFooterSource.ClientNoFooterSafeArea;
-                bandBottomSource = clientBand.PressableTightened ? ResultBoundSource.FooterControl : ResultBoundSource.ScreenFoot;
-                // 下界来自一条真的可按控件时，那一版条带就是它自己的承诺（与主机同一条 ceiling 规则）；来自页面
-                // 固定几何时脚下什么都没有量过，于是保留舒适带宽 —— 这正是 `ResultsFontGrowth.FootIsTheWall` 的回答。
-                footIsWall = clientBand.PressableTightened;
-                // 客机的「页脚」只可能是真正可按的控件：等待状态文字不算页脚。量不到就是没有页脚可量，
-                // 而不是「页脚在 1228」——后者正是把条带压回 370px 的那次读数。这里报的是本页见过的最高那堵墙，
-                // 也就是条带自己用的那一堵：条带与它的下限永远说同一个数。
+                // 下界来自哪一堵墙，日志就说哪一堵：等待文字是 `footer-text`，可按控件是 `footer-control`。
+                bandBottomSource = clientBand.PressableTightened ? ResultBoundSource.FooterControl
+                    : clientBand.WaitingTextTightened ? ResultBoundSource.FooterText
+                    : ResultBoundSource.ScreenFoot;
+                // 下界来自一堵量到的墙（等待文字或可按控件）时，这条条带就是它自己的承诺（与主机同一条 ceiling
+                // 规则，`ResultsFontGrowth.FootIsTheWall` 的回答）；一堵墙都没有时它根本不会走到这里。
+                footIsWall = clientBand.WallMeasured;
+                // 客机的「页脚」是这一页真正画出来的墙：等待文字自己的上沿，或更靠上的可按控件。这里报的是本页
+                // 见过的最高那堵墙，也就是条带自己用的那一堵：条带与它的下限永远说同一个数。
                 float clientWall = ClientWall.Wall;
                 buttonTop = clientWall;
                 buttonMeasured = float.IsFinite(clientWall);
                 buttonHeight = restartInStrip && Math.Abs(namedTop - restartTop) <= 0.5f ? restartRect.Height
                     : goInStrip && Math.Abs(namedTop - goTop) <= 0.5f ? goRect.Height : float.NaN;
                 if (HeadingReports.Add("failure-client-fixed-geometry"))
-                    Plugin.Logger?.LogInfo($"[DIAG] failure footerSource=client-fixed-page-geometry: native lobbyVisible={nativeFooterVisible.ToString().ToLowerInvariant()}, anchor=settled-mission-title, nativeFooterMeasured={buttonMeasured.ToString().ToLowerInvariant()} (logged only), waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")},waitingTextCovered={clientBand.WaitingTextCovered.ToString().ToLowerInvariant()}, wallSettled={ClientWall.Settled.ToString().ToLowerInvariant()},wallSamples={ClientWall.Samples}, hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},pageActionsPending={pageActionsPending.ToString().ToLowerInvariant()}, strip=({top:0}..{bottom:0}) of a {Screen.height} window; the waiting-status line is measured and logged only and never bounds this strip, the interaction scan is consulted only for controls the player can press, and no footer button is required for release.");
+                    Plugin.Logger?.LogInfo($"[DIAG] failure footerSource=client-fixed-page-geometry: native lobbyVisible={nativeFooterVisible.ToString().ToLowerInvariant()}, anchor=settled-mission-title, nativeFooterMeasured={buttonMeasured.ToString().ToLowerInvariant()}, waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")},waitingTextCovered={clientBand.WaitingTextCovered.ToString().ToLowerInvariant()}, waitingTextTightened={clientBand.WaitingTextTightened.ToString().ToLowerInvariant()}, pressableTightened={clientBand.PressableTightened.ToString().ToLowerInvariant()}, wallSettled={ClientWall.Settled.ToString().ToLowerInvariant()},wallSamples={ClientWall.Samples}, hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},wallPending={wallPending.ToString().ToLowerInvariant()}, strip=({top:0}..{bottom:0}) of a {Screen.height} window; this page's lower bound is the top edge of what the page really draws under the board - the client's non-clickable waiting-status line (the same role the host's pressable button plays), or a pressable control when that reaches higher - and never the page's own screen-derived foot, which only caps the band.");
             }
             else
             {
@@ -3432,16 +3831,15 @@ internal static class ResultsDisplay
             }
             // ---- the agreed band, on the failure page too ----------------------------------------------------
             //
-            // Upper: the page's own mission-failed title layout edge. Lower: the button the host presses.
+            // Upper: the page's own mission-failed title layout edge. Lower: the wall the player's role really has.
             //
-            // 1.19.38: 客机的条带不再经过 `ResultsBounds`。客机的下界就是页面固定几何的下界（本机实测 1429），
-            // 原生「正在等待厅主」文字块（实测 1228）不是墙：它照旧被测量、照旧写进 `waitingText=` 字段，
-            // 但不参与下界的决定。旧版这里把 waitingTextTop 传给 `ResultsBounds.TryResolve`，于是 1429 被二次
-            // 夹紧成 1207（370px，30 行只够 8px 字号），等待文字跨帧下移 30px 还会再触发一次「result board
-            // re-measured」。主机这一行都没有变：它的下界仍然取「按钮 / 量到的控件 / 屏幕脚」里最高的那堵墙。
+            // 1.19.45（用户纠正）：客机失败页的下界由上面那个客机分支给出，来自「等待文字自己的上沿」或更靠上的可按
+            // 控件，页面固定几何只做封顶——和主机页「按钮上沿减 clearance」是同一条规则的两张面孔。这里因此只把这一页
+            // 的 band 报一次（`ReportBand` 的 `waitingText=` 字段就是那堵墙的读数）。主机这一行没有变：它的下界仍然取
+            // 「按钮 / 量到的控件 / 屏幕脚」里最高的那堵墙。
             if (GuestClient())
             {
-                // 客机：条带的两个边界已经由上面那个固定几何分支决定，这里只把这一页的 band 报一次。
+                // 客机：条带的两个边界已经由上面那个客机分支决定，这里只把这一页的 band 报一次。
                 ReportBand("failure", new ResultsBand(top, bottom, bandTopSource, bandBottomSource, false),
                     float.NaN, waitingTextTop, _boardFloor);
             }
@@ -3582,6 +3980,10 @@ internal static class ResultsDisplay
         var tally = new ResultInteractionTally(0, 0, 0, 0);
         string reason = string.Empty;
         bool complete = true, overlaps = false, client = false, parentCoverageComplete = true;
+        // 固定模式的那一块：哪些控件真的和板相交。自适应链不看这两个值（它只用 `overlaps`），所以这里多记一条
+        // 身份不会改变它的任何决定；记的是**第一个**相交控件（日志用它说清"压到了谁"）和相交的个数。
+        ResultFixedBlocker blocker = ResultFixedBlocker.None;
+        int blockers = 0;
         // The client flag decides which result action the page is expected to have hidden, so an unreadable one is
         // a coverage edge of the scan itself and keeps the vanilla page up rather than being guessed at.
         try { client = ResultPageRolePolicy.IsClient(ResultPageRolePolicy.Of(SNet.IsMaster)); } catch { complete = false; reason = "client-state-unreadable"; }
@@ -3597,6 +3999,10 @@ internal static class ResultsDisplay
         //     cases that keep it false are the ones about the page's *structure*: an unreadable item registry, a
         //     parent node that cannot be reached, a type conversion that fails, a client flag nobody could read.
         //     None of those is repaired by waiting, so a scan that hits one must leave the board alone.
+        //
+        // TextMeshPro footer bounds are measured separately below. A label and its parent
+        // button have different native identities; protecting text must never exempt that button.
+
         void AddControl(Component control)
         {
             if (control == null) return;
@@ -3634,7 +4040,11 @@ internal static class ResultsDisplay
             }
             actions.Add(new ResultActionBounds(rect));
             if (inspectBoard && ResultInteractionStripPolicy.OverlapsBoard(rect, board, ResultBoardHold.ButtonClearance))
+            {
                 overlaps = true;
+                blockers++;
+                if (!blocker.Any) blocker = Blocker(control, rect, pressable: true);
+            }
         }
 
         void ScanSiblingParent(Component source, bool required)
@@ -3725,6 +4135,7 @@ internal static class ResultsDisplay
         // which is not true of an element that stops the guest safe area outright. A line whose own *state* cannot
         // be read is still the structural case and keeps the scan incomplete, because there is no telling whether it
         // is on the screen at all.
+        // Footer text is measured separately from any real button that contains it.
         if (protectedPageText != null)
         {
             try
@@ -3743,7 +4154,11 @@ internal static class ResultsDisplay
                     // 把板子整体撤下来，于是客机页面上完全没有板子。主机上它仍然是页脚文字，遮挡拒绝保持原样。
                     // 真正可按的控件走上面的 `AddControl`，那一路没有任何角色判断。
                     if (inspectBoard && !client && ResultInteractionStripPolicy.OverlapsBoard(rect, board, ResultBoardHold.ButtonClearance))
+                    {
                         overlaps = true;
+                        blockers++;
+                        if (!blocker.Any) blocker = Blocker(protectedPageText, rect, pressable: false);
+                    }
                 }
             }
             catch { complete = false; if (reason.Length == 0) reason = "protected-text-unreadable"; }
@@ -3774,8 +4189,24 @@ internal static class ResultsDisplay
         float bandAnchor = float.IsFinite(strip.BoardTop) ? strip.BoardTop : anchorBottom + gap;
         ResultBoardBands.TryBelowActions(bandAnchor, Screen.height, actions, gap, out ResultBoardBand belowActions);
         return new FooterControls(strip.FooterTop, strip.BoardTop, tally.Active, tally.Hidden + tally.Active, complete, parentCoverageComplete, overlaps,
-            tally.Hidden, tally.HiddenPageActions, reason, tally.Unmeasurable, belowActions, strip.PressableTop);
+            tally.Hidden, tally.HiddenPageActions, reason, tally.Unmeasurable, belowActions, strip.PressableTop,
+            blocker, blockers);
     }
+    // 一个相交控件在日志里要有的身份：它是什么组件、对象叫什么名字、它自己的真实矩形。名字读不出来不算结构故障
+    // ——它只是这一行的措辞少一段，决定本身不受影响。
+    private static ResultFixedBlocker Blocker(Component control, LayoutRect rect, bool pressable)
+    {
+        string name = "(unnamed)", type = "control";
+        try
+        {
+            if (control != null && control.gameObject != null) name = control.gameObject.name;
+        }
+        catch { name = "(unreadable)"; }
+        try { type = control != null ? control.GetType().Name : "control"; }
+        catch { type = "(unreadable)"; }
+        return new ResultFixedBlocker(rect, name, type, pressable);
+    }
+
 
     private static bool IsKnownClientHiddenLobbyAction(Component page, Component control)
     {

@@ -287,6 +287,20 @@ public sealed class PanelBehaviour : MonoBehaviour
             if (!succeeded && state != eGameStateName.ExpeditionFail) return false;
             if (!ResultsZoom.Accepts(current.delta.y)) return false;
             if (!ResultsDisplay.ZoomAt(current.mousePosition, succeeded, Time.frameCount)) return false;
+            // 固定模式（1.19.45）：滚轮仍然被这块板吃掉（不漏给下面的页面），但它**不改字号**——玩家在 [Results]
+            // FixedFontPixels 里指定的像素值就是这块板的字号，滚轮在这里悄悄乘一个倍率正是这个模式不允许的事。
+            if (ResultsDisplay.FixedLayoutActive())
+            {
+                current.Use();
+                if (!_loggedFixedWheel)
+                {
+                    _loggedFixedWheel = true;
+                    Plugin.Logger?.LogInfo("[DIAG] settlement board wheel: this page is drawn with the fixed layout the player configured "
+                        + "([Results] FixedLayout=true), so the wheel is consumed here and the glyph stays at [Results] FixedFontPixels; "
+                        + "turn FixedLayout off to scale the adaptive board with the wheel again.");
+                }
+                return true;
+            }
             ResultPageKind page = ResultsZoom.Page(succeeded);
             float scale = ResultsZoom.Next(Plugin.ResultFontScale(succeeded), current.delta.y);
             bool changed = Plugin.PersistResultFontScale(page, scale);
@@ -299,6 +313,8 @@ public sealed class PanelBehaviour : MonoBehaviour
     }
 
     private static bool _loggedWheel;
+    // 固定模式下滚轮被吃掉但不改字号：这条诊断一局只写一次，免得每滚一格就刷一行。
+    private static bool _loggedFixedWheel;
 
     [HideFromIl2Cpp]
     private static void LogWheelOnce(Exception error)

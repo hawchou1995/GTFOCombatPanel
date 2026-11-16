@@ -406,8 +406,11 @@ internal static class GuestSettlementBandScenarios
             "and F8 asks that answer - not the `Forced` override, which is false for a board the fail-open path put up itself");
         check(display.Contains("_boardDrawnFrame = -1;") && display.Contains("_boardDrawnFrame = Time.frameCount;"),
             "the drawn frame is written before every early return of a repaint and set again only by the draw at its end");
-        check(CountOf(display, "_boardDrawnFrame = Time.frameCount;") == 1,
-            "exactly one place records a drawn board, right after the table's draw call");
+        // 1.19.45: two draw paths record a drawn board now - the adaptive one at the end of `Draw`, and the fixed-mode one
+        // in `FixedLayoutDraw` (which returns before the adaptive tail). Both write the same fact, so F8's answer stays
+        // one fact; the count is pinned so a third, accidental writer still fails here.
+        check(CountOf(display, "_boardDrawnFrame = Time.frameCount;") == 2,
+            "exactly two places record a drawn board, each right after its own table draw call: the adaptive repaint and the fixed-mode one");
     }
 
     // The fit spends the ceiling of the strip it was given, and the failure/success placements build that strip from the

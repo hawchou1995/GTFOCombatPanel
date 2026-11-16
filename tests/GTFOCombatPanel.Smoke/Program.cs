@@ -1805,6 +1805,9 @@ internal static partial class Program
         // ---- the two defects this round fixes on top of 1.19.20: the flashlight anchor's restarted retry round and
         //      the settlement board drawn against a mid-reveal edge --------------------------------------------
         AnchorAndFinalGeometryScenarios.RunInto(Check);
+        RunClientReviveScenarios();
+        RunFixedLayoutScenarios();
+        RunResultReviewFixScenarios();
         // The official 1.19.20 assertions this workspace's own Release11916Scenarios.cs does not carry (36 runs: the two
         // scenario methods and the band-policy block of `Wiring`), restored without touching that file.
         Release11920OfficialRegressionScenarios.RunInto(Check);
@@ -1903,6 +1906,11 @@ internal static partial class Program
         //      又把含它的 `FooterTop` 当页脚控件，于是同一张 2560x1440 页面上兜底只有 370px（8px 字号）、严格有
         //      593px；现在两层都走 `ResultPageLowerBoundPolicy` + `ResultFallbackBandPolicy` ----------------------
         RunRelease11940ClientFallbackBandScenarios();
+        // ---- 1.19.44: 客机失败页的「墙量到了吗」只剩一个定义，而且屏幕下界不算墙。记录页面（run 3）在第 60 次
+        //      严格拒收后按 pageFloor=1429 编出 band (488..1429)、900 高的板，晚一帧出现的控件 1177 只能被压住并
+        //      降成 0.55；现在没有墙时只有页面自己的原生失败协程终点能放行，墙到了第一块板就按 488..1155 拟合，
+        //      已经站着的错板由 `ResultAnchorRecovery`/`ResultAnchorDrift` 有界重落位 ---------------------------
+        RunClientFailureWallEvidenceScenarios();
         // ---- the client settlement page's own band: a band that ends above the waiting-status block may be filled to its
         //      foot, so the recorded 316px client page draws the 7px / 315px table instead of a 6px / 270px one and then
         //      re-fitting itself 30px lower - and every host band keeps the comfort ceiling -------------------------
