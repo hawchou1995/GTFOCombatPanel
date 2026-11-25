@@ -1,4 +1,4 @@
-﻿# CombatPanel
+# CombatPanel
 
 独立 GTFO 战斗统计面板：局内查看战斗数据，成功或失败结算查看队伍贡献。仅依赖 **BepInEx-BepInExPack_GTFO-3.2.4**；EWC（ExtraWeaponCustomization）是可选集成，不是依赖。
 
