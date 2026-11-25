@@ -850,7 +850,9 @@ internal static class Release11912Scenarios
 
         int fit = results.IndexOf("private static bool Fit(BoardStrip strip", StringComparison.Ordinal);
         int record = results.IndexOf("Drift.Record(Time.frameCount, strip.Top, strip.Bottom - strip.Top);", StringComparison.Ordinal);
-        int hold = results.IndexOf("_holdStrip = strip;", StringComparison.Ordinal);
+        // 1.19.47: the fallback path records the strip it re-fitted into as well (that is review #4's atomic update), so the
+        // search for the strict placement's own record starts at `Fit` instead of at the top of the file.
+        int hold = fit >= 0 ? results.IndexOf("_holdStrip = strip;", fit, StringComparison.Ordinal) : -1;
         check(fit >= 0 && record > fit && hold > fit,
             "the strip a placed board was measured into is recorded in the one place that really places a board");
 
@@ -863,24 +865,35 @@ internal static class Release11912Scenarios
               && results.Contains("private static void Prefix(CM_PageExpeditionFail __instance) => ResultsDisplay.BeginFailurePage(__instance);"),
             "a new visit to the failure page drops the settle state the previous visit spent - the page object is reused");
 
-        // What this release must not have changed: the success board still hangs from its upper edge, the fit-failure
-        // latch still records a placement only after a fit that really placed one, and the growth guard is still asked.
-        check(results.Contains("bottomAligned: false") && !results.Contains("bottomAligned: true"),
-            "the success board still hangs from the completion section's upper edge");
-        int latch = results.IndexOf("ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded)", StringComparison.Ordinal);
+        // What this release must not have changed: the fit-failure latch still records a placement only after a fit
+        // that really placed one, and the growth guard is still asked. 1.19.47（最新用户合同）changes exactly one thing
+        // here: the board no longer hangs from its upper edge on either page - it is bottom-aligned to the wall it may
+        // not cross and grows upward from it, which is what makes the same roster land in the same normalized size and
+        // place at 1920x1080 and 2560x1440.
+        check(results.Contains("bottomAligned: true") && !results.Contains("bottomAligned: false"),
+            "both result pages hang their board from the measured wall below and grow upward from it (1.19.47)");
+        int latch = results.IndexOf("ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded, header)", StringComparison.Ordinal);
         int record_ = results.IndexOf("_placed = true; _placedSucceeded = succeeded;", StringComparison.Ordinal);
         check(latch >= 0 && record_ > latch,
             "a placement is still recorded only after the latch has accepted the fit");
-        int heldCheck = results.IndexOf("ResultBoardHold.HeldGridFits(_holdStrip, strip, _holdBoard, grid.Height, Screen.height, BoardSlack)", StringComparison.Ordinal);
-        int heldKeep = results.IndexOf("_origin = _holdBoard;", StringComparison.Ordinal);
-        check(heldCheck > fit && heldKeep > heldCheck && visibility.Contains("public static bool HeldGridFits("),
-            "the hold branch refuses a grid that would reach the button or run past the strip it was measured into");
+        // 1.19.46 (UI review F2): the growth guard is still asked, and it is asked with the *plate* the refreshed grid would be
+        // drawn into - measured by the same `PlateFor` the fit uses - rather than the unscrolled table height. The guard's
+        // contract (refuse a grid that would reach the button or run past the strip) is unchanged; the figure it is asked about
+        // is the one the board really occupies. 1.19.59 moves the whole judgement into `TryFitHeld`: the candidate plate is
+        // re-placed against *this* frame's strip, must sit inside it (`PlateInsideBand`) and must pass the same `HeldGridFits`,
+        // so a page whose footer really rose can never be walked through by the "larger of the two rooms" rule.
+        int heldCheck = results.IndexOf("private static bool TryFitHeld(PanelGrid grid, float room, float header, BoardStrip strip,", StringComparison.Ordinal);
+        int heldFits = results.IndexOf("ResultBoardHold.HeldGridFits(_holdStrip, strip, candidate, total, Screen.height, BoardSlack)", StringComparison.Ordinal);
+        int heldBand = results.IndexOf("ResultChromeLayout.PlateInsideBand(candidate, strip.Top, strip.Bottom, Screen.height, BoardSlack)", StringComparison.Ordinal);
+        int heldKeep = results.IndexOf("_origin = new LayoutRect(keptRect.X, keptRect.Y + headerNow", StringComparison.Ordinal);
+        check(heldCheck > 0 && heldBand > heldCheck && heldFits > heldCheck && heldKeep > heldFits
+              && visibility.Contains("public static bool HeldGridFits("),
+            "the hold branch refuses a grid whose refreshed plate would reach the button, run past the strip it was measured into, or cross a wall this frame really tightened");
 
         check(policy.Contains("public sealed class ResultNoFooterGate")
               && policy.Contains("public static class ResultNoFooterSafeArea")
               && results.Contains("menuPage.m_allItems")
               && results.Contains("GetComponentsInChildren<CM_Item>(true)")
-              && results.Contains("success.m_lobbyButtonVisible")
               && results.Contains("nativeFooterVisible = fail.m_lobbyButtonVisible")
               && results.Contains("ResultNoFooterSafeArea.TryResolve")
               && results.Contains("ResultFooterSource.ClientNoFooterSafeArea")

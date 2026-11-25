@@ -402,8 +402,9 @@ internal static class GuestSettlementBandScenarios
         string display = Code(Source("ResultsDisplay.cs"));
         check(display.Contains("internal static bool BoardOnScreen => ResultTogglePolicy.BoardUp(_boardDrawnFrame, Time.frameCount);"),
             "the display's own answer to \"is the board on the page\" is the last repaint's drawn frame");
-        check(display.Contains("ResultBoardToggle toggle = ResultTogglePolicy.Next(BoardOnScreen);"),
-            "and F8 asks that answer - not the `Forced` override, which is false for a board the fail-open path put up itself");
+        check(display.Contains("bool requestedShown = ResultTogglePolicy.RequestedShown(SwitchesWantBoard(), Session.HiddenByPress, Forced);")
+              && display.Contains("bool show = ResultTogglePolicy.Press(requestedShown) == ResultBoardToggle.Show;"),
+            "1.19.47 (review #1): F8 asks the page's *request* - the player's switches, this page's own hide and an outstanding show request - not the last painted frame and not the `Forced` override, which is false for a board the fail-open path put up itself");
         check(display.Contains("_boardDrawnFrame = -1;") && display.Contains("_boardDrawnFrame = Time.frameCount;"),
             "the drawn frame is written before every early return of a repaint and set again only by the draw at its end");
         // 1.19.45: two draw paths record a drawn board now - the adaptive one at the end of `Draw`, and the fixed-mode one
@@ -418,12 +419,13 @@ internal static class GuestSettlementBandScenarios
     private static void ABoardIsFittedIntoTheStripItWasMeasuredAgainst(Action<bool, string> check)
     {
         string display = Code(Source("ResultsDisplay.cs"));
-        check(display.Contains("PanelGrid grid = FitBoard(content, room, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);"),
+        check(display.Contains("PanelGrid grid = FitBoard(content, tableRoom, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);"),
             "the strict fit spends the strip's own ceiling instead of a constant");
-        check(display.Contains("PanelGrid resized = FitBoard(content, room, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);"),
+        check(display.Contains("PanelGrid resized = FitBoard(content, tableRoom, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);"),
             "and so does the re-fit a refreshed snapshot runs, so a refresh cannot ask for a different size than the placement did");
-        check(display.Contains("size => NaturalSize(content, size, bandFloor), out int floor, fillCeiling);"),
-            "the ceiling travels into `ResultsFontGrowth.FitBoardIntoStrip` as its own argument - the call the interrupted write left unwired");
+        check(display.Contains("float fittedCeiling = squeezed ? ResultsFontGrowth.BandFillCeiling : fillCeiling;")
+              && display.Contains("size => NaturalSize(content, size, bandFloor), out int floor, fittedCeiling);"),
+            "the ceiling still travels into `ResultsFontGrowth.FitBoardIntoStrip` as its own argument - the incoming `fillCeiling` on the comfort branch, and the band's own 100% only when the band cannot hold the comfort glyph");
         check(display.Contains("float fillCeiling = ResultsFontGrowth.StripFillCeiling)"),
             "and a caller that names no ceiling keeps the historical one");
 

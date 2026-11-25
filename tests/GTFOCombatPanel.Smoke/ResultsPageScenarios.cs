@@ -152,98 +152,161 @@ internal static class ResultsPageScenarios
               && !ResultAnchorRecovery.LatchFallback(1, false),
             "only a placement against the fallback, on a page that has not spent its retry, arms the second look");
 
-        // ---- the wheel: one page's preference, one step, and never past the strip ---------------------------
+        // ---- the manual multipliers that stayed, and the wheel that no longer writes them ------------------
         check(near(ResultsZoom.Default, 1f) && ResultsZoom.Minimum < ResultsZoom.Default && ResultsZoom.Maximum > ResultsZoom.Default,
-            $"the wheel's own default is 1.0 inside a bounded range ({ResultsZoom.Minimum}..{ResultsZoom.Maximum})");
+            $"the manual multiplier's own default is 1.0 inside a bounded range ({ResultsZoom.Minimum}..{ResultsZoom.Maximum})");
         check(ResultsZoom.Section == "Results" && ResultsZoom.SuccessKey == "SuccessFontScale" && ResultsZoom.FailureKey == "FailureFontScale",
             "the two preferences are stored under readable keys in the section the rest of the result settings live in");
         check(ResultsZoom.KeyFor(ResultsZoom.Page(true)) == ResultsZoom.SuccessKey
-              && ResultsZoom.KeyFor(ResultsZoom.Page(false)) == ResultsZoom.FailureKey
-              && ResultsZoom.Page(true) != ResultsZoom.Page(false),
-            "the success page and the failure page each read and write their own key, so one page's setting cannot move the other");
-        check(ResultsZoom.KeyFor(ResultPageKind.Success) != ResultsZoom.KeyFor(ResultPageKind.Failure),
-            "and the two keys are distinct");
-
-        // Direction: a notch up enlarges. The convention IMGUI reports the wheel with lives in one constant, and
-        // this is the assertion that would catch it being read backwards.
-        check(ResultsZoom.Direction(-1f) == 1 && ResultsZoom.Direction(1f) == -1,
-            $"a notch up is a positive step and a notch down a negative one (up={ResultsZoom.Direction(-1f)}, down={ResultsZoom.Direction(1f)})");
-        check(ResultsZoom.Direction(0f) == 0 && ResultsZoom.Direction(float.NaN) == 0 && ResultsZoom.Direction(0.00001f) == 0,
-            "a wheel that did not move - a resting trackpad, or not a number at all - is not a notch");
-
-        check(near(ResultsZoom.Next(1f, -1f), 1.1f) && near(ResultsZoom.Next(1f, 1f), 0.9f),
-            $"one notch is exactly one step: 1.0 -> {ResultsZoom.Next(1f, -1f):0.##} up, 1.0 -> {ResultsZoom.Next(1f, 1f):0.##} down");
-        check(near(ResultsZoom.Next(ResultsZoom.Maximum, -1f), ResultsZoom.Maximum)
-              && near(ResultsZoom.Next(ResultsZoom.Minimum, 1f), ResultsZoom.Minimum),
-            $"the wheel stops at {ResultsZoom.Minimum} and {ResultsZoom.Maximum} instead of wrapping round them");
-        check(near(ResultsZoom.Next(1f, 0f), 1f), "a wheel that did not move leaves the stored scale exactly as it was");
-        int steps = 0;
-        for (float scale = ResultsZoom.Minimum; scale < ResultsZoom.Maximum - 0.0001f; scale = ResultsZoom.Next(scale, -1f)) steps++;
-        check(steps == (int)Math.Round((ResultsZoom.Maximum - ResultsZoom.Minimum) / ResultsZoom.Step),
-            $"the range is a whole number of steps the wheel can reach from either bound ({steps} notches)");
-
+              && ResultsZoom.KeyFor(ResultsZoom.Page(false)) == ResultsZoom.FailureKey,
+            "the success page and the failure page each read their own key, so one page's preference cannot move the other");
         check(near(ResultsZoom.Clamp(float.NaN), ResultsZoom.Default)
               && near(ResultsZoom.Clamp(-3f), ResultsZoom.Minimum)
               && near(ResultsZoom.Clamp(9f), ResultsZoom.Maximum),
-            "a stored value nobody could read falls back to 1.0, and one out of range to the bound it passed");
-        check(near(ResultsZoom.Snap(1.04f), 1f) && near(ResultsZoom.Snap(1.07f), 1.1f) && near(ResultsZoom.Snap(0.5f), 0.5f),
-            $"every stored scale is a value the wheel can produce again ({ResultsZoom.Snap(1.04f):0.##}, {ResultsZoom.Snap(1.07f):0.##})");
+            "a multiplier nobody could read falls back to 1.0, and one out of range to the bound it passed");
 
-        // The size the board is drawn at: the wheel scales the size the page's strip produced. Asked without a box,
-        // the answer is conservative - scaled down, never enlarged - because a size nobody measured cannot be
-        // promised to fit; asked with the page's own strip and width, a notch up is allowed the room the fit's
-        // comfort band leaves free, and refused the moment the board would reach the button.
-        check(ResultsZoom.ScaleSize(10, 1f) == 10, "a scale of 1.0 draws the board at the size its own strip produced");
-        check(ResultsZoom.ScaleSize(10, ResultsZoom.Maximum) == 10,
-            "a scale above 1 is clamped onto the strip's own size, so the wheel can never make the board cover the button");
-        check(ResultsZoom.ScaleSize(20, 0.55f) == 11 && ResultsZoom.ScaleSize(10, 0.5f) == ResultsFontGrowth.MinimumReadablePixels,
-            $"a smaller scale draws a smaller board, and never below the readable minimum ({ResultsZoom.ScaleSize(20, 0.55f)}px, {ResultsZoom.ScaleSize(10, 0.5f)}px)");
-        check(ResultsZoom.ScaleSize(10, float.NaN) == 10,
-            "a scale that could not be read keeps the board at the strip's own size");
-        int zoomedOut = ResultsZoom.ScaleSize(readable, 0.5f);
-        check(Measure(30, 1.5f, 40f, zoomedOut).Height <= 511f * ResultsFontGrowth.StripFillCeiling + 0.5f,
-            $"the zoomed-out board still fits the strip it is drawn in: {Measure(30, 1.5f, 40f, zoomedOut).Height:0}px of 511px, drawn at {zoomedOut}px");
-        check(zoomedOut < readable && zoomedOut >= ResultsFontGrowth.MinimumReadablePixels,
-            $"and the wheel really changes the board it is aimed at ({readable}px -> {zoomedOut}px)");
-        int zoomedIn = ResultsZoom.ScaleSize(readable, ResultsZoom.Maximum, 511f, 1392f, size => Measure(30, 1.5f, 40f, size));
-        check(zoomedIn > readable && Measure(30, 1.5f, 40f, zoomedIn).Height <= 511f + 0.5f,
-            $"a notch up really enlarges the board inside the strip it is drawn in ({readable}px -> {zoomedIn}px, {Measure(30, 1.5f, 40f, zoomedIn).Height:0}px of 511px)");
-        check(zoomedIn == 11,
-            $"and it stops one step above the fit, where the next size (12px, 540px) would pass the button ({zoomedIn}px)");
-        check(ResultsZoom.ScaleSize(readable, 1f, 511f, 1392f, size => Measure(30, 1.5f, 40f, size)) == readable,
-            "a scale of 1.0 asked with the box returns exactly the size the strip produced");
-        check(ResultsZoom.ScaleSize(10, ResultsZoom.Maximum, 287f, 1392f, size => Measure(30, 1.5f, 40f, size)) == 6,
-            "a strip that cannot hold a bigger board than 6px refuses the enlargement instead of covering the button");
-        check(ResultsZoom.ScaleSize(10, 2f, 511f, 1392f, size => ResultTableSize.None) == 10
-              && ResultsZoom.ScaleSize(10, 2f, 511f, 1392f, size => throw new InvalidOperationException("no atlas")) == 10,
-            "a measurement that reports nothing or throws keeps the strip's own size rather than guessing a bigger one");
-
-        // ---- the floor of the wheel, and a box that cannot hold even that --------------------------------
+        // ---- the wheel scrolls the table: frozen header, whole rows, both ends reachable --------------------
         //
-        // A size nobody can read is not a zoom level: the absolute minimum is the floor of every answer, including a
-        // size handed in below it, and the size handed back can never be one the grid builder would drop.
-        check(ResultsZoom.ScaleSize(1, 1f) == ResultsFontGrowth.MinimumReadablePixels
-              && ResultsZoom.ScaleSize(0, 0.5f) == ResultsFontGrowth.MinimumReadablePixels
-              && ResultsZoom.ScaleSize(-40, -1f) == ResultsFontGrowth.MinimumReadablePixels,
-            $"a fitted size below the readable minimum is raised to it rather than drawn ({ResultsZoom.ScaleSize(1, 1f)}px)");
-        check(ResultsZoom.ScaleSize(ResultsFontGrowth.MinimumReadablePixels, 0.5f, 511f, 1392f,
-                  size => Measure(30, 1.5f, 40f, size)) == ResultsFontGrowth.MinimumReadablePixels,
-            "and a zoomed-out board already at the floor stays exactly on the floor");
-        int tooShort = ResultsZoom.ScaleSize(10, 2f, 20f, 1392f, size => Measure(30, 1.5f, 40f, size));
-        check(tooShort == ResultsFontGrowth.MinimumReadablePixels,
-            $"a strip too short for even the floor answers with the readable minimum instead of a size nothing can draw ({tooShort}px)");
-        bool staysInside = true, staysReadable = true;
-        for (int fitted = ResultsFontGrowth.MinimumReadablePixels; fitted <= 40; fitted++)
+        // The figures are the field report's: four player columns and thirty rows, a sixteen-pixel glyph in the fixed
+        // layout (twenty-four pixels of row at the face's 1.5 em), and a plate that only ever holds the rows the page
+        // really has room for. What used to happen here was a *scale*: the wheel multiplied the glyph until the whole
+        // table fitted, which is how a short page ended up with a six-pixel table and nothing left to scroll.
+        const int BoardRows = 30;
+        const float RowHeight16 = 24f;
+        check(ResultsScroll.FrozenRows == 1 && ResultsScroll.WheelRowsPerNotch == 1,
+            "one row is frozen (the header that carries the four player names) and one notch moves the table by one row");
+        check(ResultsScroll.Direction(-1f) == 1 && ResultsScroll.Direction(1f) == -1
+              && ResultsScroll.Direction(0f) == 0 && ResultsScroll.Direction(float.NaN) == 0
+              && ResultsScroll.Direction(0.00001f) == 0,
+            "a notch up moves the table towards its head, a notch down towards its foot, and a resting trackpad is not a notch");
+        check(ResultsScroll.VisibleRows(RowHeight16 * 6.5f, RowHeight16) == 6
+              && ResultsScroll.VisibleRows(float.NaN, RowHeight16) == ResultsScroll.MinimumVisibleRows,
+            "a plate holds whole rows only, and a room nobody could measure still holds the minimum");
+        check(near(ResultsScroll.PlateHeight(6, RowHeight16, RowHeight16 * 6.5f), RowHeight16 * 6f),
+            "the plate is exactly the rows it holds, so nothing is drawn between it and the button underneath it");
+        check(ResultsScroll.Clamp(0, BoardRows, ResultsScroll.FrozenRows, 5) == ResultsScroll.FrozenRows,
+            "the table cannot be scrolled above its frozen header row");
+        int footFirst = ResultsScroll.Clamp(BoardRows, BoardRows, ResultsScroll.FrozenRows, 5);
+        check(footFirst == ResultsScroll.MaximumFirst(BoardRows, ResultsScroll.FrozenRows, 5)
+              && footFirst + 5 >= BoardRows,
+            $"the foot of the table is reachable: first={footFirst} with five slots lands on row {footFirst + 5} of {BoardRows}");
+        // Every row, on a plate of any height a page can offer - from two rows to the whole table - and on both kind
+        // of page: the geometry does not know which result page it is drawing, so one walk covers success and failure.
+        bool allReachable = true;
+        for (int slots = 1; slots <= BoardRows; slots++)
         {
-            for (float scale = ResultsZoom.Minimum; scale <= ResultsZoom.Maximum + 0.001f; scale += ResultsZoom.Step)
+            var seen = new bool[BoardRows];
+            for (int row = 0; row < BoardRows; row++) if (row < ResultsScroll.FrozenRows) seen[row] = true;
+            int walk = ResultsScroll.FrozenRows;
+            for (int guard = 0; guard < BoardRows * 3; guard++)
             {
-                int size = ResultsZoom.ScaleSize(fitted, scale, 511f, 1392f, probe => Measure(30, 1.5f, 40f, probe));
-                staysInside &= Measure(30, 1.5f, 40f, size).Height <= 511f + 0.5f;
-                staysReadable &= size >= ResultsFontGrowth.MinimumReadablePixels;
+                var view = new ScrollViewport(BoardRows, ResultsScroll.FrozenRows, slots + ResultsScroll.FrozenRows, walk);
+                for (int slot = 0; slot < view.Visible; slot++)
+                {
+                    int row = view.RowAt(slot);
+                    if (row >= 0 && row < BoardRows) seen[row] = true;
+                }
+                int next = ResultsScroll.Next(walk, BoardRows, ResultsScroll.FrozenRows, slots, 1f);
+                if (next == walk) break;
+                walk = next;
             }
+            int counted = 0;
+            for (int row = 0; row < BoardRows; row++) if (seen[row]) counted++;
+            allReachable &= counted == BoardRows;
         }
-        check(staysInside && staysReadable,
-            "every fitted size and every notch of the range answers with a board that still fits the strip and is still readable");
+        check(allReachable, $"every one of the {BoardRows} rows is reachable on a plate of any height, from two rows up");
+        // The same walk on a smaller page: a 1280x720 window and a 2560x1440 one are the same rule with different
+        // room, so the reach does not depend on the resolution the player happens to run.
+        check(ResultsScroll.VisibleRows(RowHeight16 * 10.5f, RowHeight16) == 10
+              && ResultsScroll.MaximumFirst(BoardRows, ResultsScroll.FrozenRows, 9) == 21,
+            "a taller window holds more rows and reaches the foot sooner, on the same table");
+        // The glyph is the size the page's own strip really holds, and never a size raised back up to the comfort
+        // figure the button's height would have liked (1.19.45: that is how a board fitted to thirty rows came back at
+        // 16 px and showed twenty-four of them).
+        check(ResultsScroll.FontFor(13, 1f) == 13,
+            "a strip that honestly holds a 13 px table draws it at 13 px: the fit is the answer, not a preference");
+        check(ResultsScroll.FontFor(16, 1f) == 16 && ResultsScroll.FontFor(16, 0.5f) == 8,
+            "the fitted size is drawn as it is, and an explicit multiplier is applied to it - the wheel never multiplies it");
+        check(ResultsScroll.FontFor(13, 1.5f) == 20,
+            "a player who asked for a larger board gets one: the multiplier is honoured, and the overflow is scrolled");
+        check(ResultsScroll.FontFor(2, 1f) == ResultsFontGrowth.MinimumReadablePixels,
+            "no caller can talk the board below the absolute readable minimum");
+
+        // ---- the recorded failure strip: all thirty metrics on the first screen ------------------------------
+        //
+        // Log 2904/3357/3358: room=646 px, header=53 px, thirty rows at compact density. The page's own line says
+        // `room=594px for 30 rows would allow a 13px glyph, below the 16px this page would have liked` - so the
+        // readable floor that page really asked for is 16, not a figure derived from any button height here. Those
+        // two numbers are taken from the log verbatim; nothing in this regression guesses a native control.
+        float failureHeader = ResultChromeMetrics.For(2560f, 1440f).HeaderHeight;
+        float failureRoom = 646f - failureHeader;
+        const int RecordedRequested = 16;   // log 3357: "below the 16px this page would have liked"
+        int failureFloor = ResultsBandFit.FloorForBand(failureRoom, BoardRows, PanelDensity.Compact,
+            RecordedRequested, out bool failureSqueezed);
+        check(failureSqueezed && failureFloor == 13,
+            "the recorded 646 px strip minus its " + failureHeader.ToString("0") + " px header leaves "
+            + failureRoom.ToString("0") + " px, which allows a " + failureFloor + " px glyph for " + BoardRows
+            + " rows - below the " + RecordedRequested + " px that page asked for, so the band is squeezed");
+        // A squeezed band is the one the production fits against itself (`squeezed ? BandFillCeiling : fillCeiling`).
+        int failureFitted = ResultsFontGrowth.FitBoardIntoStrip(17, failureFloor, int.MaxValue, failureRoom, 2512f,
+            size => new ResultTableSize(433f + size, ResultsBandFit.RowHeight(size, PanelDensity.Compact) * BoardRows),
+            out _, ResultsFontGrowth.BandFillCeiling);
+        int failureFont = ResultsScroll.FontFor(failureFitted, 1f);
+        check(failureFont == failureFloor,
+            "a band that cannot hold the comfort glyph is fitted against itself, so the drawn glyph is the "
+            + failureFloor + " px the strip really holds (fitted=" + failureFitted + ", font=" + failureFont + ")");
+        float failureRowHeight = ResultsBandFit.RowHeight(failureFont, PanelDensity.Compact);
+        ScrollViewport failureView = ResultsScroll.Viewport(BoardRows, ResultsScroll.FrozenRows, failureRoom,
+            failureRowHeight, ResultsScroll.FrozenRows);
+        check(failureView.Visible == BoardRows && !failureView.Overflows,
+            "and all " + BoardRows + " metrics are on the first screen at that size: visible=" + failureView.Visible
+            + " of " + BoardRows + ", plate=" + ResultsScroll.PlateHeight(failureView.Visible, failureRowHeight, failureRoom).ToString("0")
+            + " px of " + failureRoom.ToString("0") + " px");
+        // ---- the other branch: a strip that CAN hold the comfort glyph keeps the 0.96 ceiling -----------------
+        //
+        // These two must never be mixed: an unsqueezed band keeps `StripFillCeiling`, and only a squeezed one is
+        // fitted against its own 100%. 800 px holds 16 px comfortably (16 x 1.5 em x 30 = 720), so the floor is the
+        // page's own requested figure and the fit must stay inside 96% of the strip.
+        const float RoomyStrip = 800f;
+        int roomyFloor = ResultsBandFit.FloorForBand(RoomyStrip, BoardRows, PanelDensity.Compact,
+            RecordedRequested, out bool roomySqueezed);
+        check(!roomySqueezed && roomyFloor == RecordedRequested,
+            "an 800 px strip holds the " + RecordedRequested + " px the page asked for, so it is NOT squeezed (floor="
+            + roomyFloor + ", squeezed=" + roomySqueezed + ")");
+        int roomyFitted = ResultsFontGrowth.FitBoardIntoStrip(17, roomyFloor, int.MaxValue, RoomyStrip, 2512f,
+            size => new ResultTableSize(433f + size, ResultsBandFit.RowHeight(size, PanelDensity.Compact) * BoardRows),
+            out _, ResultsFontGrowth.StripFillCeiling);
+        int roomyFont = ResultsScroll.FontFor(roomyFitted, 1f);
+        check(roomyFont >= RecordedRequested
+              && ResultsBandFit.RowHeight(roomyFont, PanelDensity.Compact) * BoardRows <= RoomyStrip * ResultsFontGrowth.StripFillCeiling + 0.5f,
+            "and there the fit stays inside the 96% comfort ceiling instead of the band's own foot (glyph="
+            + roomyFont + " px, table="
+            + (ResultsBandFit.RowHeight(roomyFont, PanelDensity.Compact) * BoardRows).ToString("0")
+            + " px of " + (RoomyStrip * ResultsFontGrowth.StripFillCeiling).ToString("0") + " px allowed)");
+        check(ResultsScroll.Viewport(BoardRows, ResultsScroll.FrozenRows, RoomyStrip,
+                  ResultsBandFit.RowHeight(roomyFont, PanelDensity.Compact), ResultsScroll.FrozenRows).Visible == BoardRows,
+            "and all " + BoardRows + " rows are still on that screen: the comfort branch loses nothing either");
+        // A genuinely short strip, and an explicit multiplier, are the two cases that really do scroll.
+        const float ShortStrip = 200f;
+        int shortFont = ResultsScroll.FontFor(
+            ResultsBandFit.FloorForBand(ShortStrip, BoardRows, PanelDensity.Compact,
+                ResultsFontGrowth.ReadabilityFloor(float.NaN), out _), 1f);
+        ScrollViewport shortView = ResultsScroll.Viewport(BoardRows, ResultsScroll.FrozenRows, ShortStrip,
+            ResultsBandFit.RowHeight(shortFont, PanelDensity.Compact), ResultsScroll.FrozenRows);
+        check(shortView.Overflows,
+            "a " + ShortStrip.ToString("0") + " px strip cannot hold " + BoardRows
+            + " rows even at the readable minimum, so that board scrolls (visible=" + shortView.Visible + ")");
+        ScrollViewport zoomedView = ResultsScroll.Viewport(BoardRows, ResultsScroll.FrozenRows, failureRoom,
+            ResultsBandFit.RowHeight(ResultsScroll.FontFor(13, 1.5f), PanelDensity.Compact), ResultsScroll.FrozenRows);
+        check(zoomedView.Overflows,
+            "and so does an explicitly enlarged board: the multiplier is honoured and its overflow scrolls (visible="
+            + zoomedView.Visible + ")");
+        // One notch per frame: IMGUI can deliver the same gesture to its layout pass and its repaint.
+        var latch = new ResultScrollLatch();
+        check(latch.Claim(7) && latch.SameFrame(7) && !latch.Claim(7) && latch.Claim(8) && !latch.SameFrame(7),
+            "one frame moves the table once: the second copy of the same gesture is consumed without moving it again");
+        latch.Forget();
+        check(!latch.SameFrame(7) && latch.Claim(7), "a new page forgets the frame the last gesture belonged to");
 
         // ---- the wiring the two rules above depend on, read from the production sources --------------------
         Wiring(check);
@@ -251,6 +314,8 @@ internal static class ResultsPageScenarios
         ClientStrip(check);
         // ---- 兜底：拒收预算不是「看不见这一页」的许可证 ------------------------------------------------------
         FailOpenEscape(check);
+        // ---- 1.19.47：自动模式的最新用户合同 ---------------------------------------------------------------
+        AutoModeContract(check);
     }
 
 
@@ -272,31 +337,59 @@ internal static class ResultsPageScenarios
               && results.Contains("TryScreenRect(success.m_btnLeaveExpedition")
               && results.Contains("ResultsRegion.ResolveLobbyEdge(buttonActive"),
             "SuccessRegion asks the laid-out rectangle as well as the visibility of the lobby button, through the active gate");
-        check(panel.IndexOf("ResultsZoomEvent()", StringComparison.Ordinal) >= 0
-              && panel.IndexOf("ResultsZoomEvent()", StringComparison.Ordinal) < panel.IndexOf("EventType.Repaint", StringComparison.Ordinal),
-            "OnGUI reads the wheel before the Repaint gate, so the existing draw path is untouched");
-        check(results.Contains("_hitRect = new LayoutRect(") && results.Contains("if (_hitFrame == frame) return true;")
-              && results.Contains("if (!_hitValid || _hitSucceeded != succeeded) return false;"),
-            "the wheel is judged against the rectangle the board was last drawn at, with the gesture locked per frame");
+        // 1.19.59: the wheel is no longer read from IMGUI at all - it is settled on the frame from the game's own readings,
+        // through the routing the player's other panel uses (`ResultWheel.cs`). `Update` is the frame driver and
+        // `CM_PageBase.UpdateButtonPress` the native second entry; `OnGUI` is drawing only.
+        check(panel.Contains("ResultsDisplay.PollWheel();")
+              && !panel.Contains("EventType.ScrollWheel")
+              && !panel.Contains("ResultsScrollEvent"),
+            "the frame driver settles the settlement wheel (`PollWheel`) and `OnGUI` reads no scroll event at all");
+        check(results.Contains("if (!_scrollLatch.Claim(frame)) return;")
+              && results.Contains("internal static void PollWheel()"),
+            "the two entries into one frame's wheel (the frame driver and the page's press dispatch) share the same-frame latch");
+        check(results.Contains("float native = ReadNativeScroll(page);") && results.Contains("float physical = ReadPhysicalWheel();")
+              && results.Contains("menu.ScrollInput") && results.Contains("Input.mouseScrollDelta"),
+            "the router's two sources are the page's own `ScrollInput` and the physical `mouseScrollDelta`, one of them per frame");
+        check(results.Contains("_hitRect = ResultChromeLayout.BoardOf(") && results.Contains("if (!_scrollValid || _hitSucceeded != succeeded) return false;"),
+            "the wheel is judged against the plate the board was last drawn at, through the scroll flag an early board also earns");
         check(Count(results, "ClearHit();") >= 3 && results.Contains("ClearHit();"),
             "the cached wheel rectangle is dropped when the board changes page or is hidden");
-        check(panel.Contains("ResultsDisplay.ZoomAt(current.mousePosition, succeeded, Time.frameCount)")
-              && panel.Contains("current.Use();"),
-            "a notch that landed on the board is consumed rather than handed to the page underneath");
         check(plugin.Contains("SuccessFontScale = Config.Bind(") && plugin.Contains("FailureFontScale = Config.Bind(")
-              && plugin.Contains("page == ResultPageKind.Success ? SuccessFontScale : FailureFontScale")
-              && plugin.Contains("ConfigWatcher.RecordOwnSave();")
-              && plugin.Contains("<= 0.0005f) return false;"),
-            "the two pages persist independent keys through the plugin's own save path, and a notch that changes nothing writes nothing");
-        check(Count(results, "FitBoard(content, room, boardWidth, succeeded") >= 2
-              && results.Contains("ResultsZoom.ScaleSize(fitted, Plugin.ResultFontScale(succeeded)"),
-            "both placement paths fit the board through the wheel scale of the page it belongs to");
+              && plugin.Contains("internal static float ResultFontScale(bool succeeded)")
+              && !panel.Contains("PersistResultFontScale") && !results.Contains("PersistResultFontScale"),
+            "the two manual multipliers are still read from the file, and the wheel no longer has a save path at all - a scroll never writes the config");
+        check(Count(results, "FitBoard(content, tableRoom, boardWidth, succeeded") >= 2
+              && results.Contains("ResultsScroll.FontFor(fitted, Plugin.ResultFontScale(succeeded))")
+              && !results.Contains("ResultsZoom.ScaleSize("),
+            "both placement paths fit the board to its own strip and scroll the overflow, and the old scale walk is gone from the production code");
+        check(results.Contains("ResultsScroll.Viewport(grid.Rows, ResultsScroll.FrozenRows") 
+              && results.Contains("HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity, _scrollFirst, _scrollVisible, _scrollPlate)"),
+            "the adaptive board is drawn through its scroll window, and the plate it occupies is measured from the rows its strip really holds");
         check(results.Contains("if (!FallbackRecoveryDue(succeeded, _page) && RefreshBoardData")
               && results.Contains("ResultAnchorRecovery.ShouldRetry(_fallbackRecoveries")
               && results.Contains("ResultAnchorRecovery.Record(_fallbackRecoveries)")
               && results.Contains("ResultAnchorRecovery.LatchFallback(_fallbackRecoveries")
               && policy.Contains("public const int MaximumRecoveries = 1;"),
             "the fallback recovery hangs off the refresh path and stays bounded to one attempt per page");
+
+        // ---- review #1: a refreshed snapshot is committed as a PAIR, or not at all ------------------------
+        //
+        // The table is drawn from `_grid` + `_content`, and they are only consistent because the placement writes both, on
+        // a frame it really placed the board. The refresh path used to measure a new grid, throw the placement's answer
+        // away and then swap `_content` regardless - the old geometry drawing the new text. The four things that keep that
+        // from happening again are pinned here, in the order the method runs them.
+        check(results.Contains("if (measured == null) return true;"),
+            "a snapshot that cannot be measured at the drawn font adopts nothing and still answers 'handled' - the board already on the page is kept, not re-placed");
+        check(results.Contains("if (GridCovers(_grid, measured))")
+              && results.Contains("boardWidth, float.PositiveInfinity, _fontFloor);"),
+            "the coverage question is asked of an UNBOUNDED measurement at the drawn font, so a grid that came back smaller is never mistaken for one that covers");
+        check(results.Contains("if (!Placement(page, succeeded, out _, out float room, out BoardStrip strip) || !(room > 0f)) return true;"),
+            "a page that hands no strip back adopts nothing and is still 'handled' before anything is written - the fall-through the review found is gone, and a good board is not reset for a frame that measured no strip");
+        check(results.Contains("return resized != null && Fit(strip, resized, content, board, report, succeeded, header);"),
+            "and the tail is the fit's own answer: no `_content` write follows it, so a refused growth keeps the pair on the page (`Fit` returns true for 'handled, kept')");
+        check(!results.Contains("bool fitted = Fit(strip, resized, content, board, report, succeeded, header);")
+              && !results.Contains("ResultsRefreshPolicy"),
+            "the discarded-answer shape and the boolean wrapper the review rejected are both absent from the production source");
 
         // The stale-hit residual, pinned by position rather than by wording: a repaint drops the cached rectangle
         // before it can reach any of its early returns, and only a frame that really drew the board re-earns it. A
@@ -310,13 +403,13 @@ internal static class ResultsPageScenarios
               && boardDrawn > noGridReturn && hitEarned > boardDrawn,
             "every repaint drops the cached wheel rectangle before the no-grid/no-placement return, and only a board that was really drawn re-earns it");
 
-        // The gesture lock is asked before the rectangle is: the notch that changed the scale is the one that took the
-        // rectangle away, so the rest of that same gesture has to be answered by the frame it belongs to.
-        int zoomAt = results.IndexOf("internal static bool ZoomAt(", StringComparison.Ordinal);
-        int frameLock = results.IndexOf("if (_hitFrame == frame) return true;", StringComparison.Ordinal);
-        int rectangleGate = results.IndexOf("if (!_hitValid || _hitSucceeded != succeeded) return false;", StringComparison.Ordinal);
-        check(zoomAt >= 0 && frameLock > zoomAt && rectangleGate > frameLock,
-            "the same-frame gesture lock is asked before the rectangle's validity, so a rebuild cannot cut one wheel gesture in half");
+        // 1.19.59: one frame's wheel is claimed once (`ResultScrollLatch.Claim`), before any reading is taken, so the frame
+        // driver and the page's own press dispatch can never both move the table for the same notch.
+        int poll = results.IndexOf("internal static void PollWheel()", StringComparison.Ordinal);
+        int frameLock = results.IndexOf("if (!_scrollLatch.Claim(frame)) return;", StringComparison.Ordinal);
+        int rectangleGate = results.IndexOf("if (!_scrollValid || _hitSucceeded != succeeded) return false;", StringComparison.Ordinal);
+        check(poll >= 0 && frameLock > poll && rectangleGate > frameLock,
+            "the same-frame latch is asked before anything is read and before the rectangle's validity, so one notch can never be applied twice");
 
         // ...and dropping the stale rectangle must not drop the lock: only the full reset - F8, leaving the page, a
         // different screen - resets the frame it belongs to.
@@ -638,11 +731,11 @@ internal static class ResultsPageScenarios
         // (a client page has no outer complete-scan gate to carry them), and no frame count appears in the gate at all.
         // 1.19.45 re-point: the client branch hands the scan's own verdicts plus the two readings that really are walls
         // (the waiting line's own top and the highest pressable control), and it reports the wait once per page.
-        check(results.Contains("controls.Complete, controls.ParentCoverageComplete, controls.Unmeasurable)")
-              && results.Contains("bool wallPending = ResultClientPageActionPolicy.Pending(waitingTextTop, pressableTop);")
+        check(results.Contains("controls.Complete, controls.ParentCoverageComplete, controls.Unmeasurable, slot.Source)")
+              && results.Contains("bool wallPending = ResultClientPageActionPolicy.Pending(slot.HostSlotTop, slot.HintGlyphTop);")
               && results.Contains("ResultClientStripState.ScanIncomplete")
               && results.Contains("HeadingReports.Add(\"failure-client-wall-not-settled\")"),
-            "the client branch hands the scan's completeness, parent coverage and unmeasurable count to the decision, names an incomplete scan as its own answer, and reports the wait once per page");
+            "the client branch hands the scan's completeness, parent coverage and unmeasurable count to the decision, names an incomplete scan as its own answer, and reports the wait once per page; 1.19.61 asks the wait about the two native slot readings (the return slot's own layout geometry and the waiting line's rendered glyphs) and hands the winning source to the decision, so a page with neither is the only 'no evidence' answer");
         check(!geometry.Contains("SampleBudget")
               && geometry.Contains("bool answerable = scanComplete && parentCoverageComplete")
               && geometry.Contains("public int Samples { get { return _samples; } }"),
@@ -777,6 +870,150 @@ internal static class ResultsPageScenarios
         => shape == "active-but-unmeasurable" ? Evidence(float.NaN, 1)
             : shape == "scan-incomplete" ? Evidence(float.NaN, 0, scanComplete: false)
             : Evidence(float.NaN, 0, parentCoverage: false);
+
+    // ---------------------------------------------------------------------------------------------------
+    // 1.19.47：自动模式的最新用户合同
+    // ---------------------------------------------------------------------------------------------------
+    //
+    // 两页的上界问的不是同一个问题，这是这条合同的核心：失败页的上界是窗口自己的上沿安全留边——原生「任务失败」标题
+    // 只是说明文字，不再卡表的位置，也不再通过 `ResultsBandFit` 卡字号；成功页的上界必须仍是原生完成信息（关卡名 / 分区框
+    // / 已清分区图标及其说明）的实测下界，测不到就保留原版页，绝不用窗口比例或等比规则换掉它。
+    //
+    // 两页共用的是其余部分，并且都断言在这里：底对齐到真实下界（`TryPlace(..., bottomAligned: true)`）、字号按分辨率等比
+    // 设目标（1080=12px、1440=16px，窗口高度的 1/90）、目标只封顶不改行数（放不下就整行 fit，再不够就交给滚轮）、下界只认
+    // 页面真正画出来的那堵墙（页面自己的脚和空扫描都不是）。
+    private static void AutoModeContract(Action<bool, string> check)
+    {
+        // ---- 目标字号：同一条归一化比例，1080 12px / 1440 16px -----------------------------------------
+        check(ResultAutoBoardContract.TargetGlyphPixels(1080f) == 12
+              && ResultAutoBoardContract.TargetGlyphPixels(1440f) == 16
+              && ResultAutoBoardContract.TargetGlyphPixels(2160f) == 24,
+            $"the automatic mode's target is the same share of the window in every frame: 12px at 1080p, 16px at 1440p, 24px at 2160p (got {ResultAutoBoardContract.TargetGlyphPixels(1080f)}/{ResultAutoBoardContract.TargetGlyphPixels(1440f)}/{ResultAutoBoardContract.TargetGlyphPixels(2160f)})");
+        check(ResultAutoBoardContract.TargetGlyphPixels(720f) == 8
+              && ResultAutoBoardContract.TargetGlyphPixels(float.NaN) == ResultAutoBoardContract.BaselineGlyphPixels
+              && ResultAutoBoardContract.TargetGlyphPixels(0f) == ResultAutoBoardContract.BaselineGlyphPixels,
+            "a 720-high window aims at 8px, and a window whose height nobody could read keeps the baseline instead of inventing one");
+        check(ResultAutoBoardContract.TargetGlyphPixels(100000f) == ResultAutoBoardContract.MaximumGlyphPixels,
+            "a pathological window height is capped at " + ResultAutoBoardContract.MaximumGlyphPixels + "px, so no page can turn the table into a poster");
+
+        // ---- 上界：失败页看窗口上沿，成功页看完成信息 ---------------------------------------------------
+        bool failureAnchored = ResultAutoBoardContract.TryUpperAnchor(false, 1440f, float.NaN,
+            out float failureAnchor, out ResultBoundSource failureSource);
+        check(failureAnchored && Math.Abs(failureAnchor - 1440f / 135f) <= 0.01f
+              && failureSource == ResultBoundSource.ScreenTopMargin,
+            "the failure page's upper edge is the window's own safe top margin (8 design px scaled: " + (1440f / 135f).ToString("0.00")
+            + " at 1440) and it is an edge even when no completion section, title or other anchor was read");
+        check(ResultAutoBoardContract.TopMargin(1080f) == 8f
+              && Math.Abs(ResultAutoBoardContract.TopMargin(1440f) - 10.6667f) <= 0.01f,
+            "that margin is the same 8/1080 of the window at both reference frames");
+        bool successAnchored = ResultAutoBoardContract.TryUpperAnchor(true, 1440f, 519f,
+            out float successAnchor, out ResultBoundSource successSource);
+        check(successAnchored && Math.Abs(successAnchor - 519f) <= 0.01f && successSource == ResultBoundSource.IconRow,
+            "the success page's upper edge is the completion section's own measured lower edge and nothing else");
+        check(!ResultAutoBoardContract.TryUpperAnchor(true, 1440f, float.NaN, out float refusedAnchor, out ResultBoundSource refusedSource)
+              && !float.IsFinite(refusedAnchor) && refusedSource == ResultBoundSource.None,
+            "a success page that cannot measure that edge gets no anchor at all, so the vanilla screen is kept rather than the level name and sector icons covered");
+        check(!ResultAutoBoardContract.TryUpperAnchor(true, 1440f, 1439f, out _, out _),
+            "and a section edge that lies on the window's own foot is not an edge either");
+
+        // ---- 下界：原版等待提示 / 可按控件才是墙，空扫描与屏幕自己的页脚永远不是 ----------------------------
+        //
+        // 1.19.47 只换了上界，下界一个字都没松：这一页一堵墙都量不到时仍然明确回答「不可信」，而页面自己的
+        // 下沿（`ResultsGuestPageGeometry.PageFloor`）只做封顶。这两条用生产里那两个入口直接驱动。
+        var fixedPage = new ResultsSafeArea(32f, ResultsGuestPageGeometry.PageFloor(1440f));
+        check(!ResultClientFailureBand.TryResolve(fixedPage, 1440f, 96f, float.NaN, float.NaN, float.NaN, out _),
+            "a client failure page with no waiting-status line and no pressable control still gets no band: an empty scan is not a wall");
+        check(ResultClientFailureBand.TryResolve(fixedPage, 1440f, 96f, 1207f, float.NaN, 1207f, out ResultClientBandReading clientWallBand)
+              && clientWallBand.WaitingTextTightened
+              && Math.Abs(clientWallBand.Bottom - (1207f - ResultsBounds.Clearance(1440f))) <= 0.01f,
+            $"the waiting-status line the page really draws is still the wall, pulled up by the same clearance: bottom={clientWallBand.Bottom:0} of a {1207f - ResultsBounds.Clearance(1440f):0} foot");
+
+        // ---- 字号：目标只封顶，整行 fit 次之，滚动是最后一条 ----------------------------------------------
+        //
+        // 生产里这条算术就是 `ResultsBandFit.FontForBand` 与 `ResultAutoBoardContract.TargetGlyphPixels` 的组合
+        // （`FitBoard` 先搜索进带、再被目标封顶），所以这里直接断言这两处，不再经过只给测试看的 helper。
+        int bandFit1122 = ResultsBandFit.FontForBand(1122f, 30, PanelDensity.Compact, int.MaxValue);
+        check(Math.Min(ResultAutoBoardContract.TargetGlyphPixels(1440f), bandFit1122) == 16,
+            $"a 1122px band holds the 16px target over 30 rows - the band alone allows {bandFit1122}px - so the target is what is drawn");
+        int tightFit = ResultsBandFit.FontForBand(480f, 30, PanelDensity.Compact, int.MaxValue);
+        check(tightFit == 10 && ResultsBandFit.RowHeight(tightFit, PanelDensity.Compact) * 30 <= 480f + 0.5f,
+            $"a 480px band answers the largest size that fits whole rows - {tightFit}px, {ResultsBandFit.RowHeight(tightFit, PanelDensity.Compact) * 30:0}px of 480px - instead of dropping a row");
+        int tinyFit = ResultsBandFit.FontForBand(200f, 30, PanelDensity.Compact, int.MaxValue);
+        check(tinyFit == 4 && tinyFit < ResultsFontGrowth.MinimumReadablePixels,
+            $"a very short legal safe area goes below the readable floor it would have liked and still keeps all thirty rows ({tinyFit}px)");
+
+        // ---- 同一个 roster，两种分辨率：归一化位置与大小一致 ------------------------------------------
+        //
+        // 回放日志里的两帧（scratch/survival-retest-20261122-225706-193/LogOutput.log:3320 与 :4943）：两条带的下界都是
+        // 主机「返回大厅」按钮上沿减 MessageGap，上界都是上面那条窗口上沿，room 就分别是 806px 与 1082px。
+        const float wall1080 = 846f, wall1440 = 1130f, messageGap = 16f;
+        float top1080 = ResultAutoBoardContract.TopMargin(1080f) + ResultsBounds.Clearance(1080f);
+        float top1440 = ResultAutoBoardContract.TopMargin(1440f) + ResultsBounds.Clearance(1440f);
+        float bottom1080 = wall1080 - messageGap, bottom1440 = wall1440 - messageGap;
+        int glyph1080 = Math.Min(ResultAutoBoardContract.TargetGlyphPixels(1080f),
+            ResultsBandFit.FontForBand(bottom1080 - top1080, 30, PanelDensity.Compact, int.MaxValue));
+        int glyph1440 = Math.Min(ResultAutoBoardContract.TargetGlyphPixels(1440f),
+            ResultsBandFit.FontForBand(bottom1440 - top1440, 30, PanelDensity.Compact, int.MaxValue));
+        check(glyph1080 == 12 && glyph1440 == 16,
+            $"the same 30-row board is drawn at the target in both frames: 12px at 1080 (got {glyph1080}) and 16px at 1440 (got {glyph1440})");
+        float height1080 = ResultsBandFit.RowHeight(glyph1080, PanelDensity.Compact) * 30;
+        float height1440 = ResultsBandFit.RowHeight(glyph1440, PanelDensity.Compact) * 30;
+        float plateTop1080 = bottom1080 - height1080, plateTop1440 = bottom1440 - height1440;
+        check(Math.Abs(height1440 / 1440f - height1080 / 1080f) <= 0.001f,
+            $"the board is the same share of the window in both frames: {height1080:0}px of 1080 is {height1080 * 100f / 1080f:0.0}%, {height1440:0}px of 1440 is {height1440 * 100f / 1440f:0.0}%");
+        check(Math.Abs(plateTop1440 / 1440f - plateTop1080 / 1080f) <= 0.01f,
+            $"and it starts at the same normalized height above the wall: {plateTop1080:0}/1080 = {plateTop1080 / 1080f:0.0000}, {plateTop1440:0}/1440 = {plateTop1440 / 1440f:0.0000} (the residual is the unscaled {messageGap:0}px message gap)");
+
+        // The bottom alignment is the production call, driven the way `Fit` drives it.
+        var strip = new BoardStrip(top1080, bottom1080, true, wall1080, 96f, true,
+            ResultFooterSource.NamedControl, ResultsFontGrowth.BandFillCeiling);
+        bool bottomPlaced = ResultBoardHold.TryPlace(1920f, 1080f, strip, 900f, height1080, 0f,
+            out LayoutRect bottomBoard, 0f, bottomAligned: true);
+        check(bottomPlaced && Math.Abs(bottomBoard.Bottom - bottom1080) <= 0.01f
+              && Math.Abs(bottomBoard.Y - plateTop1080) <= 0.01f,
+            $"the board's lower edge is the measured wall and it grows upward from it: bottom={bottomBoard.Bottom:0} of the {bottom1080:0} wall, top={bottomBoard.Y:0}");
+
+        // ---- the wiring: the two rules above are what the runtime really asks --------------------------
+        string root = SourceRoot();
+        check(root != null, "the automatic-mode contract locates the production sources");
+        if (root == null) return;
+        string display = File.ReadAllText(Path.Combine(root, "ResultsDisplay.cs"));
+        string bounds = File.ReadAllText(Path.Combine(root, "ResultsBounds.cs"));
+        check(display.Contains("int autoTarget = ResultAutoBoardContract.TargetGlyphPixels(Screen.height);")
+              && display.Contains("fitted = autoTarget;"),
+            "the fit is capped by the resolution-scaled target before the player's own zoom and before the width loop spend anything");
+        // 1.19.60: the failure page's upper edge is one rule for both roles. 1.19.47 took the mission-failed title out of
+        // the *client* page's anchor and left it in the host's - a contract the recorded 1.19.59 client page disproved:
+        // strict band 32..1185.7 against fail-open 488.33..1185.7 on one page, with the strict board bottom-aligned and
+        // therefore covering the lower 40-90 px of the title. Both checks below keep their own meaning (one shared
+        // anchor, a measured control carrying its own source, no clearance invented twice) and only name the helper that
+        // now answers it. The host call site and its inline maximum are unchanged.
+        // 1.19.60 (independent review F2): the client branch no longer hands the gap-included `FooterControls.BoardTop` to
+        // this helper - that put the same spacing on twice (504.33 instead of the fail-open's 488.33) and named a measured
+        // control that nobody had measured. It hands the gap-free edge over instead, and `TryFailureAnchor` refuses to name
+        // a control within half a pixel of the title. The rest of the assertion keeps its own meaning: one shared anchor,
+        // a measured control carrying its own source, and the host call site plus its inline maximum unchanged.
+        check(display.Contains("ResultAutoBoardContract.TryUpperAnchor(false, Screen.height, float.NaN, out float screenAnchor, out bandTopSource)")
+              && display.Contains("float rawControlTop = float.IsFinite(controls.BoardTop) ? controls.BoardTop - MessageGap : float.NaN;")
+              && display.Contains("ResultAutoBoardContract.TryFailureAnchor(Screen.height, titleBottom, rawControlTop,")
+              && display.Contains("out float guestAnchor, out bandTopSource)")
+              && display.Contains("bandTopSource = ResultBoundSource.MeasuredControl;")
+              && display.Contains("ResultsBounds.TryResolve(Screen.height, top, bandTopSource,"),
+            "both failure roles use the common anchor - the host inline, the client through the one helper with a gap-free control edge - and a measured control still carries its own source");
+        check(!display.Contains("float guestAnchor = titleBottom + configuredOffset;"),
+            "the client's anchor is never the title plus a gap the strip would add again: the strip adds the clearance exactly once (1.19.60)");
+        check(Count(display, "bottomAligned: true") >= 2 && !display.Contains("bottomAligned: false"),
+            "both placement entry points hand `TryPlace` the bottom-aligned rule, so a held board, a re-measure and a fresh page cannot disagree about it");
+        // 1.19.60: the policy now carries the failure page's title edge - once, in `TryFailureAnchor`, where both walls
+        // (title, measured control) and the window margin are weighed. It still carries no helper the runtime never
+        // calls, which is what this assertion has always been about.
+        check(bounds.Contains("public static bool TryUpperAnchor(bool successPage, float screenHeight, float completionBottom,")
+              && bounds.Contains("public static bool TryFailureAnchor(float screenHeight, float titleBottom, float measuredControlTop,")
+              && bounds.Contains("public static int TargetGlyphPixels(float screenHeight)")
+              && bounds.Contains("public static float TopMargin(float screenHeight)")
+              && !bounds.Contains("FitGlyph") && !bounds.Contains("LowerWall"),
+            "the policy a result page is wired to answers the upper edge for both page kinds - the success section, or the failure page's title and measured control over the window margin - and carries no helper the runtime never calls");
+    }
 
     private static string SourceRoot()
     {

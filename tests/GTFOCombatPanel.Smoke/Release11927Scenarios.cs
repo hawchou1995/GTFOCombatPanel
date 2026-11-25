@@ -346,9 +346,9 @@ internal static class Release11927Scenarios
               && panel.Contains("if (_anchorPolicy.DueToReport)")
               && panel.Contains("if (_anchorPolicy.FreshWarning)"),
             "one line per attempt, identical warnings suppressed once per round: the log cadence is the policy's, untouched");
-        check(panel.Contains("the flashlight anchor was given up on for this level after")
-              && panel.Contains("source=config"),
-            "and the give-up line still says the table keeps PositionX/PositionY, with `source=config` for that answer");
+        check(panel.Contains("the flashlight anchor fast retries ended after")
+              && panel.Contains("automatic HUD placement still waits for proof"),
+            "the recovery log does not claim a configured rectangle was drawn when projection was refused");
         check(panel.Contains("TryResolveOrigin") && panel.Contains("float fractionX = Plugin.PositionX.Value;"),
             "the configured position is still what a level with no measured rectangle uses");
         check(CountOf(panel, "_anchorUnavailable = false;") == 3,

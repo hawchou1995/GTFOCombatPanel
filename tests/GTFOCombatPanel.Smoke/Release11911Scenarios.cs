@@ -131,16 +131,35 @@ internal static class Release11911Scenarios
             "the latch exists as one Unity-free policy and answers the three questions this file asks it");
 
         int prepare = results.IndexOf("private static void Prepare(Component page, bool succeeded)", StringComparison.Ordinal);
-        int latchAsk = results.IndexOf("ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded)", StringComparison.Ordinal);
+        int latchAsk = results.IndexOf("ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded, header)", StringComparison.Ordinal);
         int record = results.IndexOf("_placed = true; _placedSucceeded = succeeded;", StringComparison.Ordinal);
         check(prepare >= 0 && latchAsk > prepare && record > latchAsk,
             "`Prepare` records the placement only after the latch has accepted the fit, so a refusal is never recorded");
 
+        // 1.19.47 (review #3): the pre-hide in `Refresh` is gone. It put the game's own blocks away for a placement the
+        // same frame could still refuse, which left the page empty with nothing drawn over it. The contract now: `Refresh`
+        // touches no vanilla block, and the one hide in the strict path sits *after* this frame's `HudTable.Draw`.
         int refresh = results.IndexOf("internal static void Refresh(eGameStateName state)", StringComparison.Ordinal);
-        int hidesOn = results.IndexOf("ResultBoardLatch.HidesVanilla(_placed)", StringComparison.Ordinal);
-        int firstHide = results.IndexOf("ApplyVanillaBlocks(page, succeeded);", StringComparison.Ordinal);
-        check(refresh >= 0 && hidesOn > refresh && firstHide > hidesOn,
-            "`Refresh` asks the latch before it touches a single vanilla block on that page");
+        int refreshEnd = results.IndexOf("// A settlement page is archived whether or not the board is drawn", refresh, StringComparison.Ordinal);
+        int bypass = refresh >= 0 ? results.IndexOf("ApplyVanillaBlocks(", refresh, StringComparison.Ordinal) : -1;
+        check(refresh >= 0 && refreshEnd > refresh && (bypass < 0 || bypass > refreshEnd),
+            "`Refresh` puts no vanilla block away: the pre-hide that ran before the table was drawn is gone, so a refused frame leaves the page exactly as the game drew it");
+        int draw = results.IndexOf("private static void DrawBoard()", StringComparison.Ordinal);
+        int tableDraw = draw >= 0 ? results.IndexOf("HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity, _scrollFirst, _scrollVisible, _scrollPlate);", draw, StringComparison.Ordinal) : -1;
+        int drawn = tableDraw >= 0 ? results.IndexOf("_boardDrawnFrame = Time.frameCount;", tableDraw, StringComparison.Ordinal) : -1;
+        // 1.19.57: the page handed to the hide is the live one (`LivePage`), never the `_page`/`_succeeded` cache this
+        // repaint may already have cleared; the call itself still sits after this frame's `HudTable.Draw`.
+        int hideAfterDraw = drawn >= 0 ? results.IndexOf("ApplyVanillaBlocks(vanillaPage, vanillaSucceeded);", drawn, StringComparison.Ordinal) : -1;
+        check(draw >= 0 && tableDraw > draw && drawn > tableDraw && hideAfterDraw > drawn,
+            "and the game's own blocks make way only after this frame's `HudTable.Draw` really ran (a frame that returns earlier touched nothing)");
+        // 1.19.55: the one hide now also asks the early-board contract. An early board (drawn before the page proved its own
+        // boundary) stands *over* the page as the game drew it and puts nothing away - that is what leaves a late return
+        // button, a report card and another mod's footer where they are. The fixed layout is still heard through its own plan,
+        // so there is still no second unconditional path that could put a block away.
+        check(results.Contains("ResultEarlyBoardPolicy.HidesVanilla(_earlyBoard, true)")
+                && results.Contains("&& (!FixedLayoutActive() || _fixedPlan.HidesVanilla))")
+                && results.Contains("ApplyVanillaBlocks(vanillaPage, vanillaSucceeded);"),
+            "the early board puts no vanilla block away, and the fixed layout is still heard through its own plan, so there is no second unconditional path that could put a block away");
 
         int attach = results.IndexOf("internal static bool NeedsAttach()", StringComparison.Ordinal);
         int attachAsk = results.IndexOf("ResultBoardLatch.NeedsAttach(_placed, _placedSucceeded == succeeded)", StringComparison.Ordinal);

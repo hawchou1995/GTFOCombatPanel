@@ -339,11 +339,14 @@ internal static partial class Program
         check(!body.Contains("FailureSequence.IsFinished(page.Pointer)")
               && body.Contains("ResultFailureWallPolicy.Waits(wallMeasured, wallWait, walls.GuestFailure)"),
             "and the native failure sequence is not evidence here any more: it answers where the page's script has got to, never where the wall is (static check, not a runtime proof)");
-        check(body.Contains("bool waiving = walls.GuestFailure && Forced;")
-              && body.IndexOf("if (!waiving && ResultFailureWallPolicy.Waits(", StringComparison.Ordinal) > 0,
-            "F8 keeps its meaning for the player, and only on the page this release changes: the exemption is `walls.GuestFailure && Forced`, so no host page gains or loses a wait (static check, not a runtime proof)");
+        // 1.19.61（评审 #3）：客机失败页的墙只由槽位权威给出，F8 不再豁免这一条——它授权的是「画板」，不是「编一条边界」。
+        // 主机失败页仍然走 `ResultFailureWallPolicy`（`Waits` 与 `WallMeasured` 都在上面那几条断言里）。
+        check(body.Contains("wallMeasured = float.IsFinite(walls.FooterTextTop);")
+              && body.Contains("if (!wallMeasured)")
+              && !body.Contains("bool waiving = walls.GuestFailure && Forced;"),
+            "F8 keeps its meaning for the player but not the exemption that used to skip the wall question on the page this release changes: a client failure page's bound is its own slot geometry, and the host page keeps the wait it always had (static check, not a runtime proof)");
         check(body.Contains(",wallPending=") && !body.Contains("nativeSequenceFinished")
-              && body.Contains("re-measured at the existing cadence") && body.Contains("vanilla page kept"),
+              && body.Contains("measured again at the existing cadence") && body.Contains("vanilla page is kept"),
             "the one line a page prints says which readings were missing, that the wall question is still pending, and that the vanilla page is kept and measured again - a permanent no-board is never reported as success (static check, not a runtime proof)");
         check(body.Contains("ResultFailureWallPolicy.AnswerNote(wallMeasured, wallWait, walls.GuestFailure)"),
             "and the band that is answered without a wall carries the note that names its evidence (F5, unchanged in spirit)");
@@ -369,11 +372,12 @@ internal static partial class Program
         // 客机分支：等待文字被读进证据，而且是这一页的下界之一。
         string strip = FallbackMethodBody(display, "private static bool FailureStrip(Component page");
         check(strip.Contains("new ResultClientFailureEvidence(guestAnchor, Screen.width, Screen.height,")
-              && strip.Contains("MessageGap, MinimumGuestStripHeight, waitingTextTop, pressableTop,")
-              && strip.Contains("bool wallPending = ResultClientPageActionPolicy.Pending(waitingTextTop, pressableTop);")
+              && strip.Contains("MessageGap, MinimumGuestStripHeight, clientSlotTop, pressableTop,")
+              && strip.Contains("bool wallPending = ResultClientPageActionPolicy.Pending(slot.HostSlotTop, slot.HintGlyphTop);")
+              && strip.Contains("float clientSlotTop = slot.Top;")
               && strip.Contains("clientBand.WaitingTextTightened")
               && strip.Contains("footIsWall = clientBand.WallMeasured;"),
-            "the client failure branch hands both wall readings to the one entry point, reports which of them produced the foot, and treats a measured wall as the band's own promise (static check, not a runtime proof)");
+            "the client failure branch hands the merged slot wall (the field's layout top, the slot's visible glyphs and the highest pressable control) to the one entry point, reports which of them produced the foot, and treats a measured wall as the band's own promise (static check, not a runtime proof)");
         check(!strip.Contains("never bounds this strip") && !strip.Contains("not-a-wall"),
             "and no diagnostic still claims the waiting line does not bound the strip - the sentence this correction removes (static check, not a runtime proof)");
     }

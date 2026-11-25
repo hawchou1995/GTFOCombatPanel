@@ -25,56 +25,44 @@ namespace HawChow.GTFOCombatPanel;
 // the board uses to pick the page it stands in for.
 public enum ResultPageKind { Success = 0, Failure = 1 }
 
-// The wheel-controlled glyph scale of the settlement board.
+// The board's two manual size preferences.
 //
-// The board's size on a result page is a measurement, not a preference: `ResultsFontGrowth` measures the
-// table at a candidate glyph size and answers with the largest one that fills the strip between the page's
-// completion section and the lobby button. What the wheel changes is the size that measurement is *drawn*
-// at, so a player who reads better on a smaller board can have one, and the value is remembered separately
-// per page - the success strip and the failure strip are different heights, so the same scale means two
-// different tables.
+// The board's size on a result page is a measurement, not a preference: `ResultsFontGrowth` measures the table at a
+// candidate glyph size and answers with the largest one that fills the strip between the page's completion section
+// and the lobby button, and the readable floor keeps that answer legible. What is left to the player is a *manual*
+// multiplier, remembered separately per page - the success strip and the failure strip are different heights, so the
+// same multiplier means two different tables.
+//
+// The wheel is not part of this any more. It used to scale the board (`ScaleSize`, one notch = one step, persisted to
+// the file), which is the path that turned a thirty-row table on a short strip into a six-pixel one: the size that
+// made the table fit was also the size that left nothing worth reading, and a board that already fitted had nothing
+// to scroll. The wheel now moves the table's scroll position (`ResultsScroll`), the multiplier is only ever read from
+// the file, and a page that was left is not a reason to rewrite it.
 public static class ResultsZoom
 {
-    // Where the two preferences live in the plugin's own .cfg. One readable key each, in the same section
-    // as the rest of the result-page settings.
+    // Where the two preferences live in the plugin's own .cfg. One readable key each, in the same section as the
+    // rest of the result-page settings.
     public const string Section = "Results";
     public const string SuccessKey = "SuccessFontScale";
     public const string FailureKey = "FailureFontScale";
 
-    // 1.0 is "the size the page's own strip allows", which is what the board has always been drawn at.
+    // 1.0 is "the size the page's own strip and readability floor produced", which is what the board is drawn at
+    // unless a player asked for something else in the file.
     public const float Default = 1f;
-    // The range a player may step through. The floor keeps a board a table rather than a rumour; the ceiling
-    // is where a bigger board would stop being one - and it is clamped again by the strip, so it can never
-    // be the reason a button is covered.
+    // The range a hand edit may sit in. `ResultsScroll.FontFor` clamps the result back onto the readable floor, so
+    // neither end of this range can make the table unreadable.
     public const float Minimum = 0.5f;
     public const float Maximum = 2f;
-    // One wheel notch, so both pages store the same discrete set of values and a file edit and a scroll
-    // cannot leave a value the next notch then jumps over.
+    // The grid `Snap` quantises onto. It exists so a hand edit and a re-read agree on the same discrete set; the
+    // wheel does not produce these values any more.
     public const float Step = 0.1f;
-    // A wheel delta is "a notch happened" or it is nothing: a trackpad can report a fraction of one, and the
-    // direction is what the player meant. The dead zone is what keeps a resting trackpad from rescaling.
-    public const float WheelDeadZone = 0.0001f;
-    // IMGUI reports one notch *away* from the player - scrolling down - as a positive `Event.current.delta.y`,
-    // and a notch towards them as a negative one. That convention is what `Direction` reads, and it is the one
-    // place it lives: a build whose wheel reads the other way only has to flip this constant.
-    public const bool WheelUpIsNegative = true;
 
     public static ResultPageKind Page(bool succeeded) => succeeded ? ResultPageKind.Success : ResultPageKind.Failure;
 
     public static string KeyFor(ResultPageKind page) => page == ResultPageKind.Success ? SuccessKey : FailureKey;
 
-    public static bool Accepts(float wheelDelta) => float.IsFinite(wheelDelta) && Math.Abs(wheelDelta) > WheelDeadZone;
-
-    // +1 for a notch up (the board grows), -1 for a notch down, 0 for a wheel that did not move.
-    public static int Direction(float wheelDelta)
-    {
-        if (!Accepts(wheelDelta)) return 0;
-        bool up = WheelUpIsNegative ? wheelDelta < 0f : wheelDelta > 0f;
-        return up ? 1 : -1;
-    }
-
-    // A stored value that is out of range, not a number at all (an entry nobody could read), or exactly on a
-    // bound is brought back inside the range the keys describe.
+    // A stored value that is out of range, not a number at all (an entry nobody could read), or exactly on a bound is
+    // brought back inside the range the keys describe.
     public static float Clamp(float scale)
     {
         if (!float.IsFinite(scale)) return Default;
@@ -83,70 +71,12 @@ public static class ResultsZoom
         return scale;
     }
 
-    // The value quantised onto the step grid, so every stored scale is one the wheel can produce again.
+    // The value quantised onto the step grid, so every stored multiplier is one the file's own description allows.
     public static float Snap(float scale)
     {
         double steps = Math.Round((Clamp(scale) - Minimum) / (double)Step, MidpointRounding.AwayFromZero);
         double snapped = Minimum + steps * (double)Step;
         return Clamp((float)Math.Round(snapped, 3));
-    }
-
-    // One wheel notch: up enlarges by exactly one step, down reduces by exactly one step, and a wheel that
-    // stopped at a bound keeps the bound rather than wrapping round it.
-    public static float Next(float current, float wheelDelta)
-    {
-        int direction = Direction(wheelDelta);
-        if (direction == 0) return Snap(current);
-        return Snap(Clamp(current) + direction * Step);
-    }
-
-    // The glyph size the board is really drawn at.
-    //
-    // `fittedPixels` is what the page's strip produced: the largest size that fills the strip inside the fill band
-    // `ResultsFontGrowth` keeps free above the button. The wheel scales that, and the result is then measured
-    // against the box the page really offers - `stripHeight` from the completion section to the button, and
-    // `boardWidth` the width of the page. Asking for more than the band keeps free is what makes a notch up
-    // visible at all (the band leaves 4-8% of the strip unused), and a size that would reach the button or leave
-    // the width is stepped down until it does not: the wheel can choose a bigger board, never a board over the
-    // control the player has to press. Downwards the answer is the scaled size itself, and never below the absolute
-    // readable minimum, because a board nobody can read is not a zoom level.
-    //
-    // A caller that passes no measurement - or a strip and width it could not read - gets the conservative answer:
-    // the size the strip produced, scaled but never enlarged, which is what this answered before a page offered its
-    // own box.
-    public static int ScaleSize(int fittedPixels, float scale) => ScaleSize(fittedPixels, scale, 0f, 0f, null);
-
-    // Hard bound on the walk down, so a measurement that is not monotone cannot spin here.
-    public const int MaximumScaleSteps = 512;
-
-    public static int ScaleSize(int fittedPixels, float scale, float stripHeight, float boardWidth,
-        Func<int, ResultTableSize> measure)
-    {
-        int fitted = fittedPixels < 1 ? 1 : fittedPixels;
-        // The absolute readable minimum is the floor of everything this returns, including the size a caller handed
-        // in: a board nobody can read is not a size, and a scale that could only answer with one would make the grid
-        // vanish rather than draw a smaller table.
-        if (fitted < ResultsFontGrowth.MinimumReadablePixels) fitted = ResultsFontGrowth.MinimumReadablePixels;
-        int wanted = (int)Math.Round(fitted * (double)Clamp(scale), MidpointRounding.AwayFromZero);
-        if (wanted < ResultsFontGrowth.MinimumReadablePixels) wanted = ResultsFontGrowth.MinimumReadablePixels;
-        bool boxed = measure != null && float.IsFinite(stripHeight) && stripHeight > 0f
-            && float.IsFinite(boardWidth) && boardWidth > 0f;
-        if (!boxed) return wanted > fitted ? fitted : wanted;
-        // The strip's own size fits the strip by definition, so this walk can never end below it either: it starts
-        // at the scaled size and stops at the first size the page can really draw.
-        int working = wanted, guard = 0;
-        while (working > ResultsFontGrowth.MinimumReadablePixels && guard++ < MaximumScaleSteps)
-        {
-            ResultTableSize size;
-            try { size = measure(working); }
-            catch { return wanted > fitted ? fitted : wanted; }
-            // A measurement that reports nothing is no evidence that a larger board fits, so the strip's own size
-            // stands rather than a size nobody could measure.
-            if (!size.Usable) return fitted;
-            if (size.Height <= stripHeight + 0.5f && size.Width <= boardWidth + ResultsFontGrowth.WidthSlack) break;
-            working--;
-        }
-        return working;
     }
 }
 
@@ -581,10 +511,12 @@ public static class ResultFailureBandProofPolicy
         }
     }
 
-    // The upper edge has to be the failure page's own mission-failed title, which `FailureStrip` reads from the
-    // title's laid-out rectangle whether or not the page has drawn it yet.
+    // The upper edge has to be an edge the failure page itself produced: the window's safe top margin, which is the
+    // one upper bound the newest user contract allows on that page (`ResultAutoBoardContract`), or the mission-failed
+    // title's own laid-out rectangle, which the older readings and the fallback path still hand over. A fraction of
+    // the window (`ScreenSafeArea`) is never in this set: that is the edge this proof exists to refuse.
     public static bool PageMeasuredTop(ResultBoundSource source)
-        => source == ResultBoundSource.TitleAnchor;
+        => source == ResultBoundSource.ScreenTopMargin || source == ResultBoundSource.TitleAnchor || source == ResultBoundSource.MeasuredControl;
 
     // The lower edge has to be a wall or a block the page itself laid out: the waiting-status text the player reads,
     // the leave-expedition control's own rectangle standing in for it, or another control the scan measured. The

@@ -386,6 +386,13 @@ public static class CombatStrings
         => TryReason(ImpactRating.Scan, out string template)
             ? Substitute(template, ("uses", Count(uses)), ("firstMarks", Count(firstMarks)))
             : Pick("扫描 " + Count(uses) + " 次，首次标记 " + Count(firstMarks) + " 只", "scanned " + Count(uses) + "x, first-marked " + Count(firstMarks) + " enemies");
+    // 1.19.41: the activation count is only readable on the machine that holds the scanner, so a row measured
+    // from native execution confirmations alone reports the marks those confirmations proved and no scan count
+    // at all. A configurable template keeps its own wording and receives `—` for the count it no longer has.
+    public static string ReasonScanMarks(long firstMarks)
+        => TryReason(ImpactRating.Scan, out string template)
+            ? Substitute(template, ("uses", Placeholder), ("firstMarks", Count(firstMarks)))
+            : Pick("首次标记 " + Count(firstMarks) + " 只", "first-marked " + Count(firstMarks) + " enemies");
     public static string ReasonLoneSurvivor(long count)
         => TryReason(ImpactRating.LoneSurvivor, out string template)
             ? Substitute(template, ("count", Count(count)))
@@ -472,7 +479,7 @@ public static class CombatStrings
     // figure that arrived, shown exactly as it arrived - and `?` in the two kind fields. Where the remainder is a
     // *proven* zero (the total is exactly its ammo part, so there is nothing left to be a tool or a medical pack)
     // the two kinds print a counted zero instead. No raw number is changed, and nothing here feeds the score.
-    public static string SupplyCell(string efficiency, long totalUses, long ammoUses, long toolUses, long medicalUses, bool kindsKnown)
+    public static string SupplyCell(string efficiency, long totalUses, long ammoUses, long toolUses, long medicalUses, bool kindsKnown, bool medicalKnown = true)
     {
         long total = totalUses > 0 ? totalUses : 0, ammo = ammoUses > 0 ? ammoUses : 0;
         long tool = toolUses > 0 ? toolUses : 0, medical = medicalUses > 0 ? medicalUses : 0;
@@ -488,17 +495,25 @@ public static class CombatStrings
         // exactly its ammo part (there is no remainder left to be a tool or a medical pack). The ammo figure is printed either
         // way: it travelled, it is a measurement, and it is the one kind this build can name without a split.
         long remainder = total - ammo;
+        // 1.19.41 fix: a remainder of zero proves only that no pack of the other kinds was *counted* here. The medical
+        // figure is a native application this machine either confirmed or did not, so a row whose medkits were counted
+        // on somebody else's machine prints `?` there - never the 0 that would claim "this player received no medical
+        // pack", which is exactly what the shipment-wide row used to print about every teammate.
         return remainder == 0
-            ? Compound(efficiency, Count(ammo), Count(0), Count(0))
+            ? Compound(efficiency, Count(ammo), Count(0), medicalKnown ? Count(0) : Unknown)
             : Compound(efficiency, Count(ammo), Unknown, Unknown);
     }
-    // 1.19.34: the supply row's label, in the two texts the archived settlement files are keyed by. `Legacy` is the label
-    // the released builds wrote (`补给效率 / 本人 / 弹药`); `ResultsLog` writes it beside the new one so a reader of those files
-    // keeps finding the key it has always parsed.
+    // The supply row's label, in the two texts the archived settlement files are keyed by.
     public static string SupplyRowLabel { get { return Pick("补给效率 / 弹药包 / 工具包 / 血包", "Supply efficiency / ammo / tool / med"); } }
+    // 1.19.60: the released three-field label and the three-field cell beside it are **public API only** now - the
+    // archive no longer writes either (`ResultsLog.Build` writes one key per player, the four-field one). They are kept
+    // because they are part of this assembly's public surface, and a consumer that reads them - another mod compiled
+    // against an older build, a script of the player's own driving the format offline - must not break because the
+    // *archive* stopped double-writing. Their own meaning is unchanged: this label's second field is the owner's total
+    // number of packs, never the ammo part the four-field cell prints there. Nothing in this mod calls either one.
     public static string SupplyRowLabelLegacy { get { return Pick("补给效率 / 本人 / 弹药", "Supply efficiency / self / ammo"); } }
-    // The released three-field form (`补给效率 / 本人 / 弹药`): kept because the settlement files and the tests of the
-    // builds before this one are written against it. The board no longer uses it.
+    // The released three-field form (`补给效率 / 本人 / 弹药`). Kept as public API with the label above; the board uses
+    // the four-field overload and the archive uses the board. `ResultsLog` no longer calls it.
     public static string SupplyCell(string efficiency, long selfUses, long ammoUses)
     {
         if (selfUses <= 0 && ammoUses <= 0) return efficiency;

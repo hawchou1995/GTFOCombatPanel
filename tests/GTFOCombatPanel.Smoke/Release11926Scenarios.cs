@@ -233,22 +233,28 @@ internal static class Release11926Scenarios
         int gate = display.IndexOf("ResultVisibility.Shows(", display.IndexOf("internal static void Draw()", StringComparison.Ordinal), StringComparison.Ordinal);
         check(opening > 0 && gate > opening,
             "every early return of the repaint is behind the 'nothing is showing' write, so a refused or hidden frame can never leave a stale board behind");
-        check(display.Contains("HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity);\n        // A board really went on the page this repaint.")
-              && display.Contains("_boardDrawnFrame = Time.frameCount;"),
-            "the draw itself is what records the board as on the page");
+        int boardDraw = display.IndexOf(
+            "HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity, _scrollFirst, _scrollVisible, _scrollPlate);",
+            StringComparison.Ordinal);
+        int drawnFact = display.IndexOf("_boardDrawnFrame = Time.frameCount;", boardDraw < 0 ? 0 : boardDraw,
+            StringComparison.Ordinal);
+        check(boardDraw > 0 && drawnFact > boardDraw,
+            "the draw itself is what records the board as on the page: the fact is written after the table's own draw call, not before it");
 
         string toggle = Between(display, "internal static bool ToggleForcedFallback()", "// The drawn half of the 1.19.22");
         check(toggle.Length > 0, "the F8 handler is found in the production source");
-        check(toggle.Contains("ResultTogglePolicy.Next(BoardOnScreen)"),
-            "the press asks the display what the page is showing, through the policy this suite drives");
+        check(toggle.Contains("ResultTogglePolicy.RequestedShown(SwitchesWantBoard(), Session.HiddenByPress, Forced)")
+              && toggle.Contains("ResultTogglePolicy.Press(requestedShown)"),
+            "1.19.47 (review #1): the press asks the *request* the page carries - the player's switches, this page's own hide and an outstanding show request - and flips it, instead of reading the last painted frame (`Next(BoardOnScreen)` is what turned 45 presses into 45 identical 'show' requests)");
         check(display.Contains("internal static bool BoardOnScreen => ResultTogglePolicy.BoardUp(_boardDrawnFrame, Time.frameCount);"),
             "and that answer is the drawn frame compared by the policy, not the override flag");
         check(!toggle.Contains("Forced = !Forced;"),
             "the override is no longer flipped blind: the press that should hide a board cannot turn it on");
-        check(toggle.Contains("Forced = show;") && toggle.Contains("Plugin.PersistToggle(show);"),
-            "the show half turns the override on, and both halves write the two switches the key owns to the .cfg");
-        check(toggle.Contains("_forcedOutcomePending = show;") && toggle.Contains("return show;"),
-            "a show still owes its frame a line, and the panel is handed whether the board is up now");
+        check(toggle.Contains("ApplyBoardVisibility(show);")
+              && display.Contains("Forced = show;") && display.Contains("Plugin.PersistToggle(show);"),
+            "and the press goes through the one visible-state action the two settlement buttons share: the show half turns the override on, and both halves write the two switches the key owns to the .cfg");
+        check(display.Contains("_forcedOutcomePending = true;") && toggle.Contains("return show;"),
+            "a show still owes its frame a line (the flag is set by the shared action it calls), and the panel is handed whether the board is up now");
 
         check(panel.Contains("bool shown = ResultsDisplay.ToggleForcedFallback();") && panel.Contains("visible = shown;"),
             "the panel takes the display's answer instead of assuming a press means 'board on'");

@@ -131,6 +131,21 @@ internal sealed class SquadExchange
     // rather than once per frame.
     private int _withheldPeers = -1;
 
+    // 1.19.43: one late greeting for this expedition's host, from a client that has already spent its whole bounded
+    // probe on it.
+    //
+    // The initial burst is spent inside the first seconds of an expedition, which is exactly when the host may still be
+    // loading this build, and after that the loop below is silent for the rest of the run - a recorded session ended
+    // with three greetings per peer and not one packet back, which is indistinguishable from a host that runs nothing.
+    // This is the recovery, and it is deliberately narrow: a client only (a host owes nobody a greeting), this
+    // expedition's host only (`SquadExchange._master` as the roster named it, never the placeholder a client without a
+    // named host carries), asked for once and late, one packet per expedition (`SquadCapability.LateProbeBudget`),
+    // handed over by the same wire gate as every other greeting, and never for data. The total a peer can ever cost is
+    // therefore `ProbeBudget + LateProbeBudget` packets, and a host that runs no panel writes that many error lines at
+    // most - not one per frame and not one per level.
+    public const float LateHelloSeconds = 45f;
+    private float _lateHelloDue = float.NaN;
+
     // A hello that arrived before the roster knew the player who sent it.
     //
     // The receive queue is drained on the main thread at the start of a tick and the roster is rebuilt from the
@@ -242,8 +257,10 @@ internal sealed class SquadExchange
         _squadTotal = null; _squadTotalPartial = false;
         Handshake.Reset();
         // A peer that never answered is probed again: the machine on the other end may only now have finished
-        // loading this build, and `ProbeBudget` packets per expedition is still bounded.
+        // loading this build, and `ProbeBudget` packets per expedition is still bounded. The one late greeting goes with
+        // the run it was asked in: the next expedition earns its own clock and its own reservation.
         Discovery.ResetProbes();
+        _lateHelloDue = float.NaN;
         // A hello that was waiting to be re-judged describes the run that just ended: the roster is rebuilt for the
         // new one, so a packet kept from before it must never be re-judged against that new roster - the peer may not
         // even be in this expedition, and a hello is answered only for the session that received it.
@@ -267,6 +284,8 @@ internal sealed class SquadExchange
         // it names machines, not a lobby.
         Discovery.ResetEvidence();
         _withheldPeers = -1;
+        // The late greeting is the session's as well: a new lobby is a new host to reach.
+        _lateHelloDue = float.NaN;
         // A hello waiting for the roster is about the lobby that just ended, so it goes with it.
         _deferred.Clear();
         Report("[DIAG] squad sync peers cleared: the lobby, the session or this machine's role in it changed, so every peer is fresh again.");
@@ -403,6 +422,28 @@ internal sealed class SquadExchange
                     + " machine that runs no mod never produces one, and answers every packet it does receive with one"
                     + " GTFO-API error line in its own log, which is why the probe is bounded rather than open.");
         }
+        // 1.19.43: the one late greeting, for this expedition's host only, from a client only.
+        //
+        // `EvidenceOf` answers `Nothing` for a peer whose bounded probe is spent, and that test is asked *before*
+        // `ShouldGreet` in the loop above - deliberately, because the budget is what keeps an unmodded machine's log
+        // short. The recovery therefore cannot ride that loop: it is asked here, once, against this exchange's own
+        // knowledge of who the host is and of how long the expedition has run. The physical side is unchanged - the
+        // packet is handed to the transport only through `SquadCapability.MayPutOnWire`, which counts it against
+        // `LateProbeBudget` and pays for exactly one packet - so what a peer can cost stays bounded, and a send that
+        // never reaches the transport spends the reservation rather than buying another attempt.
+        if (LateHelloDue(now) && ClientHost(out ulong lateHost) && !Handshake.IsAnswered(lateHost)
+            && Discovery.ProbesSent(lateHost) >= SquadCapability.ProbeBudget && Discovery.NoteLateProbe(lateHost))
+        {
+            sends.Add(new SquadSend(SquadSendKind.Hello, lateHost, default(SyncSnapshot), _generation));
+            Report("[DIAG] squad sync discovery: host=" + lateHost + " has still not answered although this machine's"
+                + " bounded probe for it was spent at the start of this expedition, so one late greeting is sent to it"
+                + " now - the " + SquadCapability.LateProbeBudget + " late greeting a host costs per expedition. It is one"
+                + " packet on this build's own channel rotation, it carries no row, and nothing else changes: an unproven"
+                + " peer is still sent no data, the total a host can ever cost stays "
+                + (SquadCapability.ProbeBudget + SquadCapability.LateProbeBudget) + " packets, and an answer - not this"
+                + " greeting - is what makes it a peer this machine can read. This machine's own log can say only that no"
+                + " usable host data has arrived; it cannot say which build the host runs.");
+        }
         if (now < _nextSnapshot) return sends;
         _nextSnapshot = now + SnapshotSeconds;
         CombatPlayer own = Find(measured, _local);
@@ -436,6 +477,31 @@ internal sealed class SquadExchange
     // operator named, has a handler for these bytes; the bounded probe state has none by definition.
     private static bool CarriesRows(SquadEvidence evidence)
         => evidence == SquadEvidence.Proven || evidence == SquadEvidence.Allowlisted;
+
+    // Whether the one late greeting is due. The clock starts on the first tick of an expedition and the greeting is
+    // asked for `LateHelloSeconds` later, far enough after the entry burst that it cannot be spent while the host is
+    // still loading the level. Once the reservation exists (`SquadCapability.NoteLateProbe`) this answers true on every
+    // later tick, and the reservation - not this clock - is what keeps it to one packet: a tick that arrives early costs
+    // nothing and a tick that arrives late cannot lose the greeting.
+    private bool LateHelloDue(float now)
+    {
+        if (!float.IsFinite(now)) return false;
+        if (float.IsNaN(_lateHelloDue)) _lateHelloDue = now + LateHelloSeconds;
+        return now >= _lateHelloDue;
+    }
+
+    // This expedition's host, when this machine is a client and that host is a real peer the roster named. The
+    // placeholder master a client without a named host carries (`1UL`, "the vanilla host") is not a peer here and is
+    // never greeted by this path: nothing is known about it, which is exactly what the roster said.
+    private bool ClientHost(out ulong host)
+    {
+        host = 0UL;
+        if (_localIsMaster || _master == 0UL || _master == _local) return false;
+        if (!TryPeer(_master, out SquadPeer peer)) return false;
+        if (!peer.IsHuman || peer.IsLocal) return false;
+        host = _master;
+        return true;
+    }
 
     // For the diagnostic lines only: how many human peers the roster holds, and how many of them have
     // proved they run this mod. A machine that is in a level with human peers and has never heard from one
@@ -701,12 +767,43 @@ internal sealed class SquadExchange
     // rows, plus a row for a player this machine never measured but a host described. The capture store is
     // read, never written, so a later measurement can never be added on top of a figure that came off the
     // wire, and a figure that came off the wire can never be added into the ledger.
+    //
+    // 1.19.60: a row in the capture store is not by itself a row the public statistics may draw. The store also
+    // holds the receiver of this machine's own medkit (`SupplyTracker.CandidateFor`), which is the right place
+    // for that credit and the wrong reason to put a player on the board: on the recorded client page two seats
+    // that run no mod stood there with a bare row and no figure in it. `SquadRowEligibility` answers that
+    // question from evidence alone - this machine's own row, a row this run really received, or a seat this
+    // machine is the authority for - and the credit stays in the store either way, so a qualified row that
+    // arrives later merges on top of it.
+    internal bool RoleIsMaster => _localIsMaster;
+
+    // The two-argument form answers with this exchange's own record of the role, which is what `SetRoster` was last told.
     internal List<CombatPlayer> Project(IReadOnlyList<CombatPlayer> measured, ulong local)
+        => Project(measured, local, _localIsMaster);
+
+    // `localIsAuthority` is the live answer to "is this machine the host of this session", passed in by the caller
+    // because only the caller can read it (this class is Unity-free). 1.19.60: that answer must not come from the
+    // roster alone. `_localIsMaster` is written by `SetRoster`, so a host whose roster read throws for a few frames -
+    // the exact frames in which the network is closed - would be read as a client and would drop every seat it
+    // measured itself, which is "the host loses its squad because the network went away". The production call site
+    // therefore asks the live fact and falls back to this exchange's own record, and the rule below is unchanged:
+    // a seat is drawn when this machine measured it as the authority, or when this run received its row, or when it
+    // is this machine's own row.
+    //
+    // `local` is the caller's reading of this machine's own lookup. A reading that came back as 0 - `SNet.LocalPlayer`
+    // throwing for a frame - must not make this machine's own row look like somebody else's, so `_local` (the lookup
+    // this exchange was configured with, the same one `Find(measured, _local)` uses) is the fallback for that and
+    // nothing else: no row is admitted by it that the rule would otherwise have refused.
+    internal List<CombatPlayer> Project(IReadOnlyList<CombatPlayer> measured, ulong local, bool localIsAuthority)
     {
+        ulong self = local != 0UL ? local : _local;
         var rows = new List<CombatPlayer>();
         for (int index = 0; measured != null && index < measured.Count; index++)
         {
-            CombatPlayer display = CombatMerge.Project(measured[index]);
+            CombatPlayer capture = measured[index];
+            if (capture == null) continue;
+            if (!SquadRowEligibility.Draws(capture.Lookup == self, Cache.Has(capture.Lookup), localIsAuthority)) continue;
+            CombatPlayer display = CombatMerge.Project(capture);
             if (display != null) rows.Add(display);
         }
         foreach (ulong owner in Cache.Owners)
@@ -717,20 +814,55 @@ internal sealed class SquadExchange
         foreach (CombatPlayer row in rows)
         {
             if (Cache.TryGet(row.Lookup, out SyncSnapshot snapshot))
-                CombatMerge.ApplyRemote(row, snapshot, _primarySlot, _specialSlot, _classSlot, _meleeSlot, local);
+                CombatMerge.ApplyRemote(row, snapshot, _primarySlot, _specialSlot, _classSlot, _meleeSlot, self);
             // 1.19.34: the split sent beside that row. It fills in the kinds only where the pair the row now holds is exactly the
             // pair the split describes, so a row is never assembled out of two machines' counts; a row whose pair came from
             // somewhere else keeps its kinds unknown, which is what the cell prints as `?`. 1.19.35: the cache also checks that the
             // block describes the *run* that row came from, so a split left over from the previous expedition cannot attach its
             // kinds to a new row that happens to hold the same total/ammo pair (review C4).
-            Cache.TryApplySupplyKinds(row.Lookup, row.Impact, row.Lookup == local);
+            Cache.TryApplySupplyKinds(row.Lookup, row.Impact, row.Lookup == self);
         }
         return rows;
     }
-
     private static bool Contains(List<CombatPlayer> rows, ulong lookup)
     {
         for (int index = 0; index < rows.Count; index++) if (rows[index].Lookup == lookup) return true;
         return false;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 1.19.60: which rows the public statistics may draw
+// ---------------------------------------------------------------------------------------------------
+//
+// The recorded 2026-11-24 client session (a squad whose host runs no mod) put two bare rows on the level HUD
+// halfway through the run: a weapon column of dashes, a kill column of zeros, no name, and - in the archive -
+// one and five medical packs. They were the two seats that run no mod, and the only thing that had ever opened
+// a row for them was this machine's own medkit: `SupplyTracker.CandidateFor` writes the receiver's credit into
+// the capture store on purpose (a client's real application to a remote teammate must reach that teammate's
+// row), and every row in that store was projected onto the board.
+//
+// The rule below is about evidence and nothing else. A row may be drawn when
+//
+//   own          this machine measures it itself (`lookup == local`), always;
+//   described    this run received a row for it through the exchange - the receiver-side gate already refused
+//                everything that is not the player's own row or the authoritative host's description of a
+//                slotted player, so a cached row *is* qualified evidence, and a host's description of a
+//                teammate who runs no mod, or of a bot, arrives this way;
+//   authority    this machine is the host of this session and measured the seat itself, which is how a bot's
+//                row and a slotted player's row exist on the authority at all.
+//
+// and *not* when the seat is still in the roster (a seat that left keeps no row here; a seat that stayed and
+// was never measured gets none either), what a handshake answered, whether this machine happened to apply one
+// medkit or five to that seat, whether every figure in the row is zero, or whether the row already has a name.
+// Those are facts about this machine's own bookkeeping, never about the player's statistics, and a row admitted
+// or refused by one of them is a row the player cannot account for.
+//
+// The receiver's raw supply ledger is untouched: the credit stays in the capture store exactly where it was
+// written, so a qualified row for that seat that arrives later merges on top of it, a real zero on a drawn row
+// stays a zero, and an unknown stays unknown. Nothing here deletes a figure or turns absence into a zero.
+public static class SquadRowEligibility
+{
+    public static bool Draws(bool ownRow, bool describedByThisRun, bool measuredByThisAuthority)
+        => ownRow || describedByThisRun || measuredByThisAuthority;
 }

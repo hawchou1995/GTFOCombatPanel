@@ -343,7 +343,7 @@ internal static class Release11914Scenarios
 
         int stillSafe = results.IndexOf("if (!BoardStillSafe())", StringComparison.Ordinal);
         int defer = results.IndexOf("DeferBoardForInteraction();", stillSafe, StringComparison.Ordinal);
-        int scan = results.IndexOf("controls = ScanFooterControls(page, completion, MessageGap, null, board, inspectBoard);", StringComparison.Ordinal);
+        int scan = results.IndexOf("controls = ScanFooterControls(page, completion, MessageGap, null, board, inspectBoard, boardColumn);", StringComparison.Ordinal);
         check(stillSafe >= 0 && defer > stillSafe && scan >= 0,
             "the per-repaint rescan that asks for the collision set again is untouched, which is what takes an unmeasurable control back");
         Console.WriteLine("WIRING: RESULT_UNMEASURABLE_CONTROL (static source check; not a runtime behaviour test)");

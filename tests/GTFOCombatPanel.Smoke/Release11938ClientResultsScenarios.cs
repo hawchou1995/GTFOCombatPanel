@@ -248,7 +248,7 @@ internal static partial class Program
                   && strip.Contains("float pressableTop = ResultsRegion.HighestTop(namedTop, controls.PressableTop);")
                   && resolve != null
                   && resolve.Contains("ResultClientFailureBand.TryResolve(fixedPage, evidence.ScreenHeight, evidence.MinimumStripHeight,")
-                  && resolve.Contains("evidence.WaitingTextTop, evidence.PressableTop, wallTop, out reading)"),
+                  && resolve.Contains("evidence.SlotTop, evidence.PressableTop, wallTop, out reading)"),
                 "the client failure branch takes its band from `ResultClientFailureBand`, handing it both walls - the waiting line's own top and the highest pressable control - plus the highest wall this page has shown (static check, not a runtime proof)");
             check(ClientResultsCount(strip, "ResultsBounds.TryResolve(") == 1,
                 "and the waiting line is passed to `ResultsBounds.TryResolve` in exactly one place - the host's `else if` - so no client frame can reach that arithmetic (static check, not a runtime proof)");
@@ -257,10 +257,16 @@ internal static partial class Program
             int guestReport = strip.IndexOf("ReportBand(\"failure\", new ResultsBand(top, bottom, bandTopSource, bandBottomSource, false),", StringComparison.Ordinal);
             check(guestAt >= 0 && guestReport > guestAt && boundsAt > guestReport,
                 "the client's own band is reported before the host's `ResultsBounds` call, so the two branches cannot be taken in the same frame (static check, not a runtime proof)");
-            check(strip.Contains("float clientWall = ClientWall.Wall;") && strip.Contains("buttonTop = clientWall;")
+            // 1.19.61：客机的页脚报的是「这条条带自己用的那一堵墙」（`clientBand.WallTop`）。1.19.60 报的是门保留的
+            // 墙（`ClientWall.Wall`），于是同一帧里条带可以按一个数落位、`BoardStillSafe` 的页脚校验却按另一个数判它
+            // （2026-11-25 快照 L4881 条带 1371 / L4883 footerTop=1338），板只能靠 F8 强绘一帧。
+            check(strip.Contains("float clientWall = clientBand.WallTop;") && strip.Contains("buttonTop = clientWall;")
                   && strip.Contains("buttonMeasured = float.IsFinite(clientWall);")
                   && strip.Contains("footIsWall = clientBand.WallMeasured;"),
-                "on a client the measured footer is the highest wall this page has really shown - the waiting line when it is the higher one, a pressable control when that is - and a measured foot makes the band its own promise (static check, not a runtime proof)");
+                "on a client the measured footer is the very wall the band's own foot was cut from - the slot's layout top, the slot's visible glyphs or a pressable control, whichever reaches higher - so the measurement and the per-repaint check cannot name two different boundaries (static check, not a runtime proof)");
+            check(strip.Contains("float clientSlotTop = slot.Top;")
+                  && strip.Contains("ResultClientSlotEvidence slot = ClientSlot(page);"),
+                "and the bound comes from the production slot reading - the client's own return slot plus the waiting line's rendered glyphs - so a layout box that sits below the text it draws cannot become the board's lower bound (static check, not a runtime proof)");
             check(strip.Contains("clientBand.WaitingTextTightened") && strip.Contains("ResultBoundSource.FooterText"),
                 "and the log line names which of the two walls produced the foot (static check, not a runtime proof)");
         }
@@ -294,7 +300,7 @@ internal static partial class Program
         check(success != null, "the success region is found in the production source (static check, not a runtime proof)");
         if (success != null)
         {
-            check(success.Contains("controls = ScanFooterControls(page, completion, MessageGap, null, board, inspectBoard);"),
+            check(success.Contains("controls = ScanFooterControls(page, completion, MessageGap, null, board, inspectBoard, boardColumn);"),
                 "the client success page never nominates the waiting line as protected page text - it passes `null` - so its tightening can only come from a control the player can press (static check, not a runtime proof)");
             check(success.Contains("ResultsGuestPageGeometry.TryResolve(completion, Screen.width, Screen.height,"),
                 "and its fixed geometry is resolved from the completion edge with no text-derived second clamp (static check, not a runtime proof)");

@@ -43,19 +43,24 @@ internal static class ResultBoardBandIntrusionScenarios
         check(ResultLateControlPolicy.MustMove(standing.Y, standing.Bottom, 180f, 500f),
             "the band's top arriving at 180 with the board's top at 120 and its foot still inside the band's foot is a real intrusion");
 
-        bool placed = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 180f, 500f, standing.Width, standing.Height, 0f, out LayoutRect moved);
+        // 1.19.47 (review #4): the band's foot is a bound, so the board that follows its top is the board that fits the band;
+        // a taller one is refused here and re-fitted smaller by the caller (`TrySmallerGrid`), never drawn past the foot.
+        float fittedHeight = 300f;   // the caller's smaller legal grid: 180..500 holds 320 px
+        bool placed = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 180f, 500f, standing.Width, fittedHeight, 0f, out LayoutRect moved);
         check(placed && Math.Abs(moved.Y - 180f) < 0.01f,
             $"the board follows the band's own top and not some invented coordinate (top={moved.Y:0.##})");
-        check(Math.Abs(moved.Height - standing.Height) < 0.01f,
-            "and it keeps the height - i.e. the grid and glyph size - it was fitted with; only its place moves");
+        check(placed && Math.Abs(moved.Height - fittedHeight) < 0.01f,
+            "and it is placed at the height the caller fitted for this band - the place and the grid it was fitted at move together");
         check(Math.Abs(moved.X - (2560f - standing.Width) * 0.5f) < 0.01f && Math.Abs(moved.Width - standing.Width) < 0.01f,
             "the horizontal place and the width are the placement's own (the band's centring, same width); a vertical intrusion changes neither");
-        // The band did not grow, so the board that followed its top now reaches past the foot: the fail-open path draws it
-        // fainter instead of sliding it back up over the anchor the moved top edge is.
-        float opacity = ResultFallbackOpacity.Resolve(1f, moved.Bottom, 180f, 500f);
+        check(!ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 180f, 500f, standing.Width, standing.Height, 0f, out _),
+            "a board of the old 380 px height is refused by the 320 px band it is now measured against, instead of being drawn past its foot");
+        // The band did not grow, so a board that still reaches past its foot is answered by the faint tier, never by sliding it
+        // back up over the anchor the moved top edge is.
+        float opacity = ResultFallbackOpacity.Resolve(1f, 180f + standing.Height, 180f, 500f);
         check(Math.Abs(opacity - ResultFallbackLayout.OverlapOpacity) < 0.001f,
             $"a board that no longer fits under the moved top is drawn faint ({opacity:0.00}), never slid back over the anchor");
-        check(ResultLateControlPolicy.MustMove(moved.Y, moved.Bottom, 180f, 500f),
+        check(ResultLateControlPolicy.MustMove(180f, 180f + standing.Height, 180f, 500f),
             "the policy keeps reporting the over-band foot, which is the fade's own input - while the repaint's destination is the place the board already stands, so it is not moved a second time for the same band");
     }
 
@@ -85,12 +90,17 @@ internal static class ResultBoardBandIntrusionScenarios
         check(!ResultLateControlPolicy.MustMove(standing.Y, standing.Bottom, 100f, 479.8f),
             "and neither is half a pixel of it");
 
-        bool placed = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 100f, 420f, standing.Width, standing.Height, 0f, out LayoutRect moved);
+        // 1.19.47 (review #4): the foot that arrived leaves 320 px for a 360 px board, so the placement is refused here and
+        // the caller re-fits a smaller legal grid into the same band. What must not happen is the old answer - place it at the
+        // band's top, let it run 60 px past the foot, and correct it a frame later.
+        check(!ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 100f, 420f, standing.Width, standing.Height, 0f, out _),
+            "a foot that arrives under a board taller than the room it leaves refuses the placement instead of drawing past it");
+        bool placed = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 100f, 420f, standing.Width, 300f, 0f, out LayoutRect moved);
         check(placed && Math.Abs(moved.Y - 100f) < 0.01f,
-            "the destination is still the band's own top, which here is above the board: a foot that arrived does not move the board");
+            "a board the band holds is placed at the band's own top, which here is above it: a foot that arrived does not move the board");
         float opacity = ResultFallbackOpacity.Resolve(1f, 480f, 100f, 420f);
         check(Math.Abs(opacity - ResultFallbackLayout.OverlapOpacity) < 0.001f,
-            $"so the board is drawn faint over the control that arrived ({opacity:0.00}) rather than moved somewhere that does not exist");
+            $"and a board that still ends below the foot is drawn faint over the control that arrived ({opacity:0.00}) rather than moved somewhere that does not exist");
 
         // A foot that arrives and leaves a band the board can hold does move it: the whole band slid up.
         bool moved2 = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 60f, 420f, standing.Width, standing.Height, 0f, out LayoutRect up);
@@ -152,18 +162,19 @@ internal static class ResultBoardBandIntrusionScenarios
         check(repaint.Length > 0, "the fail-open repaint re-check was found in ResultsDisplay");
         check(repaint.Contains("ResultLateControlPolicy.MustMove(_origin.Y, _origin.Bottom, strip.Top, strip.Bottom)"),
             "it asks about the rectangle that is on the screen and about both edges of the newly measured band");
-        check(repaint.Contains("bool intrudes = ") && repaint.Contains("bool moved = horizontal || (intrudes && vertical);"),
-            "a vertical move needs a real intrusion and a destination that really differs; a horizontal re-layout keeps its own threshold");
-        check(repaint.Contains("_origin = rect; _holdBoard = rect;") && !repaint.Contains("_grid = null") && !repaint.Contains("ResetPlacement"),
-            "a move assigns the place only - the grid the board was fitted with, and with it the glyph size, is untouched");
+        check(repaint.Contains("bool intrudes = ") && repaint.Contains("bool moved = refitted || sizeChanged || horizontal || (intrudes && vertical);"),
+            "a vertical move needs a real intrusion and a destination that really differs; a horizontal re-layout and a re-fit (review #4) keep their own thresholds");
+        check(repaint.Contains("_origin = rect;") && repaint.Contains("_holdBoard = plate;") && repaint.Contains("_holdStrip = strip;")
+              && !repaint.Contains("_grid = null") && !repaint.Contains("ResetPlacement"),
+            "and a move assigns the place together with the plate and the strip it was re-measured into (review #4's atomic update), never dropping the board or its grid");
         check(repaint.Contains("beforeTop") && repaint.Contains("boardTop={beforeTop:0}->{_origin.Y:0}"),
             "and the line says which edge moved and by how much, so a moved board is explainable from the log");
 
         // The path it runs on: the fail-open branch, i.e. exactly the branch that skips `BoardStillSafe`.
         check(display.Contains("if (!_fallbackPlaced)") && display.Contains("RefreshFallbackSafety();"),
             "the fail-open re-check is the branch the strict path's `BoardStillSafe` is *not* used in - the finding's own point");
-        check(repaint.Contains("if (_page == null || _grid == null) return;"),
-            "a page that has gone away draws nothing new");
+        check(repaint.Contains("if (_page == null || _grid == null || _content == null) return;"),
+            "a page that has gone away - or one whose table content is gone - draws nothing new");
         check(!repaint.Contains("GuestClient()") && !repaint.Contains("ResultPageRole.Host"),
             "the rule is the same for host and client pages; the band it follows is the one each page's own scan produced");
         check(display.Contains("internal static bool ToggleForcedFallback()"),
@@ -171,7 +182,6 @@ internal static class ResultBoardBandIntrusionScenarios
     }
 
     // The fail-open board is moved and faded, never taken away: a screen with no table is the defect that path exists to
-    // remove, and a page whose controls are simply not measurable must still get its board.
     private static void TheFallbackBoardIsNeverTakenAway(Action<bool, string> check)
     {
         string display = Source("ResultsDisplay.cs");
@@ -182,8 +192,9 @@ internal static class ResultBoardBandIntrusionScenarios
             "the fade is derived from the same band the move is, on every repaint");
         check(repaint.Contains("_holdOpacity = opacity;"),
             "and the drawn opacity follows it, so a board that cannot fit is faint rather than invisible");
-        check(display.Contains("It is moved out of their way - down to the band's own top when that edge moved into it - and drawn fainter when"),
-            "the log line says the same thing in words");
+        check(display.Contains("The place and the strip are committed together, the band's foot is read,")
+              && display.Contains("a board that no longer fits is fitted smaller inside the same band instead of being drawn past it."),
+            "the log line says the same thing in words: the band's foot is read, the place and the strip are one measurement, and a board that no longer fits is re-fitted instead of drawn past it");
     }
 
     // A walk that threw is not a miss: it is unreadable, it is retried, and a hit or a real miss is still answered from the

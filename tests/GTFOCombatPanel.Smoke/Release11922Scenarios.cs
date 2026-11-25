@@ -271,7 +271,7 @@ internal static class Release11922Scenarios
         check(fallback.Contains("band=extended") && fallback.Contains("floor + ControlClearance")
               && fallback.Contains("ResultFallbackPlan(top, covered, OverlapOpacity, ResultFallbackReason.OverlapsControls, extended, crosses)"),
             "the invented band is sized from the board in ResultFallbackLayout.TryResolve and reports itself as extended");
-        check(display.Contains("grid.Height <= strip.Bottom - strip.Top + 0.5f"),
+        check(display.Contains("total <= strip.Bottom - strip.Top + 0.5f"),
             "the strict band invariant is untouched: a board taller than the page's own band is still refused");
         check(display.Contains("ResultReportPolicy.OncePerPage(HeadingReports") && display.Contains("ReportForcedDraw("),
             "the forced-frame exception is wired into every refusal gate and the drawn half into the fit/draw path");
@@ -284,8 +284,17 @@ internal static class Release11922Scenarios
             "the anchor failure line keeps the DueToReport contract and adds the FreshWarning cap");
         check(ladder.Contains("canvasDrawn && mode == AnchorCanvasMode.ScreenSpaceCamera"),
             "the canvas-projection rule for screen-space-camera UI elements is in the ladder");
-        check(info.Contains("Version = \"1.19.40\""),
-            "the version carrier says 1.19.40 (the forced-frame and anchor contracts themselves are unchanged, only the forced refusal is now one line per press)");
+        // 1.19.49: one number has to cover the plugin, the manifest and the docs, so it is read and compared instead of being
+        // frozen at this round's own value (the forced-frame and anchor contracts themselves are unchanged: the forced refusal
+        // is still one line per press).
+        const string carrierMark = "internal const string Version = \"";
+        int carrierAt = info.IndexOf(carrierMark);
+        string carrier = carrierAt < 0 ? string.Empty
+            : info.Substring(carrierAt + carrierMark.Length,
+                info.IndexOf('"', carrierAt + carrierMark.Length) - carrierAt - carrierMark.Length);
+        check(carrier.Length > 0
+                && File.ReadAllText(Path.Combine(root, "Thunderstore", "manifest.json")).Contains("\"version_number\": \"" + carrier + "\""),
+            "the version carrier and the Thunderstore manifest carry one number: " + carrier);
         Console.WriteLine("WIRING: RELEASE_11922_FORCED_FRAME_AND_ANCHOR (static source check; not a runtime behaviour test)");
     }
 

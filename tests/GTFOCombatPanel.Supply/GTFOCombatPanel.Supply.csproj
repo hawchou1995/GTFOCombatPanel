@@ -16,6 +16,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
+    <Compile Include="..\..\PackApplication.cs" Link="PackApplication.cs" />
     <Compile Include="..\..\ImpactMetrics.cs" Link="ImpactMetrics.cs" />
     <Compile Include="..\..\CombatStats.cs" Link="CombatStats.cs" />
     <Compile Include="..\..\Localization.cs" Link="Localization.cs" />

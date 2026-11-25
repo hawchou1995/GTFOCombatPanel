@@ -177,7 +177,7 @@ internal static class Release11929Scenarios
             "the panel arms the configured position on the failing branch, and the only lock in the file is on the answering branch below it");
         check(CountOf(panel, "_anchorLocked = true;") == 1,
             "there is exactly one place that locks, so a second path to a lock would fail here");
-        check(panel.Contains("if (!TryResolveOrigin(_grid, out var origin)) { _grid = null; _content = null; return; }", StringComparison.Ordinal)
+        check(panel.Contains("if (!TryResolveOrigin(_grid, out var origin)) { _grid = null; _content = null; _origin = default; return; }", StringComparison.Ordinal)
               && panel.Contains("return false;   // still settling", StringComparison.Ordinal),
             "and a round that has not answered draws nothing rather than jumping to a guess");
     }

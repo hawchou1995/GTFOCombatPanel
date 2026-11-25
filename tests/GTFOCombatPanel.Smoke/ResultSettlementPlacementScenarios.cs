@@ -545,15 +545,15 @@ internal static class ResultSettlementPlacementScenarios
         int pendingAt = display.IndexOf("bool wallPending = ResultClientPageActionPolicy.Pending(", StringComparison.Ordinal);
         int decideAt = display.IndexOf("ResultClientFailureStrip.Decide(Time.frameCount, ClientWall, clientEvidence", StringComparison.Ordinal);
         check(pendingAt >= 0 && decideAt > pendingAt
-              && display.Contains("bool wallPending = ResultClientPageActionPolicy.Pending(waitingTextTop, pressableTop);")
+              && display.Contains("bool wallPending = ResultClientPageActionPolicy.Pending(slot.HostSlotTop, slot.HintGlyphTop);")
               && display.Contains("hidden={controls.Hidden}") && display.Contains("hiddenPageActions={controls.HiddenPageActions}")
               && display.Contains("HeadingReports.Add(\"failure-client-wall-pending-to-fail-open\")"),
-            "the client failure branch feeds the honest predicate the two readings that really are walls (the waiting line's own top and the highest pressable control), prints hidden/hiddenPageActions/waitingText/pressable once per page - including the once-per-page line for a page that stays pending until the fail-open budget answers it - and only then asks the shared decision");
+            "the client failure branch feeds the honest predicate the merged slot wall (the field's layout top, the slot's visible glyphs, the highest pressable control), prints hidden/hiddenPageActions/waitingText/pressable once per page - including the once-per-page line for a page that stays pending until the fail-open budget answers it - and only then asks the shared decision");
         check(geometry.Contains("public static bool Pending(float waitingTextTop, float pressableTop)")
               && geometry.Contains("=> !float.IsFinite(waitingTextTop) && !float.IsFinite(pressableTop);")
               && geometry.Contains("bool answerable = scanComplete && parentCoverageComplete && readable && unmeasuredControls == 0;")
-              && geometry.Contains("wall.Observe(frame, true, true, evidence.WallTop, evidence.UnmeasurableControls)")
-              && geometry.Contains("evidence.WallTop, evidence.UnmeasurableControls);"),
+              && geometry.Contains("wall.Observe(frame, true, true, evidence.WallTop, evidence.UnmeasurableControls, evidence.WallSource)")
+              && geometry.Contains("evidence.WallTop, evidence.UnmeasurableControls, evidence.WallSource);"),
             "the predicate is exactly 'this page measured no wall at all' - the waiting line counts, which is the whole correction - the gate makes a frame with no wall unanswerable, and both the first placement and the standing board (`Measure`) are fed the same combined reading");
 
         // B: the reveal is asked before the section is measured, the gate is a policy call with an escape, and the

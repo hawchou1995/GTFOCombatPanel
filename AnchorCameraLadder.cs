@@ -1192,3 +1192,29 @@ public static class AnchorElementCanvasPolicy
     public static bool ManualAuthorized(bool elementCanvasPresent, AnchorManualCanvasFacts manual)
         => !elementCanvasPresent && manual.Verified;
 }
+
+// Whether the camera a round proved for the equipment column may still project through this poll.
+//
+// This is the decision `PanelBehaviour.BandCameraAlive` makes, kept here - free of Unity and of BepInEx - so that it can be
+// asserted headlessly instead of only being read back out of the source. The facts it takes are exactly the ones that method
+// reads: whether this round proved a camera at all (`proved`), whether that proof came from the HUD's own manual canvas
+// (`manualCanvasProved`, set only from `AnchorCameraChoice.ManualCanvas`), the camera's own `isActiveAndEnabled`, its
+// `gameObject.activeInHierarchy`, and whether those facts could be read at all (`readable` false = the wrapper threw).
+//
+// The rule, and why it is typed rather than general: an enabled, active camera is alive as it always was. A *disabled* camera
+// is alive only when this round proved it through the manual-canvas chain AND it is still active in the hierarchy - because a
+// manual canvas is rendered on demand, so `enabled` names who calls `Render` rather than whether the pixels land in the window
+// (log 2827: `enabled=no, activeInHierarchy=yes`). Nothing else is relaxed: a camera no round proved, an ordinary disabled
+// camera, a camera whose object is no longer active, and an unreadable wrapper all answer false.
+//
+// A `null` camera is deliberately not this function's business: `null` is the *proved* screen-space-overlay answer (Unity
+// composites without a camera), and the caller answers `true` for it before asking anything here.
+public static class BandCameraLiveness
+{
+    public static bool Alive(bool proved, bool manualCanvasProved, bool enabledAndActive, bool activeInHierarchy, bool readable)
+    {
+        if (!readable) return false;
+        if (enabledAndActive) return true;
+        return proved && manualCanvasProved && activeInHierarchy;
+    }
+}

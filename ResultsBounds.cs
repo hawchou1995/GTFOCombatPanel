@@ -38,7 +38,9 @@ public enum ResultBoundSource
     // The same edge, from the last frame that could measure it: a page still revealing itself keeps the band
     // it had instead of falling back to a fraction of the window.
     LastTrustedIconRow = 2,
-    // A page's own title edge - the failure page's mission-failed message - as its upper bound.
+    // A page's own title edge - the failure page's mission-failed message - as its upper bound. 1.19.47 no longer
+    // takes the failure page's band from it (a caption is not completion information, `ResultAutoBoardContract`); it
+    // survives for the callers that still hand it over, and it is still an accepted page-measured top.
     TitleAnchor = 3,
     // Nothing measurable at all: a fraction of the window, used only when both of the above are absent.
     ScreenSafeArea = 4,
@@ -50,6 +52,10 @@ public enum ResultBoundSource
     // TextMeshPro of its own for the waiting line. Named apart so a log line can tell "the line the player reads"
     // from "where that line would be".
     FooterTextControl = 9,
+    // The failure page's own upper edge: the window's safe top margin, the one bound the newest user contract allows
+    // there. The native "mission failed" title is a caption rather than completion information, so it no longer sets
+    // the band's top and no longer spends the table's glyph size - see `ResultAutoBoardContract`.
+    ScreenTopMargin = 10,
     // Any other interaction the page's own scan measured: it may shorten the band, never lengthen it.
     MeasuredControl = 7,
     // Nothing measurable below: the window's own foot margin.
@@ -183,6 +189,10 @@ public static class ResultsBounds
             case ResultBoundSource.FooterControl: return "footer-control";
             case ResultBoundSource.FooterText: return "footer-text";
             case ResultBoundSource.FooterTextControl: return "footer-text-control";
+            // The failure page's own upper edge: the window's safe top margin, which is the one upper bound the newest
+            // user contract allows there. The mission-failed title is a caption rather than completion information, so
+            // it no longer sets the band's top or spends the table's glyph size (`ResultAutoBoardContract`).
+            case ResultBoundSource.ScreenTopMargin: return "screen-top-margin";
             case ResultBoundSource.MeasuredControl: return "measured-control";
             case ResultBoundSource.ScreenFoot: return "screen-foot";
             default: return "none";
@@ -267,4 +277,137 @@ public static class ResultsBandFit
     // and the caller says so once instead of looping on the same impossible measurement for ever.
     public static float MinimumDrawableHeight(int rows, PanelDensity density)
         => Math.Max(1, rows) * RowHeight(AbsoluteMinimumPixels, density);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The settlement board's automatic mode: the newest user contract, in one place
+// ---------------------------------------------------------------------------------------------------
+//
+// The two pages do not answer the same question about their upper edge, and pretending they did is what made a
+// failure page push its table down the screen:
+//
+//   failure  the native "mission failed" title is a caption, not completion information, so it is *not* the band's
+//            upper bound any more. The band starts at the window's own safe top margin and ends at the highest wall
+//            the page really draws below it - the host's leave-expedition button, the client's waiting-status line,
+//            or a pressable control above either. A title laid out lower can no longer push the table down the page
+//            nor spend its glyph size through `ResultsBandFit`.
+//   success  the page's own completion section - the level name, the sector box, the cleared-sector icons and their
+//            captions - is the information the player came for, so its measured lower edge stays the board's upper
+//            bound. A page that cannot prove that edge keeps the vanilla screen: nothing here substitutes a fraction
+//            of the window for it, and no proportionality rule is ever paid for with the section.
+//
+// What both pages do share is the rest of the rule, and it is written once, here:
+//
+//   * the board is bottom-aligned to the wall (`ResultBoardHold.TryPlace(..., bottomAligned: true)`): it grows
+//     upward from the one edge that may not move, instead of hanging from a top edge the page can slide around.
+//   * the glyph is aimed at a resolution-scaled target rather than at "as large as the band allows": 12 px at a
+//     1080-high window and 16 px at 1440, the same 1/90 of the window height in both. That is what keeps one page
+//     with a tall band from turning into a poster while another keeps a readable table, and what makes the same
+//     roster land in the same normalized size and place at 1920x1080 and 2560x1440 (whole pixels are the only
+//     quantisation allowed).
+//   * the target is a target and never a licence to drop content: the row count is fixed, a band that cannot hold
+//     the whole table at the target shrinks the glyph to the largest size that really fits whole rows, and only a
+//     band too short even for the readable floor - or the player's own explicit zoom - leaves rows to the wheel
+//     (`ResultsScroll`). Nothing here crops a row or changes what the table says.
+//
+// Everything here is free of Unity and of BepInEx, so the whole of it is asserted headlessly in
+// tests/GTFOCombatPanel.Smoke (`ResultsPageScenarios.AutoModeContract`).
+public static class ResultAutoBoardContract
+{
+    // The reference frame the target is written in, and the target itself: 12 px at 1080, 16 px at 1440.
+    public const float BaselineScreenHeight = 1080f;
+    public const int BaselineGlyphPixels = 12;
+    // A sanity ceiling: a pathological window height may not ask for a glyph that is no longer a table.
+    public const int MaximumGlyphPixels = 48;
+    // The air the failure page keeps from the window's own top edge, in the pixels of a 1080-high window.
+    public const float TopMarginDesign = 8f;
+
+    // The glyph size this window's automatic mode aims at: 12 px at 1080p and 16 px at 1440p, rounded to whole
+    // pixels because a glyph is drawn at whole pixels, and clamped to the absolute minimum at the small end.
+    public static int TargetGlyphPixels(float screenHeight)
+    {
+        if (!float.IsFinite(screenHeight) || screenHeight <= BaselineScreenHeight * 0.01f) return BaselineGlyphPixels;
+        int pixels = (int)Math.Round(BaselineGlyphPixels * ((double)screenHeight / BaselineScreenHeight));
+        if (pixels < ResultsBandFit.AbsoluteMinimumPixels) pixels = ResultsBandFit.AbsoluteMinimumPixels;
+        if (pixels > MaximumGlyphPixels) pixels = MaximumGlyphPixels;
+        return pixels;
+    }
+
+    // The failure page's own top margin: the same eight design pixels a 1080p window gets, scaled with the height,
+    // and never below the margin every other placement in this mod keeps from the window's edge.
+    public static float TopMargin(float screenHeight)
+    {
+        if (!float.IsFinite(screenHeight) || screenHeight <= BaselineScreenHeight * 0.01f) return TopMarginDesign;
+        float margin = TopMarginDesign * (screenHeight / BaselineScreenHeight);
+        return margin < ResultsBounds.ScreenMargin ? ResultsBounds.ScreenMargin : margin;
+    }
+
+    // The upper edge of one result page's band, and the fact that produced it.
+    //
+    // A success page may only answer with the completion section's own measured lower edge: an unmeasurable one is
+    // `false` here, which is what keeps the vanilla page up instead of drawing the table over the level name and the
+    // sector icons. A failure page answers with the window's safe top margin whatever its title did - its caller
+    // keeps that title for the interaction scan's split and for its own gates, but never as a bound on the table.
+    public static bool TryUpperAnchor(bool successPage, float screenHeight, float completionBottom,
+        out float anchor, out ResultBoundSource source)
+    {
+        anchor = float.NaN;
+        source = ResultBoundSource.None;
+        if (!float.IsFinite(screenHeight) || screenHeight <= ResultsBounds.ScreenMargin * 2f) return false;
+        if (successPage)
+        {
+            // A completion section that cannot be placed on this page is not an edge: the caller defers.
+            if (!float.IsFinite(completionBottom) || completionBottom < 0f
+                || completionBottom >= screenHeight - ResultsBounds.ScreenMargin) return false;
+            anchor = completionBottom;
+            source = ResultBoundSource.IconRow;
+            return true;
+        }
+        anchor = TopMargin(screenHeight);
+        source = ResultBoundSource.ScreenTopMargin;
+        return true;
+    }
+
+    // 1.19.60: the failure page's upper edge, asked once for a client page as well.
+    //
+    // The recorded 1.19.59 client failure page answered this question twice and differently: the strict path started
+    // its band at the window's own safe margin (10.67 at 1440) while the fail-open path started at the live
+    // mission-failed title's bottom (467) plus the same clearance the strict path applies - ~456 px apart on one
+    // page, with the strict board bottom-aligned to its wall and therefore covering the lower 40-90 px of the title
+    // the player is reading. The title is protection, not decoration (that has been this contract's own word for it
+    // since 1.19.55), and it is literally the same page object on both roles, so it bounds both.
+    //
+    // `titleBottom` is the page's live mission-failed title edge; `float.NaN` means this frame could not read it, and
+    // the window margin then stands alone - the one case the contract allows, never an invented title. `measuredControlTop`
+    // is the highest interaction the page's own scan saw reaching past the anchor (`FooterControls.BoardTop`): a
+    // control standing above the title is a wall too, and it may only tighten the band downwards. No clearance is
+    // added here - every caller adds `ResultsBounds.Clearance` exactly once, from the rule that owns it.
+    public static bool TryFailureAnchor(float screenHeight, float titleBottom, float measuredControlTop,
+        out float anchor, out ResultBoundSource source)
+    {
+        anchor = float.NaN;
+        source = ResultBoundSource.None;
+        if (!float.IsFinite(screenHeight) || screenHeight <= ResultsBounds.ScreenMargin * 2f) return false;
+        float limit = screenHeight - ResultsBounds.ScreenMargin;
+        if (!(limit > ResultsBounds.ScreenMargin)) return false;
+        anchor = TopMargin(screenHeight);
+        source = ResultBoundSource.ScreenTopMargin;
+        if (float.IsFinite(titleBottom) && titleBottom > anchor && titleBottom < limit)
+        {
+            anchor = titleBottom;
+            source = ResultBoundSource.TitleAnchor;
+        }
+        // 1.19.60 (review F2): `measuredControlTop` is the *raw* edge of the deepest interaction that reaches past the
+        // anchor - never a value that already had this page's clearance applied to it. The caller subtracts the gap the
+        // scan was run with (`FooterControls.BoardTop - MessageGap`), because the strip adds the clearance itself, once.
+        // A control within half a pixel of the anchor adds nothing, so a value that is the anchor plus a gap can never be
+        // dressed up as a measured control.
+        if (float.IsFinite(measuredControlTop) && measuredControlTop > anchor + 0.5f && measuredControlTop < limit)
+        {
+            anchor = measuredControlTop;
+            source = ResultBoundSource.MeasuredControl;
+        }
+        return true;
+    }
+
 }

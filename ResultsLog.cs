@@ -38,25 +38,24 @@ public static class ResultsLog
             // The new counters are written as the numbers they are, not only as the text of a cell: the cell
             // carries a merged rendering ("12 (3 ~sleeping)"), which cannot be read back into figures.
             AppendCounters(text, entry.Input == null ? null : entry.Input.Counters);
-            // Every row of the board under the name it carries on screen, in board order.
+            // Every row of the board under the name it carries on screen, in board order - exactly one key per row.
+            //
+            // 1.19.60: the supply row used to be written twice. 1.19.34 added a second key under the released
+            // three-field label (`补给效率 / 本人 / 弹药`, `Supply efficiency / self / ammo`) so that a reader of the
+            // archived files kept finding the key it had always parsed. That alias was a *rebuilt* cell, never a second
+            // measurement: its second field was the owner's total, where this build's cell has that player's ammo packs -
+            // so the same player's two lines disagreed about what their own second field meant, and a reader could not
+            // tell which shape it was holding (the archive carries no language field, so a Chinese and an English build
+            // wrote two different alias keys for the same figures). Nothing in this mod ever read it back, and every
+            // number the alias quoted is still written below: the total is `counters.selfSupplyUses`, and the
+            // ammo/tool/med split is `counters.selfAmmoUses` / `selfToolUses` / `selfMedicalUses` beside their two
+            // "known" flags. A script that parsed the old key moves to `counters`, which is the same measurement as
+            // numbers rather than as text.
             for (int row = 1; row < board.Rows; row++)
             {
                 string label = Label(board, row);
                 if (string.IsNullOrEmpty(label)) continue;
                 text.Append("      \"").Append(Escape(label)).Append("\": \"").Append(Escape(board.Joined(row, column))).Append("\",\n");
-                // 1.19.34: the released label is written beside the new one, with the same figures in the released
-                // three-field form, so a reader of these archived files keeps finding the key it has always parsed. The new
-                // cell's first field is the efficiency and the pair behind it is in `counters`, so the legacy value is the
-                // released cell rebuilt from the same numbers rather than a second measurement.
-                if (string.Equals(label, CombatStrings.SupplyRowLabel, StringComparison.Ordinal)
-                    && entry.Input != null && entry.Input.Counters != null)
-                {
-                    string cell = board.Joined(row, column);
-                    string efficiency = cell.Split(new[] { CombatStrings.CellSeparator }, StringSplitOptions.None)[0];
-                    text.Append("      \"").Append(Escape(CombatStrings.SupplyRowLabelLegacy)).Append("\": \"")
-                        .Append(Escape(CombatStrings.SupplyCell(efficiency, entry.Input.Counters.SelfSupplyUses, entry.Input.Counters.SelfAmmoUses)))
-                        .Append("\",\n");
-                }
             }
             text.Append("      \"nameCell\": \"").Append(Escape(board.Joined(0, column))).Append("\"\n");
             text.Append(index + 1 == report.Entries.Count ? "    }\n" : "    },\n");
@@ -89,6 +88,11 @@ public static class ResultsLog
         text.Append("        \"selfToolUses\": ").Append(Count(counters.SelfToolUses)).Append(",\n");
         text.Append("        \"selfMedicalUses\": ").Append(Count(counters.SelfMedicalUses)).Append(",\n");
         text.Append("        \"selfSupplyKindsKnown\": ").Append(counters.SelfSupplyKindsKnown ? "true" : "false").Append(",\n");
+        // 1.19.41: `selfMedicalUses` is a native application this machine either confirmed or did not, so the archive
+        // says which one it is. A row whose medkits were counted on somebody else's machine writes 0 beside
+        // `selfMedicalKnown: false` - an absence a reader can see - instead of a zero it has to guess at. The key is
+        // additive: every existing key and its type are unchanged, and the v8 protocol is not touched.
+        text.Append("        \"selfMedicalKnown\": ").Append(counters.SelfMedicalKnown ? "true" : "false").Append(",\n");
         text.Append("        \"healthLost\": ").Append(Decimal(counters.HealthLost)).Append("\n");
         text.Append("      },\n");
     }

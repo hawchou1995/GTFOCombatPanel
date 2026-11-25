@@ -94,9 +94,10 @@ public readonly struct AnchorSample
 // the caller writes in its place is the last word on the round.
 public sealed class AnchorSamplePolicy
 {
-    // How many failed measurements one round may spend. Twelve failures on the schedule below span 39.5 s of wall
-    // time - 0.5 + 1 + 2 and nine more at the 4 s ceiling - which is far longer than a level's HUD takes to come up
-    // and short enough that a build which can never measure the icon falls back within one expedition.
+    // How many failed measurements one round may spend. Twelve failures are *waited* as eleven intervals between twelve
+    // attempts - 0.5 + 1 + 2 and eight more at the 4 s ceiling = 35.5 s of backoff - which is far
+    // longer than a level's HUD takes to come up and short enough that a build which can never measure the icon falls back
+    // within one expedition. The twelfth delay is the one the spent budget never waits for, and it is not counted (1.19.59).
     public const int Budget = 12;
     // The cadence while the anchor measures: the same 0.25 s poll the table itself refreshes on, so the
     // settle window (`PanelBehaviour` holds the icon still for a second) is unchanged.
@@ -128,8 +129,11 @@ public sealed class AnchorSamplePolicy
     public int Failures { get; private set; }
     public bool Abandoned { get; private set; }
     public AnchorSampleFailure LastFailure { get; private set; }
-    // How long this round has spent waiting between attempts. Printed with the give-up line so the reason
-    // and the cost are stated together.
+    // How much backoff this round has really waited *between* attempts: the retry delays that a following attempt
+    // actually followed, accumulated. It is not a measured wall clock (nothing here times the frame loop) and it does not
+    // include the delay of the failure that spent the budget, which no attempt ever waited through - the twelve-failure
+    // budget therefore reads 35.5 s over eleven intervals. Printed with the give-up line so the reason and the cost are
+    // stated together.
     public float Waited { get; private set; }
     // How many of this round's attempts have already been written to the log. One line per attempt is the only cadence
     // that is both honest and bounded: the attempt number such a line prints is this round's own count, and the number
@@ -282,7 +286,11 @@ public sealed class AnchorSamplePolicy
         Failures++;
         LastFailure = reason == AnchorSampleFailure.None ? AnchorSampleFailure.Unmeasurable : reason;
         float delay = DelayAfter(Failures);
-        Waited += delay;
+        // 1.19.59: only the delays that are really *waited* between attempts are accumulated. The failure that spends the
+        // budget (the twelfth) ends the round, so its delay is never waited through - counting it made the give-up line quote
+        // 39.5 s for a round that actually backed off 35.5 s (eleven intervals). `Waited` is the accumulated backoff of this
+        // round, not a measured wall clock: it says nothing about how long the frame loop took to poll it.
+        if (Failures < Budget) Waited += delay;
         _nextAttempt = float.IsFinite(now) ? now + delay : float.PositiveInfinity;
         if (Failures < Budget) return false;
         Abandoned = true;

@@ -39,6 +39,8 @@ internal static class Release11934Scenarios
         AnOlderPeerRowPrintsUnknownNotZero(check);
         AMalformedPairPrintsUnknownAndKeepsItsFigures(check);
         AnUnclassifiedHealIsCountedAndNeverCalledABloodPack(check);
+        AClientsPackReachesTheTeammatesSettlementRow(check);
+        ADroppedSplitNeverPrintsAMedicalZero(check);
         TheKindsPacketIsBesideTheRowAndAV8PeerIgnoresIt(check);
         AV8PeersRowStillArrivesAndIsReadable(check);
         TheExchangeAcceptsOnlyTheOwnersSplit(check);
@@ -256,8 +258,12 @@ internal static class Release11934Scenarios
             string label = CombatStrings.SupplyRowLabel;
             check(label.Contains("弹药包") && label.Contains("工具包") && label.Contains("血包") && !label.Contains("本人"),
                 "the row label names the four fields it prints: " + label);
+            // 1.19.60: the released label is kept as public API (and as the string a reader may still meet in older
+            // files), but the archive no longer writes it - see `ResultsLog.Build` and the enumeration in
+            // `Release11960Scenarios`. Its own text is unchanged, which is what this assertion is about.
             check(CombatStrings.SupplyRowLabelLegacy.Contains("本人"),
-                "while the released label is still the string the archived files are keyed by: " + CombatStrings.SupplyRowLabelLegacy);
+                "while the released label keeps its own text as public API, even though the archive no longer writes it: "
+                    + CombatStrings.SupplyRowLabelLegacy);
         }
         finally { CombatStrings.Language = language; }
     }
@@ -501,14 +507,18 @@ internal static class Release11934Scenarios
             check(row.GetProperty("selfToolUses").GetInt64() == 1 && row.GetProperty("selfMedicalUses").GetInt64() == 2,
                 "and the two new keys carry the split");
             check(row.GetProperty("selfSupplyKindsKnown").GetBoolean(), "with the flag that says the split was observed");
+            // 1.19.60: exactly one supply key per player, the four-field one. The released three-field alias that used
+            // to be written beside it is gone from the archive (`Release11960Scenarios` enumerates every player
+            // property in both languages to prove it), and every number it quoted is here as a number: the total is
+            // `selfSupplyUses` and the split is the three kind keys.
             check(player.TryGetProperty(CombatStrings.SupplyRowLabel, out JsonElement cell)
                   && cell.GetString() == "30.0% / 1 / 1 / 2",
                 "the row is archived under its new label with the four values: "
                 + (player.TryGetProperty(CombatStrings.SupplyRowLabel, out JsonElement shown) ? shown.GetString() : "missing"));
             string legacy = player.TryGetProperty(CombatStrings.SupplyRowLabelLegacy, out JsonElement legacyCell)
                 ? legacyCell.GetString() : "missing";
-            check(legacy == "30.0% / 4 / 1",
-                "and under the released label with the released three-field value, so a reader of those files keeps working: " + legacy);
+            check(legacy == "missing" && row.GetProperty("selfSupplyUses").GetInt64() == 4,
+                "and no second key is written beside it: the released alias is absent from the archive, while the total it quoted lives on in `counters.selfSupplyUses`: " + legacy);
         }
         finally { CombatStrings.Language = language; }
     }
@@ -547,8 +557,9 @@ internal static class Release11934Scenarios
         check(hud.Contains("string joined = string.Join(content.FieldSeparator, content.Cell(row, column));")
               && hud.Contains("PanelGeometry.SettlementColumnWidths(content.Columns, measured, fontSize);"),
             "the board measures each joined cell, so a fourth field widens the column instead of being cut off");
-        check(display.Contains("=> grid != null && grid.Height <= room + 0.5f && grid.Width <= boardWidth + 0.5f;"),
-            "and a board wider than the page is refused (and re-fitted at a smaller glyph) rather than drawn clipped");
+        check(display.Contains("while (grid != null && grid.Width > boardWidth + 0.5f")
+              && display.Contains("=> HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, float.PositiveInfinity, floor);"),
+            "and a board wider than the page is re-fitted at a smaller glyph rather than drawn clipped - only the height is answered with a scroll position, never the width");
 
         // The board's own measurement, driven the way `HudTable.BuildGrid` drives it: every cell of a column joined as the
         // board joins it, the widest one kept, then the settlement rule turned into the widths the page draws with.
@@ -750,6 +761,100 @@ internal static class Release11934Scenarios
         return parts[0] + CombatStrings.CellSeparator + parts[1];
     }
 
+    // The review's case, end to end: a client (A) applies one medkit to a remote teammate (B). The bracket proves B,
+    // `MedicalPackCredit` writes B's own row, `SettlementRows` keeps that row for the results page, and the cell the
+    // page draws prints one medical pack for B and no fabricated zero for A.
+    private static void AClientsPackReachesTheTeammatesSettlementRow(Action<bool, string> check)
+    {
+        var ledger = new PackApplyLedger();
+        PackBracket bracket = ledger.Begin(Supplier, false);
+        ledger.NoteGive(bracket, Receiver, 0.2);
+        PackApplyResult applied = ledger.End(bracket, null);
+
+        var supplier = new CombatPlayer(Supplier);
+        var receiver = new CombatPlayer(Receiver);
+        var players = new Dictionary<ulong, CombatPlayer> { { Supplier, supplier }, { Receiver, receiver } };
+        var credit = new MedicalPackCredit();
+        int credited = credit.Apply(applied, lookup =>
+            players.TryGetValue(lookup, out CombatPlayer row)
+                ? new MedicalRowCandidate { Known = true, InSlot = true, Row = row.Impact }
+                : default);
+        check(credited == 1, "the client's application credits its remote teammate's row");
+        check(supplier.Impact.SelfMedicalUses == 0 && receiver.Impact.SelfMedicalUses == 1,
+            "the pack's user reads no medical pack of its own and the receiver reads one");
+
+        // The results page shows the rows this class keeps, not the live capture store.
+        var settlement = new SettlementRows();
+        List<CombatPlayer> shown = settlement.Update(new[] { supplier, receiver }, 3);
+        CombatPlayer shownReceiver = shown.Find(row => row != null && row.Lookup == Receiver);
+        CombatPlayer shownSupplier = shown.Find(row => row != null && row.Lookup == Supplier);
+        check(shownReceiver != null && shownReceiver.Impact.SelfMedicalUses == 1 && shownReceiver.Impact.SelfMedicalKnown,
+            "the settlement row still carries the medical pack and the fact this machine confirmed it");
+
+        var receiverInput = new ImpactInput { Name = "B", Lookup = Receiver, Counters = shownReceiver.Impact };
+        var supplierInput = new ImpactInput { Name = "A", Lookup = Supplier, Counters = shownSupplier.Impact };
+        ImpactEntry receiverEntry = ImpactScoring.Evaluate(new[] { receiverInput }, ImpactScoring.DefaultWeights, 1, 1).Entries[0];
+        ImpactEntry supplierEntry = ImpactScoring.Evaluate(new[] { supplierInput }, ImpactScoring.DefaultWeights, 1, 1).Entries[0];
+        string receiverCell = ImpactBoard.MetricFields(receiverEntry, ImpactMetric.SupplyEfficiency, KillTier.Minor, false, true)[0];
+        string supplierCell = ImpactBoard.MetricFields(supplierEntry, ImpactMetric.SupplyEfficiency, KillTier.Minor, false, true)[0];
+        string[] receiverParts = receiverCell.Split(new[] { CombatStrings.CellSeparator }, StringSplitOptions.None);
+        check(receiverParts.Length == 4 && receiverParts[3] == "1",
+            "the cell the results page draws prints one medical pack for the receiver: " + receiverCell);
+        check(supplierCell == CombatStrings.Placeholder,
+            "and the player who applied the pack prints no fabricated zero of its own: " + supplierCell);
+
+        // A later refresh of the same run must not drop the row the pack was written to.
+        List<CombatPlayer> again = settlement.Update(new[] { supplier, receiver }, 3);
+        CombatPlayer refreshed = again.Find(row => row != null && row.Lookup == Receiver);
+        check(refreshed != null && refreshed.Impact.SelfMedicalUses == 1,
+            "a later settlement refresh keeps the row the pack was written to");
+    }
+
+    // When a row's split is dropped, the medical figure is dropped with it - and so is the flag that said this machine
+    // confirmed it. A confirmed flag beside a zeroed count prints as a counted zero: that is the fabricated zero this
+    // release removes, and the archive must not write it either.
+    private static void ADroppedSplitNeverPrintsAMedicalZero(Action<bool, string> check)
+    {
+        var confirmed = new CombatPlayer(Supplier);
+        confirmed.Impact.CreditSelfSupply(SupplyPackKind.Medical);
+        check(confirmed.Impact.SelfMedicalKnown && confirmed.Impact.SelfSupplyKindsKnown,
+            "a confirmed medical pack marks the row's medical figure as known");
+
+        // The same row later reported with a larger total that arrives without a split (an older peer's pair).
+        var larger = new CombatPlayer(Supplier);
+        larger.Impact.SelfSupplyUses = 3;
+        larger.Impact.SelfAmmoUses = 0;
+        larger.Impact.SelfSupplyKindsKnown = false;
+
+        var settlement = new SettlementRows();
+        settlement.Update(new[] { confirmed }, 9);
+        List<CombatPlayer> shown = settlement.Update(new[] { larger }, 9);
+        CombatPlayer row = shown.Find(r => r != null && r.Lookup == Supplier);
+        check(row != null && row.Impact.SelfSupplyUses == 3 && !row.Impact.SelfSupplyKindsKnown,
+            "the larger pair still wins and its split is unknown");
+        check(row.Impact.SelfMedicalUses == 0 && !row.Impact.SelfMedicalKnown,
+            "and the medical figure is not left flagged as confirmed unless it still holds a count");
+
+        var input = new ImpactInput { Name = "R", Lookup = Supplier, Counters = row.Impact };
+        ImpactEntry entry = ImpactScoring.Evaluate(new[] { input }, ImpactScoring.DefaultWeights, 1, 1).Entries[0];
+        string cell = ImpactBoard.MetricFields(entry, ImpactMetric.SupplyEfficiency, KillTier.Minor, false, true)[0];
+        string[] parts = cell.Split(new[] { CombatStrings.CellSeparator }, StringSplitOptions.None);
+        check(parts.Length == 4 && parts[3] == CombatStrings.Unknown,
+            "the cell prints `?` for that medical figure rather than a zero: " + cell);
+
+        // The archive says the same thing in words a reader can act on: a number beside `selfMedicalKnown: false`.
+        var ammoOnly = new ImpactCounters();
+        ammoOnly.CreditSelfSupply(SupplyPackKind.Ammo);
+        var writer = new ImpactInput { Name = "AmmoOnly", Counters = ammoOnly };
+        ImpactReport report = ImpactScoring.Evaluate(new[] { writer }, ImpactScoring.DefaultWeights, 1, 1);
+        ImpactBoardLayout board = ImpactBoard.Build(report, true, true);
+        string json = ResultsLog.Build(true, new DateTime(2026, 11, 21, 12, 0, 0, DateTimeKind.Utc), "1.19.34", board, report);
+        using var document = JsonDocument.Parse(json);
+        JsonElement counters = document.RootElement.GetProperty("players")[0].GetProperty("counters");
+        check(counters.GetProperty("selfMedicalUses").GetInt64() == 0 && !counters.GetProperty("selfMedicalKnown").GetBoolean(),
+            "and the archive writes that absence as 0 beside `selfMedicalKnown: false`, never as an unqualified zero");
+    }
+
     // ---- 6. wiring ---------------------------------------------------------------------------------------------------
 
     private static void Wiring(Action<bool, string> check)
@@ -762,18 +867,25 @@ internal static class Release11934Scenarios
         string board = Code(File.ReadAllText(Path.Combine(root, "ImpactBoard.cs")));
         string protocol = Code(File.ReadAllText(Path.Combine(root, "SyncProtocol.cs")));
 
-        // 1.19.39: the medical kind is named one step further out than the ammo/tool one - the heal path hands the packet's
-        // own `source` fact to `SupplyUse.RecordHealthConsumption`, which is the single place that answers "medical or
-        // unknown". Both native paths still name their kind; only the file that states it moved.
+        // 1.19.39/1.19.41: the medical kind is named further out than the ammo/tool one, and since 1.19.41 it is named
+        // by the native pack-application bracket - one pack per proven receiver - instead of by the arriving heal.
+        // Both native paths still name their kind; only the file that states it moved.
+        string packs = Code(File.ReadAllText(Path.Combine(root, "PackApplication.cs")));
+
+        // 1.19.41: the medical kind is no longer named by a heal - `ReceiveAddHealth` cannot tell a medkit from a
+        // syringe, a disinfection pack or another mod's trickle heal, which is what made one expedition report 1319
+        // medical packs. The kind is named once per proven receiver by the native application bracket, and the heal
+        // keeps its give/receive efficiency measurement. The ammo/tool scope is unchanged.
         check(supply.Contains("scope.Tool ? SupplyPackKind.Tool : SupplyPackKind.Ammo")
-              && supply.Contains("use.RecordHealthConsumption(counters, change.SourceIsPlayer);")
+              && packs.Contains("CreditSelfSupply(SupplyPackKind.Medical);")
+              && supply.Contains("int credited = Credit.Apply(result, CandidateFor);")
               && use.Contains("? RecordConsumption(receiver, SupplyPackKind.Medical)"),
-            "the two native paths name their kind: the ammo/tool scope here and the giver-sourced heal through the one rule");
+            "the two native paths name their kind: the ammo/tool scope here, and one medical pack per proven receiver through the application bracket");
         check(use.Contains("receiver.CreditSelfSupply(kind);"),
             "one place credits a consumed pack, so a use can never be counted as two kinds");
-        check(board.Contains("counters.SelfSupplyKindsKnown)")
+        check(board.Contains("counters.SelfSupplyKindsKnown, counters.SelfMedicalKnown)")
               && board.Contains("counters.SelfToolUses") && board.Contains("counters.SelfMedicalUses"),
-            "the row prints the split and knows whether it was split");
+            "the row prints the split, whether it was split, and whether this machine could confirm the medical part at all");
         check(protocol.Contains("public const ushort KindSupplyKinds = 3;")
               && protocol.Contains("public static bool TryCaptureSupplyKinds(CombatPlayer player, out SupplyKinds kinds)")
               && protocol.Contains("public static bool ApplySupplyKinds(ImpactCounters impact, in SupplyKinds kinds, bool own)"),

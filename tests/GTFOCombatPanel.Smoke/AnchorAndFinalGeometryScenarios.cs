@@ -79,14 +79,18 @@ internal static class AnchorAndFinalGeometryScenarios
         check(!oldAbandoned && oldFailures <= 1 && oldSamples > 1000,
             $"the old baseline is what produced the flood: every repaint restarted the round, so no round ever spent the budget (reads={oldSamples}, attempts={oldAttempts} in the round that was running at the end, failures={oldFailures}, abandoned={oldAbandoned})");
 
-        // The schedule itself, as the failure line quotes it: 0.5 s doubling to a 4 s ceiling, twelve failures spanning
-        // 39.5 s - longer than a level's HUD takes to come up, short enough to fall back within one expedition.
+        // The schedule itself, as the failure line quotes it: 0.5 s doubling to a 4 s ceiling. Twelve *failures* are
+        // waited as **eleven** intervals - the delay of the failure that spends the budget is never waited through -
+        // so the round backs off 35.5 s (1.19.59: the line used to quote the nominal 39.5 s sum, which counted a delay
+        // nothing ever waited for). The cadence itself is unchanged; only the figure the give-up line reports is.
         check(AnchorSamplePolicy.DelayAfter(1) == 0.5f && AnchorSamplePolicy.DelayAfter(2) == 1f && AnchorSamplePolicy.DelayAfter(3) == 2f,
             "the first three retries are half a second, one second and two seconds");
         check(AnchorSamplePolicy.DelayAfter(4) == 4f && AnchorSamplePolicy.DelayAfter(40) == 4f,
             "and the doubling stops at the four second ceiling instead of growing without bound");
         check(Math.Abs(0.5f + 1f + 2f + 9 * 4f - 39.5f) < 1e-4f,
-            "twelve failures really span 39.5 s of waiting, which is the figure the release note quotes");
+            "the nominal sum of all twelve delays is still 39.5 s - the figure the release note quotes");
+        check(Math.Abs(0.5f + 1f + 2f + 8 * 4f - 35.5f) < 1e-4f,
+            "while the eleven intervals that are really waited between twelve attempts sum to 35.5 s");
         check(AnchorSamplePolicy.DelayAfter(0) == AnchorSamplePolicy.SettleInterval,
             "a measurable anchor goes back to the ordinary settle cadence");
 
@@ -613,8 +617,16 @@ internal static class AnchorAndFinalGeometryScenarios
 
         check(ladder.Contains("public static AnchorCameraChoice Select(") && final.Contains("public sealed class ResultFinalGate"),
             "the two policies this round adds are their own files, so both can be asserted without Unity");
-        check(info.Contains("Version = \"1.19.40\""),
-            "the version carrier says 1.19.40: the settlement board is sized by what the page really draws, with the anchor contract asserted above unchanged");
+        // 1.19.49: one number has to cover the plugin, the manifest and the docs (the settlement board is sized by what the page
+        // really draws, with the anchor contract asserted above unchanged), so the carrier is read and compared with the
+        // manifest rather than frozen at this round's own value.
+        const string carrierMark = "internal const string Version = \"";
+        int carrierAt = info.IndexOf(carrierMark);
+        string carrier = carrierAt < 0 ? string.Empty
+            : info.Substring(carrierAt + carrierMark.Length,
+                info.IndexOf('"', carrierAt + carrierMark.Length) - carrierAt - carrierMark.Length);
+        check(carrier.Length > 0 && Source(Path.Combine("Thunderstore", "manifest.json")).Contains("\"version_number\": \"" + carrier + "\""),
+            "the version carrier and the Thunderstore manifest carry one number: " + carrier);
 
         // 1.19.20's own increment, untouched: the split kill tiers and the drawable floor.
         check(board.Contains("public static bool SplitKillTiersFor(float room, float emPerGlyph)") && board.Contains("private static int GlyphFor("),
@@ -681,8 +693,8 @@ internal static class AnchorAndFinalGeometryScenarios
         check(display.Contains("if (succeeded && !CompletionReady(page))"),
             "the drift re-measure stands down while the success page's own reveal is still running");
         check(display.Contains("ResultLateControlPolicy.MustMove(_origin.Y, _origin.Bottom, strip.Top, strip.Bottom)")
-              && display.Contains("bool moved = horizontal || (intrudes && vertical);"),
-            "a standing fail-open board asks about both edges of its band, and about the rectangle that is on the screen rather than the one it was just moved to");
+              && display.Contains("bool moved = refitted || sizeChanged || horizontal || (intrudes && vertical);"),
+            "a standing fail-open board asks about both edges of its band, and about the rectangle that is on the screen rather than the one it was just moved to - and a re-fit (review #4's smaller legal grid) is a move in its own right");
 
         // Everything the board already promised: the native reveal, the interaction proof, the two roles, the wheel,
         // F8, and the vanilla page being restored rather than overlaid.
@@ -694,10 +706,12 @@ internal static class AnchorAndFinalGeometryScenarios
             "the host/client branches, the no-footer proof and the band below the page's actions all still exist");
         check(display.Contains("ToggleForcedFallback") && display.Contains("Forced"),
             "F8 still forces the board and still outranks every gate");
-        check(display.Contains("ApplyVanillaBlocks(page, succeeded)") && display.Contains("RestoreHidden();"),
-            "the vanilla blocks are still put away and still restored");
-        check(display.Contains("ResultsZoom.ScaleSize"),
-            "the wheel's own scaling of the board is unchanged by this round");
+        check(display.Contains("ApplyVanillaBlocks(vanillaPage, vanillaSucceeded)") && display.Contains("RestoreHidden();"),
+            "the vanilla blocks are still put away (after the table drew, 1.19.47 review #3) and still restored - the page"
+                + " handed over is the live one (`LivePage`, 1.19.57), never the cache a repaint may already have cleared");
+        check(display.Contains("ResultsScroll.FontFor(fitted, Plugin.ResultFontScale(succeeded))")
+              && display.Contains("float fittedCeiling = squeezed ? ResultsFontGrowth.BandFillCeiling : fillCeiling;"),
+            "the board is drawn at the size its own strip really fits - a band that cannot hold the comfort glyph is fitted against itself - and any overflow is scrolled");
         check(display.Contains("Completion.Observe(Time.frameCount, true, area.Top)")
               && display.Contains("Footer.Observe(Time.frameCount, measured, top)")
               && display.Contains("Title.Observe(Time.frameCount, active, alpha, measured"),

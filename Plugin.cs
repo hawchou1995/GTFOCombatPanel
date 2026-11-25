@@ -98,13 +98,15 @@ public sealed class Plugin : BasePlugin
             + "0 = 窗口顶端，1 = 底端，0.80 = 屏幕下方五分之一处（默认）。表格向上生长、底边落在这条横线上："
             + "上边缘 = FixedAnchorY × 窗口高度 − 表格高度。所以字号或行数变化时，底边中点不动，只有顶边跟着长。"
             + "允许 0-1；越界或非数字时不夹，保留原版并写诊断。例：FixedAnchorY = 0.80");
-        // The wheel's two preferences. Readable keys, the same section as the rest of the result-page settings,
-        // and a range the wheel itself steps through - so a hand edit, a re-read and a scroll all agree.
+        // The board's two manual size preferences. Readable keys, the same section as the rest of the result-page
+        // settings, and a range a hand edit has to stay inside. They are **manual**: the wheel no longer writes them.
+        // It scrolls the table; a size a player chose in the file is applied to the fitted glyph and clamped to the
+        // readable floor, so a preference can never make the table unreadable - it scrolls instead.
         SuccessFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.SuccessKey, ResultsZoom.Default,
-            new ConfigDescription("SUCCESS 页结算板的字号缩放，用滚轮在板上调节并单独记忆。1.0 是页面自身条带允许的大小——即完成区与送全队返回大厅按钮之间的那段条带。低于 1 画出更小的板；高于 1 会被夹回条带自身的大小，滚轮永远不会让板子盖住那个按钮。滚轮一挡就是一步 0.1。",
+            new ConfigDescription("SUCCESS 页结算板的字号倍率（手动）。1.0 是页面自身为这张表量出的可读字号；0.5-2.0 之间按这个倍率乘上去，并且永远不会低于可读下限——放不下的行改为用滚轮上下滚动，而不是把字缩到看不清。滚轮不再改这个值（滚轮=滚动），只有改文件（或热重载）才会变。",
                 new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
         FailureFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.FailureKey, ResultsZoom.Default,
-            new ConfigDescription("FAILURE 页结算板的字号缩放，用滚轮在板上调节并单独记忆。1.0 是页面自身条带允许的大小——即任务失败提示与下方按钮之间的那段条带。低于 1 画出更小的板；高于 1 会被夹回条带自身的大小，滚轮永远不会让板子盖住按钮。滚轮一挡就是一步 0.1。",
+            new ConfigDescription("FAILURE 页结算板的字号倍率（手动）。1.0 是页面自身为这张表量出的可读字号；0.5-2.0 之间按这个倍率乘上去，并且永远不会低于可读下限——放不下的行改为用滚轮上下滚动，而不是把字缩到看不清。滚轮不再改这个值（滚轮=滚动），只有改文件（或热重载）才会变。",
                 new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
         // The influence board, and the thirteen metrics it scores.
         ShowImpactBoard = Config.Bind("Results", "ShowImpactBoard", true, "在结算页画影响力看板（每位玩家按 100 分制打分并排名，配一句称号与十三项指标）。设 false 则结算页保持游戏原样：没有旧统计表可回落。在关卡内切换 HUD 的同一个键（ToggleKey，默认 F8）在结算页也用于隐藏与显示这块板，但它从不写这个键：F8 保存的是 ShowPanel 和 ShowResultOverlay，此值始终保持这里设置的样子。");
@@ -148,6 +150,10 @@ public sealed class Plugin : BasePlugin
         var harmony = new Harmony(PluginInfo.Guid);
 
         harmony.PatchAll();
+        // 1.19.41: the medical pack bracket is resolved by name, so an interop drift reports an unavailable
+        // metric instead of silently measuring something else. Installed after `PatchAll` so its own diagnostic
+        // line is the last word on what this build actually hooked.
+        PackApplicationPatches.Install(harmony);
         EwcProjectileBridge.EnsureInitialized();
         AddComponent<PanelBehaviour>();
         CombatSync.Register();
@@ -316,52 +322,16 @@ public sealed class Plugin : BasePlugin
         }
     }
 
-    // The wheel scale in force for one result page. Read on every rebuild and never cached, so a hand edit of
-    // the file - or the hot reload that follows it - is on screen the next frame, and so a value that could not be
-    // read at all falls back to the published 1.0 rather than to something nobody asked for.
+    // The manual size multiplier in force for one result page. Read on every rebuild and never cached, so a hand edit
+    // of the file - or the hot reload that follows it - is on screen the next frame, and a value that could not be read
+    // at all falls back to the published 1.0 rather than to something nobody asked for.
+    //
+    // This is a preference and nothing else: the wheel does not write it (the wheel scrolls the table), and the fit
+    // applies it on top of the readable floor (`ResultsScroll.FontFor`), so a multiplier can never be the reason a
+    // table became unreadable - the rows that no longer fit are scrolled to instead.
     internal static float ResultFontScale(bool succeeded)
         => ResultsZoom.Clamp(succeeded ? SuccessFontScale != null ? SuccessFontScale.Value : ResultsZoom.Default
                                        : FailureFontScale != null ? FailureFontScale.Value : ResultsZoom.Default);
-
-    // The wheel's one write, on the same controlled path as F8: the file is saved once by hand and the watcher is
-    // told this save was ours, so the hot reload it would otherwise arm does not fire back at the frame that made
-    // the change. The setting's own `SettingChanged` handler is deliberately left running - that is what drops the
-    // cached board and rebuilds it at the new size - and only the file's automatic save is taken out of the way.
-    //
-    // A wheel that has reached a bound changes nothing, and nothing is what it does: no disk write, no watcher
-    // record, no cache invalidation and no "the scale is now" line. Only a value that really moved is persisted, so
-    // holding the wheel against the end of the range is a no-op rather than a stream of identical saves.
-    //
-    // Returns whether the stored scale really changed.
-    internal static bool PersistResultFontScale(ResultPageKind page, float scale)
-    {
-        ConfigEntry<float> entry = page == ResultPageKind.Success ? SuccessFontScale : FailureFontScale;
-        if (entry == null) return false;
-        float snapped = ResultsZoom.Snap(scale);
-        if (Math.Abs(entry.Value - snapped) <= 0.0005f) return false;
-        ConfigFile file = Instance?.Config;
-        bool autoSave = file != null && file.SaveOnConfigSet;
-        try
-        {
-            if (file != null) file.SaveOnConfigSet = false;
-            entry.Value = snapped;
-            if (file != null)
-            {
-                file.Save();
-                ConfigWatcher.RecordOwnSave();
-            }
-            return true;
-        }
-        catch (Exception error)
-        {
-            Logger?.LogWarning("the settlement board's wheel scale could not be written back to the config file: " + error.Message);
-            return false;
-        }
-        finally
-        {
-            if (file != null) file.SaveOnConfigSet = autoSave;
-        }
-    }
 
     // Rebuilt on every config change. The player name is the row label and is always
     // present; every data column is optional.

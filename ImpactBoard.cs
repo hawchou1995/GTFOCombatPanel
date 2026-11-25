@@ -271,9 +271,14 @@ public static class ImpactBoard
             case ImpactRating.Supply: return counters.SupplyUses > 0 ? CombatStrings.ReasonSupply(counters.SupplyUses, Percent(counters.SupplyEfficiency, 1)) : CombatStrings.Placeholder;
             case ImpactRating.Scan:
                 // A bot's sweep reports no owner, so both figures are marked as an estimate, exactly as
-                // the scan row above them is.
-                return counters.ScanUses > 0
-                    ? (counters.ScanEstimated ? "~" : string.Empty) + CombatStrings.ReasonScan(counters.ScanUses, counters.ScanFirstMarks)
+                // the scan row above them is. 1.19.41: the activation count is only known on the machine that
+                // holds the scanner, so a row read from confirmations alone reports the marks it proved and
+                // never a number of scans.
+                return counters.ScanUses > 0 || counters.ScanFirstMarks > 0 || counters.ScanMarks > 0
+                    ? (counters.ScanEstimated ? "~" : string.Empty)
+                        + (counters.ScanUses > 0
+                            ? CombatStrings.ReasonScan(counters.ScanUses, counters.ScanFirstMarks)
+                            : CombatStrings.ReasonScanMarks(counters.ScanFirstMarks))
                     : CombatStrings.Placeholder;
             case ImpactRating.LoneSurvivor: return counters.LoneSurvivor > 0 ? CombatStrings.ReasonLoneSurvivor(counters.LoneSurvivor) : CombatStrings.Placeholder;
             case ImpactRating.Downs: return counters.Downs > 0 ? CombatStrings.ReasonDowns(counters.Downs) : CombatStrings.Placeholder;
@@ -378,7 +383,7 @@ public static class ImpactBoard
                         || counters.SelfToolUses > 0 || counters.SelfMedicalUses > 0
                     ? CombatStrings.SupplyCell(counters.SupplyUses > 0 ? Percent(counters.SupplyEfficiency, 1) : CombatStrings.Placeholder,
                         counters.SelfSupplyUses, counters.SelfAmmoUses, counters.SelfToolUses, counters.SelfMedicalUses,
-                        counters.SelfSupplyKindsKnown)
+                        counters.SelfSupplyKindsKnown, counters.SelfMedicalKnown)
                     : CombatStrings.Placeholder);
             case ImpactMetric.ToolEfficiency: return Single(ToolEfficiencyText(entry));
             case ImpactMetric.LoneSurvivor: return Single(expeditionSucceeded ? Count(counters.LoneSurvivor) : CombatStrings.Placeholder);
@@ -487,8 +492,14 @@ public static class ImpactBoard
         ImpactCounters counters = entry.Counters ?? new ImpactCounters();
         string name = entry.Input.ToolName ?? string.Empty;
         string scan = IsScannerTool(name)
-            ? counters.ScanUses > 0
-                ? CombatStrings.ToolScan(counters.ScanEstimated, Count(counters.ScanUses), Count(counters.ScanFirstMarks), Count(counters.ScanMarks))
+            ? counters.ScanUses > 0 || counters.ScanFirstMarks > 0 || counters.ScanUsesKnown
+                // 1.19.41: a row whose scanner cooldown this machine read (`ScanUsesKnown`) has a *counted* figure -
+                // including a counted zero for a scanner that never recharged. A row with marks but no readable cooldown
+                // - a teammate's row here, or a row that arrived over the v8 pair - prints `—` for the count beside the
+                // marks it did prove, instead of the precise 0 that would claim a scanner nobody could see.
+                ? CombatStrings.ToolScan(counters.ScanEstimated,
+                    counters.ScanUses > 0 || counters.ScanUsesKnown ? Count(counters.ScanUses) : CombatStrings.Placeholder,
+                    Count(counters.ScanFirstMarks), Count(counters.ScanMarks))
                 : CombatStrings.ToolScanUnavailable
             : string.Empty;
         string details;

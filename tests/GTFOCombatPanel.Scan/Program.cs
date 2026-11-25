@@ -106,6 +106,33 @@ internal static class Program
         Execute(new Enemies.EnemyAgent { Pointer = enemy.Pointer, IsTagged = true, Identity = 999 });
         ScanTagPipeline.Drain();
         Check(CombatTracker.Credits.Count == 0, "production pairing rejects a different Unity instance at the requested native address");
+        // 1.19.41: the activation figure of one scanner is one independent native cooldown session, on the machine
+        // that holds it. Repeated samples of one `m_rechargeStartTime` are one scan, a later start time is the next
+        // one, and a cooldown this build cannot read is an unknown count rather than a precise 0 or 1.
+        var cooldown = new ScannerCooldownLedger();
+        Check(!cooldown.Observable && cooldown.Activations == 0, "a ledger that never read a cooldown reports nothing observable");
+        Check(cooldown.Observe(true, true, true, 100f) == ScannerCooldownSignal.Started, "the first readable session is a scan");
+        Check(cooldown.Observe(true, true, true, 100f) == ScannerCooldownSignal.Continuing && cooldown.Activations == 1,
+            "the same start time polled again is the same scan");
+        Check(cooldown.Observe(true, false, true, 100f) == ScannerCooldownSignal.Completed && cooldown.Completions == 1,
+            "m_recharging going true->false closes the session");
+        Check(cooldown.Observe(true, false, true, 100f) == ScannerCooldownSignal.Idle, "an idle sample after the session closed proves nothing");
+        Check(cooldown.Observe(true, true, true, 100f) == ScannerCooldownSignal.Continuing && cooldown.Activations == 1,
+            "a scanner that leaves and re-enters the *same* cooldown is not a new scan: a mid-session reset of m_recharging never re-counts");
+        Check(cooldown.Observe(true, true, true, 200f) == ScannerCooldownSignal.Started && cooldown.Activations == 2,
+            "a later m_rechargeStartTime is a second, independent activation");
+        Check(cooldown.Observe(true, true, true, 150f) == ScannerCooldownSignal.Continuing && cooldown.Activations == 2,
+            "an out-of-order older start time never adds an activation");
+        Check(cooldown.Observe(false, false, false, float.NaN) == ScannerCooldownSignal.Unavailable && cooldown.Activations == 2 && cooldown.Unusable == 1,
+            "an unreadable cooldown counts nothing and keeps the number it had");
+        var risky = new ScannerCooldownLedger();
+        Check(risky.Observe(true, true, false, float.NaN) == ScannerCooldownSignal.Unavailable && risky.Activations == 0 && risky.SessionOpen,
+            "a busy scanner whose start time cannot be read names no session, so it is not counted and not called zero");
+        Check(risky.Observe(true, false, false, float.NaN) == ScannerCooldownSignal.Completed && risky.Activations == 0,
+            "the unreadable session still closes on the native finish, and still counts no scan");
+        risky.ResetExpedition();
+        Check(!risky.Observable && risky.Activations == 0 && risky.Completions == 0 && risky.Repeats == 0 && risky.Unusable == 0,
+            "a new expedition starts from nothing");
         Console.WriteLine($"PASS: {count} scan pipeline assertions (managed replay, not Unity/Steam)");
     }
 }

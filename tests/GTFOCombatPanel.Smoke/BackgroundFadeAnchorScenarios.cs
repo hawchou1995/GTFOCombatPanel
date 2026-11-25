@@ -335,8 +335,8 @@ internal static class BackgroundFadeAnchorScenarios
             "and the latch is cleared exactly where a round starts again");
         check(panel.Contains("triedBackgroundFade={background}") && panel.Contains("triedBackgroundFade={_backgroundFadeLookup.Describe()}"),
             "the failure line and the give-up line both say whether the background was tried, and why not");
-        check(panel.Contains("source=config"),
-            "and both say that the position in use is the configured one");
+        check(panel.Contains("automatic HUD placement waits for proof") && panel.Contains("automatic HUD placement still waits for proof"),
+            "neither failed measurement claims the configured position was drawn");
         check(CountOf(panel, "triedBackgroundFade=") == 2,
             "there are exactly two rate-limited lines that mention it - the failure and the give-up");
         check(!panel.Contains("\"Background Fade\""),

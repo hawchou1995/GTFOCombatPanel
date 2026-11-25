@@ -202,17 +202,22 @@ internal static class Release11917Scenarios
         check(resolved && plan.Placed && plan.Height > 0f,
             "the answer is a band, never an empty one");
 
-        // The placement arithmetic keeps a board on the band's *top* edge and inside the window; 1.19.21's fit never
-        // hands this helper a board taller than the band it was fitted into, so the old over-band fade in `Fit` is gone
-        // with it. The assertions below pin the helper's own top-aligned, in-window contract.
-        bool tall = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 800f, 900f, 1200f, 540f, 0f, out LayoutRect rect);
-        check(tall, "a board taller than its fallback band is still placed");
-        check(tall && rect.Y >= 800f - 0.5f,
-            $"it keeps the band's upper edge and never climbs above it: y={(tall ? rect.Y : float.NaN):0.##} bandTop=800");
-        check(tall && near(rect.Y, 800f),
-            $"which is the band's own top edge: y={(tall ? rect.Y : float.NaN):0.##}");
-        check(tall && rect.Bottom <= 1440f,
-            "and it still never leaves the window");
+        // 1.19.47 (review #4): the placement arithmetic keeps a board on the band's *top* edge and inside the band, and the
+        // band's foot now binds exactly as its top does. A board taller than the band is refused here - the caller fits a
+        // smaller legal grid into the same band - instead of being drawn past the page's own lower bound (the old rule slid
+        // it up to the window's bottom edge, which is the "guess the screen foot, draw, then correct" loop this replaces).
+        bool tall = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 800f, 900f, 1200f, 540f, 0f, out _);
+        check(!tall, "a board taller than its fallback band is refused instead of drawn past the band's foot");
+        bool fits = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 800f, 1400f, 1200f, 540f, 0f, out LayoutRect rect);
+        check(fits, "a board the band really holds is placed");
+        check(fits && near(rect.Y, 800f),
+            $"and it keeps the band's own top edge and never climbs above it: y={(fits ? rect.Y : float.NaN):0.##}");
+        check(fits && rect.Bottom <= 1400f + 0.5f,
+            "and it stays inside the band it was given, which is the bound the close and the header are measured against");
+        check(!ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 800f, 1440f, 1200f, 1400f, 0f, out _),
+            "a board that would leave the window is refused, whatever its band says");
+        check(!ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 800f, float.NaN, 1200f, 540f, 0f, out _),
+            "and an unmeasured band foot is not a band: the caller keeps the rectangle it already has and draws it faint");
 
         // A page whose controls move under the board is answered with a move, not with a blank screen: the per-repaint
         // re-check exists to hand over a new band, and the failure of a strict gate is not consulted at all.

@@ -279,16 +279,17 @@ public static class ResultFallbackLayout
     {
         rect = default;
         if (!float.IsFinite(screenWidth) || screenWidth <= 0f) return false;
-        if (!float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
         if (!float.IsFinite(width) || !float.IsFinite(height) || width <= 0f || height <= 0f) return false;
         float bandTop = float.IsFinite(top) ? Math.Max(0f, top) : 0f;
-        // The band's own top edge, and never above it: the `bottom` the caller passed is the fit's opacity decision, not a
-        // placement bound, so it is not read here at all.
+        // The band is a *band*: its foot binds exactly as its top does (review #4 - this used to ignore `bottom` entirely and
+        // slide a board that did not fit up to `screenHeight - height`, i.e. it guessed the window's bottom edge and drew a
+        // board the page had refused, which the next repaint then had to take away again). A board that does not fit inside
+        // the band is refused here so the caller can fit a smaller legal grid into the *same* band.
+        float bandBottom = float.IsFinite(bottom) ? bottom : float.NaN;
+        if (!float.IsFinite(bandBottom) || !(bandBottom > bandTop)) return false;
+        if (height > bandBottom - bandTop + 0.5f) return false;
+        if (!float.IsFinite(screenHeight) || bandTop + height > screenHeight - 8f) return false;
         float y = bandTop;
-        float highest = screenHeight - height - 1f;
-        if (!float.IsFinite(highest) || highest < 0f) highest = 0f;
-        if (y > highest) y = highest;
-        if (y < 0f) y = 0f;
         float x = (screenWidth - width) * 0.5f + (float.IsFinite(offsetX) ? offsetX : 0f);
         float widest = screenWidth - width;
         if (!float.IsFinite(widest) || widest < 0f) widest = 0f;

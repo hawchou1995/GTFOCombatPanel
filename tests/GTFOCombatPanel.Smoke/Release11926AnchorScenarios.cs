@@ -257,14 +257,14 @@ internal static class Release11926AnchorScenarios
             "the give-up is cleared in exactly three places: entering a level, a re-anchor, and a sample that measured something - the watch that found the element again");
         check(panel.Contains("_anchorPolicy.Restart();") && panel.Contains("_loggedAnchorCamera = false;"),
             "a re-anchor really starts a new round - its own attempts, its own failure lines, its own camera report");
-        check(panel.Contains("the flashlight anchor was given up on for this level after")
-              && panel.Contains("The HUD is still looked at once every")
-              && panel.Contains("the table keeps the configured PositionX/PositionY"),
-            "a real give-up is still named out loud, says the low-rate watch goes on, and keeps the configured position on screen");
+        check(panel.Contains("the flashlight anchor fast retries ended after")
+              && panel.Contains("The HUD is checked every")
+              && panel.Contains("automatic HUD placement still waits for proof"),
+            "the give-up names the ongoing watch and does not authorize an unproven placement");
         check(panel.Contains("_anchorFallback = true;")
               && panel.Contains("triedBackgroundFade={background}")
-              && panel.Contains("source=config"),
-            "and the retries are drawn from the configured position while they run, with the lookup's own state in the line");
+              && panel.Contains("automatic HUD placement waits for proof"),
+            "the automatic table waits for valid geometry while retries continue");
     }
 
     // ---- wiring, read from the production source -----------------------------------------------

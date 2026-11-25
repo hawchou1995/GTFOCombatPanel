@@ -18,12 +18,14 @@
     <Compile Include="..\..\ImpactMetrics.cs" Link="ImpactMetrics.cs" />
     <Compile Include="..\..\ImpactBoard.cs" Link="ImpactBoard.cs" />
     <Compile Include="..\..\ScanSession.cs" Link="ScanSession.cs" />
+    <Compile Include="..\..\ScannerCooldown.cs" Link="ScannerCooldown.cs" />
     <Compile Include="..\..\ScanTagLedger.cs" Link="ScanTagLedger.cs" />
     <Compile Include="..\..\ToolImpactLedger.cs" Link="ToolImpactLedger.cs" />
     <Compile Include="..\..\ExpeditionMetadata.cs" Link="ExpeditionMetadata.cs" />
     <Compile Include="..\..\RundownKeyResolver.cs" Link="RundownKeyResolver.cs" />
     <Compile Include="..\..\FriendlyFireAttributionLedger.cs" Link="FriendlyFireAttributionLedger.cs" />
     <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
+    <Compile Include="..\..\PackApplication.cs" Link="PackApplication.cs" />
     <Compile Include="..\..\ResultsLog.cs" Link="ResultsLog.cs" />
     <Compile Include="..\..\SettlementArchive.cs" Link="SettlementArchive.cs" />
     <Compile Include="..\..\SettlementRows.cs" Link="SettlementRows.cs" />
@@ -46,15 +48,23 @@
     <Compile Include="..\..\EnemyDeathLedger.cs" Link="EnemyDeathLedger.cs" />
     <Compile Include="..\..\HealthLossLedger.cs" Link="HealthLossLedger.cs" />
     <Compile Include="..\..\ResultsPagePolicy.cs" Link="ResultsPagePolicy.cs" />
+    <Compile Include="..\..\ResultsScroll.cs" Link="ResultsScroll.cs" />
     <Compile Include="..\..\GuestPageGeometry.cs" Link="GuestPageGeometry.cs" />
     <Compile Include="..\..\SentryShotLedger.cs" Link="SentryShotLedger.cs" />
     <Compile Include="..\..\SquadDiagnostics.cs" Link="SquadDiagnostics.cs" />
     <Compile Include="..\..\AnchorSamplePolicy.cs" Link="AnchorSamplePolicy.cs" />
     <Compile Include="..\..\AnchorCameraLadder.cs" Link="AnchorCameraLadder.cs" />
+    <Compile Include="..\..\HudAvoidance.cs" Link="HudAvoidance.cs" />
     <Compile Include="..\..\ResultFinalLayout.cs" Link="ResultFinalLayout.cs" />
     <Compile Include="..\..\FallbackLayout.cs" Link="FallbackLayout.cs" />
     <Compile Include="..\..\ResultsBounds.cs" Link="ResultsBounds.cs" />
     <Compile Include="..\..\FixedLayout.cs" Link="FixedLayout.cs" />
+    <Compile Include="..\..\ResultSettlementChrome.cs" Link="ResultSettlementChrome.cs" />
+    <Compile Include="..\..\SettlementPointer.cs" Link="SettlementPointer.cs" />
     <Compile Include="..\..\SettlementStorage.cs" Link="SettlementStorage.cs" />
+    <Compile Include="..\..\HudAbsenceLedger.cs" Link="HudAbsenceLedger.cs" />
+    <Compile Include="..\..\ResultWheel.cs" Link="ResultWheel.cs" />
+    <Compile Include="..\..\ResultVanillaHold.cs" Link="ResultVanillaHold.cs" />
+    <Compile Include="..\..\ResultFrameSample.cs" Link="ResultFrameSample.cs" />
   </ItemGroup>
 </Project>

@@ -89,6 +89,8 @@ public static class ResultFixedLayout
     public const string GridUnmeasurable = "fixed-layout-grid-unmeasurable";
     public const string FontNotHonoured = "fixed-layout-font-not-honoured";
     public const string OffScreen = "fixed-layout-offscreen";
+    // 1.19.41 review #4：固定板在竖直方向放不下（预留页面自己的表头带之后）。
+    public const string VerticalRoom = "fixed-layout-vertical-room";
     public const string OverlapsControl = "fixed-layout-overlaps-control";
     // 画了：这块板干净地替代了原版块（opacity 1.0）。
     public const string Placed = "fixed-layout-placed";

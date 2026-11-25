@@ -201,10 +201,15 @@ internal static class Release11924Scenarios
         string info = File.ReadAllText(Path.Combine(root, "PluginInfo.cs"));
         string manifest = File.Exists(Path.Combine(root, "Thunderstore", "manifest.json"))
             ? File.ReadAllText(Path.Combine(root, "Thunderstore", "manifest.json")) : string.Empty;
-        check(info.Contains("Version = \"1.19.40\""),
-            "the version carrier says 1.19.40");
-        check(manifest.Contains("\"version_number\": \"1.19.40\""),
-            "the Thunderstore manifest carries version_number 1.19.40");
+        // 1.19.49: one number covers the plugin, the manifest and the docs, so the carrier is read and compared with the
+        // manifest rather than frozen at this round's own value.
+        const string carrierMark = "internal const string Version = \"";
+        int carrierAt = info.IndexOf(carrierMark);
+        string carrier = carrierAt < 0 ? string.Empty
+            : info.Substring(carrierAt + carrierMark.Length,
+                info.IndexOf('"', carrierAt + carrierMark.Length) - carrierAt - carrierMark.Length);
+        check(carrier.Length > 0 && manifest.Contains("\"version_number\": \"" + carrier + "\""),
+            "the version carrier and the Thunderstore manifest carry one number: " + carrier);
         Console.WriteLine("WIRING: RELEASE_11924_CHINESE_CONFIG_SURFACE (static source check; not a runtime behaviour test)");
     }
 

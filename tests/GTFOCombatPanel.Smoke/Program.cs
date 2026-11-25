@@ -171,6 +171,32 @@ internal static partial class Program
         SyncProtocol.Apply(mirror, snap, 0, 1, 2, 3);
         Check(mirror.Total.ShotsFired == 100 && Math.Abs(mirror.Total.EnemyDamage - 1234.5) < 0.01, "re-applying the same snapshot does not double count");
 
+        // 1.19.41: an activation count is exact only on the machine that reads the holder's scanner, so a snapshot -
+        // which may carry an older peer's window count, or an echo of this machine's own broadcast - never overwrites
+        // it there. The marks are per-confirmation evidence and still travel.
+        var scanHolder = new CombatPlayer(0xABCUL);
+        scanHolder.Impact.ScanUsesKnown = true;
+        scanHolder.Impact.ScanUses = 2;
+        SyncProtocol.Apply(scanHolder, snap, 0, 1, 2, 3);
+        Check(scanHolder.Impact.ScanUses == 2 && scanHolder.Impact.ScanFirstMarks == 5 && scanHolder.Impact.ScanMarks == 9,
+            "a snapshot cannot overwrite the activation count of the row whose scanner this machine reads, and its marks still arrive");
+        var scanReader = new CombatPlayer(0xDEFUL);
+        SyncProtocol.Apply(scanReader, snap, 0, 1, 2, 3);
+        Check(scanReader.Impact.ScanUses == 2 && !scanReader.Impact.ScanUsesKnown,
+            "a row this machine cannot read still takes the travelling figure and stays marked as not locally observed");
+        // The merge path has the same guard: a snapshot from an older peer cannot replace an observed count with its
+        // own larger one, while a row nothing was observed for still takes it.
+        var echoSnap = SyncProtocol.Capture(new CombatPlayer(0xDEFUL), 0, 1, 2, 3, 0, false);
+        echoSnap.ScanUses = 99;
+        var observed = new CombatPlayer(0xABCUL);
+        observed.Impact.ScanUsesKnown = true;
+        observed.Impact.ScanUses = 1;
+        CombatMerge.ApplyRemote(observed, echoSnap, 0, 1, 2, 3, 0xABCUL);
+        Check(observed.Impact.ScanUses == 1, "a merged snapshot never replaces the observed activation count with a peer's figure");
+        var unobserved = new CombatPlayer(0x111UL);
+        CombatMerge.ApplyRemote(unobserved, echoSnap, 0, 1, 2, 3, 0x111UL);
+        Check(unobserved.Impact.ScanUses == 99, "and a row with no readable cooldown still takes the figure that travelled");
+
         Check(!SyncProtocol.Accepts(0xABCUL, snap), "a snapshot about the local player is refused, its own measurement wins");
         Check(SyncProtocol.Accepts(0xDEFUL, snap), "a snapshot about another player is accepted");
         Check(!SyncProtocol.Accepts(0xDEFUL, new SyncSnapshot()), "a snapshot that names nobody is refused");
@@ -1090,22 +1116,130 @@ internal static partial class Program
         Check(board.Cell(-1, 1).Length == 0 && board.Cell(0, 999).Length == 0 && board.Tone(999, 999) == ImpactTone.Neutral, "board bounds are safe");
         var scanState = new ScanSession();
         var scans = new ImpactCounters();
-        Check(scanState.MarkEnemy(11, scans) && scans.ScanFirstMarks == 1 && scans.ScanUses == 1 && scans.ScanMarks == 1, "a fresh session's first reveal is a first mark and stands as its own sweep");
-        Check(scanState.ObserveTagging(true, scans) && scans.ScanUses == 2 && scans.ScanMarks == 1, "a rising tag flag starts exactly one attempt without changing previous cumulative marks");
-        Check(!scanState.ObserveTagging(true, scans) && scans.ScanUses == 2, "prefix postfix and frame polling share one attempt");
+        Check(scanState.MarkEnemy(11, scans) && scans.ScanFirstMarks == 1 && scans.ScanUses == 0 && scans.ScanMarks == 1, "a fresh session's first reveal is a first mark, and a mark is not an activation");
+        Check(scanState.ObserveTagging(true, scans) && scans.ScanUses == 0 && scans.ScanMarks == 1, "a rising tag flag opens one sweep window and counts no scan: the flag flips many times inside one native scan");
+        Check(!scanState.ObserveTagging(true, scans) && scans.ScanUses == 0, "prefix postfix and frame polling share one window, and no window is an activation");
         Check(!scanState.MarkEnemy(11, scans) && scans.ScanFirstMarks == 1 && scans.ScanMarks == 2, "a repeat target counts once in a new sweep but not as a first mark");
         Check(!scanState.MarkEnemy(11, scans) && scans.ScanMarks == 2, "repeated samples of one target in the same sweep are deduplicated");
-        Check(scanState.MarkEnemy(12, scans) && scans.ScanFirstMarks == 2 && scans.ScanUses == 2 && scans.ScanMarks == 3, "a second target increments cumulative marks only once within the sweep");
+        Check(scanState.MarkEnemy(12, scans) && scans.ScanFirstMarks == 2 && scans.ScanUses == 0 && scans.ScanMarks == 3, "a second target increments cumulative marks only once within the sweep, and still no activation");
         scanState.ObserveTagging(false, scans);
-        Check(scanState.MarkEnemy(13, scans) && scans.ScanUses == 3 && scans.ScanMarks == 4, "a reveal outside a tag still counts the sweep it evidences");
-        Check(scanState.ObserveTagging(true, scans) && !scanState.MarkEnemy(11, scans) && !scanState.MarkEnemy(13, scans) && scans.ScanFirstMarks == 3 && scans.ScanUses == 4 && scans.ScanMarks == 6, "later sweeps count repeated targets cumulatively without recounting first marks");
+        Check(scanState.MarkEnemy(13, scans) && scans.ScanUses == 0 && scans.ScanMarks == 4, "a reveal outside a tag counts its mark and no activation");
+        Check(scanState.ObserveTagging(true, scans) && !scanState.MarkEnemy(11, scans) && !scanState.MarkEnemy(13, scans) && scans.ScanFirstMarks == 3 && scans.ScanUses == 0 && scans.ScanMarks == 6, "later sweeps count repeated targets cumulatively without recounting first marks or inventing scans");
         var botState = new ScanSession();
         var botScans = new ImpactCounters();
         Check(botState.BeginBotTag(10f, 2f, botScans) && botScans.ScanEstimated, "bot tagging is explicitly estimated");
-        Check(!botState.BeginBotTag(10.1f, 2f, botScans) && !botState.BeginBotTag(11.9f, 2f, botScans) && botScans.ScanUses == 1, "continuous bot callbacks within tag duration share one denominator");
+        Check(!botState.BeginBotTag(10.1f, 2f, botScans) && !botState.BeginBotTag(11.9f, 2f, botScans) && botScans.ScanUses == 0, "continuous bot callbacks within tag duration share one window, and a bot's unreadable cooldown is no activation");
         Check(botState.MarkEnemy(20, botScans, true) && !botState.MarkEnemy(20, botScans, true) && botScans.ScanMarks == 1, "bot enemy identities are deduplicated within a sweep");
-        Check(botState.BeginBotTag(12f, 2f, botScans) && botScans.ScanUses == 2 && !botState.MarkEnemy(20, botScans, true) && botScans.ScanMarks == 2, "a later bot sweep counts the same enemy cumulatively but only once");
+        Check(botState.BeginBotTag(12f, 2f, botScans) && botScans.ScanUses == 0 && !botState.MarkEnemy(20, botScans, true) && botScans.ScanMarks == 2, "a later bot sweep counts the same enemy cumulatively but only once");
         Check(!botState.BeginBotTag(float.NaN, 2f, botScans) && !botState.MarkEnemy(0, botScans, true), "invalid bot times and zero identities are discarded");
+
+        // 1.19.42: a bot's scan is counted from the one piece of evidence that names exactly one scan - the scan
+        // start the bot's own action publishes - and from nothing else. `StartScanning` (RVA 0x17DB430) writes it
+        // as the scan begins, `UpdateStateScan` (RVA 0x17DBA90) reads it as its elapsed baseline and re-enters its
+        // tag state calling `BotTag` again inside that same scan (the one call site is 0x17DBF0D), while
+        // `BotGetScanResult` is only a query. Until now a bot row had marks and no activation at all.
+        var botUseScan = new ScanSession();
+        var botUses = new ImpactCounters();
+        Check(!botUses.ScanUsesKnown && botUses.ScanUses == 0,
+            "a bot row whose scan start was never read knows no number of scans");
+        Check(botUseScan.ObserveBotScan(true, 8f, botUses) == BotScanSignal.Started && botUses.ScanUses == 1 && botUses.ScanUsesKnown,
+            "one readable scan start is exactly one scan, and the figure becomes a counted number");
+        Check(botUseScan.ObserveBotScan(true, 8f, botUses) == BotScanSignal.Continuing && botUses.ScanUses == 1,
+            "the same start polled again - or a second BotTag inside that scan - is the same scan");
+        Check(botUseScan.ObserveBotScan(false, float.NaN, botUses) == BotScanSignal.Unavailable && botUses.ScanUses == 1,
+            "a scan start this build cannot read counts nothing and is never turned into an estimate");
+        Check(botUseScan.ObserveBotScan(true, 16f, botUses) == BotScanSignal.Started && botUses.ScanUses == 2,
+            "a later start is a second, independent scan");
+        for (int flip = 0; flip < 5; flip++)
+        {
+            botUseScan.ObserveTagging(flip % 2 == 0, botUses);
+            botUseScan.MarkEnemy(60 + flip, botUses, true);
+        }
+        botUseScan.ObserveConfirmed(60, botUses, true, true);
+        botUseScan.BeginBotTag(9f, 2f, botUses);
+        botUseScan.BeginConfirmWindow();
+        Check(botUses.ScanUses == 2,
+            "tag windows, marks, an execution confirmation and the result query add no bot scan");
+        // The replay the recorded expedition gives us: a bot sweeping every ~8 s for 69 minutes is 518 real starts
+        // from 0 s to 4136 s, while the same expedition flipped a human's `m_tagging` 722 times - windows, not
+        // scans. Repeated polls, marks and short unreadable stretches are interleaved on purpose. There is no cap:
+        // the figure is whatever the evidence proves, and nothing is derived from a duration.
+        var replayScan = new ScanSession();
+        var replayUses = new ImpactCounters();
+        for (int index = 0; index < 518; index++)
+        {
+            float start = index * 8f;
+            for (int poll = 0; poll < 3; poll++) replayScan.ObserveBotScan(true, start, replayUses);
+            replayScan.ObserveTagging(false, replayUses);
+            replayScan.ObserveTagging(true, replayUses);
+            replayScan.MarkEnemy(400 + index % 7, replayUses, true);
+            replayScan.BeginBotTag(start + 0.5f, 2f, replayUses);
+            replayScan.ObserveBotScan(true, start, replayUses);
+            if (index % 97 == 0) replayScan.ObserveBotScan(false, float.NaN, replayUses);
+        }
+        Check(replayUses.ScanUses == 518 && replayUses.ScanUsesKnown,
+            "69 minutes of a bot sweeping every ~8 s is 518 scans however often each start is polled: " + replayUses.ScanUses);
+        Check(replayUses.ScanUses < 1036,
+            "the 1036 tag-flag windows of that replay are windows, not scans");
+        // The production wiring, so the rule above is the one the game actually calls: the count happens on the
+        // BotTag return path only, the owner and the start both have to come from the action's own scope, and the
+        // scope is popped even when the native update throws.
+        var scanSource = new DirectoryInfo(AppContext.BaseDirectory);
+        while (scanSource != null && !File.Exists(Path.Combine(scanSource.FullName, "GTFOCombatPanel.csproj"))) scanSource = scanSource.Parent;
+        Check(scanSource != null, "the bot scan wiring regression locates the production source");
+        string scanTracker = scanSource == null ? string.Empty : File.ReadAllText(Path.Combine(scanSource.FullName, "CombatTracker.cs"));
+        string scanHooks = scanSource == null ? string.Empty : File.ReadAllText(Path.Combine(scanSource.FullName, "ScanPatches.cs"));
+        Check(scanHooks.Contains("out CombatTracker.BotScanScope __state") && scanHooks.Contains("CombatTracker.EndBotScanAction(__state)"),
+            "the scan action's prefix publishes its own scope and the finalizer pops it, so a throwing update cannot leave a stale scope");
+        Check(scanTracker.Contains("bool startKnown = fromAction && scope.StartKnown;")
+              && scanTracker.Contains("probe.Session.ObserveBotScan(startKnown, scanStart, player.Impact);"),
+            "a bot use is counted only when the owner came from the bot's own scan action and that action's scan start was readable");
+        Check(scanTracker.Split(new[] { "ObserveBotScan(" }, StringSplitOptions.None).Length - 1 == 1,
+            "exactly one production call site counts a bot scan, and it is the BotTag return path");
+        Check(scanTracker.Contains("probe.Session.BeginBotTag(Time.time, EnemyScanner.s_tagDuration, player.Impact);"),
+            "the tag-window estimate is still the window estimate: it opens marks and is never the activation");
+
+        // 1.19.41: the activation figure is one independent native cooldown session - `m_recharging` true with a
+        // `m_rechargeStartTime` later than the last one this holder showed - and it exists only on the machine
+        // that holds the scanner. Polling the same session on every frame is the same scan; the tag flag, a mark
+        // and the local echo of one's own tag are none of them activations; a cooldown this build cannot read is
+        // an *unknown* count, never a precise zero.
+        var cooldown = new ScanSession();
+        var cooldownCounters = new ImpactCounters();
+        Check(!cooldownCounters.ScanUsesKnown, "a row whose scanner cooldown was never read knows no number of scans");
+        Check(cooldown.ObserveRecharge(true, true, true, 100f, cooldownCounters) == ScannerCooldownSignal.Started, "a readable cooldown session is the activation");
+        Check(cooldownCounters.ScanUses == 1 && cooldownCounters.ScanUsesKnown, "the first session is exactly one scan, and the figure is now a counted number");
+        Check(cooldown.ObserveRecharge(true, true, true, 100f, cooldownCounters) == ScannerCooldownSignal.Continuing && cooldownCounters.ScanUses == 1, "the same start time polled again is the same scan");
+        for (int flip = 0; flip < 5; flip++) cooldown.ObserveTagging(flip % 2 == 0, cooldownCounters);
+        cooldown.MarkEnemy(31, cooldownCounters);
+        Check(cooldownCounters.ScanUses == 1, "five tag-flag flips and a mark add no scan: the flag is in-sweep progress, not an activation");
+        Check(cooldown.ObserveRecharge(true, false, true, 100f, cooldownCounters) == ScannerCooldownSignal.Completed, "the cooldown leaving is the session's completion edge");
+        Check(cooldown.ObserveRecharge(true, true, true, 200f, cooldownCounters) == ScannerCooldownSignal.Started && cooldownCounters.ScanUses == 2, "a later start time is a second, independent activation");
+        Check(cooldown.ObserveRecharge(true, true, true, 150f, cooldownCounters) == ScannerCooldownSignal.Continuing && cooldownCounters.ScanUses == 2, "an out-of-order older start time never adds an activation");
+        Check(cooldown.ObserveRecharge(false, false, false, float.NaN, cooldownCounters) == ScannerCooldownSignal.Unavailable && cooldownCounters.ScanUses == 2, "an unreadable cooldown counts nothing and keeps the number it had");
+        var unreadableSession = new ScanSession();
+        var unreadableCounters = new ImpactCounters();
+        Check(unreadableSession.ObserveRecharge(false, false, false, float.NaN, unreadableCounters) == ScannerCooldownSignal.Unavailable
+              && unreadableCounters.ScanUses == 0 && !unreadableCounters.ScanUsesKnown,
+            "a scanner whose cooldown cannot be read reports an unknown count, not a precise zero");
+        Check(CombatStrings.ToolScan(false, CombatStrings.Placeholder, "3", "3") == "扫描 — 次 / 首次 3 只",
+            "the cell prints `—` for a count nobody could observe beside the marks it did prove");
+        // A holder whose cooldown was read has a *counted* figure even when it is zero - the two states the row must
+        // never confuse: nobody observed it (`—`) and observed-with-no-scan (`0`).
+        var knownZeroScan = new ImpactInput { Name = "Scout", ToolName = "Bio Tracker" };
+        knownZeroScan.Counters.ScanUsesKnown = true;
+        var knownZeroBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { knownZeroScan }, ImpactScoring.DefaultWeights, 1, 1), false, true);
+        Check(knownZeroBoard.Joined(22, 1) == "扫描 0 次 / 首次 0 只",
+            "a scanner whose cooldown this machine read prints its counted zero, not a dash: " + knownZeroBoard.Joined(22, 1));
+        var unobservedScan = new ImpactInput { Name = "Scout", ToolName = "Bio Tracker" };
+        unobservedScan.Counters.ScanFirstMarks = 2;
+        unobservedScan.Counters.ScanMarks = 2;
+        var unobservedBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { unobservedScan }, ImpactScoring.DefaultWeights, 1, 1), false, true);
+        Check(unobservedBoard.Joined(22, 1) == "扫描 — 次 / 首次 2 只",
+            "and a row nobody could observe prints a dash for the count beside the marks it proved: " + unobservedBoard.Joined(22, 1));
+        estimatedScan.Counters.ScanUses = 0; estimatedScan.Counters.ScanFirstMarks = 3; estimatedScan.Counters.ScanUsesKnown = false;
+        Check(ImpactScoring.HasValue(estimatedScan, ImpactMetric.ToolEfficiency),
+            "a scanner with first marks but no readable cooldown still has a utility figure, so the scoring normalization is not silently changed");
         var newScanState = new ScanSession();
         newScanState.ObserveTagging(true, new ImpactCounters());
         Check(newScanState.MarkEnemy(11, new ImpactCounters()), "a fresh expedition ledger has no previous enemy identities");
@@ -1137,12 +1271,12 @@ internal static partial class Program
         var confirmCounters = new ImpactCounters();
         confirmScan.BeginConfirmWindow();
         confirmScan.ObserveConfirmed(81, confirmCounters, true);
-        Check(confirmCounters.ScanFirstMarks == 1 && confirmCounters.ScanMarks == 1 && confirmCounters.ScanUses == 1,
-            "one native confirmation is one reveal, one cumulative mark and one attempt");
+        Check(confirmCounters.ScanFirstMarks == 1 && confirmCounters.ScanMarks == 1 && confirmCounters.ScanUses == 0,
+            "one native confirmation is one reveal and one cumulative mark, and it is not an activation");
         confirmScan.BeginConfirmWindow();
         confirmScan.ObserveConfirmed(81, confirmCounters, true);
-        Check(confirmCounters.ScanFirstMarks == 1 && confirmCounters.ScanMarks == 2 && confirmCounters.ScanUses == 1,
-            "the same enemy confirmed twice is one first mark, two cumulative marks, and the second confirmation adds no attempt");
+        Check(confirmCounters.ScanFirstMarks == 1 && confirmCounters.ScanMarks == 2 && confirmCounters.ScanUses == 0,
+            "the same enemy confirmed twice is one first mark, two cumulative marks, and the second confirmation adds no activation");
         // The guest row takes the same path with no readable flag at all - no `ObserveTagging` call anywhere in
         // this block - which is exactly the host-side case for a player it has no scanner for: the cumulative
         // figure grows by one per confirmation instead of mirroring the unique reveals.
@@ -1151,9 +1285,9 @@ internal static partial class Program
         guestScan.BeginConfirmWindow(); guestScan.ObserveConfirmed(81, guestCounters, true);
         guestScan.BeginConfirmWindow(); guestScan.ObserveConfirmed(81, guestCounters, true);
         guestScan.BeginConfirmWindow(); guestScan.ObserveConfirmed(82, guestCounters, true);
-        Check(guestCounters.ScanFirstMarks == 2 && guestCounters.ScanMarks == 3 && guestCounters.ScanUses == 1,
-            "a remote player's row credited only through native confirmations accumulates one mark per confirmation instead of mirroring the first marks");
-        Check(!guestScan.ObserveTagging(false, null) && guestCounters.ScanMarks == 3 && guestCounters.ScanUses == 1,
+        Check(guestCounters.ScanFirstMarks == 2 && guestCounters.ScanMarks == 3 && guestCounters.ScanUses == 0 && !guestCounters.ScanUsesKnown,
+            "a remote player's row credited only through native confirmations accumulates one mark per confirmation, and its scan count stays unknown rather than 0");
+        Check(!guestScan.ObserveTagging(false, null) && guestCounters.ScanMarks == 3 && guestCounters.ScanUses == 0,
             "the tracker's own flag poll still changes no figure when the flag reads false and there is no counter");
 
         // The scan cell prints the cumulative figure only when it really differs from the first-mark figure:
@@ -1175,10 +1309,10 @@ internal static partial class Program
         var secondScanner = new ScanSession();
         var secondCounters = new ImpactCounters();
         firstScanner.ObserveTagging(true, firstCounters);
-        Check(firstScanner.MarkEnemy(41, firstCounters) && firstCounters.ScanFirstMarks == 1 && firstCounters.ScanUses >= 1, "the sweep that reveals an enemy first takes the credit");
+        Check(firstScanner.MarkEnemy(41, firstCounters) && firstCounters.ScanFirstMarks == 1 && firstCounters.ScanUses == 0, "the sweep that reveals an enemy first takes the credit, and its tag window is not an activation");
         Check(!firstScanner.MarkEnemy(41, firstCounters) && firstCounters.ScanFirstMarks == 1, "a second sweep of the same enemy by the same scanner is a repeat, not a mark");
         secondScanner.ObserveTagging(true, secondCounters);
-        Check(secondScanner.MarkEnemy(41, secondCounters) && secondCounters.ScanFirstMarks == 1 && secondCounters.ScanUses >= 1, "an enemy the squad's other tracker revealed is still a first mark for this scanner");
+        Check(secondScanner.MarkEnemy(41, secondCounters) && secondCounters.ScanFirstMarks == 1 && secondCounters.ScanUses == 0, "an enemy the squad's other tracker revealed is still a first mark for this scanner, and its tag window is not an activation");
         Check(secondScanner.Observe(41, secondCounters) == ScanMark.Repeat, "the same scanner sweeping the same enemy again is a repeat");
         Check(secondScanner.MarkEnemy(42, secondCounters) && secondCounters.ScanFirstMarks == 2, "an enemy nobody had revealed is a first mark");
         Check(secondScanner.Observe(43, secondCounters) == ScanMark.First, "the tracker can tell a repeat from a first mark");
@@ -2060,6 +2194,119 @@ internal static partial class Program
             "a damage base with no enemy behind it is scenery, not a hit");
         Check(!EwcReconcile.ProjectileHitCounts(true, true, true),
             "a static scenery damage base is never a hit, even when it reports an owner");
+        // ---- the settlement page's own controls: the toggle, the close, and the one action they share -----
+        ResultChromeScenarios.RunInto(Check);
+        // ---- and their timing: one place per page, committed once, paused by a late control, never chased --
+        Console.WriteLine("---- settlement controls: one place per page, committed once ----");
+        ResultChromeCommitScenarios.RunInto(Check);
+        // ---- the six findings of the settlement-controls review, one scenario each --------------------------
+        Console.WriteLine("---- settlement controls review: page source, close lifecycle, invalidation, styles, probes, reveal ----");
+        ResultChromeReviewScenarios.RunInto(Check);
+        // ---- the recorded host failure pages: the entry, the press, the band and the vanilla page ----------
+        Console.WriteLine("---- settlement entry: header seat, bounded click, band invariant, vanilla page kept ----");
+        ResultChromeEntryScenarios.RunInto(Check);
+        // ---- the recorded host failure page, in order, with the production functions (ResultBoardOrderReplayScenarios.cs)
+        Console.WriteLine("---- settlement order replay: budget, band, plate, vanilla blocks, press ----");
+        ResultBoardOrderReplayScenarios.RunInto(Check);
+        // ---- 1.19.41: the in-level table's place beside the *equipment column*, not under the anchor row. 记录远征
+        //      2560x1440：锚行 (2336,294) 211x110 → 底边 404，旧版把 397x60 的表放在 (2150,412)-(2547,472)，正压在
+        //      锚行之下的武器/弹药/工具/补给各行上（截图同形）。新落点读同一 HUD 链上的每一行
+        //      （`m_iconDisplay` + `m_inventorySlots`/`m_slotGUIOrder`），用同一个相机与 `ScreenBounds` 门，
+        //      以原有 8px 间隙贴在该栏最下行的下方；底部无空间时依次尝试上方与左邻，全部不可行才用玩家自己的
+        //      PositionX/PositionY，绝不退回已知重叠点。晚到的底边（选枪/拾取补给/投掷物）由 `EquipmentBandWatch`
+        //      即时放大、收敛需连续两次一致，收起时不抖 ------------------------------------------------------
+        Console.WriteLine("---- 1.19.41: the table clears the measured equipment column, late edges included ----");
+        HudAvoidanceScenarios.RunInto(Check);
+        // ---- 1.19.42: the equipment-column fallback (a measured column under the configured position is deferred, not
+        //      drawn over) and the settlement header's own plan (the page dock may not budget the band; a box is never
+        //      narrower than its words). Both are recorded findings replayed on the run's own numbers ---------------
+        Console.WriteLine("---- 1.19.42: measured-column fallback, and a header plan that holds its own words ----");
+        ResultHeaderPlanScenarios.RunInto(Check);
+        // ---- 1.19.44: the settlement controls' own pointer, main button and cursor (ported from conflictmodlist) ----
+        Console.WriteLine("---- 1.19.44: page cursor, page main button, press ownership and the cursor it stands in for ----");
+        SettlementPointerScenarios.RunInto(Check);
+        // ---- 1.19.43: the PE Pure 1.19.40 run's three findings, on that run's own numbers ---------------
+        Console.WriteLine("---- 1.19.43: one unreadable slot row, the settlement plate, the controls' hit lifecycle ----");
+        PePure11943Scenarios.RunInto(Check);
+        // ---- 1.19.43: one late greeting for this expedition's host, measured on the wire -------------------
+        Console.WriteLine("---- 1.19.43: the bounded late greeting, measured on the real send and receive paths ----");
+        RunSquadLateHelloScenarios();
+        // ---- 1.19.49: the 2026-11-23 recording, retested - the conservative place moves to the window's right margin (the
+        //      recorded frame drew it at (24,526) on the far side from the column), the whole "no proven place" family becomes
+        //      Info and is written once per round under a semantic key, the settlement page's press exception stops re-printing
+        //      diagnostics that do not answer a press, and one version number covers the plugin, the manifest and the docs ----
+        Console.WriteLine("---- 1.19.49: right-margin conservative place, one line per absence, one answer per press, one version ----");
+        RunRelease11949Scenarios();
+        // ---- 1.19.50: the independent review of the 1.19.49 build - the obstacle list belongs to the round (a new level, a
+        //      config reload or a resolution change no longer inherits the previous scene's rows), the place's own line prints
+        //      the margin the place really kept, and the absence vocabulary's ten reasons all still write their first line
+        //      under a bound that is the vocabulary's own size ----
+        Console.WriteLine("---- 1.19.50: round-owned rows, the margin the place kept, ten reasons that can all still speak ----");
+        RunRelease11950Scenarios();
+        // ---- 1.19.51: the recorded 1080p success page - the band's lower wall is the interaction that reaches the
+        //      board's own column, so a control standing beside the board (the left-hand booster notice) no longer ends
+        //      it. Old rule 8 of 30 rows, new rule 30 of 30 at 1080 and 1440; a control that really spans the column
+        //      still ends the band and the wheel still reaches the last row ----
+        Console.WriteLine("---- 1.19.51: the success band's wall is the one the board can reach, and the line states the rows it shows ----");
+        Release11951Scenarios.RunInto(Check);
+        // ---- 1.19.52: the review of the 1.19.51 build - the strip hangs from the drawn completion floor as well as the
+        //      laid-out edge (F1), the board's own column is measured by the fit and used by the strict, fail-open and
+        //      re-measured band alike (F2/F6), a refreshed width is re-centred before it is committed (F4), and the
+        //      success page may stand in the free band below a real mid-column control (F5) ----
+        Console.WriteLine("---- 1.19.52: the drawn floor, the board's own column, the re-aligned width, the band below ----");
+        Release11952Scenarios.RunInto(Check);
+        // ---- 1.19.53: the last open item - the *band* hangs from the same combined anchor the pre-paint gate protects
+        //      (1.19.52 raised `completion` but still resolved the band from the container), the gate asks about the real
+        //      plate, the column uses the measured width, and the fit reserves the header so a short band shows every row ----
+        Console.WriteLine("---- 1.19.53: one anchor for the band, the plate in the gate, the measured column, the header reserved ----");
+        Release11953Scenarios.RunInto(Check);
+        // ---- 1.19.54: the `FitBoard` input contract - the parameter is the *body* height (the caller deducts the header
+        //      exactly once), which fixes 1.19.53's double deduction on both pages (the 1440 failure page was drawn at
+        //      14 px / 728 px instead of its recorded 16 px / 773 px) and gives the fallback its one deduction on success ----
+        Console.WriteLine("---- 1.19.54: FitBoard takes the body height, the failure page is back at its 1.19.50 numbers ----");
+        Release11954Scenarios.RunInto(Check);
+        // ---- 1.19.55: the five things the recorded 2026-11-23 four-run session asked for - an early non-interactive
+        //      success board with no key (D), the two per-page loops and the 2,873/895 log families behind "it only
+        //      appears after F8" (E), a committed toggle that is not paused by a two-pixel touch (B), one grid for the
+        //      pointer, the measured rectangles and the drawn board (C), and a vanilla block taken apart branch by branch
+        //      with the way back written down (A) ----
+        Console.WriteLine("---- 1.19.55: early board, one grid, a stable committed place, branch-wise vanilla, bounded lines ----");
+        Release11955Scenarios.RunInto(Check);
+        // ---- 1.19.57: the five point fixes an independent review of 1.19.56 found - block identity aligned onto the node
+        //      (transform, then GameObject) and decided by the player's own switches, the classifier's order reversed so
+        //      registration outranks the block root, `Unknown` no longer a whole-block hide, an unreadable registry
+        //      protected, a mixed root giving up only its proven visuals, and an early board that is kept on its own page
+        //      until the mature one really places ----
+        Console.WriteLine("---- 1.19.57: node identity, registered-first classification, proven-visual branches, kept early board ----");
+        Release11957Scenarios.RunInto(Check);
+        // ---- 1.19.59: the whole-row plate, the drawing-only half of the page's own blocks, one cursor for every gesture
+        //      and a place that steps aside once instead of pausing and releasing at the page's own animation rate ----
+        Console.WriteLine("---- 1.19.59: whole-row plates, drawing-only replacement, one cursor, one move-aside ----");
+        Release11959Scenarios.RunInto(Check);
+        // ---- 1.19.59: the wheel routed the way the player's other panel routes it, checked frame by frame against a
+        //      transcription of that router (provenance in the file), plus whole-row steps, the same-frame latch and the
+        //      hit-edge rule ----
+        Console.WriteLine("---- 1.19.59: native-first wheel routing, one settlement per frame, whole-row steps ----");
+        ResultWheelScenarios.RunInto(Check);
+        // ---- 1.19.59 (independent review of the round): the five findings, driven rather than read - the record's two
+        //      halves taken at their own first write (H1), only what was taken put back and nothing added to the game's
+        //      objects (M3), no raycast flag anywhere and a late button given back (H2), an already taken block measured
+        //      once with one safety check (L4), and one pointer sample per frame shared by both entries (L5) ----
+        Console.WriteLine("---- 1.19.59: hold ledger halves, no raycast flags, cheap re-hide, one pointer sample ----");
+        ResultHoldReviewScenarios.RunInto(Check);
+        // ---- 1.19.60: the two rules the recorded 2026-11-24 client session moved onto the boundary they belong to -
+        //      which rows the public statistics may draw (evidence only: own row, a row this run received, a seat this
+        //      machine is the authority for), driven through the whole production chain to the archived JSON, and the
+        //      client's automatic first board fitted into the strip the mature board will use, so it never shrinks once ----
+        Console.WriteLine("---- 1.19.60: eligible rows at the projection boundary, a client board that is final on its first frame ----");
+        Release11960Scenarios.RunInto(Check);
+        // ---- 1.19.61: the client failure page's footer slot, replayed on the recorded 2026-11-25 session - one
+        //      boundary for the fit and for the per-repaint check (the retained wall only tightens, the recorded
+        //      1371/1373 pair reproduced and then cleared), host and client giving the same reserve for the same
+        //      slot, the slot's *visible* glyphs tightening it, a standing board moved on the frame its footer rises,
+        //      the fail-open/F8 band reading the same boundary, and late/blind/cross-page paths that keep the slot ----
+        Console.WriteLine("---- 1.19.61: one client footer boundary, the slot's drawn glyphs, a tightened standing band ----");
+        Release11961Scenarios.RunInto(Check);
         Console.WriteLine($"PASS: {_assertions} combat-panel assertions");
     }
     // The same slot arithmetic HudTable.BuildGrid performs at runtime, with every geometry constant

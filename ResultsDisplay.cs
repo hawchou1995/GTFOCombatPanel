@@ -36,6 +36,12 @@ internal static class ResultsDisplay
     private static LayoutRect _hitRect;
     private static bool _hitSucceeded;
     private static bool _hitValid;
+    // 1.19.59: whether the wheel may move the table this repaint drew. It is written by the same line that writes
+    // `_hitRect` and is deliberately *wider* than `_hitValid`: an early board is a picture and takes no press (its own
+    // button stays the page's), but the table under it still has to be readable to its last row. The recorded success page
+    // never matured, so `_hitValid` was false for the whole page and the wheel could not reach rows 27..30 of a board whose
+    // own log line said "rows shown 30 of 30" was the aim.
+    private static bool _scrollValid;
     private static int _hitFrame = -1;
 
     // The glyph floor the grid on screen was fitted with, so a refresh that has to re-measure it asks for
@@ -89,6 +95,13 @@ internal static class ResultsDisplay
         // the client failure page's strip is tightened against this figure, because its waiting-status line is neither a
         // control nor a wall. On every other page it is the same number `FooterTop` carries unless the text sits higher.
         public readonly float PressableTop;
+        // 1.19.51：扫描量到、但横向站在板子自己那一栏之外的控件个数（见 `LayoutColumn`）。它们既没有把条带起点
+        // 往下推，也没有成为条带的下界：板子永远画不到它们身上，而真正和板相交的控件由每帧的 `OverlapsBoard`
+        // 继续拦（拒绝落板），那条保护一个有字的都没动。栏宽读不出来时这个数是 0，也就是这一条根本不参与。
+        public readonly int BeyondColumn;
+        // 1.19.51：这一段条带的下界是「谁」给出来的（类型、对象名、它自己的矩形）。记录的 1080p 成功页上这一格
+        // 完全不存在：日志只说条带是 190 px，没有任何一行说 455 上站着什么，于是根因只能靠截图去猜。
+        public readonly string Wall;
         // 固定模式专用：第一个和固定板真实相交的控件（类型、对象名、它自己的矩形），以及相交的控件个数。
         // 只有 `inspectBoard` 的调用会填它；自适应那条链读都不读，所以这里多存两个值不改变它的任何决定。
         public readonly ResultFixedBlocker Blocker;
@@ -97,12 +110,14 @@ internal static class ResultsDisplay
         public FooterControls(float footerTop, float boardTop, int count, int scannedCount, bool complete,
             bool parentCoverageComplete, bool overlapsBoard, int hidden = 0, int hiddenPageActions = 0, string reason = "",
             int unmeasurable = 0, ResultBoardBand belowActions = default, float pressableTop = float.NaN,
-            ResultFixedBlocker blocker = default, int blockers = 0)
+            ResultFixedBlocker blocker = default, int blockers = 0, int beyondColumn = 0, string wall = "")
         {
             FooterTop = footerTop; BoardTop = boardTop; Count = count; ScannedCount = scannedCount;
             Complete = complete; ParentCoverageComplete = parentCoverageComplete; OverlapsBoard = overlapsBoard;
             Hidden = hidden; HiddenPageActions = hiddenPageActions; Reason = reason ?? string.Empty;
             Unmeasurable = unmeasurable;
+            BeyondColumn = beyondColumn;
+            Wall = wall ?? string.Empty;
             Tally = new ResultInteractionTally(count, hidden, hiddenPageActions, unmeasurable);
             BelowActions = belowActions;
             PressableTop = pressableTop;
@@ -116,21 +131,49 @@ internal static class ResultsDisplay
     // 观察新页面的墙，而这一页上一次的读数（`Wall` 是这一页见过的最高一堵）绝不会跟到下一张页面上去。
     private static readonly ResultClientWallGate ClientWall = new ResultClientWallGate();
 
-    // The vanilla blocks this mod has moved, with the exact position and active state each had before it
-    // touched them. Restoration is the inverse of hiding, one block at a time: the moment a flag is
-    // switched off, the page changes or the results screen is left, every block goes back to exactly
-    // where it was and exactly the state it was in. The previous release only ever moved them off the
-    // page, so switching the flag off left them off the page for good.
-    private sealed class HiddenBlock
-    {
-        public Transform Target;
-        public GameObject Host;
-        public Vector3 Position;
-        public bool Active;
-    }
-    private static readonly Dictionary<IntPtr, HiddenBlock> Hidden = new Dictionary<IntPtr, HiddenBlock>();
-    // What was hidden the last time the page was touched, so a flag that changed can be noticed and the
-    // blocks it covered restored before the new set is applied.
+    // 客机失败页页脚槽位的一帧读数（`ClientSlot`）：同一帧里落位、逐帧校验、兜底与二次测量都会问它，所以每帧
+    // 只量一次。评审 #5：这既去掉了 1.19.61 第一次尝试里的整树扫描，也去掉了同一帧的重复测量。
+    private static int _slotFrame = -1;
+    private static IntPtr _slotPage;
+    private static ResultClientSlotEvidence _slot;
+
+    // The vanilla blocks this mod has touched, with the exact position, active state and drawing state each had before it
+    // touched them. Restoration is the inverse of taking, one block at a time: the moment a flag is switched off, the page
+    // changes or the results screen is left, every block goes back to exactly where it was and exactly the state it was
+    // in.
+    //
+    // 1.19.59: an entry has two independent halves and either may be empty:
+    //   * the *move* - `localPosition` off the page plus `SetActive(false)` - for a block the classifier proved carries no
+    //     control of the player's (`WholeBlock`), or for a branch of one that carries none (`SafeBranches`);
+    //   * the *drawing* - the block's own `CanvasGroup` at zero alpha and its own renderers switched off - for everything
+    //     else, including the early board's own frame and any block that really carries a `Button`. Nothing is moved,
+    //     deactivated or unregistered by that half, so a press the page hung inside the block still answers; only the
+    //     pixels go away.
+    //
+    // 1.19.59 (independent review): the record itself is a Unity-free ledger (`ResultVanillaHold`), so the two questions
+    // this file used to answer with one object are answered separately and can be driven headlessly:
+    //   * H1 - each half is taken at its own first *write*, never at the first touch of any kind, and the ledger's
+    //     `HoldMove` is idempotent, so a block whose drawing was switched off first still records the position the page
+    //     drew it at when it is finally moved. The old record answered the move of such a block with `Position =
+    //     default`, i.e. F8 put it back at (0,0,0) for the rest of the run.
+    //   * M3 - nothing is put back that was not taken: a drawing-only record has no active state at all (the old one
+    //     hardcoded `Active = true` and switched on blocks the page had left switched off), and this mod never adds a
+    //     `CanvasGroup` to the game's object - only a group the block already has is used, and only its alpha.
+    //   * H2 - no raycast flag is recorded or written: `interactable`/`blocksRaycasts` are absent from the ledger, and the
+    //     drawing half owns alpha and renderer enablement alone.
+    private static readonly ResultVanillaHoldLedger Hidden = new ResultVanillaHoldLedger();
+    // The last repaint that really drew a board and put the page's own blocks away. A repaint that has to defer the board
+    // (`DeferBoardForInteraction`) does *not* give the blocks back: the recorded pages restored them on the deferred frame
+    // and hid them again on the next one, i.e. the prisoner cards blinked at the poll cadence. They come back on real
+    // evidence - a placement the page refused twice in a row (`NoteVanillaRefusal`), a page that went away, F8 off, a page
+    // change, leaving the screens - and, only as a last resort for a page that gives no evidence at all, after
+    // `VanillaHideGrace` seconds in which nothing was drawn.
+    private static float _vanillaHiddenAt = float.NegativeInfinity;
+    private const float VanillaHideGrace = 3f;
+    // Consecutive refused placements this hide has outlived, and the frame the last one was counted on. A refusal is
+    // evidence about the page ("this board cannot be placed here"), not a frame budget: two of them while nothing is drawn
+    // is the point at which the game's own blocks are given back.
+    private static int _vanillaRefusals, _vanillaRefusalFrame = -1;
     private static bool _appliedSuccessBlocks, _appliedPrisonerReports, _appliedFailBlocks, _appliedAny;
     // Clearance between the failure screen's own message and the board that stands under it.
     private const float MessageGap = 16f;
@@ -172,6 +215,10 @@ internal static class ResultsDisplay
             // *drawing* the board, never recording the settlement. A page that exists archives its screen even
             // with the board hidden; the same (page, run) latch keeps one record per expedition per page.
             ArchiveScreen(succeeded);
+            // Nothing is measured for a board-less entry any more: 1.19.45 removed the second storey that used to
+            // stand the toggle on this page's own title edge while no board was placed. A page with no board has the
+            // key and nothing else, which is the contract: F8 is the shortcut and it is answered by the same unified
+            // show/hide the toggle uses.
             if (_page != null) RestoreHidden();
             ResetPlacement();
             ClearHit();
@@ -187,9 +234,13 @@ internal static class ResultsDisplay
         // placement that had to fall back before one of the page's own edges was readable, or a page that has
         // moved since (another mod's footer, a resolution change, a section that finished drawing later). Both
         // are budgeted per page, so a settled board is never rebuilt for a frame of the page's own animation.
-        if (_placed && _placedSucceeded == succeeded && _grid != null && _content != null &&
+        if (_placed && !_earlyBoard && _placedSucceeded == succeeded && _grid != null && _content != null &&
             _page != null && _page.gameObject.activeInHierarchy)
         {
+            // 1.19.56 (review 6/12): the early board must not short-circuit this poll for ever - that is what left a page
+            // stuck on a non-interactive picture with no way to mature. While an early board stands, the re-measure runs
+            // on the retry cadence and the early board keeps drawing meanwhile (`_holdValid` is deliberately not cleared
+            // by `ResetPlacement`), so the promotion is measured, bounded and non-destructive.
             if (!FallbackRecoveryDue(succeeded, _page) && RefreshBoardData(_page, succeeded)) return;
         }
         // A page whose own anchors have not arrived yet is measured every frame while its reveal runs, then at a
@@ -199,9 +250,19 @@ internal static class ResultsDisplay
         // game's own page stays exactly as it drew it.
         if (!Retry.Due(Time.frameCount)) return;
 
+        // 1.19.57 (independent review of 1.19.56 D): a standing early board is *kept*, not thrown away to re-measure the same
+        // page. This path used to answer every retry with `ResetPlacement()` + `RestoreHidden()` before the page was read
+        // again, which cleared the grid, its place and the plate the wheel and the draw read: a page that never hands over the
+        // facts the mature board needs lost and regained the table on the retry cadence, and any frame whose re-measure
+        // refused left the player looking at the game's own page again. The measurement still runs at the same cadence - that
+        // is what promotes it - and the mature board replaces the early one in the single fit that really places it.
+        bool keepStanding = EarlyBoardStanding(succeeded, out IntPtr standingPage);
         Component previous = _page;
-        ResetPlacement();
-        if (previous != null) RestoreHidden();
+        if (!keepStanding)
+        {
+            ResetPlacement();
+            if (previous != null) RestoreHidden();
+        }
         Component page = null;
         if (succeeded && Success != null && Success.gameObject.activeInHierarchy) page = Success;
         else if (!succeeded && Fail != null && Fail.gameObject.activeInHierarchy) page = Fail;
@@ -217,25 +278,69 @@ internal static class ResultsDisplay
                 + ",pagePresent=False,pageActive=False");
             return;
         }
+        // 1.19.57: a board that entered early may only be kept on the page it was measured for. A later settlement reuses
+        // the same page object, and the socket that says so is the pointer the placement was recorded under.
+        if (keepStanding && page.Pointer != standingPage)
+        {
+            keepStanding = false;
+            ResetPlacement();
+            if (previous != null) RestoreHidden();
+        }
         // A different page is a different screen: the placement, the strip it was measured in and the
         // readiness of the previous one are dropped here and nowhere else. A configuration change, the F8
         // write it triggers and the hot reload that follows it all leave them standing.
-        if (_holdPage != page.Pointer) ForgetPage();
-        _holdPage = page.Pointer;
+        //
+        // 1.19.55: "a different page" is the page this mod last *attached* to (`_attachedPage`), not the page a board was
+        // placed on (`_holdPage`, written only by a placement that really happened). Asking the second question meant that
+        // a page whose board was still being refused - which is every page until its own boundary is proven - was treated as a
+        // new page on every repaint: `ForgetPage` dropped the reveal latch, the settle gates, the retry cadence, the strict-miss
+        // budget and the per-page line budgets, the page was measured from nothing again, and the fail-open ladder could never
+        // be spent (`strictRefusals=1 of 60` on every recorded page). That is the loop the recorded log calls 895 `released`
+        // lines, 2,873 `completion parts` lines and a board that only ever appeared after F8.
+        if (_attachedPage != page.Pointer)
+        {
+            _attachedPage = page.Pointer;
+            // A new settlement starts with the board up. This undo is for this mod's own hide only - the press on
+            // this page's toggle, its close, or the key wrote the two switches off - so the next expedition is not
+            // asked to live with a decision made about the last one. A switch the player turned off in the
+            // configuration file is not what this restores, and it is never written over by anything else here.
+            bool startOfSettlement = page.Pointer != _holdPage;
+            bool owed = startOfSettlement && Session.OweRestore(page.Pointer);
+            ForgetPage();
+            // `ForgetPage` drops the attachment with the page, so it is restored for the page this repaint is attaching to.
+            _attachedPage = page.Pointer;
+            _earlyBoard = false;
+            if (owed)
+            {
+                Plugin.PersistToggle(true);
+                Forced = false;
+                if (HeadingReports.Add("settlement-shown-again"))
+                {
+                    Plugin.Logger?.LogInfo("[DIAG] a new settlement page starts with the board up: the previous screen's hide was this mod's own "
+                        + "(a press on the settlement toggle, its close or the toggle key), so the two switches it wrote off are given back here and "
+                        + "nothing the player set in the configuration file is touched.");
+                }
+            }
+        }
         _page = page; _succeeded = succeeded;
         Readiness.Bind(page.Pointer);
+        if (keepStanding && ResultReportPolicyStrict.OncePerPage(HeadingReports, "early-board-kept"))
+            Plugin.Logger?.LogInfo("[DIAG] the early board is kept while this page has not handed over the facts the mature board"
+                + " needs: the grid, its place and the scroll window measured for this same page are left exactly as they are, and"
+                + " nothing is reset or put back. The page is still measured on this retry's cadence and the mature board replaces"
+                + " this one in the single fit that really places it (1.19.57).");
         try
         {
+            // 1.19.59: the page's own blocks are given back only when this mod has really stopped standing in for them - not
+            // on the deferred frame of a board that is about to come back. A repaint is the right place for the question: it
+            // runs once per attached page, and the answer needs no new observation.
+            VanillaHideExpired();
             Prepare(page, succeeded);
-            // 预绘制和 `Draw` 必须用**同一份计划**。
-            //
-            // `ResultBoardLatch.HidesVanilla(_placed)` 只回答"这一帧有没有一块真的落到页面上的板"，而在固定模式下 `_placed`
-            // 在有真实相交、或扫描证据不足时也为真（板照画，只是淡画）。如果这里按 `_placed` 就把原版块挪到 6000，而
-            // `FixedLayoutDraw` 按 `_fixedPlan.HidesVanilla`（完整且无相交才让位）又把它放回去，就是每帧隐藏/恢复；更糟的是
-            // 页面在 `Draw` 之前失活（`no-live-page` / `no-placement` 早退），原版块已被挪走而板没画出来，留下一张空洞的页面。
-            // 所以固定模式下这个入口只听 `_fixedPlan`；自适应那条链的条件一个字都没变。
-            if (ResultBoardLatch.HidesVanilla(_placed) && (!FixedLayoutActive() || _fixedPlan.HidesVanilla))
-                ApplyVanillaBlocks(page, succeeded);
+            // 原版块只在这一帧**真的画出表格之后**才让位（`Draw` 里，`HudTable.Draw` 之后同一帧）。这里不再预隐藏：
+            // 预隐藏是 review #3 找到的那条旁路——`_placed` 为真、`Prepare` 也量到了板，但 `Draw` 在 1793 行之前
+            // 还有七道门（可见性、无页面、无 placement、固定模式、`BoardStillSafe`、band 不变式、settle），任何一道
+            // 退出去就把页面留在"原版块被挪走、板没画"的空洞里。固定模式本来就只听 `_fixedPlan`，它自己的绘制路径
+            // 同样在画完之后才让位（`FixedLayoutDraw`）。
         }
         catch (Exception error)
         {
@@ -283,10 +388,54 @@ internal static class ResultsDisplay
     // the per-page hold below: a re-placement attempt for the same page is exactly what has to keep it.
     private static void ResetPlacement()
     {
+        // 1.19.56 (review 7/8/9): what this cache is being replaced *from* is captured before anything is cleared. The
+        // page and the row count are what tell a re-measure of the same page apart from a new one - without them the
+        // scroll owner could never match (the page was already null), every re-measure looked like a new page and the
+        // player's scroll position was dropped with it.
+        Component previousPage = _page;
+        int previousRows = _grid != null ? _grid.Rows : 0;
         _grid = null; _content = null; _page = null; _succeeded = false; _placed = false; _placedSucceeded = false;
+        // 1.19.52: the measured table width and the probe budget belong to the page as well - a new page must not
+        // inherit the previous table's column, and its own two-phase measurement starts from its own first frame.
+        // 1.19.55: `_widthProbe` and `_columnProbes` are *not* reset here any more. This method runs on every repaint, and
+        // wiping the measured table width here is what made `Fit`'s two-phase column measurement impossible to complete: phase
+        // one recorded the width and refused the frame, and the next frame's reset had already thrown it away, so the first
+        // placement of every success page was refused for ever (the "board before column, column before board" loop). They
+        // are dropped with the page instead (`ForgetPage`), which is the only thing that can invalidate them.
+        _drawnFloorCompletion = float.NaN;
         // 固定模式的落位也是这个缓存的一部分：换了页面、改了配置或关了开关，下一帧重新按玩家的数字判定。
         _fixedPlaced = false;
         _fixedPlan = ResultFixedDrawPlan.None;
+        // The scroll position belongs to the page, not to the build: a new page starts at its own head, and the
+        // gesture lock is released with it so the first notch of the new page is never mistaken for a repeat. A
+        // re-measure of the *same* page keeps the offset the player scrolled to - a poll, a refresh or a resolution
+        // change must not snap the table back to its head - and it is clamped to the viewport that measurement
+        // produced, so a smaller plate cannot leave the offset past the table's foot.
+        // 1.19.56: the same page keeps the player's scroll position, and a different page starts at its head. The page
+        // and the row count were captured before this cache was cleared (`previousPage`/`previousRows`), which is the
+        // only way `sameScrollPage` could ever be true - it compared against `_page` after `_page` had been set to null.
+        bool sameScrollPage = _scrollOwner != null && ReferenceEquals(_scrollOwner, previousPage);
+        _scrollFirst = ResultsScroll.OffsetAfterReset(_scrollFirst, sameScrollPage, previousRows,
+            ResultsScroll.FrozenRows, Math.Max(1, _scrollVisible - ResultsScroll.FrozenRows));
+        if (!sameScrollPage) { _scrollVisible = 0; _scrollPlate = 0f; }
+        _scrollOwner = previousPage;
+        _scrollLatch.Forget();
+    }
+
+    // Whether a board that entered early against this same page is still standing, and the page it was measured for.
+    //
+    // This is the reading of the page's own objects; the rule itself is `ResultEarlyBoardPolicy.KeepsStanding`, so a test
+    // can assert the same answer the game asks for. `_holdPage` is the page the last placement was recorded under, which is
+    // the only pointer that can tell a re-measure of this page from the next settlement reusing the same page object.
+    private static bool EarlyBoardStanding(bool succeeded, out IntPtr pagePointer)
+    {
+        pagePointer = _holdPage;
+        bool live = false;
+        try { live = _page != null && _page.gameObject.activeInHierarchy; } catch { live = false; }
+        IntPtr current = _page != null ? _page.Pointer : IntPtr.Zero;
+        return ResultEarlyBoardPolicy.KeepsStanding(_earlyBoard, _placed,
+            ResultVisibility.SamePage(_holdPage, current), _placedSucceeded == succeeded, live,
+            _grid != null, _content != null);
     }
 
     // The rectangle the wheel is judged against, dropped when the board it describes is no longer on the page: a
@@ -295,7 +444,7 @@ internal static class ResultsDisplay
     // caused it must still find the board it was aimed at.
     private static void ClearHit()
     {
-        _hitRect = default; _hitValid = false; _hitSucceeded = false; _hitFrame = -1;
+        _hitRect = default; _hitValid = false; _scrollValid = false; _hitSucceeded = false; _hitFrame = -1;
     }
 
     // The rectangle is re-earned on every repaint: it describes a board that is on the screen now, not one that was on
@@ -311,8 +460,33 @@ internal static class ResultsDisplay
     {
         _hitRect = default;
         _hitValid = false;
+        _scrollValid = false;
         _hitSucceeded = false;
     }
+
+    // ---- the settlement table's scroll position ---------------------------------------------------------
+    //
+    // The board is a table of a fixed row count drawn into a plate only as tall as the room its page offers.
+    // `_scrollFirst` is the first scrollable row on screen, `_scrollVisible` how many rows the plate holds and
+    // `_scrollPlate` the plate's height in pixels; all three are decided by the fit from the strip this frame
+    // really measured, so the wheel can only ever move a table that is on the page. The frozen row (the column
+    // header carrying the four player names) is never part of the offset: it is drawn from the table's own head
+    // on every frame.
+    //
+    // `_scrollLatch` is the same-frame guard. IMGUI runs a layout pass and then a repaint, so one notch can be
+    // delivered twice in one Unity frame; the first copy moves the table, the second is consumed here without
+    // moving it again - which is what keeps one notch from costing two rows.
+    private static int _scrollFirst = ResultsScroll.FrozenRows;
+    private static int _scrollVisible;
+    private static float _scrollPlate;
+    private static readonly ResultScrollLatch _scrollLatch = new ResultScrollLatch();
+    // 1.19.59: the wheel's own two pieces - the reference's router (native first, physical fallback, consumed by change,
+    // 3 rows per notch, at most 5 notches per frame) and the whole-row step that carries its sub-row remainder.
+    private static readonly ResultWheelRouter _wheel = new ResultWheelRouter();
+    private static readonly ResultWheelSteps _wheelSteps = new ResultWheelSteps();
+    // The page whose scroll position `_scrollFirst` belongs to. A re-measure of *this* page keeps the offset; a page
+    // that replaced it (or the results screens being left, which clears this in `ForgetPage`) starts at its head.
+    private static Component _scrollOwner;
 
     // Everything the board caches for one result page: the place it was measured into, the strip that place
     // came from and the readiness its completion section has already earned. None of it is dropped by
@@ -325,6 +499,17 @@ internal static class ResultsDisplay
     private static bool _holdValid;
     private static LayoutRect _holdBoard;
     private static float _holdOpacity;
+    // 1.19.55: the page this mod last *attached* to, which is not the page a board was placed on. `_holdPage` is written only
+    // by a placement that really happened, and `Refresh` used it to answer "is this a new page?" - so every repaint of a page
+    // whose board was still being refused looked like a new page, ran `ForgetPage()` (dropping the reveal latch, the settle
+    // gates, the retry cadence, the strict-miss budget and the per-page line budgets) and measured the page again from
+    // nothing. That is the loop behind `895 released` / `2873 completion parts` / `strictRefusals=1 of 60` and behind the board
+    // that only ever appeared after F8: the fail-open budget could never be spent because it was reset every frame. This
+    // field is the honest identity for that question, and it is cleared with the page itself (`ForgetPage`).
+    private static IntPtr _attachedPage;
+    // 1.19.55: the board standing now entered before the page had proven its own boundary (`ResultEarlyBoardPolicy`): it is
+    // drawn, it is not a control surface, and it puts none of the game's own blocks away. The mature placement clears it.
+    private static bool _earlyBoard;
     // The page animates its footer in. A button measured mid-animation sits higher than the one the player ends up
     // pressing, and the board built against that edge is permanently too short - `TryHold` never enlarges a board, by
     // design, so a first measurement taken too early is never corrected. `Footer` follows that edge across frames and
@@ -359,6 +544,23 @@ internal static class ResultsDisplay
     // 这两个有界触发器置位，所以一页最多一行，不刷屏。
     private static bool _relayoutPending;
     private static string _relayoutReason = string.Empty;
+    // ---- 1.19.52: the board's own column, measured before it is drawn -------------------------------------------
+    //
+    // F2: the band's lower wall may only be set by an interaction the board could really cover, which needs the board's
+    // *width* - and on the first placement of a page no board has been fitted yet, so nothing on the page has measured
+    // it. 1.19.51 fell back to the page's footer control (not the board) and then, when that was unreadable, to
+    // `LayoutColumn.None` - the old eight-row band. The fit therefore records the width it really measured for this
+    // page's content (`_widthProbe`) and refuses to commit that first frame at all: the vanilla page stays up for one
+    // repaint, the next frame's band is measured against the table's own column, and nothing is ever drawn in between
+    // and re-aligned under the player (F4). The budget is bounded per page, so a table whose width keeps changing can
+    // never loop here.
+    private static float _widthProbe = float.NaN;
+    private static int _columnProbes;
+    private const int MaximumColumnProbes = 2;
+    // F1: the deepest pixel the completion section has really drawn on this frame (`CompletionFinalBounds.DrawnFloor`).
+    // The strip may hang no higher than this; the per-repaint safety check reads it to tell a board that stands above
+    // content the page has painted since it was placed.
+    private static float _drawnFloorCompletion = float.NaN;
     // ---- the page's final geometry ---------------------------------------------------------------------------
     //
     // The strip a settlement board is measured into has to be the one the page *ends at*, not the one it is passing
@@ -388,6 +590,10 @@ internal static class ResultsDisplay
     // 被观察到的 reveal 永远不由帧数放行——那正是这一轮要消灭的「先画再变」。
     // 1.19.43 F1-STALL: 无进展停滞改用真实秒（`RevealProgressClock`），任何新的原生事实都会重置它。
     private static readonly RevealProgressClock RevealClock = new RevealProgressClock();
+    // 1.19.60（独立评审 F1）：这一页「看了但账本还是 0 个目标」的次数。它只喂 `ResultRevealStatePolicy` 的
+    // `Unobservable` 边界（有界、带名字、且仍要求几何闩），每页重置；一个稍后才登记目标的页面在登记的那一帧就离开
+    // 这个状态，因为只有 `Required == 0` 的观察才计数。
+    private static int _revealObservations;
     // The per-part completion reading is printed as one line per part, at most `CompletionPartReportLines` times per
     // page, and only when the reading it would describe really changed: a live log has to say which part produced the
     // band and from which reading, without printing anything per frame.
@@ -406,9 +612,14 @@ internal static class ResultsDisplay
     // Whether this page's native reveal has finished, read where a caller only needs the *answer* rather than the
     // feeding of the latch: the completion section's own edge and the icon row the band hangs from
     // (`CompletionFinalBounds.Placed`), and the fail-open band. `CompletionReady` is what feeds it, once per frame, at
-    // the top of the success placement - so the section is measured as final on the very frame the ledger completes
+    // the top of the success placement - so the section is measured as final on the very frame the ledger completes,
     // and the two never disagree about which reading the board was placed from.
     private static bool RevealFinished { get { return Readiness.Ready; } }
+    // 1.19.60 (independent review F1): the host's early-display privilege needs a host that was really read. `Role()`
+    // answers `Unreadable` when the native flag throws, which is deliberately the host's *measuring* path - it measures
+    // and refuses instead of handing out a client's fixed safe area. A page whose role nobody could read may not inherit
+    // the privilege on top of that, so the one place that grants it asks `HostProven()` (defined beside `Role()`, from the
+    // same single read) instead of `!GuestClient()`.
     // The height the table wants, and the height the page is judged against. Kept apart on purpose, because they
     // answer different questions and conflating them is what made a 269 px strip draw nothing while a 286 px strip
     // drew a 6 px table.
@@ -484,6 +695,13 @@ internal static class ResultsDisplay
         _holdValid = false;
         _holdBoard = default;
         _holdOpacity = 0f;
+        // 1.19.41 review #4: the scroll offset belongs to the page it was made on, so leaving or replacing the page
+        // drops the owner as well as the offset - the next page starts at its own head.
+        _scrollOwner = null;
+        // 1.19.59: the wheel's consumed native fingerprint and its sub-row remainder belong to the page the pointer was
+        // over, so a new screen never inherits them (the reference's `Reset`, not its `Suspend`). Leaving the results
+        // screens and F8 off go through here as well, which is what makes a hidden board hand the page its own wheel back.
+        ResetWheel();
         // A different screen has a different footer, title and completion section: every settle state, the retry
         // cadence and the recorded strip are dropped here and nowhere else.
         Footer.Forget(); Title.Forget(); FailureLayoutTitle.Forget(); Completion.Forget();
@@ -491,17 +709,37 @@ internal static class ResultsDisplay
         SuccessNoFooter.Forget(); FailureNoFooter.Forget();
         // 客机的下界墙属于这一张页面：它的样本、它读到过的最高一堵墙都留在这一页上。
         ClientWall.Forget();
+        // 1.19.61：槽位读数与墙一样属于这一张页面（同一帧只量一次的那份缓存也在其中）。
+        _slotFrame = -1; _slotPage = IntPtr.Zero; _slot = default;
         _holdStrip = default;
         Drift.Forget();
         _placedOnFallback = false; _fallbackRecoveries = 0; _boardFloor = float.NaN;
         // The page's final geometry is a property of the page: the latch, whether the last frame could read it, how many
         // of the section's parts were still waiting to be drawn and the frame the wait started on all go with it.
         FinalLayout.Forget(); _finalMeasurable = false; _finalEverMeasurable = false; _finalUndrawn = 0; _finalFirstFrame = -1;
+        // 1.19.60 (review F1): how often this page was watched with an empty ledger is the page's own count too, so a new
+        // settlement starts from `NotStarted` instead of inheriting the previous screen's observation budget.
+        _revealObservations = 0;
         // The reveal's stall clock belongs to the page too: the next result screen starts from zero progress.
         RevealClock.Forget();
         // The per-part completion diagnostic is a statement about this page's own parts: its signature and its line
-        // budget go with the page, so the next screen prints its own reading.
+        // budget go with the page, so the next screen prints its own reading. 1.19.55: the reset itself has to stay -
+        // without it the budget of the previous page held the next page's reading back.
         _completionPartSignature = string.Empty; _completionPartLines = 0;
+        // 1.19.55: the measured table width and its probe budget are the page's own too. `ResetPlacement` runs on every
+        // repaint (a wheel notch, a hide/show) and used to wipe them there, so the two-phase column measurement (`Fit`:
+        // "record the width, refuse this frame, resolve the band against it next frame") could never reach its second
+        // phase: the width was gone by the time the next frame asked, the fit refused again, and the *first* placement of
+        // every success page was impossible - that is the "the board must be drawn before the column can be known, the
+        // column must be known before the board may be drawn" loop. They are dropped here instead, where the page itself
+        // is dropped.
+        _widthProbe = float.NaN; _columnProbes = 0;
+        // The page this mod last attached to, and whether the board standing on it entered early: both are statements
+        // about this page and go with it.
+        _attachedPage = IntPtr.Zero;
+        _earlyBoard = false;
+        // 1.19.55: the pointer-space observation belongs to the page it described, so the next screen prints its own.
+        _spaceReported = string.Empty;
         // The failure page's own wall clock goes with the page as well: the next result screen waits through its own.
         _failureWallFirstFrame = -1;
         // A different screen is a different fail-open decision: the refusal count and the fallback placement belong to
@@ -515,7 +753,7 @@ internal static class ResultsDisplay
         // A different screen has a different board, and the wheel is only ever aimed at the one on the page now.
         ClearHit();
         Readiness.Forget();
-        // A new result screen reports its own board: the layout line belongs to the screen, not to the
+        _iconRowBottom = float.NaN;
         // session. A page pointer is reused across a session's runs, so a once-per-session latch left every
         // result screen after the first without its own line and its own archive entry in the log.
         _loggedDraw = false;
@@ -524,6 +762,9 @@ internal static class ResultsDisplay
         // 固定模式的落位与这一页一起结束。
         _fixedPlaced = false;
         _fixedPlan = ResultFixedDrawPlan.None;
+        // The page's controls belong to the page: their rectangles, the presses in flight and the frame that drew
+        // them are dropped with it, so a click on the next screen can never be answered by the last one's box.
+        ForgetChrome();
     }
 
     // The success page's "sectors cleared" row: its own label and the four icon slots, and *nothing else*. The white
@@ -657,19 +898,1511 @@ internal static class ResultsDisplay
     // the blocks it stands in for, so the caches are dropped and the next poll remeasures. The retry cadence is
     // dropped too: a change the player just made is measured on the next frame, not on the next cadence tick.
     // Called on the main thread from Plugin.ApplyConfig.
-    internal static void Invalidate() { ResetPlacement(); Retry.Forget(); }
+    // This is the *board's* cache and nothing else. `ChromePlaces` deliberately does not go with it: a
+    // configuration reload (or the config write an F8 press makes) re-measures the board, and a re-measured board
+    // is not a new page - the toggle stands beside the page's own control and nothing here follows the re-measured
+    // header. The places are forgotten by `ForgetChrome` alone: leaving the results screens, a
+    // genuinely different page/settlement, or a repaint that failed.
+    internal static void Invalidate()
+    {
+        ResetPlacement(); Retry.Forget();
+        ChromePlaces.Relayout();
+    }
+
+    // -------------------------------------------------------------------------------------------------
+    // The settlement board's own controls.
+    //
+    // Two controls hang off what the page really draws rather than off a guess:
+    //
+    //   toggle  immediately left of the control the page puts at its foot - the host's own return
+    //           button, or, on a client page, the waiting-status line that page actually draws (a client
+    //           settlement page has no return button at all: the game leaves it permanently inactive).
+    //           It is drawn whether the board is up or not, because it is the pointer that can give the
+    //           board back after it has been hidden.
+    //   close   in the board's own reserved header, top right. The header is taken out of the strip the
+    //           board was measured into before the table is fitted (`ChromeHeader()`), so no figure is
+    //           ever drawn under the button and the board never grows past its band to make room.
+    //
+    // It is drawn and hit from the same struct, it is simply absent when the page hands over nothing to
+    // anchor it (no anchor means no control, never a rectangle over an imagined one), and the one action it
+    // shares with F8 is `ToggleForcedFallback`: one visible-state answer, so the key and the control can
+    // never disagree about what a press does. Nothing here suppresses input:
+    // the controls are placed where the page's own controls are not, and the pointer is read - never
+    // taken - from the game.
+    private static readonly ResultSettlementSession Session = new ResultSettlementSession();
+    private static readonly ResultChromeInputGate ToggleGate = new ResultChromeInputGate();
+    // The one place, committed once per page, page flavour and window (`ResultChromeLayout.Step`), and the
+    // observation that decides whether the thing the toggle stands beside has stopped moving. The rectangle
+    // below is *this repaint's* answer - drawn and hit only when the step put it on the screen - so a repaint,
+    // a key or a paused control can never leave a click box behind while the place itself survives.
+    private static readonly ResultChromeCommit ChromePlaces = new ResultChromeCommit();
+    private static readonly ResultChromeSettle ChromeAnchorSettle = new ResultChromeSettle();
+    private static readonly ResultChromeProbe ChromeFrame = new ResultChromeProbe();
+    private static readonly List<LayoutRect> ChromeNative = new List<LayoutRect>(8);
+    // This repaint's rectangle. `_chromeToggleRect` is only ever filled by a repaint that really draws the control;
+    // the *place* lives in `ChromePlaces`, which is what survives the frame.
+    private static LayoutRect _chromeToggleRect, _chromeBoardRect;
+    private static bool _chromeToggleValid;
+    private static int _chromeDrawnFrame = -1;
+    private static int _chromeScreenWidth, _chromeScreenHeight;
+    // What this repaint booked and `FinishChromeDraw` paints: the band only when the table really drew, the toggle on
+    // every path. `_chromeToggleHides` is the word the toggle carried this repaint and the action its press takes - a
+    // button never does the opposite of its own label (review #1).
+    //
+    // 1.19.43: the toggle is booked here and made clickable by the paint, never by the booking. `_chromeToggleValid` was
+    // written from the decision, i.e. one step before `DrawChromeControl`, so a repaint that decided on the control and
+    // then failed - or returned - before painting it left a hot rectangle with no button under it.
+    //
+    // 1.19.45: the close and the two fallback seats this block used to hold went with the second control. Every field
+    // left here belongs to one button, and nothing in this file can paint or hit a rectangle the step did not give it.
+    private static LayoutRect _chromeHeaderRect;
+    private static bool _chromeHeaderPending, _chromeTogglePending, _chromeToggleHides;
+    private static ResultChromeVisual _chromeToggleVisual;
+    private static ResultChromeAnchor _chromeAnchor;
+    private static string _chromeWhy = string.Empty;
+
+    // ---- 1.19.44: the settlement page's own pointer, its own main button, and the cursor this mod draws ----
+    //
+    // Ported from the panel the user already runs (`conflictmodlist/src/TeamVersionsDriver.cs` 443-513/517-569/584-616,
+    // `shared/PanelPointer.cs` 54-144). The rules are the same and the globals are still absent: this mod never touches
+    // `Cursor.visible`, never locks, never captures and never asks the game for an input mode. It reads the page's cursor
+    // and the page's own main button, and it only *stands in for* the cursor inside a rectangle it painted this repaint.
+    private static ResultPointerSample _pointer = ResultPointerSample.None;
+    // 1.19.59 (independent review L5): the frame this sample was taken on. Every entry that answers from the pointer -
+    // the repaint, the page's own press dispatch and the wheel - asks `EnsurePointer` first, so a frame has exactly one
+    // sample and all three read the same point. The defect this closes: `PollWheel` runs in the press dispatch *before*
+    // `DispatchPressFrame`, and it used to read whatever `_pointer` the previous repaint had left behind.
+    private static readonly ResultPointerFrameCache PointerFrame = new ResultPointerFrameCache();
+    // The session the two fields above belong to, and the press bookkeeping that belongs to that session only.
+    private static ResultPointerSession _pointerSession = ResultPointerSession.None;
+    private static bool _pointerSessionValid;
+    private static ResultPressSource _pressSource = ResultPressSource.None;
+    private static bool _pressDown;
+    // The one sample this frame, whoever asked for it first: the native dispatch's prefix and this mod's own `Update` may
+    // run in either order, and a second derivation of the same physical press would be a second edge.
+    private static int _pressFrame = -1;
+    private static ResultPressFrame _pressFrameValue = ResultPressFrame.Unavailable;
+    // The press this mod consumed, kept until it really ends (`ResultPressOwnership`). Its identity is the page it began
+    // on, captured at the press - never this mod's layout cache, which the hide that press performs drops in the same
+    // frame (`ResetPlacement` sets `_page = null`).
+    private static ResultPressOwnership _pressOwned;
+    // 1.19.46 (UI review F1 close-out): the frame's one *decision*, shared by the page's own dispatch and this mod's
+    // poll, and the action layer's own memory of the frame it has already answered. The decision cache is dropped with
+    // the layout (`ForgetChrome`); the answer ledger deliberately is not - a hide is not the end of the press that
+    // caused it.
+    private static int _dispatchFrame = -1;
+    private static ResultPressDispatch _dispatchValue = ResultPressDispatch.None;
+    private static ResultPressAnswer _pressAnswer = ResultPressAnswer.None;
+    // Bounded diagnostic: which source answered, once per change, and why the cursor is not drawn when it is not.
+    private static string _pointerNote = string.Empty;
+    private static uint _pointerReportGeneration;
+    private static int _pointerFailures;
+    private const int PointerReportLimit = 6;
+    // One cached label style *per control*, each one rebuilt only when that control's glyph size changes. The two
+    // controls carry different sizes (13 px toggle, a scaled close), so a single slot rebuilt one of them on every
+    // repaint - two `new GUIStyle` allocations a frame for nothing.
+    private static GUIStyle _toggleStyle;
+    private static int _toggleStyleSize = -1;
+    // The header's two runs of text get their own slots for the same reason the two controls do: the name (left
+    // aligned) and the key hint (right aligned) are different glyph sizes in two different alignments, and a
+    // single slot would rebuild one of them on every repaint.
+    private static GUIStyle _titleStyle, _hintStyle;
+    private static int _titleStyleSize = -1, _hintStyleSize = -1;
+    // One line per kind of failure, not per frame: a page whose controls cannot be measured says so once. The
+    // event lines of the two controls are rate-limited per *page* (`ReportChrome`), not by these flags.
+    private static bool _loggedChromeDraw, _loggedChromeInput;
+
+    // The height the board's header takes out of its own strip, from the one metrics rule the controls,
+    // the tests and the offline preview all read.
+    private static float ChromeHeader()
+    {
+        try { return ResultChromeMetrics.For(Screen.width, Screen.height).HeaderHeight; }
+        catch { return ResultChromeMetrics.For(1920f, 1080f).HeaderHeight; }
+    }
+
+    private static ResultChromeMetrics ChromeMetrics()
+    {
+        try { return ResultChromeMetrics.For(Screen.width, Screen.height); }
+        catch { return ResultChromeMetrics.For(1920f, 1080f); }
+    }
+
+    private static bool ResultsPage()
+    {
+        var state = GameStateManager.CurrentStateName;
+        return state == eGameStateName.ExpeditionSuccess || state == eGameStateName.ExpeditionFail;
+    }
+
+    // The pointer, in the same window space every measured rectangle of this mod lives in.
+    //
+    // 1.19.44 (ported from the panel the user already runs): the *page's own cursor* first - `CM_PageBase.CursorWorldPosition`
+    // projected through the camera this build already proves for that page, one Y flip - and the physical mouse only as a
+    // labelled fallback for a frame in which the page cannot answer. The order matters: the page's cursor is the point the
+    // game itself hit-tests its own menu items with, so a control of this mod answers on a frame where the system cursor is
+    // hidden (which is the settlement screen's normal state) exactly as a native one does.
+    //
+    // `Cursor.visible` is read, never written: while the game is showing a hardware cursor there is nothing to stand in
+    // for, and the sample says so (the cursor this mod draws is then suppressed rather than fighting the system one).
+    private static bool ChromePointer(out float x, out float y)
+    {
+        x = float.NaN; y = float.NaN;
+        EnsurePointer();
+        if (!_pointer.Valid) return false;
+        x = _pointer.X; y = _pointer.Y;
+        return x >= 0f && y >= 0f && x <= Screen.width && y <= Screen.height;
+    }
+
+    // The frame's one pointer sample (L5). The first entry to ask in a frame takes it and every other entry in that same
+    // frame reads it: the repaint that draws the table, the press dispatch that answers the page's own button, and the
+    // wheel - which is settled from the frame driver and again from the page's press dispatch, i.e. *before*
+    // `DispatchPressFrame`. A frame that changes its mind about where the pointer is, half way through, is not a thing:
+    // the page's own cursor is written once per frame by the game, so one read of it is the frame's answer. A new frame
+    // always samples again - the point of the cache is that two entries agree, not that a value is kept.
+    //
+    // A read that throws leaves the previous sample in place and is not remembered as this frame's answer: the cache is
+    // only claimed by a sample that really happened.
+    private static void EnsurePointer()
+    {
+        int frame;
+        try { frame = Time.frameCount; } catch { frame = -1; }
+        if (frame < 0 || !PointerFrame.Claim(frame)) return;
+        try { _pointer = SamplePagePointer(); }
+        catch { PointerFrame.Forget(); }
+    }
+
+    // The one page-cursor sample of the frame: world point from the page, the page's own camera, one conversion.
+    //
+    // Every refusal names itself (`ResultPointerSample.Note`) and falls through to the physical mouse, which is the only
+    // source left when the page cannot answer - an unreadable cursor, a camera that is not there, a projection that is
+    // not a number or a point behind the camera. A refusal never keeps the previous frame's coordinates.
+    private static ResultPointerSample SamplePagePointer()
+    {
+        Component page = ChromePage();
+        if (page == null) return ResultPointerSample.Invalid(ResultPointerSource.PageCursor, "no live result page");
+        CM_PageBase menu = null;
+        try { menu = page.TryCast<CM_PageBase>(); } catch { menu = null; }
+        if (menu == null) return ResultPointerSample.Invalid(ResultPointerSource.PageCursor, "the page is not a CM_PageBase");
+        Camera camera = PointerCamera(page);
+        if (camera == null) return FallBackToPhysical("no camera proved for this page");
+        // 1.19.59: the sampled point is the one the player is looking at. The page carries the game's own cursor object
+        // (`CM_PageBase.m_cursor` -> `CM_Cursor.m_trans`/`WorldPos`/`IsLocal`/`IsVisible`, written by the page's own
+        // `UpdateCursorPosition`), so that transform is asked first and the mouse-derived `CursorWorldPosition` is the
+        // fallback. Both are projected through the same camera and the same one conversion, which is what makes the drawn
+        // board, the hovered control, the click and the wheel answer for one point.
+        Vector3 world;
+        string source;
+        if (NativeCursorWorld(menu, out world)) source = "native-cursor";
+        else
+        {
+            source = "page-cursor";
+            try { world = menu.CursorWorldPosition; }
+            catch (Exception error) { return FallBackToPhysical("CursorWorldPosition threw: " + error.Message); }
+        }
+        Vector3 screen;
+        try { screen = camera.WorldToScreenPoint(world); } catch (Exception error) { return FallBackToPhysical("the projection threw: " + error.Message); }
+        ResultPointerViewport viewport = PointerViewport(camera, out bool wholeWindow);
+        // 1.19.59: a camera whose raster this build cannot prove is not used to move the player's hotspot. 1.19.55/1.19.56
+        // still flipped that unproven point and only labelled it, so on a page whose camera is not the window's own (a
+        // render-texture camera, another mod's viewport) the hover, the press and the wheel were all aimed at a point the
+        // player was not pointing at - and "space=direct" could not prove otherwise, because it only judges this camera
+        // against itself. The physical mouse is where the hotspot really is; the label says so and nothing is guessed.
+        if (!ResultPointerSpace.TryWindow(viewport, screen.x, screen.y, screen.z, out float gx, out float gy, out string note))
+            return FallBackToPhysical(note);
+        if (!wholeWindow)
+            return FallBackToPhysical("the page's camera does not prove this window's raster (" + viewport.Describe() + ")");
+        _pointerNote = source;
+        return new ResultPointerSample(true, gx, gy, ResultPointerSource.PageCursor, string.Empty);
+    }
+
+    // The world point of the game's own cursor, when the page exposes one this build may trust.
+    //
+    // `CM_Cursor` is the sprite the player sees on these menu pages (`m_cursorSprite`, `m_trans`); it is marked
+    // `IsLocal`/`IsVisible`, and both are read rather than assumed - a cursor that is a remote player's, or one the page has
+    // hidden, is not this machine's hotspot. A transform that is not a number, or one at the world origin (the value an
+    // uninitialised wrapper answers), is refused so the fallback stays in charge.
+    private static bool NativeCursorWorld(CM_PageBase menu, out Vector3 world)
+    {
+        world = default;
+        try
+        {
+            CM_Cursor cursor = menu.m_cursor;
+            if (cursor == null) return false;
+            try { if (!cursor.IsVisible) return false; } catch { }
+            try { if (!cursor.IsLocal) return false; } catch { }
+            Transform transform = null;
+            try { transform = cursor.m_trans; } catch { transform = null; }
+            if (transform != null)
+            {
+                Vector3 point = transform.position;
+                if (float.IsFinite(point.x) && float.IsFinite(point.y) && float.IsFinite(point.z) && point.sqrMagnitude > 0.0001f)
+                {
+                    world = point;
+                    return true;
+                }
+            }
+            Vector3 direct = cursor.WorldPos;
+            if (float.IsFinite(direct.x) && float.IsFinite(direct.y) && float.IsFinite(direct.z) && direct.sqrMagnitude > 0.0001f)
+            {
+                world = direct;
+                return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    // The raster facts of a page camera, from the camera's own fields, for `ResultPointerSpace`.
+    //
+    // 1.19.56 (review 2/3/10): the projection is already a window point (`WorldToScreenPoint` includes the camera's
+    // `pixelRect` offset), so this never converts anything - it only decides whether the mapping can be *proven* and what
+    // the `settlement space` line may therefore claim. `wholeWindow` is false when a camera renders into a texture or its
+    // metadata could not be read; the point is then still flipped with `Screen.height` (the 1.19.54 behaviour) and every
+    // line says `unproven`, so a reader is never told a mapping was validated when it was only carried over. The window's
+    // own size is always carried, because a rectangle this mod cannot prove must still be measurable - refusing here is
+    // what would make the whole page unmeasurable.
+    private static ResultPointerViewport PointerViewport(Camera camera, out bool wholeWindow)
+    {
+        wholeWindow = false;
+        try
+        {
+            // An overlay canvas (`RenderMode.ScreenSpaceOverlay`) hands back a null camera, and
+            // `RectTransformUtility.WorldToScreenPoint(null, ...)` is then *documented* to answer in window pixels: the
+            // raster is this window's own grid and the mapping is proven direct.
+            if (camera == null)
+            {
+                wholeWindow = true;
+                return new ResultPointerViewport(Screen.width, Screen.height, 0f, 0f, Screen.width, Screen.height,
+                    Screen.width, Screen.height);
+            }
+            // A camera that renders into a texture answers in that texture's pixels and where the game puts it on the
+            // window is not read here. Unproven - and still answerable, with the window's own height.
+            if (camera.targetTexture != null)
+                return new ResultPointerViewport(float.NaN, float.NaN, 0f, 0f, Screen.width, Screen.height,
+                    Screen.width, Screen.height);
+            Rect viewport = camera.pixelRect;
+            var facts = new ResultPointerViewport(camera.pixelWidth, camera.pixelHeight,
+                viewport.x, viewport.y, viewport.width, viewport.height, Screen.width, Screen.height);
+            wholeWindow = facts.Whole;
+            return facts;
+        }
+        catch
+        {
+            return new ResultPointerViewport(float.NaN, float.NaN, 0f, 0f, Screen.width, Screen.height,
+                Screen.width, Screen.height);
+        }
+    }
+    // own canvas camera is asked first (`PageCamera`, the same one `TryScreenRect` projects every measured rectangle
+    // with), then the page's static `CM_PageBase.Camera`, then `Camera.main` - and nothing is remembered across a page:
+    // a camera from the previous settlement is not evidence about this one.
+    //
+    // 1.19.46 (UI review note): the blueprint's live finding is transplanted here - the camera that really renders a
+    // `CM_PageBase` menu page is `page.m_guiLayer.m_menuCamera.m_camera` (`MainMenuGuiLayer.CameraController.m_camera`,
+    // both confirmed in this profile's `Modules-ASM` interop), and `CM_PageBase.Camera` answered null in that reference
+    // case. The menu camera is therefore asked *first*, and the chain below it stays as the fallbacks. A camera that
+    // cannot be shown to be live is never used: the sample then falls to the physical mouse, which is labelled, instead
+    // of projecting the page cursor through the wrong camera.
+    private static Camera PointerCamera(Component page)
+    {
+        try
+        {
+            var menu = page != null ? page.TryCast<CM_PageBase>() : null;
+            Camera drawn = menu != null && menu.m_guiLayer != null && menu.m_guiLayer.m_menuCamera != null
+                ? menu.m_guiLayer.m_menuCamera.m_camera
+                : null;
+            if (Usable(drawn)) return drawn;
+        }
+        catch { }
+        try
+        {
+            Camera canvas = PageCamera(page, out bool overlay);
+            if (Usable(canvas)) return canvas;
+        }
+        catch { }
+        try { if (Usable(CM_PageBase.Camera)) return CM_PageBase.Camera; } catch { }
+        try { if (Usable(Camera.main)) return Camera.main; } catch { }
+        return null;
+    }
+
+    private static bool Usable(Camera camera)
+    {
+        try { return camera != null && camera.isActiveAndEnabled; } catch { return false; }
+    }
+
+    // The physical mouse, kept only as the labelled fallback. Same conversion as always; the note says which refusal sent
+    // the frame here, so a log can tell "the page cannot answer on this build" from "nobody moved the mouse".
+    private static ResultPointerSample FallBackToPhysical(string why)
+    {
+        _pointerNote = "physical-fallback: " + why;
+        try
+        {
+            Vector3 pointer = Input.mousePosition;
+            if (!float.IsFinite(pointer.x) || !float.IsFinite(pointer.y))
+                return ResultPointerSample.Invalid(ResultPointerSource.PhysicalMouse, _pointerNote);
+            float x = pointer.x, y = Screen.height - pointer.y;
+            if (x < 0f || y < 0f || x > Screen.width || y > Screen.height)
+                return ResultPointerSample.Invalid(ResultPointerSource.PhysicalMouse, _pointerNote + "; outside the window");
+            return new ResultPointerSample(true, x, y, ResultPointerSource.PhysicalMouse, why);
+        }
+        catch (Exception error) { return ResultPointerSample.Invalid(ResultPointerSource.PhysicalMouse, _pointerNote + ": " + error.Message); }
+    }
+
+    // The page's own main button state, and the one place a press edge is made.
+    //
+    // `CM_PageBase.MainButtonStatus` is the state the game's own `UpdateButtonPress` dispatches on, so it is asked first;
+    // `Input.GetMouseButton(0)` is the labelled fallback for a build whose page cannot answer. Edges are derived from this
+    // one sample against the previous frame's *down* state - never from `GetMouseButtonDown/Up`, which would be a second,
+    // independent sampler and could disagree with it inside one frame.
+    private static ResultPressFrame SamplePress()
+    {
+        // 1.19.46: one sample per frame, whoever asks. The native dispatch (`CM_PageBase.UpdateButtonPress`, through the
+        // prefix) and this mod's own `Update` may run in either order inside one frame; a second call returns the frame
+        // that was already derived, so neither order can produce a second edge out of the same physical press.
+        int frame = Time.frameCount;
+        if (frame == _pressFrame) return _pressFrameValue;
+        ResultPressFrame sampled = SamplePressUncached();
+        _pressFrame = frame;
+        _pressFrameValue = sampled;
+        return sampled;
+    }
+
+    private static ResultPressFrame SamplePressUncached()
+    {
+        Component page = ChromePage();
+        CM_PageBase menu = null;
+        try { menu = page != null ? page.TryCast<CM_PageBase>() : null; } catch { menu = null; }
+        if (menu != null)
+        {
+            try
+            {
+                bool down = menu.MainButtonStatus;
+                ResultPressFrame frame = ResultPressFrame.Of(true, down, _pressDown, ResultPressSource.Page);
+                _pressDown = down; _pressSource = ResultPressSource.Page;
+                return frame;
+            }
+            catch { /* the physical fallback below is the answer, and it says so */ }
+        }
+        try
+        {
+            bool down = Input.GetMouseButton(0);
+            ResultPressFrame frame = ResultPressFrame.Of(true, down, _pressDown, ResultPressSource.Physical);
+            _pressDown = down; _pressSource = ResultPressSource.Physical;
+            return frame;
+        }
+        catch
+        {
+            _pressSource = ResultPressSource.None;
+            return ResultPressFrame.Unavailable;
+        }
+    }
+
+    // The resident result page's native pointer, read from the page the controls stand on (`ChromePage`, which survives
+    // `_page` being dropped by a hide) - the identity a press claim is made against.
+    private static IntPtr ChromePagePointer()
+    {
+        try { Component page = ChromePage(); return page != null ? page.Pointer : IntPtr.Zero; }
+        catch { return IntPtr.Zero; }
+    }
+
+    // Whether the sampled pointer is over a rectangle the page itself is drawing. A press that began on one of the
+    // page's own controls is never claimed by this mod, so a known native protection zone keeps its press whatever else
+    // is true about the frame.
+    private static bool PointerOverNative()
+    {
+        if (!_pointer.Valid) return false;
+        for (int index = 0; index < ChromeNative.Count; index++)
+            if (ResultPointerHit.Inside(ChromeNative[index], _pointer.X, _pointer.Y)) return true;
+        return false;
+    }
+
+    // Every rectangle the page itself is drawing this repaint: the control at the foot of the page and, on a
+    // client failure page, the waiting-status line. Only what the page is really drawing reaches this list - a
+    // control the game has switched off is not a rectangle on the screen, and treating it as one is what would
+    // let a hidden button pause the toggle that stands beside the visible one (`Conflicts`).
+    //
+    // `TryChromeTextRect` is the same measurement the anchor uses, so the obstacle and the thing the control
+    // stands beside can never be two different rectangles for the same text.
+    private static void ChromeNativeControls(List<LayoutRect> into, Component page, bool succeeded)
+    {
+        into.Clear();
+        try
+        {
+            if (succeeded)
+            {
+                var success = page != null ? page.TryCast<CM_PageExpeditionSuccess>() : null;
+                if (success != null && ButtonActive(success.m_btnLeaveExpedition)
+                    && TryScreenRect(success.m_btnLeaveExpedition, out LayoutRect leave)) into.Add(leave);
+                return;
+            }
+            var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
+            if (fail == null) return;
+            if (ButtonActive(fail.m_btnRestartCheckpoint)
+                && TryScreenRect(fail.m_btnRestartCheckpoint, out LayoutRect restart)) into.Add(restart);
+            if (ButtonActive(fail.m_btnGoToLobby)
+                && TryScreenRect(fail.m_btnGoToLobby, out LayoutRect goToLobby)) into.Add(goToLobby);
+            if (fail.m_returnToLobby_text != null && ButtonActive(fail.m_returnToLobby_text)
+                && TryChromeTextRect(fail.m_returnToLobby_text, out LayoutRect waiting)) into.Add(waiting);
+        }
+        catch { }
+    }
+
+    // The one anchor this page really offers, and which native fact it came from.
+    //
+    // A host's page carries the button that sends the squad home, so the toggle stands beside it. A
+    // client's page does not - the game leaves `m_btnGoToLobby` permanently inactive and the success
+    // page has no waiting-status field at all - so the anchor there is the line the page is really
+    // drawing: on the failure page `m_returnToLobby_text`, and on the success page the topmost label in
+    // `m_btnLeaveExpedition`'s own subtree that is active, carries text and has arrived at full
+    // opacity. No field is invented for it and no coordinate is guessed: a page that draws no such line
+    // and no button hands over no anchor, and the toggle is simply not there.
+    //
+    // `reveal` is how far that native fact has come in, and it is deliberately three answers rather than a
+    // number: a button the page has switched on has no reveal at all (`Arrived`), a text still fading in is
+    // `Waiting`, and a text whose own alpha could not be read is `Unreadable` - a failed read, which is neither
+    // an arrival nor a verdict that the page has no waiting line.
+    //
+    // `m_returnToLobby_text` is measured by `TryChromeTextRect`, which asks the text's own content twice - its
+    // laid-out text bounds and then the glyph mesh it really draws - and never falls back to a parent's
+    // rectangle. A decoration container on this page is the size of the screen, and a screen-sized rectangle
+    // standing in for "the waiting line" is the one measurement that must never be handed to a control.
+    private static bool TryChromeAnchor(Component page, bool succeeded, out LayoutRect anchor,
+        out ResultChromeAnchor source, out ResultChromeReveal reveal, out string why)
+    {
+        anchor = default; source = ResultChromeAnchor.None; reveal = ResultChromeReveal.Arrived; why = "no-page";
+        if (page == null) return false;
+        try
+        {
+            if (succeeded)
+            {
+                var success = page.TryCast<CM_PageExpeditionSuccess>();
+                if (success == null) { why = "no-success-page"; return false; }
+                if (ButtonActive(success.m_btnLeaveExpedition) && TryScreenRect(success.m_btnLeaveExpedition, out anchor))
+                {
+                    source = ResultChromeAnchor.HostReturnButton;
+                    why = "leave-expedition-button";
+                    reveal = ResultChromeReveal.Arrived;   // proven by activation: this anchor has no reveal
+                    return true;
+                }
+                if (success.m_btnLeaveExpedition == null) { why = "no-leave-button"; return false; }
+                try
+                {
+                    foreach (TextMeshPro label in success.m_btnLeaveExpedition.GetComponentsInChildren<TextMeshPro>(true))
+                    {
+                        if (label == null || !label.gameObject.activeInHierarchy) continue;
+                        string text = label.text;
+                        if (string.IsNullOrWhiteSpace(text)) continue;
+                        if (!(HeadingAlpha(label) >= 0.99f)) continue;
+                        if (!TryChromeTextRect(label, out LayoutRect rect)) continue;
+                        if (anchor.Width <= 0f || rect.Y < anchor.Y) anchor = rect;
+                    }
+                }
+                catch { why = "label-walk-failed"; return false; }
+                if (anchor.Width > 0f && anchor.Height > 0f)
+                {
+                    // The label this anchor came from is already proven to be drawing at full opacity.
+                    reveal = ResultChromeReveal.Arrived;
+                    source = ResultChromeAnchor.ClientWaitingStatus;
+                    why = "success-footer-label";
+                    return true;
+                }
+                why = "no-drawn-footer-label";
+                return false;
+            }
+            var fail = page.TryCast<CM_PageExpeditionFail>();
+            if (fail == null) { why = "no-failure-page"; return false; }
+            if (ResultPageRolePolicy.IsClient(Role()))
+            {
+                if (ChromeTextAnchor(fail.m_returnToLobby_text, out anchor, out reveal, out string textWhy))
+                {
+                    source = ResultChromeAnchor.ClientWaitingStatus;
+                    why = "return-to-lobby-text/" + textWhy;
+                    return true;
+                }
+                // "The page has no such field" and "the field is there and could not be measured this repaint"
+                // are different answers, and only the first one is a page with nothing to stand beside.
+                why = fail.m_returnToLobby_text == null ? "no-waiting-status-field" : "waiting-status-" + textWhy;
+                return false;
+            }
+            LayoutRect restartRect = default;
+            LayoutRect lobbyRect = default;
+            bool restart = ButtonActive(fail.m_btnRestartCheckpoint) && TryScreenRect(fail.m_btnRestartCheckpoint, out restartRect);
+            bool lobby = ButtonActive(fail.m_btnGoToLobby) && TryScreenRect(fail.m_btnGoToLobby, out lobbyRect);
+            if (!restart && !lobby)
+            {
+                if (ChromeTextAnchor(fail.m_returnToLobby_text, out anchor, out reveal, out string textWhy))
+                {
+                    source = ResultChromeAnchor.ClientWaitingStatus;
+                    why = "return-to-lobby-text-host-fallback/" + textWhy;
+                    return true;
+                }
+                why = "no-host-action";
+                return false;
+            }
+            // 开关贴在哪颗按钮左边：**优先「返回大厅」**，而不是位置更高的「重启检查点」。玩家在失败页真正要按的是
+            // 回大厅；把开关挂在更高的那颗键上，会让它落在两者之间那块空处，看起来谁也不属于。两颗键都仍然参与
+            // 避让（`TryToggle` 的 obstacles 里两颗都在），所以原版的避让没有被取消，只是排队的顺序换了。
+            anchor = lobby ? lobbyRect : restartRect;
+            source = ResultChromeAnchor.HostActionButton;
+            why = lobby ? "go-to-lobby-button" : "restart-checkpoint-button";
+            reveal = ResultChromeReveal.Arrived;   // proven by activation
+            return true;
+        }
+        catch (Exception error)
+        {
+            why = "anchored-read-failed: " + error.GetType().Name;
+            return false;
+        }
+    }
+
+    // A native text as an anchor: drawn, measurable, and with its reveal read out of the text itself.
+    //
+    // The three refusals are named, because the recorded client page's only line was "no-waiting-status" and
+    // that word covered "the field is null", "the object is switched off" and "the text measured nothing" - three
+    // different facts, only the first of which means the page has nothing to stand beside.
+    private static bool ChromeTextAnchor(TMP_Text text, out LayoutRect rect, out ResultChromeReveal reveal, out string why)
+    {
+        rect = default; reveal = ResultChromeReveal.Arrived; why = "no-field";
+        if (text == null) return false;
+        try
+        {
+            if (!text.gameObject.activeInHierarchy) { why = "not-drawn"; return false; }
+            if (!TryChromeTextRect(text, out rect)) { why = "unmeasured"; return false; }
+            reveal = ChromeReveal(text);
+            why = reveal == ResultChromeReveal.Arrived ? "alpha-arrived"
+                : reveal == ResultChromeReveal.Waiting ? "alpha-fading" : "alpha-unreadable";
+            return true;
+        }
+        catch (Exception error) { why = "read-failed-" + error.GetType().Name; return false; }
+    }
+
+    // How far a text has come in. A not-a-number alpha is `Unreadable`, never `Arrived`: a TMP whose alpha cannot
+    // be read is a measurement that failed, and the settle rule then has to earn the place from the geometry
+    // alone. It is also never reported as "this page has no waiting line" - one failed read must not decide that.
+    private static ResultChromeReveal ChromeReveal(TMP_Text text)
+    {
+        // A text that cannot even be cast to the component the alpha is read from is a failed read, not an
+        // arrival - the same answer as a not-a-number alpha.
+        var heading = text != null ? text.TryCast<TextMeshPro>() : null;
+        if (heading == null) return ResultChromeReveal.Unreadable;
+        float alpha = HeadingAlpha(heading);
+        if (!float.IsFinite(alpha)) return ResultChromeReveal.Unreadable;
+        return alpha >= 0.999f ? ResultChromeReveal.Arrived : ResultChromeReveal.Waiting;
+    }
+
+    // The rectangle a native text really draws, by two independent routes and never by a parent's rectangle.
+    //
+    // `TryTextRect` is the text's own laid-out extent; on a world-space `TextMeshPro` it answers whenever the
+    // text has been laid out, and it is the route that knows nothing about renderers. The second route is the
+    // glyph mesh the same text draws: `TryScreenRect` measures a `Renderer`'s own bounds, which for a TMP text
+    // is the generated quads - the pixels the player is reading - and it refuses a rectangle that covers the
+    // whole window. Both routes measure *this text*, so a page's decoration container (which on this page is
+    // the size of the screen) can never be mistaken for the waiting-status line.
+    //
+    // The two routes are asked in that order because the first is exact when it answers and the second costs a
+    // projection; either one answering is a real measurement of the text, and both answering "no" means the
+    // text is not on the screen this frame - which is the only thing that makes a control go pending rather
+    // than get a place it did not earn.
+    private static bool TryChromeTextRect(TMP_Text text, out LayoutRect rect)
+    {
+        rect = default;
+        if (text == null) return false;
+        if (TryTextRect(text, out rect)) return true;
+        try
+        {
+            var component = text.TryCast<Component>();
+            if (component == null) return false;
+            // Exactly the text's own renderer. `TryScreenRect` asks the component it is given for one, so this
+            // is a check that a glyph mesh exists rather than a walk up the hierarchy.
+            if (component.GetComponent<Renderer>() == null) return false;
+            return TryScreenRect(component, out rect);
+        }
+        catch { rect = default; return false; }
+    }
+
+    // The plate the board is drawn on, header included: the header is the band this mod plans above the table.
+    private static LayoutRect ChromeBoardRect()
+    {
+        if (_fixedPlaced && _origin.Width > 0f) return ResultChromeLayout.BoardOf(_origin, ChromeMetrics());
+        if (_holdValid && _holdBoard.Width > 0f) return _holdBoard;
+        if (_grid != null && _origin.Width > 0f) return ResultChromeLayout.BoardOf(_origin, ChromeMetrics());
+        return default;
+    }
+
+    // The page the two controls stand on.
+    //
+    // Deliberately not the board's layout page: `_page` is the cache the board's own placement lives in, and it is
+            // dropped the moment the board is hidden (F8 or the toggle), by a configuration reload and by every
+    // re-measure. Sourcing the controls from it is exactly why the SHOW button used to disappear together with
+    // the board it was meant to bring back. The result context and its resident page object are the truth here:
+    // the game keeps both result pages alive for the session and raises the one for the state it is in.
+    private static Component ChromePage()
+    {
+        if (_page != null && PageActive(_page)) return _page;
+        var state = GameStateManager.CurrentStateName;
+        if (state == eGameStateName.ExpeditionSuccess) return Success != null && PageActive(Success) ? Success : null;
+        if (state == eGameStateName.ExpeditionFail) return Fail != null && PageActive(Fail) ? Fail : null;
+        return null;
+    }
+
+    // 1.19.55: the one bounded observation that can locate a real pointer/board mismatch, written once per page *and* window.
+    //
+    // The recorded 1280x960 page pressed twice at (353,935) and (347,925) while the committed toggle stood at (393,916,68x21) -
+    // forty-odd pixels apart, and nothing in that log could say which of the two the drawn board agreed with, or whether the
+    // pointer, the measured controls and the drawn board were even on one grid. This line puts the spaces beside each other in
+    // one place: the window, the page camera's own raster and viewport (the grid every measured rectangle and the pointer are
+    // converted through, `ResultPointerSpace`), the IMGUI mouse position the engine handed this repaint (`Event.current`), the
+    // sampled page pointer with the source it came from, the physical mouse, and the toggle this repaint committed. It is a
+    // measurement, not a claim: `grid=same` means the camera really renders the window and no conversion took place.
+    private static string _spaceReported = string.Empty;
+
+    private static void ReportPointerSpace(Component page, ResultChromeMetrics metrics)
+    {
+        try
+        {
+            string key = (page != null ? page.Pointer.ToString("X") : "none") + "/" + Screen.width + "x" + Screen.height;
+            if (key == _spaceReported) return;
+            _spaceReported = key;
+            Camera camera = PointerCamera(page);
+            ResultPointerViewport viewport = PointerViewport(camera, out bool whole);
+            float guiX = float.NaN, guiY = float.NaN;
+            try { if (Event.current != null) { guiX = Event.current.mousePosition.x; guiY = Event.current.mousePosition.y; } }
+            catch { }
+            float physicalX = float.NaN, physicalY = float.NaN;
+            try { Vector3 mouse = Input.mousePosition; physicalX = mouse.x; physicalY = Screen.height - mouse.y; }
+            catch { }
+            Plugin.Logger?.LogInfo("[DIAG] settlement space: window=" + Screen.width + "x" + Screen.height
+                + "," + viewport.Describe()
+                + ",space=" + (whole ? "direct" : "unproven")
+                + ",gui=" + Vector2Text(guiX, guiY)
+                + ",physical=" + Vector2Text(physicalX, physicalY)
+                + "," + _pointer.Describe()
+                + ",toggle=" + ChromeRect(_chromeToggleRect) + (_chromeToggleValid ? string.Empty : "(not drawn)")
+                + ",toggleFont=" + metrics.ToggleFont.ToString("0") + "px"
+                + ",role=" + ResultPageRolePolicy.Name(Role())
+                + "; one line per page and window - the camera's raster, the engine's own GUI mouse position, the sampled page"
+                + " pointer and the rectangle that was committed, so a page whose clicks land beside the drawn control says"
+                + " which of the four drifted instead of leaving it to be guessed (1.19.55).");
+        }
+        catch { }
+    }
+
+    private static string Vector2Text(float x, float y)
+        => float.IsFinite(x) && float.IsFinite(y)
+            ? "(" + x.ToString("0") + "," + y.ToString("0") + ")"
+            : "unreadable";
+
+    // One repaint of the two controls. Called from the top of `Draw`, before every gate and every early
+    // return, because the toggle belongs to the result page and not to the board: it stays on the screen
+    // while the board is hidden, which is the only way back to it.
+    //
+    // Every frame starts from "no control drawn": the rectangle is dropped, and `_chromeDrawnFrame` is only
+    // written by a frame that really drew it. That is what keeps the input path from ever answering for a
+    // rectangle that belongs to a page, a window or a visibility the player is no longer looking at. What
+    // survives the frame is the *place* (`ChromePlaces`), which is the whole point: a new figure on the board,
+    // a key, a pointer and a hide/show of the board must not move the control.
+    private static void DrawChrome(bool boardUp)
+    {
+        _chromeToggleValid = false;
+        _chromeDrawnFrame = -1;
+        try
+        {
+            if (!ResultsPage()) { ForgetChrome(); return; }
+            // The page the controls stand on - the resident result page itself, not the board's layout cache.
+            // `_page` is dropped the moment the board is hidden (F8, the toggle), by a configuration
+            // reload and by every re-measure, so sourcing the controls from it is what made the SHOW button
+            // disappear with the board it was meant to bring back.
+            Component page = ChromePage();
+            // No page this repaint: draw nothing and keep every place already committed. A repaint that cannot
+            // see the page is not a page change (the places are forgotten by `ForgetChrome` alone).
+            if (page == null) return;
+            bool succeeded = GameStateManager.CurrentStateName == eGameStateName.ExpeditionSuccess;
+            _chromeScreenWidth = Screen.width; _chromeScreenHeight = Screen.height;
+            ResultChromeMetrics metrics = ChromeMetrics();
+            bool pointerValid = ChromePointer(out float pointerX, out float pointerY);
+
+            // The commitment is told what page/settlement/window this repaint belongs to *before* the page is
+            // asked for anything: a new layout is a new layout, and a re-measure of the same one is not. `Step`
+            // makes the same call, so this only prepares the state the probe gate below reads.
+            bool newContext = ChromePlaces.Starts(page.Pointer, succeeded, Screen.width, Screen.height, _settlementGeneration);
+            if (newContext) ChromeAnchorSettle.Forget();
+
+            // This repaint's measurement of the page, filled in exactly as the page answered: nothing is
+            // derived here and nothing is guessed. An anchor the page did not draw says so, and a plate it
+            // derived here and nothing is guessed. An anchor the page did not draw says so, and a plate it could not be read
+            // from says so, which is what keeps a control off the screen in that frame.
+            ChromeFrame.Reset();
+            ChromeFrame.Page = page.Pointer;
+            ChromeFrame.Succeeded = succeeded;
+            ChromeFrame.Session = _settlementGeneration;
+            // 1.19.48: the frame this repaint belongs to. `OnGUI` runs several times per frame and the native-conflict rule
+            // counts *frames*, never calls, so the number is handed in here - the one place that knows it.
+            ChromeFrame.Frame = Time.frameCount;
+            ChromeFrame.ScreenWidth = Screen.width;
+            ChromeFrame.ScreenHeight = Screen.height;
+            ChromeFrame.BoardUp = boardUp;
+            ChromeNative.Clear();
+            ChromeNativeControls(ChromeNative, page, succeeded);
+            ChromeFrame.Native = ChromeNative;
+            LayoutRect board = ChromeBoardRect();
+            _chromeBoardRect = board;
+            ChromeFrame.PlateDrawn = board.Width > 0f && board.Height > 0f;
+            ChromeFrame.Plate = board;
+            // There is no second storey to offer the toggle any more (1.19.45): the place it stands in is the one
+            // beside the control the page really draws, or nothing at all.
+            if (ChromePlaces.NeedsAnchor)
+            {
+                // Only while the toggle is still pending is the page walked for an anchor. Once the place is
+                // committed the page's own tree is not searched again - the settle observation would have
+                // nothing to add and the walk is the expensive half of this method.
+                if (TryChromeAnchor(page, succeeded, out LayoutRect anchor, out ResultChromeAnchor source,
+                        out ResultChromeReveal reveal, out string why))
+                {
+                    ChromeFrame.AnchorDrawn = true;
+                    ChromeFrame.Anchor = anchor;
+                    ChromeFrame.Source = source;
+                    ChromeFrame.Reveal = reveal;
+                    ChromeFrame.AnchorWhy = why;
+                    _chromeAnchor = source;
+                }
+                else
+                {
+                    ChromeFrame.AnchorDrawn = false;
+                    ChromeFrame.AnchorWhy = why;
+                    _chromeAnchor = ResultChromeAnchor.None;
+                }
+            }
+            else
+            {
+                ChromeFrame.AnchorDrawn = false;
+                ChromeFrame.AnchorWhy = "committed";
+            }
+            _chromeWhy = ChromeFrame.AnchorWhy;
+
+            // The one decision: what stands where this frame, and whether this is the frame that committed it.
+            ResultChromeDecision decision = ResultChromeLayout.Step(ChromePlaces, ChromeAnchorSettle, metrics, ChromeFrame);
+            if (newContext || decision.NewContext)
+            {
+                // A new page, a new settlement, a new page flavour or a new window - the only thing that drops a
+                // press in flight.
+                ToggleGate.Reset();
+            }
+            // The decision is *booked* here and painted by `FinishChromeDraw`, which `Draw` runs in a `finally`:
+            // the band belongs to a board that is really on the screen this repaint, so a frame that deferred the
+            // board still leaves no header floating over the game's page, while the toggle is booked on every path,
+            // board or no board - it is the only pointer back to a hidden board.
+            // (`_chromeToggleHides` is the label this repaint draws: HIDE when the board is up, SHOW when it is not.
+            // The press reads exactly that, so a button can never do the opposite of the word on it.)
+            //
+            // 1.19.43: booked only. `FinishChromeDraw` paints it and opens the hit rectangle afterwards, so the
+            // rectangle the input path tests is always one that was really painted.
+            _chromeToggleRect = decision.ToggleDrawn ? decision.Toggle : default;
+            _chromeTogglePending = decision.ToggleDrawn;
+            _chromeToggleValid = false;
+            _chromeToggleHides = boardUp;
+            _chromeToggleVisual = ResultChromeLayout.Visual(ToggleGate, decision.Toggle, true, pointerValid, pointerX, pointerY);
+            _chromeHeaderRect = decision.HeaderDrawn ? decision.Header : default;
+            _chromeHeaderPending = decision.HeaderDrawn;
+            ReportChrome(decision, metrics);
+            // 1.19.55: one bounded observation of the four spaces this repaint measured in, once per page and window.
+            ReportPointerSpace(page, metrics);
+        }
+        catch (Exception error)
+        {
+            ForgetChrome();
+            if (_loggedChromeDraw) return;
+            _loggedChromeDraw = true;
+            Plugin.Logger?.LogWarning("[DIAG] the settlement board's controls could not be drawn this frame and are not clickable: " + error.Message);
+        }
+    }
+
+    // Everything the settlement page's own surface paints, in the one order that makes each of it true.
+    //
+    //   the band    painted only when this repaint's table really drew (`_boardDrawnFrame == Time.frameCount`, written
+    //               by the one `HudTable.Draw` in `Draw`). The recorded pages painted the band ahead of every gate, so
+    //               a frame that deferred the board still left a header floating over the game's page.
+    //   the toggle  painted on *every* path, board or no board: it is the only pointer back to a hidden board.
+    //
+    // The close that used to be painted between them is gone with the second control (1.19.45): this page's surface
+    // has one button on it, and no button belongs to the band.
+    //
+    // Called from `Draw`'s `finally`, so every early return and every exception lands here with the right answer.
+    private static void FinishChromeDraw()
+    {
+        try
+        {
+            bool boardDrawn = _boardDrawnFrame == Time.frameCount;
+            if (boardDrawn && _chromeHeaderPending && _chromeHeaderRect.Width > 0f) DrawChromeHeader(_chromeHeaderRect);
+            ResultChromeMetrics metrics = ChromeMetrics();
+            if (_chromeTogglePending && _chromeToggleRect.Width > 0f && _chromeToggleRect.Height > 0f)
+            {
+                DrawChromeControl(_chromeToggleRect, metrics.ToggleFont, ResultChromeTheme.ToggleLabel(_chromeToggleHides),
+                    _chromeToggleVisual, 1f);
+                _chromeToggleValid = true;
+            }
+            else
+            {
+                // Nothing was painted, so nothing is clickable: no ghost hit rectangle on the empty place a control
+                // this repaint decided on but did not draw would have left behind.
+                _chromeToggleValid = false;
+                _chromeToggleRect = default;
+            }
+            if (_chromeToggleValid) _chromeDrawnFrame = Time.frameCount;
+        }
+        catch (Exception error)
+        {
+            ForgetChrome();
+            if (_loggedChromeDraw) return;
+            _loggedChromeDraw = true;
+            Plugin.Logger?.LogWarning("[DIAG] the settlement board's controls could not be drawn this frame and are not clickable: " + error.Message);
+        }
+    }
+
+    // There is no second cursor.
+    //
+    // 1.19.59: this file used to paint its own gold cross (`DrawPointerCursor`) whenever `!Cursor.visible`, clipped to the
+    // plate or the toggle. It was a *second* cursor: the settlement pages already draw the game's own one, and the interop
+    // this profile ships says so plainly - `CM_PageBase.m_cursor` is a `CM_Cursor` with its own `m_trans`/`WorldPos`/
+    // `LocalPos` and `m_cursorSprite`, updated by the page's own `UpdateCursorPosition`. Two cursors drawn from two different
+    // points is exactly the "游戏鼠标与看板光标错位" the player reported, and no amount of converting the mod's own copy can
+    // fix a hotspot the player is not looking at. What the player aims with is the game's cursor: `SamplePagePointer` reads
+    // *its* world transform when the page exposes one, and falls back to the labelled physical mouse - the one place the
+    // hotspot is certainly true - instead of painting a third answer on top of both.
+
+    // Whether the game's own press dispatch must skip this press.
+    //
+    // The question is answered from one decision and one claim, and from nothing else:
+    //
+    //   * the decision (`ResultPressDispatch`) is the *frame's* - the same one this mod's own poll makes, made here when
+    //     the page's dispatch runs first. That is the 1.19.46 (UI review F1) close-out: a press that starts on this
+    //     mod's toggle used to find no claim yet, pass the press through, and then be answered by the mod a moment
+    //     later in the same frame - one click, two things. The prefix is therefore allowed to *make* the decision, and
+    //     the decision claims the press at the moment it is made (`EvaluatePressFrame`), not when the action is issued.
+    //   * the claim (`ResultPressOwnership`) carries the *page it was made on*, by native pointer. 1.19.46 (UI review
+    //     F1) had already replaced the layout cache `_page` with that identity, because the hide the press performs drops
+    //     `_page` in the same frame (`ApplyBoardVisibility(false)` -> repaint -> `ResetPlacement` -> `_page = null`).
+    //
+    // Everything else - another page, an inactive page, no focus, a released or expired press, no claim at all - answers
+    // false and drops the claim, so the game keeps every press that is not provably ours and no other page loses input.
+    internal static bool ShouldSuppressNativePress(CM_PageBase page)
+    {
+        try
+        {
+            if (page == null || !ResultsPage()) return false;
+            IntPtr candidate;
+            bool active;
+            try
+            {
+                candidate = page.Pointer;
+                active = page.gameObject != null && page.gameObject.activeInHierarchy;
+            }
+            catch { _pressOwned.Clear(); return false; }
+            if (!active) { _pressOwned.Clear(); return false; }
+            bool focused;
+            try { focused = Application.isFocused; } catch { focused = true; }
+            if (!focused) { _pressOwned.Clear(); return false; }
+            // Only the page this mod is resident on may be answered - and claimed - here: the poll below reads *its*
+            // pointer and *its* two rectangles. A dispatch for any other page passes through untouched; it cannot end a
+            // claim that was made on ours.
+            if (candidate != ChromePagePointer()) return false;
+            // 1.19.59: the page's own press dispatch is the second place a frame's wheel can be settled from - the frame
+            // driver is the other - and the router's frame latch keeps the two to one settlement, exactly like the
+            // reference's `HandleMouse` being called from both `Update` and `SuppressLobbyPress`. It only reads.
+            PollWheel();
+            ResultPressDispatch frame = DispatchPressFrame();
+            if (!frame.Live) return false;
+            // A release, or a button state that cannot be read, is not a press this mod owns: it passes through, and the
+            // claim ends with it.
+            if (!frame.Press.Available || !frame.Press.Down) { _pressOwned.Clear(); return false; }
+            return _pressOwned.ShouldSuppress(candidate, active, focused, Time.realtimeSinceStartup);
+        }
+        catch { _pressOwned.Clear(); return false; }
+    }
+
+    // What the two controls did this repaint, one line per event and never one per frame.
+    //
+    // Rate limiting is per page, not per process: `ResultReportPolicy.OncePerPage` writes into
+    // `HeadingReports`, which is cleared when a result page attaches. The old flags
+    // (`_loggedChromeToggle`/`_loggedChromeClose`) were process-wide, and the recorded Survival run proves what
+    // that costs - three settlements, one line, and the second and third unable to say whether their page drew
+    // a waiting-status line at all. The committed line carries the numbers a reader needs without a screenshot:
+    // the control's rectangle, the header band with its two type sizes, and how many times the place was placed.
+    private static void ReportChrome(ResultChromeDecision decision, ResultChromeMetrics metrics)
+    {
+        if (decision.ToggleCommitted)
+        {
+            if (ResultReportPolicy.OncePerPage(HeadingReports, "chrome-committed", Forced, _forcedOutcomePending))
+            {
+                Plugin.Logger?.LogInfo($"[DIAG] settlement controls committed: toggle={ChromeRect(ChromePlaces.Toggle.Rect)} "
+                    + $"(anchor={_chromeAnchor}, {ChromePlaces.Toggle.Why}), "
+                    + $"header={(decision.HeaderDrawn ? ChromeRect(decision.Header) : "unmeasurable")} inside the board's own plate "
+                    + $"(titleFont={metrics.HeaderFont:0}px, hintFont={metrics.HeaderHintFont:0}px), "
+                    + $"placements=toggle{ChromePlaces.Toggle.Placements}, "
+                    + $"role={ResultPageRolePolicy.Name(Role())}, screen={Screen.width}x{Screen.height}; "
+                    + "a place is committed once per page, page flavour and window - a repaint, a key, a pointer or a new figure on the board never moves it, "
+                    + "and a native control that later arrives on top of it only pauses the hit until it leaves. There is exactly one control on this page: the toggle at the page's own anchor.");
+            }
+        }
+        if (decision.Pending && ResultReportPolicy.OncePerPage(HeadingReports, "chrome-toggle-pending", Forced, _forcedOutcomePending))
+        {
+            string why = string.IsNullOrEmpty(decision.ToggleWhy) ? _chromeWhy : decision.ToggleWhy;
+            Plugin.Logger?.LogInfo($"[DIAG] settlement toggle pending: {why}, restarts={ChromeAnchorSettle.Restarts}, role={ResultPageRolePolicy.Name(Role())}, "
+                + $"screen={Screen.width}x{Screen.height}; the page has not settled the control this toggle stands beside - it has not arrived "
+                + $"(reveal={ResultChromeRevealName.Of(ChromeFrame.Reveal)}) or it is still moving - so nothing is drawn and no click box exists "
+                + "for it: no provisional rectangle is ever painted, an alpha that could not be read is never treated as arrived (the settle "
+                + "observation is dropped, so the place has to be earned again from two fresh arrived samples), F8 is untouched, and the page "
+                + "is observed again next repaint.");
+        }
+        if (decision.ToggleSuspended)
+        {
+            if (ResultReportPolicy.OncePerPage(HeadingReports, "chrome-toggle-paused-" + ChromePlaces.Toggle.Suspensions, Forced, _forcedOutcomePending))
+            {
+                // 1.19.48: the line names the rectangle that paused it (index `#n` into the page's own list, with its pixels)
+                // and the number of distinct frames it stood there, so the next recorded frame can be read without guessing.
+                Plugin.Logger?.LogInfo($"[DIAG] settlement toggle paused: the page's own control now covers {ChromeRect(ChromePlaces.Toggle.Rect)} "
+                    + $"({ChromePlaces.Toggle.Pause}, suspensions={ChromePlaces.Toggle.Suspensions}); the hit and the draw are withheld and the same "
+                    + "rectangle comes back when it leaves - the control is not moved and no second place is measured for it. The pause needs the "
+                    + "overlap to stand for " + ResultChromeSlot.ConflictFrames + " distinct frames, so a single-frame overlap never pauses it; a press "
+                    + "that lands on the page's own control is answered by the page on the first frame, paused or not.");
+            }
+        }
+        else if (decision.ToggleMoved)
+        {
+            // 1.19.59: a real native rectangle that stood on the place moved it instead of withholding it. One line per page
+            // is enough - the place is committed once per page, flavour and window, and this says where it went.
+            if (ResultReportPolicy.OncePerPage(HeadingReports, "chrome-toggle-moved", Forced, _forcedOutcomePending))
+            {
+                Plugin.Logger?.LogInfo($"[DIAG] settlement toggle moved aside: a real native rectangle covered the place it was committed to "
+                    + $"({decision.ToggleConflict ?? "overlaps=none"}), so the same search the commit ran was asked again with this repaint's own rectangles and the control now stands at "
+                    + $"{ChromeRect(ChromePlaces.Toggle.Rect)} (placements={ChromePlaces.Toggle.Placements}, revisions={ChromePlaces.Toggle.Revisions}, "
+                    + $"moves={ResultChromeSlot.ConflictMoves} at most per page). The button is never taken away from the pointer: it is re-earned beside the page's control.");
+            }
+        }
+        else if (decision.ToggleResumed)
+        {
+            if (ResultReportPolicy.OncePerPage(HeadingReports, "chrome-toggle-resumed-" + ChromePlaces.Toggle.Suspensions, Forced, _forcedOutcomePending))
+            {
+                Plugin.Logger?.LogInfo($"[DIAG] settlement toggle released: the conflict left and the control is back at {ChromeRect(ChromePlaces.Toggle.Rect)}, "
+                    + $"the same place it was committed to (placements={ChromePlaces.Toggle.Placements}).");
+            }
+        }
+        // A flicker - an overlap that did not survive `ResultChromeSlot.ConflictFrames` - costs one line per page instead of
+        // one withdrawal per frame: it is the recorded defect, and the line is what says the button was kept.
+        if (decision.ToggleFlicker && ResultReportPolicy.OncePerPage(HeadingReports, "chrome-toggle-flicker", Forced, _forcedOutcomePending))
+        {
+            Plugin.Logger?.LogInfo($"[DIAG] settlement toggle kept: a native rectangle touched {ChromeRect(ChromePlaces.Toggle.Rect)} "
+                + $"({decision.ToggleConflict ?? "overlaps=none"}, streak={ChromePlaces.Toggle.ConflictStreak} of "
+                + ResultChromeSlot.ConflictFrames + " frames); one repaint of overlap is a flicker, not a conflict, so the draw and the hit stay "
+                + "exactly where they are and the button is not taken away from the pointer that is aiming at it.");
+        }
+    }
+    // 1.19.45: `OfferChromeSeat`, `EntryAnchorLine` and `MeasureEntryBand` lived here - the two fallback storeys that
+    // stood the toggle in the board's own header (beside a close that no longer exists) and, when there was no board
+    // to stand in at all, docked it at the window's right margin on the page's own title edge. They are gone: the
+    // toggle stands beside the control the page really draws or it is not drawn, and a page with no board has F8.
+    // Nothing in this file invents a place for it that the page did not draw.
+
+    // The board's own header band: the raised tone one step above the table's ground, with the band's plan drawn on
+    // it - the 2 px accent rule across its top edge, the board's own name and the key that operates it
+    // (`ResultChromeLayout.PlanHeader`). It is drawn from the rectangle the same decision gave the band, and the plan
+    // is told the toggle's own rectangle so a control that really stands on the band keeps its room.
+    //
+    // What this replaced: a bare `GroundRaised @0.92` band with one button on it and nothing else - the recorded pages
+    // had a plate a player could not name and no key hint anywhere on it. Every part is planned, and the plan gives the
+    // key hint up before the name, so a narrow plate loses decoration and never the line that says how to get the
+    // board back. The button itself is not here: the only visible way to show or hide the board is the toggle at the
+    // page's own anchor (1.19.45), and the band draws only what the plan measured.
+    private static void DrawChromeHeader(LayoutRect header)
+    {
+        Texture2D white = Texture2D.whiteTexture;
+        if (white == null) return;
+        if (!(header.Width > 0f) || !(header.Height > 0f)) return;
+        ResultChromeMetrics metrics = ChromeMetrics();
+        ResultChromeLayout.ResultChromeHeaderPlan plan = ResultChromeLayout.PlanHeader(header, metrics,
+            _chromeToggleRect, _chromeToggleValid);
+        Color previous = GUI.color;
+        Color previousContent = GUI.contentColor;
+        try
+        {
+            GUI.color = ChromeColor(ResultChromeTheme.GroundRaised, ResultChromeTheme.HeaderBandAlpha);
+            GUI.DrawTexture(new Rect(header.X, header.Y, header.Width, header.Height), white);
+            // One line on the whole board, and it is the accent's: 2 px, full width, flat. No gradient, no glow.
+            if (plan.Rule.Width > 0f && plan.Rule.Height > 0f)
+            {
+                GUI.color = ChromeColor(ResultChromeTheme.Accent, 1f);
+                GUI.DrawTexture(new Rect(plan.Rule.X, plan.Rule.Y, plan.Rule.Width, plan.Rule.Height), white);
+            }
+            GUI.contentColor = Color.white;
+            // 1.19.42: the plan names the label it measured, and that label is the only one drawn. Drawing `TitleLabel`
+            // here would draw a word wider than the box the plan just measured for it - the 74 px box on a 300 px plate,
+            // with `战斗结算看板` six ems wide inside it, spilling over the close.
+            if (plan.HasTitle) DrawChromeLabel(plan.Title, metrics.HeaderFont, plan.TitleLabel, ResultChromeTheme.HeaderTitle, false);
+            if (plan.HasHint) DrawChromeLabel(plan.Hint, metrics.HeaderHintFont, ResultChromeTheme.KeyHintLabel, ResultChromeTheme.HeaderHint, true);
+        }
+        finally
+        {
+            GUI.color = previous;
+            GUI.contentColor = previousContent;
+        }
+        if (HeadingReports.Add("chrome-header-plan"))
+            Plugin.Logger?.LogInfo($"[DIAG] settlement header: {plan.Describe()}, titleFont={metrics.HeaderFont:0}px, hintFont={metrics.HeaderHintFont:0}px, screen={Screen.width}x{Screen.height}, titleLabel={(plan.HasTitle ? plan.TitleLabel : "none")}; the band is a step of tone with one 2 px accent rule, only a control that stands on the band spends its room, the key hint keeps its line first, and the name drops to its short form and then away. The band carries no button of its own since 1.19.45.");
+    }
+
+    // One run of header text, drawn in its own copy of the table's face: the name left aligned, the key hint
+    // right aligned, both with `GUI.color` and `GUI.contentColor` pinned to white by the caller so the stated ink
+    // is the pixel (the 1.19.41 finding below is the same one). No ellipsis: the plan only produces a rectangle
+    // for a line that fits, so `clipping` here is a guard and never a truncation.
+    private static void DrawChromeLabel(LayoutRect rect, float fontPixels, string label, ResultInk ink, bool rightAligned)
+    {
+        if (!(rect.Width > 0f) || !(rect.Height > 0f) || string.IsNullOrEmpty(label)) return;
+        int size = Mathf.Max(8, Mathf.RoundToInt(fontPixels));
+        GUIStyle style = ChromeLabelStyle(size, rightAligned);
+        if (style == null) return;
+        style.normal.textColor = ChromeColor(ink, 1f);
+        GUI.Label(new Rect(rect.X, rect.Y, rect.Width, rect.Height), label, style);
+    }
+
+    // One control: a flat fill, a label in the native
+    // TMP face the board already draws with, and the accent rule under a control the player is pressing.
+    // No scale, no animation, no glow.
+    //
+    // The label is drawn with `GUI.color` back at white and with its own copy of the table's style. Both are
+    // 1.19.41 findings and both were real, which is why a control could be unreadable on a live client page:
+    //
+    //   GUI.color  IMGUI multiplies it into everything it draws, text included, and it was still holding the
+    //              *fill* when the label was drawn - so an idle toggle's ivory word was multiplied by #33332B
+    //              (a fifth of the brightness it is stated at). A face and a label of the same tone is a control
+    //              no resolution makes readable.
+    //   the style  `HudTable.Style` hands back one cached instance shared with the board's own text, so the
+    //              `alignment`/`normal.textColor` writes were a mutation of the table's style rather than of
+    //              this control's. `ChromeStyle` copies it once per glyph size instead; the table keeps the
+    //              instance it owns and this control keeps its own.
+    private static void DrawChromeControl(LayoutRect rect, float fontPixels, string label, ResultChromeVisual state,
+        float opacity)
+    {
+        Texture2D white = Texture2D.whiteTexture;
+        if (white == null) return;
+        ResultChromeLayout.Visuals(state, out ResultInk fill, out ResultInk ink);
+        Color previous = GUI.color;
+        Color previousContent = GUI.contentColor;
+        try
+        {
+            GUI.color = ChromeColor(fill, opacity);
+            GUI.DrawTexture(new Rect(rect.X, rect.Y, rect.Width, rect.Height), white);
+            if (state == ResultChromeVisual.Pressed)
+            {
+                GUI.color = ChromeColor(ResultChromeTheme.Accent, opacity);
+                GUI.DrawTexture(new Rect(rect.X, rect.Bottom - ResultChromeTheme.FocusRule, rect.Width, ResultChromeTheme.FocusRule), white);
+            }
+            int size = Mathf.Max(8, Mathf.RoundToInt(fontPixels));
+            GUIStyle style = ChromeStyle(size);
+            if (style == null || string.IsNullOrEmpty(label)) return;
+            // Both IMGUI tints are pinned to white before the word is drawn: `GUI.color` is what used to multiply
+            // the label by the fill it stands on, and `GUI.contentColor` is the one anything outside this renderer
+            // may have left behind - a tint that would make "the stated ink" a promise rather than the pixel. Both
+            // are put back in the `finally`, so nothing this control does can colour the board, the in-level HUD or
+            // the next control.
+            GUI.color = Color.white;
+            GUI.contentColor = Color.white;
+            style.normal.textColor = ChromeColor(ink, opacity);
+            GUI.Label(new Rect(rect.X + ResultChromeTheme.ControlPadX, rect.Y,
+                Mathf.Max(1f, rect.Width - ResultChromeTheme.ControlPadX * 2f), rect.Height), label, style);
+        }
+        finally
+        {
+            GUI.color = previous;
+            GUI.contentColor = previousContent;
+        }
+        }
+    // The chrome's own label style: a copy of the table's face, never the cached instance itself, so the alignment,
+    // padding and colour set above belong to that control alone. The one control keeps its own slot, so its 13 px
+    // style is not rebuilt on every repaint.
+    private static GUIStyle ChromeStyle(int size)
+    {
+        if (_toggleStyle != null && _toggleStyleSize == size) return _toggleStyle;
+        GUIStyle face = HudTable.Style(size);
+        if (face == null) return null;
+        var style = new GUIStyle(face);
+        style.alignment = TextAnchor.MiddleCenter;
+        style.padding = new RectOffset(0, 0, 0, 0);
+        style.clipping = TextClipping.Clip;
+        style.wordWrap = false;
+        style.richText = false;
+        _toggleStyle = style; _toggleStyleSize = size;
+        return style;
+    }
+
+    // The header's own label styles: one copy of the table's face per alignment and glyph size, never the cached
+    // instance `HudTable.Style` hands back, so the header's left/right alignment can never re-align the table's
+    // own text (the same 1.19.41 mutation the controls' styles were split for).
+    private static GUIStyle ChromeLabelStyle(int size, bool rightAligned)
+    {
+        if (rightAligned)
+        {
+            if (_hintStyle != null && _hintStyleSize == size) return _hintStyle;
+        }
+        else if (_titleStyle != null && _titleStyleSize == size) return _titleStyle;
+        GUIStyle face = HudTable.Style(size);
+        if (face == null) return null;
+        var style = new GUIStyle(face);
+        style.alignment = rightAligned ? TextAnchor.MiddleRight : TextAnchor.MiddleLeft;
+        style.padding = new RectOffset(0, 0, 0, 0);
+        style.clipping = TextClipping.Clip;
+        style.wordWrap = false;
+        style.richText = false;
+        if (rightAligned) { _hintStyle = style; _hintStyleSize = size; }
+        else { _titleStyle = style; _titleStyleSize = size; }
+        return style;
+    }
+
+    // The rows a plate could not show, said on the plate's own foot: the existing bottom line plus one arrow that
+    // points where the rest of the table is.
+    //
+    // It reads the same `ScrollViewport` the wheel and the plate are built from, so it can never claim an overflow the
+    // plate does not have - and a board whose every row is already on the screen draws nothing here at all. The fixed
+    // layout keeps its own drawing contract untouched: this is the adaptive board's own foot.
+    private static void DrawOverflowHint()
+    {
+        if (FixedLayoutActive()) return;
+        if (_grid == null || !(_scrollPlate > 0f) || _scrollVisible < 1) return;
+        ScrollViewport view = ResultsScroll.Viewport(_grid.Rows, ResultsScroll.FrozenRows, _scrollPlate,
+            _grid.RowHeight, _scrollFirst);
+        if (!view.Overflows) return;
+        bool more = !view.AtEnd;      // rows below the plate's foot
+        bool above = !view.AtStart;   // rows above the plate's head
+        if (!more && !above) return;
+        Texture2D white = Texture2D.whiteTexture;
+        if (white == null) return;
+        ResultChromeMetrics metrics = ChromeMetrics();
+        int size = Mathf.Max(9, Mathf.RoundToInt(metrics.HeaderHintFont));
+        GUIStyle style = ChromeLabelStyle(size, true);
+        if (style == null) return;
+        Color previous = GUI.color;
+        Color previousContent = GUI.contentColor;
+        try
+        {
+            // The plate's own bottom line: 2 px of the one accent, the same weight as the header's rule.
+            GUI.color = ChromeColor(ResultChromeTheme.Accent, 1f);
+            GUI.DrawTexture(new Rect(_origin.X, _origin.Y + _scrollPlate - 2f, _grid.Width, 2f), white);
+            GUI.contentColor = Color.white;
+            // One arrow in the header's own hint ink, at the edge the rest of the table lies beyond.
+            style.normal.textColor = ChromeColor(ResultChromeTheme.HeaderHint, 1f);
+            float labelY = more ? _origin.Y + _scrollPlate - size - 4f : _origin.Y + 2f;
+            GUI.Label(new Rect(_origin.X + _grid.Width - 18f, labelY, 16f, size + 2f), more ? "▼" : "▲", style);
+        }
+        finally
+        {
+            GUI.color = previous;
+            GUI.contentColor = previousContent;
+        }
+    }
+
+    private static Color ChromeColor(ResultInk ink, float opacity)
+        => new Color(ink.R, ink.G, ink.B, ink.A * (float.IsFinite(opacity) ? Mathf.Clamp01(opacity) : 1f));
+
+    private static string ChromeHex(ResultInk ink)
+        => "#" + Mathf.RoundToInt(Mathf.Clamp01(ink.R) * 255f).ToString("X2")
+             + Mathf.RoundToInt(Mathf.Clamp01(ink.G) * 255f).ToString("X2")
+             + Mathf.RoundToInt(Mathf.Clamp01(ink.B) * 255f).ToString("X2");
+
+    private static string ChromeRect(LayoutRect rect)
+        => rect.Width > 0f && rect.Height > 0f
+            ? "(" + rect.X.ToString("0") + "," + rect.Y.ToString("0") + "," + rect.Width.ToString("0") + "x" + rect.Height.ToString("0") + ")"
+            : "none";
+
+    // Everything that belongs to one page's control: the committed place, the anchor observation and the presses in
+    // flight. Called when the results screens are left and when a repaint failed - never for a repaint, a key or a new
+    // figure, because none of those is a new page.
+    internal static void ForgetChrome()
+    {
+        _chromeToggleValid = false;
+        _chromeTogglePending = false;
+        _chromeDrawnFrame = -1;
+        // The press probe is per page too: the first few left edges of the *next* result page are worth reporting.
+        _chromePressProbes = 0;
+        _chromeAnchor = ResultChromeAnchor.None;
+        _chromeWhy = string.Empty;
+        _chromeBoardRect = default;
+        ChromePlaces.Forget();
+        ChromeAnchorSettle.Forget();
+        ChromeFrame.Reset();
+        ToggleGate.Reset();
+        // 1.19.44: the pointer belongs to the page it was sampled on. A new page starts with no sample and no previous-down
+        // state, and the press is re-derived from the new frame rather than inherited from the old one.
+        //
+        // 1.19.46 (UI review F1): the *press claim* is deliberately NOT dropped here. This method is the layout's "this
+        // page is no longer what I was measuring" line, and a hide is exactly that - `ApplyBoardVisibility(false)` leads to
+        // a repaint whose `ResetPlacement` drops `_page`. Dropping the claim with the layout is what let the very press
+        // that hid the board run on into the page's own dispatch. The claim is a press-lifetime fact and keeps its own
+        // ...and the frame's pointer sample goes with it: a page with no sample left must sample again on the next ask,
+        // even if that ask lands in the same frame (L5).
+        PointerFrame.Forget();
+        // ends: a release, a page that is not the claimed one, an inactive page, lost focus, or `MaxSeconds`.
+        _pointer = ResultPointerSample.None;
+        _pointerSession = ResultPointerSession.None;
+        _pointerSessionValid = false;
+        _pressSource = ResultPressSource.None;
+        _pressDown = false;
+        _pressFrame = -1;
+        _pressFrameValue = ResultPressFrame.Unavailable;
+        // 1.19.46 (UI review F1 close-out): this frame's *decision* goes with the layout it was made against, so the
+        // next evaluation reads the new rectangles and the new page instead of reusing one measured before the hide.
+        // The action ledger (the frame already answered) is deliberately NOT dropped: it is what keeps the press that
+        // caused this invalidation from being answered twice, and a hide is not the end of the press that performed it.
+        _dispatchFrame = -1;
+        _dispatchValue = ResultPressDispatch.None;
+        _pointerNote = string.Empty;
+        _pointerLogged = string.Empty;
+    }
+
+    // The controls' input, polled once per frame from the panel's own `Update`.
+    //
+    // The pointer and the three button facts come from the one source the game's own menus and the reference mod
+    // use: `Input.mousePosition` and `Input.GetMouseButton*`, converted once into the window space every measured
+    // rectangle lives in (`ChromePointer`; `TryScreenRect` does the same conversion, so hit and draw are one space).
+    // Nothing is captured, wrapped or suppressed, and the page underneath keeps every click that is not on one of
+    // these two rectangles.
+    //
+    // A press counts when the last repaint that drew the control is recent (`ResultChromeInputPolicy.Fresh`, six
+    // frames) *and* the window has not changed since. That is the whole of the "no stale hot rectangle" rule, with
+    // the one correction the recorded runs needed: "recent" is a bound, not exactly one frame. A repaint that does
+    // not happen - a paused window, a frame the renderer skipped - used to close the only window in which a click
+    // could be answered, and the refusal went into the log nowhere.
+    //
+    // The decision, the request and the presentation are three different lines: this method logs the bounded click
+    // decision (`settlement board click`), `PressChromeControl` logs the request (`settlement board ... pressed`),
+    // and the repaint that follows logs what was really painted (`F8 forced frame`) or the fact that refused it.
+    internal static void PollChromeInput()
+    {
+        try
+        {
+            ResultPressDispatch frame = DispatchPressFrame();
+            if (!frame.Live) { ForgetChrome(); return; }
+            ReportPointerState(frame.Session, frame.Press, frame.NewSession);
+            // The close slots of these two report-only helpers are passed as "not drawn": this mod paints one control
+            // on the settlement page (1.19.45), so neither line can ever describe a second rectangle.
+            ReportChromeClick(frame.ToggleInside, false, frame.Down, frame.Held, frame.Up, frame.Fresh,
+                frame.Focused, frame.SameWindow, frame.Toggle, false, frame.PointerValid, frame.PointerX, frame.PointerY);
+            ReportChromePressProbe(frame.ToggleInside, false, frame.Down, frame.Fresh, frame.Focused,
+                frame.SameWindow, frame.PointerValid, frame.PointerX, frame.PointerY);
+            if (!frame.Mine) return;
+            // 1.19.46 (UI review F1 close-out): the press is this mod's - and the page's own dispatch may have asked the
+            // same question first, this very frame. The action is therefore booked here, once per frame, and never by
+            // the decision itself: `_pressAnswer` is the action layer's own dedupe, and it is deliberately not dropped
+            // by `ForgetChrome` - the hide this press performs must not let the same click be answered a second time.
+            if (_pressAnswer.Covers(frame.Frame)) return;
+            _pressAnswer = _pressAnswer.Take(frame.Frame);
+            PressChromeControl("toggle");
+        }
+        catch (Exception error)
+        {
+            ForgetChrome();
+            if (_loggedChromeInput) return;
+            _loggedChromeInput = true;
+            Plugin.Logger?.LogWarning("[DIAG] the settlement board's controls could not read the pointer and are not clickable this frame: " + error.Message);
+        }
+    }
+
+    // The frame's one decision, made by whoever asks first.
+    //
+    // 1.19.46 (UI review F1 close-out): two callers ask inside one frame - this mod's `Update` (`PollChromeInput`) and the
+    // page's own press dispatch (`SettlementPressPatch`, through `ShouldSuppressNativePress`) - and they may run in
+    // either order. Both get the same answer, and both get it from the *same* evaluation: one press sample, one pointer
+    // sample, one pair of gate edges. That is what makes the prefix-first order safe, which is the order the recorded run
+    // used and the one the previous round could not answer.
+    private static ResultPressDispatch DispatchPressFrame()
+    {
+        int frame = Time.frameCount;
+        if (frame == _dispatchFrame) return _dispatchValue;
+        ResultPressDispatch dispatch = EvaluatePressFrame(frame);
+        _dispatchFrame = frame;
+        _dispatchValue = dispatch;
+        return dispatch;
+    }
+
+    // The evaluation itself. It may *claim* the press (`_pressOwned.Arm`) and it never answers it: the action belongs to
+    // `PollChromeInput` alone, so a frame in which the page's dispatch asked first still produces exactly one action -
+    // the one this mod's own poll issues when it reads this same decision a moment later.
+    private static ResultPressDispatch EvaluatePressFrame(int frame)
+    {
+        if (!ResultsPage()) return ResultPressDispatch.None;
+        bool sameWindow = _chromeScreenWidth == Screen.width && _chromeScreenHeight == Screen.height;
+        bool fresh = ResultChromeInputPolicy.Fresh(_chromeDrawnFrame, frame) && sameWindow;
+        bool focused = true;
+        try { focused = Application.isFocused; } catch { focused = true; }
+        bool pointerValid = ChromePointer(out float pointerX, out float pointerY);
+        // 1.19.44: one *pointer session* per (page, source, focus, window). A change of any of them is a different
+        // pointer, so the gates and the previous-down state are reset instead of carrying the old gesture across -
+        // that is what keeps a source switch (page cursor <-> labelled physical fallback) from inventing a down or
+        // an up edge nobody performed.
+        IntPtr pagePointer = ChromePagePointer();
+        var session = new ResultPointerSession(pagePointer, _pointer.Source, focused, Screen.width, Screen.height);
+        ResultPressFrame press = SamplePress();
+        bool newSession = !_pointerSessionValid || !session.Equals(_pointerSession);
+        if (newSession)
+        {
+            _pointerSession = session; _pointerSessionValid = true;
+            ToggleGate.Reset();
+            _pressOwned.Clear();
+            // The first frame of a session has no edges at all: this sample describes a pointer the previous frame
+            // never saw, so whatever it reads now is a state, not a transition.
+            if (press.Available) press = ResultPressFrame.Of(true, press.Down, press.Down, press.Source);
+        }
+        // 1.19.46: the claim is confirmed only by a frame that really read the button *down*, and a confirmation never
+        // renews it: its bound is the press's own (`ResultPressOwnership.MaxSeconds`), not the last frame that saw it.
+        else _pressOwned.Observe(press.Available && press.Down);
+        bool down = press.Pressed, held = press.Down, up = press.Released;
+        bool toggleInside = pointerValid && press.Available && _chromeToggleValid
+            && ResultChromeLayout.Inside(_chromeToggleRect, pointerX, pointerY);
+        // 1.19.48: the *action* asks the same question the claim already asked. `PointerOverNative` is one source (the
+        // pointer this frame sampled and the rectangles the last repaint measured), and a press that lands on one of the
+        // page's own controls is the page's press - immediately, on the first frame that control is there, and whether or
+        // not the pause above has had time to withhold the button. Without this the toggle could still act on a click that
+        // began on a native control whenever the conflict had not yet survived its threshold: the flicker fix and the input
+        // rule have to be the same rule, or the button takes the press the page was about to answer.
+        bool overNative = PointerOverNative();
+        bool toggle = ToggleGate.Fire(focused, press.Available && fresh && _chromeToggleValid && !overNative, toggleInside, down, held, up);
+        // `closeInside`/`close` are handed over as false: the second control is gone (1.19.45), and the dispatch's own
+        // `Mine` therefore answers for the toggle alone.
+        var dispatch = new ResultPressDispatch(frame, press, session, newSession, pointerValid, pointerX, pointerY,
+            fresh, focused, sameWindow, toggleInside, false, toggle, false);
+        // The claim is made *at the decision*, not at the action: the press that starts on this mod's control may be asked
+        // about by the page's own dispatch before this mod's poll has run, and only a claim made now can stop that
+        // dispatch from acting on the same click. It carries the resident page's own pointer (which survives `_page`
+        // being dropped by the hide this very press performs) and it is never made over a rectangle the page itself is
+        // drawing: a press that began on one of the page's own controls is the page's, whatever else is true.
+        if (dispatch.Mine && !overNative) _pressOwned.Arm(pagePointer, Time.realtimeSinceStartup);
+        return dispatch;
+    }
+
+    // Where the sample came from, once per change and once per refusal, bounded - so a live log can say whether the page
+    // answered, which fallback ran and why. Nothing here claims a hit: that is the click line's business.
+    private static void ReportPointerState(ResultPointerSession session, ResultPressFrame press, bool newSession)
+    {
+        // Layout, focus and cursor-source changes can recur every frame on one result page.
+        uint generation = CombatSync.Generation;
+        if (_pointerReportGeneration != generation)
+        {
+            _pointerReportGeneration = generation;
+            _pointerFailures = 0;
+        }
+        if (_pointerFailures >= PointerReportLimit) return;
+        string note = _pointer.Describe() + ", press=" + ResultPressFrame.Name(press.Available ? press.Source : _pressSource)
+            + (string.IsNullOrEmpty(_pointerNote) ? string.Empty : ", sampled=" + _pointerNote)
+            + (press.Available ? (press.Down ? " (down)" : " (up)") : " (unreadable)");
+        bool refusal = !_pointer.Valid || !press.Available;
+        bool changed = newSession || note != _pointerLogged;
+        _pointerLogged = note;
+        if (!changed || (!refusal && !newSession)) return;
+        _pointerFailures++;
+        Plugin.Logger?.LogInfo("[DIAG] settlement pointer: " + note + ", " + session.Describe()
+            + "; the page's own cursor and the page's own main button are asked first, the physical mouse is only the"
+            + " labelled fallback, and this line is written when the answer changes or is refused ("
+            + _pointerFailures + "/" + PointerReportLimit + " per expedition).");
+    }
+
+    private static string _pointerLogged = string.Empty;
+
+    // The bounded click decision, one line per gesture edge and never one per frame.
+    //
+    // It is written *before* the request, and it says only what this frame's input decided: the rectangle the
+    // pointer was tested against, whether that rectangle was recent enough to answer, whether the gate was armed,
+    // and the gate's own word for the outcome. It never claims the board appeared - that is the repaint's line.
+    // A click that is nowhere near either control is the page's own and is not logged at all.
+    private static void ReportChromeClick(bool toggleInside, bool closeInside, bool down, bool held, bool up,
+        bool fresh, bool focused, bool sameWindow, bool toggle, bool close, bool pointerValid, float pointerX, float pointerY)
+    {
+        if (!down && !up) return;
+        bool inside = toggleInside || closeInside;
+        bool fired = toggle || close;
+        if (!inside && !fired) return;
+        string control = toggleInside ? "toggle" : "none";
+        string decision = fired || inside ? ToggleGate.LastWhy : "page";
+        string pointer = pointerValid ? "(" + pointerX.ToString("0") + "," + pointerY.ToString("0") + ")" : "unreadable";
+        Plugin.Logger?.LogInfo($"[DIAG] settlement board click: control={control}, pointer={pointer}, down={down}, held={held}, up={up}, "
+            + $"frameAge={(fresh ? (Time.frameCount - _chromeDrawnFrame).ToString() : "stale")}, windowSame={sameWindow}, focused={focused}, "
+            + $"toggleRect={ChromeRect(_chromeToggleRect)}{(_chromeToggleValid ? string.Empty : "(not drawn)")}, "
+            + $"decision={decision}{(fired ? " - the request is issued next, and the repaint answers it" : string.Empty)}; "
+            + "this is the bounded click decision, never a claim that a board was painted, and there is one control on this page.");
+    }
+
+    // How many left-button edges of one result page are written down at all, and how many have been. The recorded
+    // failure page drew this board's control and its log carried not one `settlement board click` line, and that alone
+    // cannot tell "the pointer was never read" from "the rectangle was not live on that frame" from "the player pressed
+    // somewhere else". The first few presses of a page are therefore written once each, inside and outside the rectangle
+    // alike, with the three facts that separate those cases; after them the probe is silent and only a real gesture on
+    // the control (or on one that was not drawn) still logs. Bounded per page by construction (`ForgetChrome` resets
+    // the count), so a repaint can never turn it into a flood.
+    private const int PressProbeReports = 4;
+    private static int _chromePressProbes;
+
+    private static void ReportChromePressProbe(bool toggleInside, bool closeInside, bool down, bool fresh, bool focused,
+        bool sameWindow, bool pointerValid, float pointerX, float pointerY)
+    {
+        if (!down || toggleInside || closeInside) return;
+        if (_chromePressProbes >= PressProbeReports) return;
+        _chromePressProbes++;
+        string pointer = pointerValid ? "(" + pointerX.ToString("0") + "," + pointerY.ToString("0") + ")" : "unreadable";
+        Plugin.Logger?.LogInfo($"[DIAG] settlement board press probe {_chromePressProbes}/{PressProbeReports}: pointer={pointer}, "
+            + $"toggleRect={ChromeRect(_chromeToggleRect)}{(_chromeToggleValid ? string.Empty : "(not drawn)")}, "
+            + $"frameAge={(fresh ? (Time.frameCount - _chromeDrawnFrame).ToString() : "stale")}, windowSame={sameWindow}, focused={focused}; "
+            + "the left button came down outside this board's one control, so the click is the page's and nothing here "
+            + $"has taken it - the line says only whether the pointer and that rectangle were live on that frame, and it is "
+            + $"written for the first {PressProbeReports} presses of a result page and never again.");
+    }
+
+    // One press on the board's toggle, answered from the intent of the label it was drawn with - never from the last
+    // painted frame and never from another button's intent (review #1).
+    //
+    //   toggle "隐藏看板"  hide. It was drawn while the board was up, so that is what it does.
+    //   toggle "显示看板"  show. It was drawn while the board was down - which is also the page that has no board, and
+    //                    the page whose entry the mod owes the player.
+    //
+    // There is no second button to consider any more (1.19.45): the close is gone and F8 reaches this same answer
+    // through the same `ApplyBoardVisibility`, so the key and the control can never disagree.
+    private static void PressChromeControl(string control)
+    {
+        bool show = !_chromeToggleHides;
+        bool shown = ApplyBoardVisibility(show);
+        ToggleGate.Reset();
+        _chromeToggleValid = false;
+        _chromeDrawnFrame = -1;
+        Plugin.Logger?.LogInfo($"[DIAG] settlement board toggle pressed: board={(shown ? "shown" : "hidden")}, "
+            + $"label={(_chromeToggleHides ? "hide" : "show")}; role={ResultPageRolePolicy.Name(Role())}, "
+            + $"anchor={_chromeAnchor}, screen={Screen.width}x{Screen.height}; the press takes the intent of the label it was drawn with "
+            + "(a 显示看板 shows, a 隐藏看板 hides), F8 answers through the same switch, and the vanilla result page is restored on the frame the board is hidden.");
+    }
 
     internal static void Draw()
+    {
+        // Nothing is booked until this repaint books it: a frame that throws before `DrawChrome` must not paint the
+        // previous frame's band or toggle. `FinishChromeDraw` runs in the `finally`, so the page's own surface is
+        // answered exactly once per repaint, on every path including the refused ones (review #1).
+        _chromeToggleValid = false;
+        // 1.19.43: the booking goes with the toggle, so a repaint that never reaches `DrawChrome` leaves nothing booked
+        // and nothing clickable.
+        _chromeHeaderPending = false; _chromeTogglePending = false;
+        _chromeDrawnFrame = -1;
+        try { DrawBoard(); }
+        finally { FinishChromeDraw(); }
+    }
+
+    private static void DrawBoard()
     {
         // Every repaint starts from "no board to aim at": the rectangle below is only ever re-earned by a frame that
         // really draws one. Nothing is carried over from the last frame, so a frame whose board was refused - no grid
         // yet, a strip that would not hold it - leaves the wheel to the game instead of consuming it over a rectangle
         // that is not on the screen. The same-frame gesture lock survives this; see `InvalidateHitForRepaint`.
         InvalidateHitForRepaint();
-        // Nothing on this page is showing a board until this repaint really draws one: this is the fact F8's next
+        // Nothing on this page is showing a board until this repaint really draws one: this is the fact the
         // press is answered from, so it is written here - before every early return below - and only the draw at
         // the end of this method puts a frame number back into it.
+        //
+        // The answer is kept before it is cleared, because the one control below needs it: it is drawn on this page
+        // whether or not a board is up, and there is nothing else on the page for this mod to draw.
+        bool boardUp = BoardOnScreen;
         _boardDrawnFrame = -1;
+        // The settlement page's own controls are drawn before every gate and every early return: the toggle has to
+        // be there on a page whose board is hidden (it is the way back), and a control that is not produced this
+        // frame leaves no hit box behind for the next click.
+        DrawChrome(boardUp);
         // F8 hides this mod's overlay on a result page exactly as it hides the table in a level, and the
         // influence-board switch holds it back on its own. The vanilla blocks go back on their own page, so
         // the screen is never left half-hidden.
@@ -684,7 +2417,12 @@ internal static class ResultsDisplay
                 Plugin.ShowImpactBoard == null || Plugin.ShowImpactBoard.Value,
                 PanelBehaviour.ToggleState) || Forced))
         {
+            // The one hide: the game's own page back, the board's placement dropped, and the next show starts from a
+            // budget the page has not spent (review #5: `_strictMisses` used to survive the hide, so the next show began
+            // its wait already 60 frames in).
             if (_page != null) { RestoreHidden(); ResetPlacement(); }
+            _strictMisses = 0; _fallbackMisses = 0; _fallbackFloorScale = 1f;
+            _fallbackPlaced = false; _fallbackOpacity = 1f; _forcedOutcomePending = false;
             // A hidden board is not a wheel target: F8 off means the next notch belongs to the game again.
             ClearHit();
             return;
@@ -702,6 +2440,12 @@ internal static class ResultsDisplay
             // were the only two things a reader could see, and the recorded client run's five lines of this shape
             // (`reason=no-live-page, role=client`) are a page object that was not *active* in that frame - not a
             // geometry refusal and not a missing placement. One field each, no change to what is drawn.
+            // 1.19.59: a frame in which there is no board *and no page to draw one on* is not a transient deferral - the
+            // page object is gone, so nothing will ever be drawn for it again. The blocks this mod put away belong to that
+            // page and go back with it (the same rule as leaving the screens), instead of waiting for a refusal count that
+            // can no longer arrive. A page that is merely still being measured reports `no-placement` and keeps the hide,
+            // which is the transient case `NoteVanillaRefusal` bounds with the page's own refusals.
+            if (_page == null && Hidden.Count > 0) RestoreHidden();
             ReportHeldBack("draw", _page == null || !PageActive(_page) ? "no-live-page" : "no-placement",
                 "grid=" + (_grid != null ? _grid.Width.ToString("0") + "x" + _grid.Height.ToString("0") : "none")
                 + ",content=" + (_content != null) + ",boardFloor=" + _boardFloor.ToString("0")
@@ -767,17 +2511,31 @@ internal static class ResultsDisplay
                 // and above the buttons the player has to press. A board that cannot fit is not drawn rather
                 // than drawn over a button.
                 if (!FailureStrip(_page, out float top, out float bottom, out opacity, out bool buttonMeasured, out float buttonTop, out float buttonHeight, out _, out _, out _, out _, out _, out _)) return;
-                if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight), _grid.Width, _grid.Height,
-                    Plugin.ResultsOffsetX.Value, out LayoutRect fitted, BoardSlack))
+                // The board's header is part of the board: the total height the strip has to hold is the table
+                // plus the header the close stands in, and the table's own origin is that much lower.
+                float header = ChromeHeader();
+                // The plate is the rows this strip really holds, not the whole table: a board taller than the page
+                // is scrolled inside its plate, so the button underneath it is never covered and nothing is drawn
+                // outside the band.
+                float plateHeight = PlateFor(_grid, bottom - top, header, out int scrollVisible, out int scrollFirst);
+                float total = plateHeight + header;
+                if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight), _grid.Width, total,
+                    Plugin.ResultsOffsetX.Value, out LayoutRect fitted, BoardSlack, bottomAligned: true))
                 {
                     if (ResultReportPolicy.OncePerPage(HeadingReports, "fail-no-room", Forced, _forcedOutcomePending))
-                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: strip=({top:0}..{bottom:0}), have={(bottom - top):0}px cannot hold a {_grid.Width:0}x{_grid.Height:0} (need={_grid.Height:0}px) board, so the vanilla screen is left alone rather than a button covered.{(Forced ? " forcedByF8=true - this press is answered by a refusal line, never silence." : string.Empty)}");
+                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: strip=({top:0}..{bottom:0}), have={(bottom - top):0}px cannot hold a {_grid.Width:0}x{_grid.Height:0} (need={total:0}px with the {header:0}px header) board, so the vanilla screen is left alone rather than a button covered.{(Forced ? " forcedByF8=true - this press is answered by a refusal line, never silence." : string.Empty)}");
                     // The forced press spends its answer here, exactly as ReportHeldBack does: once this refusal has
                     // printed, the next frame cannot print a second, false "board drawn" answer for the same press.
                     if (Forced) _forcedOutcomePending = false;
                     return;
                 }
-                _origin = fitted;
+                _origin = new LayoutRect(fitted.X, fitted.Y + header, fitted.Width, plateHeight);
+                _scrollVisible = scrollVisible; _scrollFirst = scrollFirst; _scrollPlate = plateHeight;
+                _holdValid = true;
+                // The hold belongs to this page - the fact `Refresh`'s new-page block and `Fit`'s "the board is
+                // already up on this page" branch both read. Recorded where the place is, never pre-set.
+                _holdPage = _page != null ? _page.Pointer : IntPtr.Zero;
+                _holdBoard = fitted;
             }
         }
         // The page switches the blocks the board replaces back on as its own animation plays, so they are
@@ -785,6 +2543,19 @@ internal static class ResultsDisplay
         // that can still hold the board back, so a frame that draws nothing also hides nothing: the vanilla
         // blocks only ever make way for a board that is really about to be drawn. It is guarded on its own
         // so a page that has already gone away can never take the board down with it.
+        //
+        // 1.19.46 additions, both answers to the recorded failure pages:
+        //
+        //   the settle     a board is painted only once the place it was measured into has been validated by
+        //                  `BoardStillSafe` on two consecutive repaints. The recorded page placed a board, hid the
+        //                  vanilla blocks and drew it, and the *next* repaint deferred it (`count=1,hidden=4`) and
+        //                  restored those blocks - one frame of board between two frames of the game's own page.
+        //                  Waiting one repaint costs 16 ms and removes the flash entirely: the frame that would be
+        //                  deferred never painted anything, so the page was never half-hidden.
+        //   the band       the plate that is about to be painted is checked against the band it was measured into
+        //                  (`ResultChromeLayout.PlateInsideBand`). The recorded re-fit claimed a 720 px plate in a
+        //                  651 px band; that is a board drawn outside its own contract, and it is deferred now with
+        //                  the two real numbers in the line rather than painted and withdrawn a frame later.
         if (!_fallbackPlaced)
         {
             if (!BoardStillSafe())
@@ -800,29 +2571,74 @@ internal static class ResultsDisplay
             RefreshFallbackSafety();
             opacity = _fallbackOpacity;
         }
-        // 固定模式的第二条隐藏入口也只认 `_fixedPlan`：`_fixedPlaced` 为真时上面已经 `return`，所以这段本来不可达；显式挡一次，
-        // 是为了以后调整顺序时不会再出现"计划说保留原版块、代码却从别处把它挪走"的第二条路。FixedLayout 关着时这一行等价于
-        // 原来的无条件调用，自适应行为一个字都没变。
-        try { if (!FixedLayoutActive() || _fixedPlan.HidesVanilla) ApplyVanillaBlocks(_page, _succeeded); }
+        // The whole board, header included, inside the band it was measured into - asked of the rectangle that is
+        // really on the screen, every repaint, before anything is painted or any vanilla block is touched.
+        if (!ResultChromeLayout.PlateInsideBand(_holdBoard, _holdStrip.Top, _holdStrip.Bottom, Screen.height, BoardSlack))
+        {
+            if (ResultReportPolicy.OncePerPage(HeadingReports, "board-outside-band", Forced, _forcedOutcomePending))
+                Plugin.Logger?.LogInfo($"[DIAG] result board deferred: the plate about to be painted does not sit inside the band it was measured into - "
+                    + $"plate=({_holdBoard.X:0},{_holdBoard.Y:0},{_holdBoard.Width:0}x{_holdBoard.Height:0}), plateBottom={_holdBoard.Bottom:0}, "
+                    + $"band=({(float.IsFinite(_holdStrip.Top) ? _holdStrip.Top.ToString("0") : "unmeasurable")}..{(float.IsFinite(_holdStrip.Bottom) ? _holdStrip.Bottom.ToString("0") : "unmeasurable")}), "
+                    + $"bandSource={_holdStrip.FooterSource}, screen={Screen.width}x{Screen.height}, role={ResultPageRolePolicy.Name(Role())}"
+                    + (Forced ? ", forcedByF8=true - this press is answered by this deferral line, never silence." : string.Empty)
+                    + "; the vanilla result page is kept exactly as the game drew it and the band is measured again.");
+            DeferBoardForInteraction();
+            return;
+        }
+        // A board that has not been painted yet waits one more repaint; a board that is already painted keeps being
+        // painted - this gate only ever delays the first paint of a placement, it never takes a board away.
+        bool painted = _boardDrawnFrame >= 0 && Time.frameCount - _boardDrawnFrame <= 2;
+        if (!painted && !BoardSettled(_holdBoard))
+        {
+            if (Forced && _forcedOutcomePending && HeadingReports.Add("board-settle-frame"))
+                Plugin.Logger?.LogInfo("[DIAG] result board settling: the placed board is validated on this repaint and is painted on the next one "
+                    + "if the band still stands, so the vanilla blocks are not put away for a board that could be deferred a frame later; "
+                    + $"plate=({_holdBoard.X:0},{_holdBoard.Y:0},{_holdBoard.Width:0}x{_holdBoard.Height:0}), band=({_holdStrip.Top:0}..{_holdStrip.Bottom:0}); "
+                    + "forcedByF8=true - this press is answered by this line and by the paint that follows it.");
+            return;
+        }
+        // The success board keeps the position it was measured at. Re-measuring it on every frame made the
+        // table resize while the page was still animating, and a table that has settled must not move: it is
+        // placed once, and placed again only when the results screen itself changes.
+        HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity, _scrollFirst, _scrollVisible, _scrollPlate);
+        // ---- the overflow is visible, not silent --------------------------------------------------------
+        //
+        // A board the fit could not hold - a genuinely short strip, or a player's own multiplier - is scrolled, and
+        // until this line existed nothing on the page said so: the recorded failure page drew thirty rows at 16 px and
+        // showed twenty-four of them without a word (log 3357/3358). The hint is drawn only on a screen that really
+        // overflows, from the same viewport the wheel and the plate are built from; a board that fits draws nothing.
+        DrawOverflowHint();
+        // A board really went on the page this repaint. That is the whole of "the page is showing a board", and it is
+        // what a press of F8 will hide from now on.
+        _boardDrawnFrame = Time.frameCount;
+        // 原版块只在这帧的表格**真的画出来之后**才让位，而且只在这一处（固定模式在它自己的绘制之后，同一道理）：
+        // 任何一道门退出去都不碰原版页，所以"被挪走、板没画"的空洞不存在（review #3）。
+        // The game's own blocks make way *here*, on the frame the table above really drew, and nowhere else.
+        try
+        {
+            // 1.19.59: a board that is painted *does* stand in for the page's own blocks - an early one only at the drawing
+            // (it may not move or deactivate anything, because its presses and wheel are still the page's), and a mature one
+            // outright. 1.19.55 put nothing away for an early board, and the recorded success page never matured, so the red
+            // crystal and the four prisoner cards stayed on the screen under a table that was already drawn.
+            if (ResultEarlyBoardPolicy.HidesVanilla(_earlyBoard, true)
+                && (!FixedLayoutActive() || _fixedPlan.HidesVanilla))
+            {
+                // 1.19.57: the page is asked of the page objects, not of the cache this repaint may already have cleared.
+                Component vanillaPage = LivePage(out bool vanillaSucceeded);
+                if (vanillaPage != null) ApplyVanillaBlocks(vanillaPage, vanillaSucceeded, _earlyBoard);
+            }
+        }
         catch (Exception error)
         {
+            // The page went away while its own blocks were being put away: the table is already on the screen, so nothing is
+            // taken back - the board simply stops touching this page and the next repaint attaches to whatever screen is up.
             _page = null;
             if (!_loggedMeasure)
             {
                 _loggedMeasure = true;
-                Plugin.Logger?.LogWarning("[DIAG] the result page went away while its blocks were being put back, so the board stops touching it: " + error.Message);
+                Plugin.Logger?.LogWarning("[DIAG] the result page went away while its blocks were being put away, so the board stops touching it: " + error.Message);
             }
         }
-        // A page that went away while its blocks were being put back gets nothing drawn on it: the board belongs to a live
-        // result screen, and the next repaint attaches to whatever screen is up then.
-        if (_page == null) return;
-        // The success board keeps the position it was measured at. Re-measuring it on every frame made the
-        // table resize while the page was still animating, and a table that has settled must not move: it is
-        // placed once, and placed again only when the results screen itself changes.
-        HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity);
-        // A board really went on the page this repaint. That is the whole of "the page is showing a board", and it is
-        // what a press of F8 will hide from now on.
-        _boardDrawnFrame = Time.frameCount;
         // 1.19.26: the forced press is answered *after* the draw, never before it. The line says what this build did - it
         // issued the board's draw calls on this frame - and not what the page ended up looking like: there is no pixel
         // readback anywhere in this pipeline, and a "board drawn" line printed ahead of the draw was a claim about pixels
@@ -830,9 +2646,19 @@ internal static class ResultsDisplay
         ReportForcedDraw(_origin);
         // The rectangle that is really on the screen now, which is what the wheel is aimed at. Written here, on the
         // draw, so it describes the board the player is looking at rather than the cache a rebuild keeps replacing.
-        _hitRect = new LayoutRect(_origin.X, _origin.Y, _grid.Width, _grid.Height);
+        // It is the plate the player sees, header included, measured from the placement this very repaint drew:
+        // `_chromeBoardRect` was taken before this frame's placement (the controls are drawn ahead of every gate),
+        // so reading it here would aim the wheel one zoom behind the plate that is on the screen - the notch that
+        // grew the board would fall outside the rectangle it grew from and cut one wheel gesture in half.
+        _hitRect = ResultChromeLayout.BoardOf(new LayoutRect(_origin.X, _origin.Y, _grid.Width, _scrollPlate > 0f ? _scrollPlate : _grid.Height), ChromeMetrics());
         _hitSucceeded = _succeeded;
-        _hitValid = true;
+        // 1.19.55: an early board is a picture, not a target. The wheel stays the page's and a press belongs to whatever the
+        // game drew under the pointer, so the rectangle is measured (the diagnostics and the next frame's column use it) but
+        // it is not opened as a hit surface until the page's own boundary is proven and the mature board stands here.
+        _hitValid = ResultEarlyBoardPolicy.Interactive(_earlyBoard);
+        // The wheel is a separate question from the press (1.19.59): a board that is really painted may be scrolled, early
+        // or not, because a table the player cannot reach the last row of is the same defect at 30 rows as at 8.
+        _scrollValid = true;
 
         if (!_succeeded && HeadingReports.Add("failure-board-placed"))
             Plugin.Logger?.LogInfo($"[DIAG] failure board placed: board=({_origin.X:0},{_origin.Y:0},{_grid.Width:0}x{_grid.Height:0}), failureTitleEdge={(float.IsFinite(Title.Edge) ? Title.Edge.ToString("0") : float.IsFinite(FailureLayoutTitle.Edge) ? FailureLayoutTitle.Edge.ToString("0") : "unseen")}, band=({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), bandSource={_holdStrip.FooterSource}; this page's native title layout and interaction lower wall were measured before drawing.");
@@ -843,10 +2669,20 @@ internal static class ResultsDisplay
     // The role is read once per decision and named in every branch that depends on it, so a host is never answered
     // with a client's rule (and never told about a proof it can never have). An unreadable native flag is a host: that
     // is the path that measures the page and refuses, not the one that hands out a fixed safe area.
+    // 1.19.60 (review F1): the same read also records whether it *answered*. `Unreadable` is deliberately the host's
+    // measuring path, so the role alone cannot tell a proven host from a page whose flag threw - and the host's
+    // early-display privilege needs the positive answer. Recorded here, from this one read, so the native flag is still
+    // read in exactly two places in this file (this helper and the scan's own coverage edge).
+    private static bool _roleReadable = true;
+
     private static ResultPageRole Role()
     {
-        try { return ResultPageRolePolicy.Of(SNet.IsMaster); } catch { return ResultPageRolePolicy.Unreadable; }
+        try { _roleReadable = true; return ResultPageRolePolicy.Of(SNet.IsMaster); }
+        catch { _roleReadable = false; return ResultPageRolePolicy.Unreadable; }
     }
+
+    // A proven host, in the few words the early-board privilege needs.
+    private static bool HostProven() => _roleReadable && Role() == ResultPageRole.Host;
 
     private static bool GuestClient() => ResultPageRolePolicy.IsClient(Role());
 
@@ -874,8 +2710,33 @@ internal static class ResultsDisplay
     // the next repaint stays silent, while a coercion-free retry with a new glyph, a new anchor, a new window or a new
     // board size is a new attempt and gets its own line. Without it, one `fixed-layout-refused` line per page would
     // swallow every later parameter change - which is exactly what made a live refusal look like silence.
+    // One refused placement, counted while this mod is standing in for the page's own blocks.
+    //
+    // The deferred case is *transient*: a board was drawn a moment ago and a re-place is in flight, so the blocks stay
+    // away and the player sees no flicker. Two refusals in a row is a different statement - the page measured a strip and
+    // the fit refused it twice - so the vanilla screen is the honest one and the game's blocks come back. Counting
+    // refusals rather than frames is the point: a hover that defers the board for one frame can never trip this, and a
+    // page that really cannot hold a board trips it within one retry round (`ResultWheel`'s "no input is banked" is the
+    // same principle applied to the wheel).
+    private static void NoteVanillaRefusal()
+    {
+        if (Hidden.Count == 0) return;
+        int frame = Time.frameCount;
+        if (frame == _vanillaRefusalFrame) return;
+        _vanillaRefusalFrame = frame;
+        _vanillaRefusals++;
+        if (_vanillaRefusals < 2) return;
+        RestoreHidden();
+        if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-blocks-refused"))
+            Plugin.Logger?.LogInfo("[DIAG] the page's own blocks were given back: this board has been hidden while the page refused two placements in a row, so no board is standing in for them - "
+                + "the vanilla screen is the honest one, and the next placement that really lands puts them away again (1.19.59).");
+    }
+
     private static void ReportHeldBack(string where, string reason, string detail, string signature = null)
     {
+        // 1.19.59: a refusal is the page's own evidence that no board is standing in for it. Counted before the per-page
+        // report latch (which exists to keep the log quiet, not to decide anything), once per frame.
+        NoteVanillaRefusal();
         string key = "held-back-" + where + "-" + reason;
         if (!string.IsNullOrEmpty(signature)) key += "|" + signature;
         if (!ResultReportPolicy.OncePerPage(HeadingReports, key, Forced, _forcedOutcomePending)) return;
@@ -908,7 +2769,18 @@ internal static class ResultsDisplay
     private static bool BoardStillSafe()
     {
         if (_page == null || _grid == null || _content == null) return false;
-        var board = new LayoutRect(_origin.X, _origin.Y, _grid.Width, _grid.Height);
+        // 1.19.43: the rectangle judged here is the one the board really occupies - the plate the table is drawn into,
+        // with the header the close stands in above it. It is *never* `_grid.Height`, the table's unscrolled height: a
+        // page whose band is shorter than the whole table gets a plate of whole rows and scrolls the rest
+        // (`PlateFor`/`ResultsScroll`), so `_grid.Height` is a number nothing paints. Judging by it refused a board that
+        // stood inside its band on `board-outside-strip`, and the scan's own overlap test then reported the same
+        // over-tall rectangle reaching the page's waiting line - the recorded failure page's "1750x900 px at (405,994)"
+        // over a 232px strip, whose real plate was 149px at (405,994) under its 53px header, i.e. inside 941..1173.
+        // `ResultChromeLayout.BoardOf` is the one rule that says where a plate and its header are; the hit rectangle
+        // below and `ChromeBoardRect` already read the board through it.
+        float plateHeight = _scrollPlate > 0f ? _scrollPlate : _origin.Height;
+        if (!(plateHeight > 0f)) plateHeight = _origin.Height;
+        var board = ResultChromeLayout.BoardOf(new LayoutRect(_origin.X, _origin.Y, _grid.Width, plateHeight), ChromeMetrics());
         if (_succeeded)
         {
             // The reveal is still watched (its ledger drives [DIAG] and the drift stand-down), never waited on.
@@ -930,6 +2802,25 @@ internal static class ResultsDisplay
             }
             // The completion settle gate keeps counting for the log; a placed board is not withdrawn over it any more.
             Completion.Observe(Time.frameCount, true, successArea.Top);
+            // 1.19.52/1.19.53 (F1): the same floor the placement hangs from, asked again about the board that is
+            // *already* up - and asked about the rectangle that is really on the page. `board` is
+            // `ResultChromeLayout.BoardOf(origin, metrics)`, i.e. the plate including the header the board reserves, so
+            // `board.Y` is the board's own top edge. The strip's top is not that edge: a bottom-aligned board stands
+            // lower than its band's top, and judging the band instead of the plate would refuse a board that is clear of
+            // everything. The clearance is the same `MessageGap` the placement leaves.
+            // 1.19.55: an early board is not withdrawn by the live drawn floor. It was placed from the section's laid-out
+            // slot while the reveal was still drawing (`CompletionFinalBounds.Placed`, revealFinished=false), so the floor
+            // walks down under it as the page animates - and taking the board away for that is exactly the "drawn first,
+            // moved after" defect this check exists to prevent on the mature path. The mature placement (which needs the
+            // page's own boundary) replaces the early one and is judged by this line from then on.
+            if (!_earlyBoard && float.IsFinite(_drawnFloorCompletion) && board.Y < _drawnFloorCompletion + MessageGap - 0.5f)
+            {
+                ReportHeldBack("success-strip", "board-above-drawn-section",
+                    "plateY=" + board.Y.ToString("0") + ",drawnFloor=" + _drawnFloorCompletion.ToString("0")
+                    + ",gap=" + MessageGap.ToString("0") + ",bandTop=" + _holdStrip.Top.ToString("0")
+                    + ",boardBottom=" + board.Bottom.ToString("0"));
+                return false;
+            }
             // The band under the page's measured actions is a placement the fit itself accepted: its own two edges are
             // the whole contract, and no button sits under the board to keep clear of. Every other placement is still
             // bounded by the button the player has to press.
@@ -964,7 +2855,10 @@ internal static class ResultsDisplay
                 return false;
             }
             // 客机：没有本页可用的 no-footer 证明（等待状态文字本身就是 active 控件），此门槛只属于主机。
-            if (!GuestClient() && !successButtonMeasured)
+            // 1.19.55: the page's band proof is what an early board is *waiting for*, never a reason to take it away: the
+            // early placement already required a complete scan, no overlap and a strip that holds the board's own floor
+            // (`ResultEarlyBoardPolicy`). The mature board is the one that must prove the footer.
+            if (!GuestClient() && !successButtonMeasured && !_earlyBoard)
             {
                 bool successScanEmpty = successControls.ProvenEmpty;
                 SuccessBandProofState successBandProof = ResultSuccessBandProofPolicy.Decide(Role(),
@@ -986,10 +2880,13 @@ internal static class ResultsDisplay
             float room = bottom - safeTop;
             var current = new BoardStrip(safeTop, safeTop + room, belowActions ? false : successButtonMeasured, successButtonTop, successButtonHeight,
                 true, successFooterSource);
-            if (!ResultBoardHold.HeldGridFits(_holdStrip, current, board, _grid.Height, Screen.height, BoardSlack))
+            // The drawn rectangle, not the table: a grid taller than its plate is scrolled inside it, so the plate is
+            // the only height that can ever reach the strip's foot or the button's clearance line.
+            if (!ResultBoardHold.HeldGridFits(_holdStrip, current, board, board.Height, Screen.height, BoardSlack))
             {
                 ReportHeldBack("success-strip", "grid-would-reach-edge",
-                    "boardBottom=" + (board.Y + _grid.Height).ToString("0") + ",heldStripBottom="
+                    "boardBottom=" + board.Bottom.ToString("0") + ",visibleHeight=" + board.Height.ToString("0")
+                    + ",fullGrid=" + _grid.Height.ToString("0") + ",heldStripBottom="
                     + (float.IsFinite(_holdStrip.Bottom) ? _holdStrip.Bottom.ToString("0") : "unmeasured")
                     + ",source=" + successFooterSource);
                 return false;
@@ -1017,8 +2914,23 @@ internal static class ResultsDisplay
         float stripTop = _holdStrip.Bottom > _holdStrip.Top ? _holdStrip.Top : failureTop;
         float failureBottom2 = _holdStrip.Bottom > _holdStrip.Top
             ? Math.Min(_holdStrip.Bottom, Screen.height - 8f) : Math.Min(failureBottom, Screen.height - 8f);
+        // 1.19.61（客机）：页脚是一个边界，而且当帧就收紧。已经站在页面上的板，判据用的条带是「落位时的条带」与
+        // 「这一帧同一套算术给出的下沿」（`failureBottom`，同一张客机条带）里**更靠上**的那个；原来那块板整块还站
+        // 得进去就整块上移（同一帧，板不消失），站不进去就交给下一次 fit 缩板——不再用「落位时的条带」去比「这一帧
+        // 的页脚」、然后每一个 repaint 都把板撤掉（2026-11-25 快照 L4881 落位 1371 / L4883 页脚 1338 的死循环）。
+        if (GuestClient() && ResultClientStandingBand.TryTighten(new ResultsSafeArea(stripTop, failureBottom2),
+                failureBottom, board.Height, BoardSlack, out ResultsSafeArea tightenedBand, out bool boardHoldsHeight))
+        {
+            if (tightenedBand.Bottom < failureBottom2 - 0.5f)
+            {
+                failureBottom2 = tightenedBand.Bottom;
+                if (boardHoldsHeight && MoveStandingFailureBoard(tightenedBand, failureFooterTop, failureFooterSource))
+                    return true;
+            }
+        }
         if (board.Y < stripTop - BoardSlack || board.Bottom > failureBottom2 + BoardSlack)
         {
+
             ReportHeldBack("failure-strip", "board-outside-strip",
                 "boardY=" + board.Y.ToString("0") + ",boardBottom=" + board.Bottom.ToString("0")
                 + ",bandTop=" + stripTop.ToString("0") + ",bandBottom=" + failureBottom2.ToString("0") + ",source=" + (_holdValid ? _holdStrip.FooterSource : failureFooterSource));
@@ -1056,19 +2968,79 @@ internal static class ResultsDisplay
         }
         var failureStrip = new BoardStrip(stripTop, failureBottom2, failureFooterMeasured, failureFooterTop, failureFooterHeight,
             true, failureFooterSource);
-        if (!ResultBoardHold.HeldGridFits(_holdStrip, failureStrip, board, _grid.Height, Screen.height, BoardSlack))
+        // Same rule as the success page: the plate is what is drawn, the table scrolls inside it.
+        if (!ResultBoardHold.HeldGridFits(_holdStrip, failureStrip, board, board.Height, Screen.height, BoardSlack))
         {
             ReportHeldBack("failure-strip", "grid-would-reach-edge",
-                "boardBottom=" + (board.Y + _grid.Height).ToString("0") + ",heldStripBottom="
+                "boardBottom=" + board.Bottom.ToString("0") + ",visibleHeight=" + board.Height.ToString("0")
+                + ",fullGrid=" + _grid.Height.ToString("0") + ",heldStripBottom="
                 + (float.IsFinite(_holdStrip.Bottom) ? _holdStrip.Bottom.ToString("0") : "unmeasured"));
             return false;
         }
         return true;
     }
 
+    // 把这一页已经画出来的板整块搬进收紧后的条带。
+    //
+    // 高度不变、宽度不变，底边按首次落位那套算术（`ResultBoardHold.TryPlace` 的 `bottomAligned` + `BoardSlack`）贴到
+    // 条带的新下沿，`_origin` 跟着移动同样的像素——所以表体、滚轮窗口和点击矩形描述的还是同一块板，只是它现在停在
+    // 页面真正画出来的那行字上面。整块放不下（页脚抬得比板还高）就回答 false，由调用方按既有路径重新 fit 一块更小的
+    // 板：那一条会写自己的日志，这里不发明一个「勉强画出来」的矩形。
+    private static bool MoveStandingFailureBoard(ResultsSafeArea band, float footerTop, ResultFooterSource source)
+    {
+        if (!band.Fits || !_holdValid) return false;
+        if (!(_holdBoard.Width > 0f) || !(_holdBoard.Height > 0f)) return false;
+        var strip = new BoardStrip(band.Top, band.Bottom, float.IsFinite(footerTop), footerTop, float.NaN,
+            _holdStrip.AnchorMeasured, source, _holdStrip.FillCeiling);
+        if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, _holdBoard.Width, _holdBoard.Height,
+                Plugin.ResultsOffsetX.Value, out LayoutRect plate, BoardSlack, bottomAligned: true))
+            return false;
+        if (!ResultChromeLayout.PlateInsideBand(plate, band.Top, band.Bottom, Screen.height, BoardSlack)) return false;
+        float delta = plate.Y - _holdBoard.Y;
+        float previousFoot = _holdStrip.Bottom;
+        if (Math.Abs(delta) < 0.5f) return true;
+        _holdBoard = new LayoutRect(plate.X, plate.Y, _holdBoard.Width, _holdBoard.Height);
+        _origin = new LayoutRect(_origin.X, _origin.Y + delta, _origin.Width, _origin.Height);
+        _holdStrip = strip;
+        if (HeadingReports.Add("failure-foot-rose"))
+            Plugin.Logger?.LogInfo($"[DIAG] failure board tightened on the frame the footer rose: the band this page now offers ends at {band.Bottom:0} (the band the plate was fitted into ended at {(float.IsFinite(previousFoot) ? previousFoot.ToString("0") : "unmeasured")}, footerTop={(float.IsFinite(footerTop) ? footerTop.ToString("0") : "unmeasurable")}), so the same plate (bottom={_holdBoard.Bottom:0}, {_holdBoard.Width:0}x{_holdBoard.Height:0}) moved up {Math.Abs(delta):0}px on this repaint instead of being withdrawn for a re-fit - the boundary the fit and the per-repaint check read is the same one, and it only ever tightens. role={ResultPageRolePolicy.Name(Role())}.");
+        return true;
+    }
+
+    // Whether the placement on the screen has survived one full repaint of the per-repaint safety check.
+    //
+    // The chain is keyed on the plate itself and on consecutive frames, never on a counter another path has to reset:
+    // a re-fit, a fallback move, a new window or a frame in which nothing was drawn all start it over, so a page that
+    // keeps moving can never accumulate two samples by accident. Two consecutive safe, *unchanged* plates is the
+    // smallest evidence that a board stands where the page's own controls leave it - the evidence the recorded
+    // failure page was missing when it drew a board for one frame and restored the vanilla blocks on the next.
+    private static int _safeFrames, _safeFrame = -1;
+    private static LayoutRect _safePlate;
+
+    private static bool BoardSettled(LayoutRect plate)
+    {
+        int frame = Time.frameCount;
+        bool same = frame == _safeFrame + 1
+            && Math.Abs(plate.X - _safePlate.X) <= ResultChromeSettle.TolerancePixels
+            && Math.Abs(plate.Y - _safePlate.Y) <= ResultChromeSettle.TolerancePixels
+            && Math.Abs(plate.Width - _safePlate.Width) <= ResultChromeSettle.TolerancePixels
+            && Math.Abs(plate.Height - _safePlate.Height) <= ResultChromeSettle.TolerancePixels;
+        _safeFrames = same ? _safeFrames + 1 : 1;
+        _safeFrame = frame;
+        _safePlate = plate;
+        return _safeFrames >= 2;
+    }
+
     private static void DeferBoardForInteraction()
     {
-        if (_page != null) RestoreHidden();
+        // 1.19.59: the page's own blocks are *not* given back here any more.
+        //
+        // This is the recorded flicker: the hover/scan refuses one frame (`count=2,hidden=1,scanned=3`), the deferred
+        // frame called `RestoreHidden()`, the next repaint placed the board again and hid the same blocks - at the poll
+        // cadence, i.e. the prisoner cards and the artifact block came and went while the pointer was simply moving over
+        // the page. The blocks belong to the page visit, not to one frame's placement: they are given back by
+        // `VanillaHideExpired` (no board for `VanillaHideGrace` seconds), by F8 hiding the board, by the switches, by a
+        // page change and by leaving the screens - every one of those is a real end of this mod's stand-in.
         ResetPlacement();
         _holdValid = false; _holdBoard = default; _holdStrip = default; _holdOpacity = 0f;
         // `_placedOnFallback` is dropped because the placement it described is gone; `_fallbackRecoveries` is not.
@@ -1087,7 +3059,7 @@ internal static class ResultsDisplay
         // deferral itself is the answer, and spending the flag keeps it to one line per press instead of per frame.
         if (ResultReportPolicy.OncePerPage(HeadingReports, "board-interaction-changed", Forced, _forcedOutcomePending))
         {
-            Plugin.Logger?.LogInfo("[DIAG] result board deferred: the page exposed an unreadable or overlapping native/UI control after placement; vanilla is restored and the strip is measured again before the overlay may return."
+            Plugin.Logger?.LogInfo("[DIAG] result board deferred: the page exposed an unreadable or overlapping native/UI control after placement; the strip is measured again before the overlay may return, and the page's own blocks stay where this mod put them until a board really stands here again (no frame-by-frame restore - that is what made them blink)."
                 + (Forced ? " forcedByF8=true - this press is answered by this deferral line, never silence." : string.Empty));
             if (Forced) _forcedOutcomePending = false;
         }
@@ -1128,11 +3100,20 @@ internal static class ResultsDisplay
         int pixels = ResultFixedLayout.RoundFontPixels(font);
         PanelGrid grid = FixedGrid(content, pixels, out refusal);
         if (grid == null) { AbandonFixedLayout(); return false; }
+        // 固定模式的板是「窗口真正放得下的那一段」：玩家给的锚点仍然决定底边中点，字号仍然决定行高，一屏放不下
+        // 的行由滚轮滚动。顶边因此被夹进窗口——关闭按钮和冻结的表头行一定在屏幕上、一定点得到，而不是「布局算得
+        // 出、实际画在屏幕外」。玩家设的 FixedFontPixels 与锚点一个数字都不改。
+        if (!TryFixedPlate(grid, anchorY, out int fixedRows, out float plateHeight, out string plateWhy))
+        { refusal = plateWhy; AbandonFixedLayout(); return false; }
         if (!ResultFixedLayout.TryResolve(Screen.width, Screen.height, anchorX, anchorY, font,
-                grid.Width, grid.Height, out ResultFixedLayoutPlan plan, out refusal))
+                grid.Width, plateHeight, out ResultFixedLayoutPlan plan, out refusal))
         { AbandonFixedLayout(); return false; }
         _origin = plan.Rect;
         _grid = grid; _content = content;
+        _scrollVisible = Mathf.Min(fixedRows, grid.Rows);
+        _scrollFirst = ResultsScroll.Clamp(_scrollFirst, grid.Rows, ResultsScroll.FrozenRows,
+            Math.Max(1, _scrollVisible - ResultsScroll.FrozenRows));
+        _scrollPlate = plateHeight;
         _fixedPlaced = true;
         _placed = true;
         _placedSucceeded = succeeded;
@@ -1173,6 +3154,46 @@ internal static class ResultsDisplay
         return grid;
     }
 
+    // 固定模式下一屏放得下的行数：底边中点以上的窗口高度 ÷ 行高。这就是「表头固定在顶部、其余行滚动」的那块
+    // 视口；它只由玩家自己的锚点、字号和窗口决定，不看页面条带，也不改任何配置。
+    private static int FixedPlateRows(PanelGrid grid, float anchorY)
+    {
+        if (grid == null) return ResultsScroll.MinimumVisibleRows;
+        // 1.19.41 review #4: the page's own header band is drawn *above* these rows, so the room the rows may use is
+        // what is left after the header is reserved. Spending it on rows is what let a top-pinned plate put the header
+        // and its reserved band above the top of the screen while still calling the placement legal.
+        float room = ResultsScroll.RowRoom(anchorY * Screen.height - ResultsBounds.ScreenMargin, ChromeHeader());
+        return ResultsScroll.VisibleRows(room, grid.RowHeight);
+    }
+
+    // The plate a fixed-mode attempt may use, or the reason there is none.
+    //
+    // `anchorY` is the player's bottom-edge midpoint and the glyph is the player's size; neither is touched here. What
+    // this decides is only how much of the window is left for the table once the screen margin *and the page's own
+    // header band* are reserved: a page that cannot hold that header plus the two readable rows refuses instead of
+    // drawing a plate whose header and close button would hang off the top of the screen.
+    private static bool TryFixedPlate(PanelGrid grid, float anchorY, out int rows, out float plateHeight, out string why)
+    {
+        rows = ResultsScroll.MinimumVisibleRows;
+        plateHeight = 0f;
+        why = string.Empty;
+        float room = Mathf.Max(1f, anchorY * Screen.height - ResultsBounds.ScreenMargin);
+        float header = ChromeHeader();
+        float rowHeight = grid != null ? grid.RowHeight : 0f;
+        if (!ResultsScroll.PlateFits(room, rowHeight, header, ResultsScroll.MinimumVisibleRows))
+        {
+            why = ResultFixedLayout.VerticalRoom + ": room=" + room.ToString("0") + "px at anchorY="
+                + anchorY.ToString("0.###") + " of a " + Screen.height + "px window cannot hold the "
+                + header.ToString("0") + "px header plus " + ResultsScroll.MinimumVisibleRows + " rows at "
+                + (float.IsFinite(rowHeight) && rowHeight > 0f ? rowHeight.ToString("0.#") : "unmeasurable")
+                + "px (nothing is clamped, shrunk or moved: lower the glyph, move the anchor, or turn FixedLayout off)";
+            return false;
+        }
+        rows = FixedPlateRows(grid, anchorY);
+        plateHeight = Mathf.Min(grid.Height, ResultsScroll.PlateHeight(rows, grid.RowHeight, ResultsScroll.RowRoom(room, header)));
+        return true;
+    }
+
     // 固定模式拒绝之后的共同收尾：把这一帧之前被挪走的原版块按记录放回去，**并且丢掉旧网格**。
     //
     // 丢掉旧网格是这个模式自己的契约：人数变了、字号变了、窗口变了，还拿上一帧的尺寸继续落位，画出来的就是一张
@@ -1182,6 +3203,7 @@ internal static class ResultsDisplay
         _fixedPlaced = false;
         _fixedPlan = ResultFixedDrawPlan.None;
         _grid = null; _content = null;
+        _widthProbe = float.NaN; _columnProbes = 0;
         _placed = false;
         Retry.Forget();
         if (_page != null) RestoreHidden();
@@ -1318,22 +3340,32 @@ internal static class ResultsDisplay
             ReportHeldBack("fixed", "fixed-layout-grid", reglyph, attempt);
             return;
         }
+        // 和落位那一帧同一条算式：视口是窗口放得下的整行，顶边夹在窗口里，底边中点就是玩家给的锚点。
+        if (!TryFixedPlate(grid, anchorY, out int fixedRows, out float plateHeight, out string plateWhy))
+        {
+            AbandonFixedLayout();
+            ReportHeldBack("fixed", "fixed-layout-vertical-room", plateWhy, attempt);
+            return;
+        }
         if (!ResultFixedLayout.TryResolve(Screen.width, Screen.height, anchorX, anchorY, configured,
-                grid.Width, grid.Height, out ResultFixedLayoutPlan plan, out why))
+                grid.Width, plateHeight, out ResultFixedLayoutPlan plan, out why))
         {
             AbandonFixedLayout();
             ReportHeldBack("fixed", "fixed-layout-offscreen",
-                why, FixedSignature(Screen.width, Screen.height, configured, anchorX, anchorY, grid.Width, grid.Height));
+                why, FixedSignature(Screen.width, Screen.height, configured, anchorX, anchorY, grid.Width, plateHeight));
             return;
         }
+        _scrollVisible = Mathf.Min(fixedRows, grid.Rows);
+        _scrollFirst = ResultsScroll.Clamp(_scrollFirst, grid.Rows, ResultsScroll.FrozenRows,
+            Math.Max(1, _scrollVisible - ResultsScroll.FrozenRows));
+        _scrollPlate = plateHeight;
         LayoutRect rect = plan.Rect;
         ResultFixedDrawPlan draw = FixedLayoutDecision(rect, out string evidence);
-        // 原版块只在这块 overlay 真的替代它（扫描完整）时才让位；证据不足的这一帧把之前挪走的放回去，页面保持
-        // 原版，板淡画在上面。两者都只改不透明度，不改玩家的字号和位置。
+        // 证据不足的这一帧把之前挪走的放回去，页面保持原版、板淡画在上面。**让位**放到下面 `HudTable.Draw` 之后：
+        // 一帧里的任何早退都不能把原版块留在 6000 以外（review #3）。
         try
         {
-            if (draw.HidesVanilla) ApplyVanillaBlocks(_page, _succeeded);
-            else RestoreHidden();
+            if (!draw.HidesVanilla) RestoreHidden();
         }
         catch (Exception error)
         {
@@ -1349,13 +3381,33 @@ internal static class ResultsDisplay
         }
         if (_page == null) { AbandonFixedLayout(); return; }
         _grid = grid; _origin = rect; _fixedPlan = draw;
-        HudTable.Draw(grid, rect.X, rect.Y, _content, draw.Opacity);
+        HudTable.Draw(grid, rect.X, rect.Y, _content, draw.Opacity, _scrollFirst, _scrollVisible, _scrollPlate);
         _boardDrawnFrame = Time.frameCount;
         ReportFixedPlacement(plan, draw, evidence, string.Empty);
         ReportForcedDraw(rect);
         _hitRect = rect;
         _hitSucceeded = _succeeded;
         _hitValid = true;
+        // The wheel follows the plate that was really painted here too (1.19.59), so the fixed board is scrolled by the same
+        // rectangle the press and the hover are judged against.
+        _scrollValid = true;
+        // 原版块让位：只在这帧 overlay 真的画出来、且扫描证据完整（`draw.HidesVanilla`）之后。
+        if (draw.HidesVanilla)
+        {
+            try
+            {
+                Component vanillaPage = LivePage(out bool vanillaSucceeded);
+                if (vanillaPage != null) ApplyVanillaBlocks(vanillaPage, vanillaSucceeded);
+            }
+            catch (Exception error)
+            {
+                if (!_loggedMeasure)
+                {
+                    _loggedMeasure = true;
+                    Plugin.Logger?.LogWarning("[DIAG] the fixed board is on the screen but the page's own blocks could not be put away: " + error.Message);
+                }
+            }
+        }
     }
 
     // 固定模式下数据刷新（人数变化、内容变宽）重新量表格，但底边中点不动：矩形按同一个锚点重算。
@@ -1416,11 +3468,21 @@ internal static class ResultsDisplay
                     anchorSource = ResultBoundSource.TitleAnchor;
                 }
                 TextMeshPro waiting = fail.m_returnToLobby_text;
-                // 1.19.21: the waiting block's laid-out rectangle is the wall - active state and text content are
-                // not asked of it, exactly as the strict path measures it now.
-                if (waiting != null && TryScreenRect(waiting, out LayoutRect waitingRect))
+                // 1.19.21: the waiting block is the protected text of this page, so the scan behind this path cannot
+                // mistake it for a control the board may cover. Its *layout* rectangle is no longer the wall (review #3):
+                // on the recorded page it sits 155px below the line the player reads.
+                protectedText = waiting;
+                // 1.19.61（评审 #3）：兜底路径（也是 F8 强绘走的那条）只认严格路径同一个槽位权威：客机上
+                // `m_btnGoToLobby` 自己的已布局几何与 `m_returnToLobby_text` 真正渲染的字形，取更靠上的那一堵。
+                // 布局框、别的可按控件、页面下界、玩家按键都不授权这条带；没有权威时下面直接拒收（保留原版 + 重测）。
+                if (GuestClient() && !succeeded)
                 {
-                    protectedText = waiting;
+                    ResultClientSlotEvidence slot = ClientSlot(page);
+                    footerText = slot.Top;
+                }
+                else if (waiting != null && TryScreenRect(waiting, out LayoutRect waitingRect))
+                {
+                    // 主机失败页：与 1.19.60 一个字节都不变。
                     footerText = waitingRect.Y;
                 }
             }
@@ -1453,7 +3515,12 @@ internal static class ResultsDisplay
             ? anchorBottom + ResultsBounds.Clearance(Screen.height)
             : ResultFallbackLayout.SafeTop(Screen.height);
         FooterControls controls = default;
-        try { controls = ScanFooterControls(page, guessTop, MessageGap, protectedText); }
+        // 1.19.52 (F2/F6): the same column the strict path reads, for the same reason - this fallback runs the same
+        // scan, and a wall it invents from an interaction the board could never cover is the eight-row plate again,
+        // one budget later. The failure page keeps `LayoutColumn.None`, byte for byte: its strip has no board column
+        // to prove, and its two pages' arithmetic must not move.
+        LayoutColumn fallbackColumn = succeeded ? BoardColumn() : LayoutColumn.None;
+        try { controls = ScanFooterControls(page, guessTop, MessageGap, protectedText, inspectBoard: false, column: fallbackColumn); }
         catch (Exception error) { if (why == "no-page") why = "scan-failed: " + error.Message; }
         // 1a. 这一页被人看见了吗？这条兜底自己的扫描就是问这个的地方，所以它的回答也在这里被读——不是拒收次数、也
         //     不是调用顺序。一个扫描看不见的控件（结构不完整 / action 父节点没覆盖）或量不到矩形的 active 控件，正是
@@ -1502,37 +3569,49 @@ internal static class ResultsDisplay
         int wallWait = 0;
         if (!succeeded)
         {
-            // 扫描自己的 `FooterTop` 只在「页脚文字真是墙、而 `walls` 还没带着它」的页面上算数：客机失败页上那行
-            // 等待文字已经由 `ResultPageLowerBoundPolicy` 作为 `FooterTextTop` 交出来，不必也不能再算一次。
-            wallMeasured = ResultFailureWallPolicy.WallMeasured(walls, pageButtonTop, controls.PressableTop,
-                walls.GuestFailure ? float.NaN : controls.FooterTop);
-            wallWait = FailureWallWaitFrames(wallMeasured);
-            // F8 在客机上照旧是玩家的答案（预算路线已经由 `MayAnswer` 放行），主机侧一个字节都没变。
-            bool waiving = walls.GuestFailure && Forced;
-            if (!waiving && ResultFailureWallPolicy.Waits(wallMeasured, wallWait, walls.GuestFailure))
+            if (walls.GuestFailure)
             {
-                why = ResultFailureWallPolicy.Unobserved + ": pressable=" + WallText(walls.PressableTop)
-                    + ",footerText=" + WallText(walls.FooterTextTop)
-                    + (walls.GuestFailure ? " (this page's waiting-status line, the wall this page draws)"
-                                          : " (" + ResultsBounds.Name(walls.FooterTextSource) + ")")
-                    + ",pageFloor=" + WallText(walls.PageFloor)
-                    + " (this page's own screen-derived foot: the band's cap, never a wall)"
-                    + ",button=" + WallText(pageButtonTop)
-                    + ",scanFooter=" + WallText(walls.GuestFailure ? float.NaN : controls.FooterTop)
-                    + ",controls=" + controls.Count + ",hidden=" + controls.Hidden
-                    + ",wallPending="
-                    + (walls.GuestFailure
-                        ? ResultClientPageActionPolicy.Pending(walls.FooterTextTop, walls.PressableTop).ToString().ToLowerInvariant()
-                        : "not-a-client-page")
-                    + ",waited=" + wallWait + " of " + ResultFailureWallPolicy.UnobservedBudget + " frames (that budget answers no client page by itself)"
-                    + "; this page has shown no lower bound at all, and two complete scans that found nothing are not a page with no wall"
-                    + (walls.GuestFailure
-                        ? " - a client failure page is answered by a wall this page really drew (its waiting-status line or a pressable control) or by the player's own F8, never by a frame count or a timeout, so the fail-open band is not invented from the screen (vanilla page kept, re-measured at the existing cadence)"
-                        : ", so the fail-open band is not invented from the window");
-                return false;
+                // 1.19.61（评审 #3）：客机失败页只有「同一个原生返回位置」的几何可以授权这条带——不是布局框、不是别的
+                // 可按控件、不是页面自己从屏幕推出来的下界，也不是玩家按下的 F8。没有它这一帧就保留原版并按既有节流
+                // 重测（`why` 说出这是「没有槽位证据」，不是超时）。
+                wallMeasured = float.IsFinite(walls.FooterTextTop);
+                wallWait = FailureWallWaitFrames(wallMeasured);
+                if (!wallMeasured)
+                {
+                    why = ResultFailureWallPolicy.Unobserved + ": no-slot-evidence; hostSlot/hintGlyph unmeasurable, "
+                        + "pressable=" + WallText(walls.PressableTop)
+                        + ", pageFloor=" + WallText(walls.PageFloor) + " (cap only, never a wall)"
+                        + ",wallPending=" + ResultClientPageActionPolicy.Pending(float.NaN, float.NaN).ToString().ToLowerInvariant() + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
+                        + ", controls=" + controls.Count + ", hidden=" + controls.Hidden
+                        + "; a forced press authorises a board, never an invented bound, so the vanilla page is kept and "
+                        + "measured again at the existing cadence until this page's own return slot or waiting glyphs read.";
+                    return false;
+                }
+            }
+            else
+            {
+                // 扫描自己的 `FooterTop` 只在「页脚文字真是墙、而 `walls` 还没带着它」的页面上算数。
+                wallMeasured = ResultFailureWallPolicy.WallMeasured(walls, pageButtonTop, controls.PressableTop,
+                    controls.FooterTop);
+                wallWait = FailureWallWaitFrames(wallMeasured);
+                if (ResultFailureWallPolicy.Waits(wallMeasured, wallWait, walls.GuestFailure))
+                {
+                    why = ResultFailureWallPolicy.Unobserved + ": pressable=" + WallText(walls.PressableTop)
+                        + ",footerText=" + WallText(walls.FooterTextTop)
+                        + " (" + ResultsBounds.Name(walls.FooterTextSource) + ")"
+                        + ",pageFloor=" + WallText(walls.PageFloor)
+                        + " (this page's own screen-derived foot: the band's cap, never a wall)"
+                        + ",button=" + WallText(pageButtonTop)
+                        + ",scanFooter=" + WallText(controls.FooterTop)
+                        + ",controls=" + controls.Count + ",hidden=" + controls.Hidden
+                        + ",waited=" + wallWait + " of " + ResultFailureWallPolicy.UnobservedBudget + " frames"
+                        + "; this page has shown no lower bound at all, and two complete scans that found nothing are not a page with no wall"
+                        + ", so the fail-open band is not invented from the window";
+                    return false;
+                }
             }
         }
-        // 客机失败页上那行字已经作为 `walls.FooterTextTop` 进了条带算术（它就是这一页的墙），所以扫描自己的
+        // 客机失败页上那行字已经作为 `walls.FooterTextTop` 进了条带算术（它就是这一页的槽位边界），所以扫描自己的
         // `FooterTop`（含那行字，也含可按控件）只在不是客机失败页时作为「量到的控件」那一路补一次。
         float measuredWall = walls.GuestFailure ? float.NaN : controls.FooterTop;
         if (!ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,
@@ -1540,8 +3619,18 @@ internal static class ResultsDisplay
         {
             why = "no-safe-area: anchorBottom=" + (float.IsFinite(anchorBottom) ? anchorBottom.ToString("0") : "unmeasurable")
                 + ",footerTop=" + WallText(walls.PressableTop)
-                + ",footerText=" + WallText(walls.FooterTextTop) + " (" + (walls.GuestFailure ? "the waiting-status line, a wall" : ResultsBounds.Name(walls.FooterTextSource)) + ")"
+                + ",footerText=" + WallText(walls.FooterTextTop) + " (" + (walls.GuestFailure ? "the native return slot, a wall" : ResultsBounds.Name(walls.FooterTextSource)) + ")"
                 + ",screen=" + Screen.height + ",boardFloor=" + FallbackFloor().ToString("0");
+            return false;
+        }
+        // 1.19.61（评审 #3）：客机失败页上，一条必须跨过那堵墙才能装下板「扩展带」同样不算证据——那是 run 3 的
+        // 0.55 全页淡画，也是强绘能走到的屏幕底托底。这里明确拒收，保留原版。
+        if (walls.GuestFailure && band.Extended)
+        {
+            why = "no-slot-band: the board floor does not fit above this page's slot wall (top=" + WallText(band.Top)
+                + ", wall=" + WallText(walls.FooterTextTop) + ", room=" + band.Height.ToString("0") + "px), and a band that "
+                + "crosses the wall to reach the window's foot is not a placement this page offers - vanilla page kept, "
+                + "measured again (forcedByF8=" + Forced.ToString().ToLowerInvariant() + " authorises a board, never an overlap).";
             return false;
         }
         top = band.Top; room = band.Height;
@@ -1577,56 +3666,111 @@ internal static class ResultsDisplay
     // defect this whole path exists to remove.
     private static void RefreshFallbackSafety()
     {
-        if (_page == null || _grid == null) return;
+        if (_page == null || _grid == null || _content == null) return;
         if (!FallbackPlacement(_page, _succeeded, out float top, out float room, out BoardStrip strip, out _)) return;
         if (room <= 0f) return;
-        if (!ResultFallbackLayout.TryPlaceInBand(Screen.width, Screen.height, top, top + room, _grid.Width, _grid.Height,
-            Plugin.ResultsOffsetX.Value, out LayoutRect rect)) return;
-        // The opacity is re-derived from the same measurement the place is, every repaint - a board that fitted when it was
-        // placed but is over its band now must go faint, and one that has been moved back inside a band must come back to
-        // full strength. The plan's own opacity is the floor of the answer: a band that was only ever the "standing over the
-        // page" tier stays faint whatever the board does inside it.
+        // The band holds the whole board: the table plus the header the close stands in, exactly as the fit that placed it
+        // measured. review #4: the place and the strip that produced it are one measurement and are committed together, the
+        // band's *foot* is read (it used to be ignored), and a board that no longer fits is answered with a smaller legal
+        // grid fitted inside the same band - never with "place it at the top and let it run to the bottom of the window".
+        float header = ChromeHeader();
+        PanelGrid grid = _grid;
+        float plateHeight = PlateFor(grid, room, header, out int scrollVisible, out int scrollFirst);
+        float total = plateHeight + header;
+        bool refitted = false;
+        if (!FitsBand(total, strip))
+        {
+            if (!TrySmallerGrid(room, header, out grid, out plateHeight, out scrollVisible, out scrollFirst, out total))
+            {
+                FadeInPlace("no-grid-fits", strip, room, total);
+                return;
+            }
+            refitted = true;
+        }
+        if (!ResultFallbackLayout.TryPlaceInBand(Screen.width, Screen.height, strip.Top, strip.Bottom, grid.Width, total,
+                Plugin.ResultsOffsetX.Value, out LayoutRect plate))
+        {
+            // The band has a foot this build cannot place inside even at the smallest grid it can draw: the board keeps the
+            // rectangle it already has and goes faint. It is never pushed to the screen's bottom edge and then "corrected".
+            FadeInPlace("band-refused", strip, room, total);
+            return;
+        }
+        LayoutRect rect = new LayoutRect(plate.X, plate.Y + header, grid.Width, plateHeight);
         float planned = _fallbackOpacity;
-        bool overBand = float.IsFinite(strip.Bottom) && rect.Bottom > strip.Bottom + 0.5f && strip.Bottom > strip.Top;
         float opacity = ResultFallbackOpacity.Resolve(planned, rect.Bottom, strip.Top, strip.Bottom);
         bool opacityChanged = Math.Abs(opacity - _fallbackOpacity) > 0.001f;
-        _fallbackOpacity = opacity;
-        _holdOpacity = opacity;
-        // A standing board moves when its band really intruded on the board that is on the screen - in either direction.
-        // Two edges bind: the band's foot is the control the player has to press, and the band's top is the page's own anchor
-        // (the completion section, the icon row, the failure title), which slides *down* when those native elements do. A
-        // board that kept an older, higher top after that was drawn over the very thing that edge keeps clear - and the rule
-        // this replaces could not see it, because it asked only whether the board's own bottom passed the band's foot, and
-        // that foot does not move when the top does.
-        //
-        // The question is asked of the rectangle that is on the screen (`_origin`), never of the destination `TryPlaceInBand`
-        // just computed: the destination is inside the new band by construction, so asking about it can only answer the fit's
-        // own question and never "the band moved into the board".
-        //
-        // Two thresholds, both already in use: an intrusion has to exceed half a pixel, and the destination has to differ by
-        // the drift minimum, so a band that jitters by a fraction of a pixel does not move a table the player is reading. A
-        // band whose foot arrived above the board's foot has no destination to move to - the destination is the band's own
-        // top, where the board already stands - and is answered by the fade below instead of by a move that changes nothing.
         float beforeTop = _origin.Y;
         bool horizontal = Math.Abs(rect.X - _origin.X) > ResultAnchorDrift.MinimumPixels;
         bool vertical = Math.Abs(rect.Y - _origin.Y) > ResultAnchorDrift.MinimumPixels;
+        bool sizeChanged = Math.Abs(rect.Height - _origin.Height) > ResultAnchorDrift.MinimumPixels
+            || Math.Abs(grid.Width - _grid.Width) > 0.5f;
+        // The question is asked of the rectangle that is on the screen (`_origin`), never of the destination just computed, and
+        // it is asked of both of the band's edges: a band whose top slid down into the board is as much an intrusion as a band
+        // whose foot rose into it.
         bool intrudes = ResultLateControlPolicy.MustMove(_origin.Y, _origin.Bottom, strip.Top, strip.Bottom);
-        bool moved = horizontal || (intrudes && vertical);
+        bool moved = refitted || sizeChanged || horizontal || (intrudes && vertical);
         if (moved)
         {
-            // The board keeps the grid it was fitted with and only its place moves; the strip recorded with the placement is
-            // left alone, so the one place that really records a placement (`Fit`) stays the only one that does.
-            _origin = rect; _holdBoard = rect;
+            // One assignment block: the place, the grid it was fitted at, the plate the close stands in and the strip that
+            // produced all three. A repaint can never see "a new place against the old band" - review #4's repeated withdrawal.
+            _origin = rect;
+            _holdBoard = plate;
+            _holdStrip = strip;
+            _grid = grid;
+            _scrollVisible = scrollVisible; _scrollFirst = scrollFirst; _scrollPlate = plateHeight;
         }
-        if (!moved && !opacityChanged) return;
-        if (HeadingReports.Add(moved ? "fallback-moved" : "fallback-fade"))
-            Plugin.Logger?.LogInfo($"[DIAG] the fail-open settlement board {(moved ? $"moved to ({rect.X:0},{rect.Y:0})" : "stayed where it was")} "
-                + $"because the page's own controls changed under it; band=({strip.Top:0}..{strip.Bottom:0}), "
-                + $"boardTop={beforeTop:0}->{_origin.Y:0}, boardBottom={_origin.Bottom:0}, intrudes={intrudes.ToString().ToLowerInvariant()}, "
-                + $"opacity={_fallbackOpacity:0.00}{(overBand ? " (over its band, drawn faint)" : string.Empty)}, role={ResultPageRolePolicy.Name(Role())}. "
-                + "It is moved out of their way - down to the band's own top when that edge moved into it - and drawn fainter when "
-                + "nothing clear is left, and it is never taken away. The next measurement that proves the page's own anchors places "
-                + "it strictly again.");
+        // The board is up whether it moved or not, and it belongs to this page.
+        _holdValid = true;
+        _holdPage = _page != null ? _page.Pointer : IntPtr.Zero;
+        _fallbackOpacity = opacity;
+        _holdOpacity = opacity;
+        if (!refitted && !moved && !opacityChanged) return;
+        if (HeadingReports.Add(refitted ? "fallback-refit" : moved ? "fallback-moved" : "fallback-fade"))
+            Plugin.Logger?.LogInfo($"[DIAG] the fail-open settlement board {(refitted ? "re-fitted" : moved ? "moved" : "faded")} "
+                + $"inside the band this repaint measured; band=({strip.Top:0}..{strip.Bottom:0}), source={strip.FooterSource}, "
+                + $"boardTop={beforeTop:0}->{_origin.Y:0}, plate={plate.Width:0}x{plate.Height:0} at ({plate.X:0},{plate.Y:0}), "
+                + $"plateBottom={plate.Bottom:0}, grid={grid.Width:0}x{grid.Height:0} glyph={grid.FontPixels:0}px, "
+                + $"room={room:0}px need={total:0}px, opacity={opacity:0.00}, refitted={refitted.ToString().ToLowerInvariant()}, "
+                + $"role={ResultPageRolePolicy.Name(Role())}. The place and the strip are committed together, the band's foot is read, "
+                + "and a board that no longer fits is fitted smaller inside the same band instead of being drawn past it.");
+    }
+
+    // Whether the whole board - table plus the header the close stands in - is inside the band this repaint measured.
+    private static bool FitsBand(float total, BoardStrip strip)
+        => float.IsFinite(total) && total > 0f && strip.Bottom > strip.Top && total <= strip.Bottom - strip.Top + 0.5f;
+
+    // A legal, smaller grid inside the same band. This is the fit the review asks for by name: when the board that is up no
+    // longer fits the band the page measures, a smaller *real* table is fitted into that band (header included) instead of
+    // the standing rectangle being pushed down the window and corrected a frame later. A page that cannot hold even the
+    // smallest drawable grid gets no new grid at all, and the caller keeps the board it has.
+    private static bool TrySmallerGrid(float room, float header, out PanelGrid grid, out float plateHeight,
+        out int scrollVisible, out int scrollFirst, out float total)
+    {
+        grid = null; plateHeight = 0f; total = 0f; scrollVisible = 0; scrollFirst = ResultsScroll.FrozenRows;
+        float boardWidth = Math.Max(1f, Math.Min(_grid != null ? _grid.Width : Screen.width - 48f, Screen.width - 48f));
+        // 1.19.54：这是唯一一个把**整条带高**交给 `FitBoard` 的调用点（两个严格调用点传的是已扣标题的
+        // `tableRoom`）。成功页按输入契约补扣一次标题，失败页原样传整条带——与 1.19.50 的实参逐字一致。
+        float body = room;
+        if (_succeeded && body - header > 0f) body -= header;
+        PanelGrid smaller = FitBoard(_content, body, boardWidth, _succeeded);
+        if (smaller == null) return false;
+        float plate = PlateFor(smaller, room, header, out int visible, out int first);
+        float sum = plate + header;
+        if (!(sum > 0f) || sum > room + 0.5f) return false;
+        grid = smaller; plateHeight = plate; scrollVisible = visible; scrollFirst = first; total = sum;
+        return true;
+    }
+
+    // The board keeps the rectangle it already has and is drawn fainter: the one answer that is never "no board at all".
+    private static void FadeInPlace(string why, BoardStrip strip, float room, float total)
+    {
+        _fallbackOpacity = Math.Min(_fallbackOpacity, ResultFallbackLayout.OverlapOpacity);
+        _holdOpacity = _fallbackOpacity;
+        if (!HeadingReports.Add("fallback-fade-" + why)) return;
+        Plugin.Logger?.LogInfo($"[DIAG] the fail-open settlement board keeps the place it has and goes fainter: {why}, "
+            + $"band=({strip.Top:0}..{strip.Bottom:0}) room={room:0}px need={total:0}px, board=({_holdBoard.X:0},{_holdBoard.Y:0},"
+            + $"{_holdBoard.Width:0}x{_holdBoard.Height:0}), opacity={_fallbackOpacity:0.00}, role={ResultPageRolePolicy.Name(Role())}; "
+            + "the band this repaint measured cannot hold a board at any grid this build can draw, and a board is never taken away for it.");
     }
 
     // Whether the settlement board is on the page right now: the last repaint's own "a board was drawn" fact.
@@ -1650,20 +3794,58 @@ internal static class ResultsDisplay
     // hid or showed: that decision belongs to the display alone.
     internal static bool ToggleForcedFallback()
     {
-        ResultBoardToggle toggle = ResultTogglePolicy.Next(BoardOnScreen);
-        bool show = toggle == ResultBoardToggle.Show;
+        // The answer comes from the request, not from the last painted frame. `RequestedShown` reads the player's own
+        // switches and this page's own hide; `Forced` is a show request a previous press already left behind and no
+        // repaint has answered yet. A page asked to show is asked to hide, and a page asked to hide is asked to show -
+        // so three quick presses are show/hide/show whatever the frame rate and whatever the geometry did (review #1).
+        bool requestedShown = ResultTogglePolicy.RequestedShown(SwitchesWantBoard(), Session.HiddenByPress, Forced);
+        bool show = ResultTogglePolicy.Press(requestedShown) == ResultBoardToggle.Show;
+        ApplyBoardVisibility(show);
+        Plugin.Logger?.LogInfo($"[DIAG] settlement board {(show ? "show" : "hide")} requested: requestedShown={requestedShown}, "
+            + $"painted={BoardOnScreen}, forced={Forced}, hiddenByPress={Session.HiddenByPress}, switchesShown={SwitchesWantBoard()}, "
+            + $"role={ResultPageRolePolicy.Name(Role())}, screen={Screen.width}x{Screen.height}; "
+            + "one line per press - the request flips with each press and is not read back from the last repaint, the request is not the "
+            + "presentation, and a hide restores the game's own page on the frame it is answered.");
+        return show;
+    }
+
+    // The four visibility switches as the player left them. `Shows` is the one rule the overlay gate and the refresh path both
+    // read, so the key can never disagree with them about what "the player asked for the board" means.
+    private static bool SwitchesWantBoard()
+        => ResultVisibility.Shows(
+            Plugin.ShowResults == null || Plugin.ShowResults.Value,
+            Plugin.ShowResultOverlay == null || Plugin.ShowResultOverlay.Value,
+            Plugin.ShowImpactBoard == null || Plugin.ShowImpactBoard.Value,
+            PanelBehaviour.ToggleState);
+
+    // The one visible-state action F8 and both settlement buttons share. `show` is the *request*; the repaint that follows
+    // answers it (`F8 forced frame`) or names the fact that refused it. A show deliberately keeps everything this page has
+    // already measured - the placement, the strip it was fitted into and the fail-open budget - because a request that waits
+    // for a valid measurement must not restart that measurement on every press (review #1/#5). A hide does drop the board's
+    // own placement: the page is going back to the game on this very frame.
+    private static bool ApplyBoardVisibility(bool show)
+    {
         Forced = show;
-        // The switch half of the documented F8 contract: the same two switches, the same saved file, on both screens.
-        // `Plugin.PersistToggle` batches them and only saves when something really moved.
+        if (show) Session.MarkShown(); else Session.MarkHidden();
+        // The switch half of the documented contract: the same two switches, the same saved file, on both screens. It never
+        // writes `ShowImpactBoard`, so a player's own switch is still theirs.
         Plugin.PersistToggle(show);
-        Invalidate();
-        _strictMisses = 0;
-        _fallbackPlaced = false;
-        _fallbackOpacity = 1f;
-        // A press that shows the board owes its frame a line: the flag is spent by `ReportForcedDraw` when the frame ends
-        // with a board, or by the forced-gated refusal reports when it ends without one. A hide is answered by the empty
-        // page itself, and a pending flag left over from an earlier show must not outlive it.
-        _forcedOutcomePending = show;
+        if (show)
+        {
+            // The press owes its frame an answer: spent by `ReportForcedDraw` when it ends with a board, or by the
+            // forced-gated refusal lines when it ends without one.
+            _forcedOutcomePending = true;
+        }
+        else
+        {
+            Invalidate();
+            // A hide is not a spent budget: the next show starts from a page that has refused nothing yet (review #5 -
+            // `_strictMisses` used to survive the hide, so the next show began 60 frames into a budget it never spent).
+            _strictMisses = 0; _fallbackMisses = 0; _fallbackFloorScale = 1f;
+            _fallbackPlaced = false; _fallbackOpacity = 1f;
+            _forcedOutcomePending = false;
+        }
+        ClearHit();
         return show;
     }
 
@@ -1890,39 +4072,152 @@ internal static class ResultsDisplay
         catch { return false; }
     }
 
-    // Where the wheel scales the settlement board.
+    // The settlement board's wheel, sampled once per frame from the game's own readings.
     //
-    // The rectangle is the one the board was drawn at during the most recent repaint, and it is dropped again at the
-    // start of the next one: a frame that could not draw the board leaves nothing to aim at, so a pointer resting
-    // where the board used to be cannot keep scaling something nobody can see. `frame` is the GUI frame the notch
-    // arrived in, and the gesture lock is asked first: the notch that changed the scale saves the configuration,
-    // that save drops the layout, and the rectangle is gone by the time the rest of the same gesture arrives - which
-    // must still be consumed here rather than reaching the page underneath. Beyond that lock, the first notch of a
-    // sequence has to be inside the rectangle that is really on screen, and nothing outside it is ever claimed.
-    internal static bool ZoomAt(Vector2 point, bool succeeded, int frame)
+    // 1.19.59 replaced the IMGUI read (`EventType.ScrollWheel` in `OnGUI`) with the routing the player's other panel
+    // already uses (conflictmodlist 1.1.15 `WheelRouter` + `HandleMouse`), ported in `ResultWheel.cs`: the page's native
+    // `CM_PageBase.ScrollInput` first, `Input.mouseScrollDelta.y` as the labelled fallback, one of the two per frame and
+    // never both, the native reading consumed by *change* (a held non-zero reading is not a second notch), three rows per
+    // notch, at most five notches per frame, 0.1-per-notch platforms normalised by ten.
+    //
+    // Two callers ask for it - the frame driver (`PanelBehaviour.Update`) and the page's own press dispatch
+    // (`SettlementPressPatch`, which runs `CM_PageBase.UpdateButtonPress`) - and `ResultScrollLatch.Claim` is what keeps
+    // them to one settlement per frame, exactly like the reference's `wheelFrame`. Nothing here is written to the
+    // configuration: a scroll position is not a setting.
+    internal static void PollWheel()
     {
-        // The same four switches the board itself is gated by - with one exception that has to agree with the draw: a
-        // player who pressed F8 on this page (`Forced`) has the board on screen whatever the switches say, so the wheel
-        // over it must keep working. A wheel that worked only while the config agreed would be a second, quieter version
-        // of the bug that left a forced board unscalable.
-        if (!Forced)
+        int frame = Time.frameCount;
+        // The second caller inside the same frame does not sample again: one notch is one settlement.
+        if (!_scrollLatch.Claim(frame)) return;
+        // 1.19.59 (independent review L5): this entry may run *before* the repaint that takes the frame's pointer sample -
+        // the page's own press dispatch calls `PollWheel` and only then `DispatchPressFrame` - so the sample is taken here
+        // when nobody has taken it yet. `WheelApplies` below judges the pointer against the plate the board was last drawn
+        // at, and answering that from the previous frame's `_pointer` is what let the wheel and the press disagree on a
+        // frame where the cursor entered or left the board. One sample per frame, whoever asks first.
+        EnsurePointer();
+        if (!WheelApplies(out bool succeeded, out ScrollViewport viewport, out float pitch, out float maxPixels))
         {
-            if (!PanelBehaviour.ToggleState) return false;
-            if (Plugin.ShowResults != null && !Plugin.ShowResults.Value) return false;
-            if (Plugin.ShowResultOverlay != null && !Plugin.ShowResultOverlay.Value) return false;
-            if (Plugin.ShowImpactBoard != null && !Plugin.ShowImpactBoard.Value) return false;
+            // Not this frame's table (pointer left the board, the board is hidden, the page is not a settlement, nothing
+            // overflows, the window lost focus). The frame's source is cleared and the consumed native fingerprint is
+            // kept - the reference's `Suspend` - so a still-held native reading does not scroll when the pointer returns.
+            _wheel.Suspend();
+            _wheelSteps.Reset();
+            return;
         }
-        // The rest of a gesture that already landed on this page's board during this very frame. Asked before the
-        // rectangle, because the rectangle is exactly what the rebuild the first notch started has taken away.
-        if (_hitFrame == frame) return true;
-        if (!_hitValid || _hitSucceeded != succeeded) return false;
-        if (!float.IsFinite(point.x) || !float.IsFinite(point.y)) return false;
-        if (!float.IsFinite(_hitRect.X) || !float.IsFinite(_hitRect.Y) || !(_hitRect.Width > 0f) || !(_hitRect.Height > 0f)) return false;
-        if (point.x < _hitRect.X || point.x > _hitRect.X + _hitRect.Width) return false;
-        if (point.y < _hitRect.Y || point.y > _hitRect.Y + _hitRect.Height) return false;
-        _hitFrame = frame;
+        Component page = ChromePage();
+        if (page == null) { _wheel.Suspend(); _wheelSteps.Reset(); return; }
+        float native = ReadNativeScroll(page);
+        float physical = ReadPhysicalWheel();
+        float pixels = _wheel.Sample(native, physical, pitch, maxPixels);
+        int rows = _wheelSteps.Rows(pixels, pitch, true);
+        if (rows == 0) return;
+        int before = _scrollFirst;
+        int after = ResultsScroll.ByRows(before, _grid.Rows, ResultsScroll.FrozenRows, viewport.ScrollSlots, rows);
+        if (after == before)
+        {
+            // The table is already against that end: the input had no effect, so the remainder it left is dropped rather
+            // than banked and replayed when the other end opens (the reference clamps the same way, in pixels).
+            _wheelSteps.Reset();
+            return;
+        }
+        _scrollFirst = after;
+        // A frame that moved fewer rows than it asked for (the table's foot) also gives up the rest of its remainder.
+        if (after - before != rows) _wheelSteps.Reset();
+        if (HeadingReports.Add("board-scrolled"))
+            Plugin.Logger?.LogInfo($"[DIAG] settlement board scrolled: rows {after}..{after + viewport.ScrollSlots} of {_grid.Rows} are on the page "
+                + $"({ResultsScroll.FrozenRows} frozen header row with the player names), plate {_scrollPlate:0}px at the {_grid.FontPixels:0}px glyph the page was read at; "
+                + $"source={_wheel.Source} (native={native:0.###}, physical={physical:0.###}, {pixels:0.#}px -> {rows} row(s), {ResultWheelRouter.RowsPerNotch:0} rows per notch, "
+                + $"at most {ResultWheelRouter.MaxNotches:0} notches per frame), pointer=({_pointer.X:0},{_pointer.Y:0}) inside ({_hitRect.X:0},{_hitRect.Y:0},{_hitRect.Width:0}x{_hitRect.Height:0}); "
+                + "the wheel scrolls the table and never changes its size, and nothing here writes the config file.");
+    }
+
+    // Whether this frame's wheel may move the table at all: the same gates the press and the hover answer, asked once.
+    //
+    // Every refusal answers "not this frame's table": the pointer outside the plate the board was really drawn at, a
+    // board that was not painted, a page that is not a settlement, the overlay switched off (F8 off), a window without
+    // focus, and a table that fits its own plate. None of them withholds input from the page: the wheel is only ever
+    // *read* here (the game keeps its own `ScrollInput`), so a frame this mod does not use is a frame the page still has.
+    private static bool WheelApplies(out bool succeeded, out ScrollViewport viewport, out float pitch, out float maxPixels)
+    {
+        succeeded = false; viewport = default; pitch = 0f; maxPixels = 0f;
+        if (!InputFocused()) return false;
+        eGameStateName state;
+        try { state = GameStateManager.CurrentStateName; } catch { return false; }
+        succeeded = state == eGameStateName.ExpeditionSuccess;
+        if (!succeeded && state != eGameStateName.ExpeditionFail) return false;
+        if (!WheelShown()) return false;
+        if (!_scrollValid || _hitSucceeded != succeeded) return false;
+        if (_grid == null || _content == null) return false;
+        if (!_pointer.Valid) return false;
+        if (!ResultChromeLayout.Inside(_hitRect, _pointer.X, _pointer.Y)) return false;
+        viewport = new ScrollViewport(_grid.Rows, ResultsScroll.FrozenRows, _scrollVisible, _scrollFirst);
+        if (!viewport.Overflows) return false;
+        pitch = _grid.RowHeight;
+        if (!(pitch > 0f) || !float.IsFinite(pitch)) return false;
+        maxPixels = Mathf.Max(pitch, _scrollPlate);
         return true;
     }
+
+    // The four switches the board itself is gated by, with the one exception that has to agree with the draw: a player who
+    // pressed F8 on this page (`Forced`) has the board on screen whatever the switches say, so the wheel over it works.
+    private static bool WheelShown()
+    {
+        if (Forced) return true;
+        if (!PanelBehaviour.ToggleState) return false;
+        if (Plugin.ShowResults != null && !Plugin.ShowResults.Value) return false;
+        if (Plugin.ShowResultOverlay != null && !Plugin.ShowResultOverlay.Value) return false;
+        if (Plugin.ShowImpactBoard != null && !Plugin.ShowImpactBoard.Value) return false;
+        return true;
+    }
+
+    // Whether this window has the input focus. Read only, and a build that cannot answer is treated as focused (the rest
+    // of the gates still apply), which is the same answer the reference's `Focused()` gives.
+    private static bool InputFocused()
+    {
+        try { return Application.isFocused; } catch { return true; }
+    }
+
+    // The page's own wheel reading (`CM_PageBase.ScrollInput`): the primary source. A build that cannot read it answers
+    // zero, which is exactly "the physical wheel decides this frame" - never a second read of the same notch.
+    private static float ReadNativeScroll(Component page)
+    {
+        try
+        {
+            var menu = page != null ? page.TryCast<CM_PageBase>() : null;
+            if (menu == null) return 0f;
+            float value = menu.ScrollInput;
+            return float.IsFinite(value) ? value : 0f;
+        }
+        catch (Exception error)
+        {
+            if (!_loggedNativeScroll) { _loggedNativeScroll = true; Plugin.Logger?.LogWarning("[DIAG] the result page's own scroll reading could not be read, so the physical wheel decides this frame: " + error.Message); }
+            return 0f;
+        }
+    }
+
+    private static bool _loggedNativeScroll;
+
+    // The one physical wheel read in this assembly: Unity's `mouseScrollDelta.y`, read and never captured (no cursor
+    // hiding, no lock, no event consumption, no global input state touched).
+    private static float ReadPhysicalWheel()
+    {
+        try
+        {
+            Vector2 delta = Input.mouseScrollDelta;
+            return float.IsFinite(delta.y) ? delta.y : 0f;
+        }
+        catch { return 0f; }
+    }
+
+    // A new page, a new window, a board that stopped being drawn: the router forgets the consumed fingerprint with it.
+    private static void ResetWheel()
+    {
+        _wheel.Reset();
+        _wheelSteps.Reset();
+        _scrollLatch.Forget();
+    }
+
+    // ---- the influence board -------------------------------------------------------------------
 
     // ---- the influence board -------------------------------------------------------------------
 
@@ -2086,7 +4381,7 @@ internal static class ResultsDisplay
                 + ResultSettlementGate.Why(settlement.Why, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,
                     CompletionTargets.Ledger.InFlight, stallSeconds, stallLimit)
                 + ", role=" + ResultPageRolePolicy.Name(Role())
-                + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
+                + ",wallPending=" + ResultClientPageActionPolicy.Pending(float.NaN, float.NaN).ToString().ToLowerInvariant() + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
                 + "; this is the only claim made about this page: it is fail-open because the reveal made no progress for the whole "
                 + "stall bound (never observed, aborted with routines still running, or scheduled and simply never finishing), "
                 + "not because anything settled, "
@@ -2108,6 +4403,20 @@ internal static class ResultsDisplay
             ReportHeldBack("prepare", wallUnobserved ? "fail-open-wall-unobserved"
                     : pageReadable ? "fallback-unavailable" : "fail-open-page-unreadable",
                 fallbackWhy + ", misses=" + _fallbackMisses + ",floor=" + FallbackFloor().ToString("0") + "px");
+            return;
+        }
+        // review #4: a host failure page may stand a board on the window's own foot, but not on nothing at all. `Top` of the
+        // fail-open band is the page's anchor (its title layout, its waiting line), and `AnchorMeasured` says whether that
+        // anchor was really read this frame. Sixty refused frames are a budget for "this page offers no measured lower
+        // bound", never a licence to invent the whole band from the window and call it the board's first appearance - which
+        // is the 330x540 @ ScreenSafeArea placement the attachment shows one frame before the page's own 488..1139 band
+        // arrived. F8 (`Forced`) is the player's own answer and still overrides it.
+        if (!Forced && !succeeded && !GuestClient() && !strip.AnchorMeasured)
+        {
+            _fallbackMisses = ResultPlacementPolicy.Spend(_fallbackMisses);
+            ReportHeldBack("prepare", "fail-open-unanchored",
+                "band=(" + strip.Top.ToString("0") + ".." + strip.Bottom.ToString("0") + ") source=" + strip.FooterSource
+                + ", anchorMeasured=False, misses=" + _fallbackMisses + ", floor=" + FallbackFloor().ToString("0") + "px");
             return;
         }
         _fallbackPlaced = true;
@@ -2132,6 +4441,10 @@ internal static class ResultsDisplay
                 + $"{fallbackWhy}, strictRefusals={_strictMisses} of {ResultFallbackPolicy.MissBudget} frames before the budget is spent, "
                 + $"forcedByF8={Forced}, role={ResultPageRolePolicy.Name(Role())}; the page's own anchors could not be proven, so the screen's "
                 + "own geometry is used and the page's controls are stepped around instead of the board being dropped.");
+        // 1.19.55: the fail-open band is the mature board's own escape (it measures the page, steps around its controls and
+        // fades rather than vanishing), so a placement made here is not the early, non-interactive one. Saying so is what lets
+        // this frame's earlier `Placement` answer stand for nothing: the board that stands is this one.
+        _earlyBoard = false;
         FinishPlacement(succeeded, strip);
     }
 
@@ -2245,13 +4558,31 @@ internal static class ResultsDisplay
             + ",source=" + strip.FooterSource;
         if (!(room > 0f)) { refusal = "reason=strip-empty," + refusal; return false; }
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
-        PanelGrid grid = FitBoard(content, room, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);
+        // The header the close stands in is reserved out of the strip before the table is fitted, so the board -
+        // table plus header - is still exactly as tall as the band the page measured. A strip so short that the
+        // header would leave no room at all keeps the old room; the placement below then refuses it on its own
+        // numbers rather than drawing a board taller than its band.
+        float header = ChromeHeader();
+        float tableRoom = room - header;
+        if (!(tableRoom > 0f)) tableRoom = room;
+        PanelGrid grid = FitBoard(content, tableRoom, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);
         if (grid == null)
         {
             refusal = "reason=grid-unmeasurable,rows=" + content.Rows + ",columns=" + content.ColumnCount + "," + refusal;
             return false;
         }
-        if (!ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded), _grid != null, _content != null))
+        // 1.19.59: a band that cannot hold the board's own header *and* two whole rows has nothing to draw. 1.19.58 placed
+        // a board into it anyway (`PlateFor` reported two rows, `PlateHeight` clipped the plate to the room), so a 48px band
+        // drew a 36px header and one 12px slot with three pixels of the second row showing - the "标题 + 碎行" the player
+        // reported. A refused band leaves the vanilla page exactly as the game drew it (and the fail-open path still has its
+        // own band), which is the honest answer: no board is better than a board nobody can read.
+        if (!ResultsScroll.PlateFits(room, grid.RowHeight, header, ResultsScroll.MinimumVisibleRows))
+        {
+            refusal = "reason=plate-below-" + ResultsScroll.MinimumVisibleRows + "-rows,rowHeight=" + grid.RowHeight.ToString("0.##")
+                + ",header=" + header.ToString("0") + "," + refusal;
+            return false;
+        }
+        if (!ResultBoardLatch.Placed(Fit(strip, grid, content, board, report, succeeded, header), _grid != null, _content != null))
         {
             refusal = "reason=fit-refused,grid=" + grid.Width.ToString("0") + "x" + grid.Height.ToString("0")
                 + ",strip=(" + strip.Top.ToString("0") + ".." + strip.Bottom.ToString("0") + ")," + refusal;
@@ -2296,7 +4627,14 @@ internal static class ResultsDisplay
     // into (`BoardStrip.FillCeiling`): the historical comfort band above a control the player has to press, or - on a
     // client page whose band already stops a clearance above its waiting-status block - the whole band, because
     // nothing under that foot is left for the ceiling to protect.
-    private static PanelGrid FitBoard(TableContent content, float room, float boardWidth, bool succeeded, float buttonHeight = float.NaN,
+    // 1.19.54（输入契约）：这一个参数是**正文高度**——即“板子可以给表格的那一段”，已经扣掉板子自己在上方保留的标题
+    // （`ChromeHeader()`）。它以前在两个严格调用点（`TryFit` 与重排）就是这么传的（`tableRoom = room - header`），
+    // 1.19.53 又在函数内部无条件再扣一次，于是成功页与失败页都被**双重扣减**；只有 fail-open 的重拟合传的是整条带高。
+    // 现在的契约是“恰好扣一次，由调用方负责”，函数内部**不再扣**：
+    //   * `TryFit`（两页共用）与重排路径：`tableRoom = room - header`（1.19.50 原样）；
+    //   * fail-open 的重拟合（`RefreshFallbackBoard`）：成功页补扣标题，失败页原样传整条带（1.19.50 原样）。
+    // 失败页因此与 1.19.50 逐字等价：同一个 `tableRoom`、同一条 `FloorForBand`/`FitBoardIntoStrip` 调用。
+    private static PanelGrid FitBoard(TableContent content, float bodyRoom, float boardWidth, bool succeeded, float buttonHeight = float.NaN,
         float fillCeiling = ResultsFontGrowth.StripFillCeiling)
     {
         int seed = Mathf.Max(1, PanelBehaviour.FontSizeForSharing);
@@ -2321,42 +4659,61 @@ internal static class ResultsDisplay
         // may not be crossed, and the page may not be left without a table, so the readability floor is lowered to
         // the band's own answer and the row shrinks with it. The measured search below then refines that answer
         // against the real text widths, and the grid is drawn at whatever it produced.
-        int bandFloor = ResultsBandFit.FloorForBand(room, content.Rows, Plugin.Density, requested, out bool squeezed);
+        // `bodyRoom` is the height the *table* may use - the caller has already taken the header out - so nothing is reserved here: the
+        // search's answer is the one `PlateFor`/`TryPlace` accept, because both of them hold `plate + header` against the
+        // whole band and the header has been taken out exactly once, by the caller.
+        int bandFloor = ResultsBandFit.FloorForBand(bodyRoom, content.Rows, Plugin.Density, requested, out bool squeezed);
         if (squeezed && HeadingReports.Add("band-squeezed"))
-            Plugin.Logger?.LogInfo($"[DIAG] settlement board squeezed by its band: room={room:0}px for {content.Rows} rows allows a {bandFloor}px glyph, "
-                + $"below the {requested}px this page would have liked; the glyph and the row shrink together so nothing is drawn outside "
-                + $"[top, bottom], and the page is not left without a table. role={ResultPageRolePolicy.Name(Role())}.");
-        int fitted = ResultsFontGrowth.FitBoardIntoStrip(seed, bandFloor, int.MaxValue, room, boardWidth,
-            size => NaturalSize(content, size, bandFloor), out int floor, fillCeiling);
-        // The player's own wheel preference scales the size the page's own strip produced, inside the box this
-        // page really offers: a bigger board is allowed the room the fit's own comfort band leaves free, and a size
-        // that would reach the lobby button or leave the width is stepped back until it does not. The two result
-        // pages keep their own scale, so the success board and the failure board cannot resize each other.
-        int fontSize = ResultsZoom.ScaleSize(fitted, Plugin.ResultFontScale(succeeded), room, boardWidth,
-            size => NaturalSize(content, size, bandFloor));
-        // The floor the grid is built with may not be above the size it is drawn at, or a zoomed-out board
-        // would be rebuilt back up into the room the player just asked it to leave - and it may never be above
-        // the band's own answer either, which is what keeps a short band from being answered with a taller table.
-        floor = Mathf.Max(bandFloor, Mathf.Min(floor, fontSize));
-        if (squeezed) floor = Mathf.Min(floor, Mathf.Max(ResultsBandFit.AbsoluteMinimumPixels, fontSize));
-        PanelGrid grid = BoardGrid(content, fontSize, floor, room, boardWidth);
-        if (!InStrip(grid, room, boardWidth) && floor > bandFloor)
+            Plugin.Logger?.LogInfo($"[DIAG] settlement board wider than its band would like: body={bodyRoom:0}px for {content.Rows} rows would allow a {bandFloor}px glyph, "
+                + $"below the {requested}px this page would have liked; the table keeps the readable glyph and the rows that no longer fit are "
+                + $"reached with the wheel instead of being squeezed into a size nobody can read. role={ResultPageRolePolicy.Name(Role())}.");
+        // A band that cannot hold the comfort glyph has already been answered by `FloorForBand` with its own
+        // figure (`squeezed`), and that figure is the largest one this page can hold. Fitting the table against
+        // the historical 96% comfort ceiling on top of it asks for less room than the band allows, so the search
+        // refuses its own floor and hands back the seed - which is the recorded 16 px over thirty rows on a
+        // 646 px strip whose own arithmetic said 13 px. A squeezed band is therefore fitted against itself;
+        // every band that can hold the comfort size keeps the ceiling it always had.
+        float fittedCeiling = squeezed ? ResultsFontGrowth.BandFillCeiling : fillCeiling;
+        int fitted = ResultsFontGrowth.FitBoardIntoStrip(seed, bandFloor, int.MaxValue, bodyRoom, boardWidth,
+            size => NaturalSize(content, size, bandFloor), out int floor, fittedCeiling);
+        // ---- 自动模式的目标字号：按窗口高度等比，而不是「带能撑多大就多大」 ----------------------------------
+        //
+        // 1.19.47（最新用户合同）：自动字号以基准画面按分辨率等比例设目标——1080 高是 12px、1440 高是 16px，同一条
+        // 1/90 的窗口高度——而不是让每一条带把自己的字号撑到带顶。撑到带顶的字号在一条高带上会变成一块巨板，而同一个
+        // roster 换一个分辨率又会得到另一个大小。目标只封顶，不改变行数：带比目标矮时 `ResultsBandFit` 早就把可读下限
+        // 降到了带自己的答案（整行 fit，行不裁），玩家自己的缩放仍然在 `ResultsScroll.FontFor` 里叠在目标之上，溢出
+        // 照旧由滚轮到达。窄宽仍然优先：下面的宽度循环在封顶之后仍然会把放不下的宽度一步一步减下去。
+        int autoTarget = ResultAutoBoardContract.TargetGlyphPixels(Screen.height);
+        if (autoTarget > 0 && fitted > autoTarget)
         {
-            floor = bandFloor;
-            grid = BoardGrid(content, fontSize, floor, room, boardWidth);
+            if (HeadingReports.Add("auto-target"))
+                Plugin.Logger?.LogInfo($"[DIAG] settlement board at the automatic mode's target: this {bodyRoom:0}px of table height would have held a {fitted}px glyph, "
+                    + $"and {autoTarget}px is what a {Screen.height}px window aims at ({ResultAutoBoardContract.BaselineGlyphPixels}px at "
+                    + $"{ResultAutoBoardContract.BaselineScreenHeight:0}px, scaled and rounded); the board keeps its {content.Rows} rows, "
+                    + $"hangs from the wall below instead of filling the band, and role={ResultPageRolePolicy.Name(Role())} keeps its own walls.");
+            fitted = autoTarget;
         }
-        // 1.19.21 (the hard band invariant): whatever the wheel preference asked for, the grid handed to the
-        // placement is stepped back until it fits the band the page really measured - the board is never placed
-        // taller than its band and merely faded, which is what the recorded failure page got (boardBottom=1388,
-        // opacity 0.55). A band too short for the absolute minimum glyph keeps the smallest grid and is refused by
-        // the placement below, which is the honest `squeezed`/`fit-failed` answer with the vanilla page kept.
-        int clampTries = 0;
-        while (!InStrip(grid, room, boardWidth)
-            && fontSize > Math.Max(bandFloor, ResultsBandFit.AbsoluteMinimumPixels) && clampTries++ < 64)
+        // ---- the fit is the size the board is drawn at -----------------------------------------------------
+        //
+        // This is the whole of the change from the zoomable board: `ResultsZoom.ScaleSize` walked the size down
+        // until the *whole* table fitted the strip, and `ResultsBandFit.FloorForBand` lowered the readable floor
+        // to the band's own answer on the way, so a short page was answered with a six-pixel table and the scroll
+        // the player needed could never happen. `ResultsScroll.FontFor` answers the size this fit measured, with
+        // the player's own `FontScale` on top of it, and the height bound is no longer handed to the grid at all:
+        // a table taller than its plate - a genuinely short strip, or a board the player asked to be larger - is
+        // a table the wheel scrolls, and the plate that clips it is measured from the rows the strip really holds.
+        int fontSize = ResultsScroll.FontFor(fitted, Plugin.ResultFontScale(succeeded));
+        // The floor the grid is built with follows the size it is drawn at. It may never be above the band's own
+        // answer, because the width still has to hold: the board has a vertical scroll and no horizontal one, so
+        // a table too wide for the page is the one case that still spends glyph size.
+        floor = Mathf.Max(ResultsBandFit.AbsoluteMinimumPixels, Mathf.Min(bandFloor, fontSize));
+        PanelGrid grid = BoardGrid(content, fontSize, floor, boardWidth);
+        int widthTries = 0;
+        while (grid != null && grid.Width > boardWidth + 0.5f
+            && fontSize > Mathf.Max(floor, ResultsBandFit.AbsoluteMinimumPixels) && widthTries++ < 64)
         {
             fontSize--;
-            floor = bandFloor;
-            grid = BoardGrid(content, fontSize, floor, room, boardWidth);
+            grid = BoardGrid(content, fontSize, floor, boardWidth);
         }
         // The floor the grid on screen was really built with, so a later refresh re-measures with that one
         // instead of asking for a floor this strip already proved it cannot honour.
@@ -2366,15 +4723,59 @@ internal static class ResultsDisplay
 
     // The grid the board is drawn with. The page's width is a bound the table may not exceed, never a width
     // the table is stretched to: `HudTable.BuildGrid` measures the cells and gives every value column the
-    // same width, and nothing afterwards widens the grid to fill the page it is drawn on.
-    private static PanelGrid BoardGrid(TableContent content, int fontSize, int floor, float room, float boardWidth)
-        => HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, room, floor);
+    // same width, and nothing afterwards widens the grid to fill the page it is drawn on. The height is
+    // deliberately unbounded: the table is built at its full row count and the plate clips it, which is what
+    // lets the rows below the plate be scrolled to instead of being squeezed into a smaller glyph.
+    private static PanelGrid BoardGrid(TableContent content, int fontSize, int floor, float boardWidth)
+        => HudTable.BuildGrid(content, fontSize, Plugin.Density, boardWidth, float.PositiveInfinity, floor);
 
-    // A board the placement will accept: no taller than the strip between the completion section and the
-    // lobby button, and no wider than the page. The half pixel is the rounding a measured width or height
-    // can leave behind; a grid a fraction over is still a board the result page refuses to draw.
-    private static bool InStrip(PanelGrid grid, float room, float boardWidth)
-        => grid != null && grid.Height <= room + 0.5f && grid.Width <= boardWidth + 0.5f;
+    // The plate this board really occupies inside the room a page offered: whole rows, the frozen header row
+    // included, and never the whole table when the table is taller than the room. `visible` is how many rows the
+    // plate holds and `first` the first scrollable row on screen; both are clamped to the table, so a page that
+    // grew, shrank or changed resolution between frames cannot leave the offset past the table's own foot.
+    private static float PlateFor(PanelGrid grid, float room, float header, out int visible, out int first)
+    {
+        visible = 0; first = ResultsScroll.FrozenRows;
+        if (grid == null) return 0f;
+        float tableRoom = room - header;
+        if (!(tableRoom > 0f)) tableRoom = room;
+        ScrollViewport view = ResultsScroll.Viewport(grid.Rows, ResultsScroll.FrozenRows, tableRoom,
+            grid.RowHeight, _scrollFirst);
+        visible = view.Visible;
+        first = view.First;
+        float plate = ResultsScroll.PlateHeight(view.Visible, grid.RowHeight, tableRoom);
+        return Mathf.Min(grid.Height, plate);
+    }
+
+
+    // One candidate plate for a standing board, re-placed against this frame's strip and judged against both bands.
+    //
+    // `room` is the room the plate is measured into (the larger of this frame's strip and the one the board stands in, or
+    // this frame's alone when the first attempt does not fit), `strip` is what the page offers *now*. The candidate has to:
+    //   * be placeable by the same bottom-aligned search the first placement used, at the current grid's width;
+    //   * sit inside this frame's band (`ResultChromeLayout.PlateInsideBand`, the screen's own foot included);
+    //   * clear the wall the held board has to stay above and the strip it was measured into (`HeldGridFits`).
+    // A plate that fails any of them is not committed, which is what stops the "larger of the two rooms" rule from ever
+    // drawing through a footer that really rose.
+    private static bool TryFitHeld(PanelGrid grid, float room, float header, BoardStrip strip,
+        out float plate, out int visible, out int first, out LayoutRect rect)
+    {
+        plate = 0f; visible = 0; first = ResultsScroll.FrozenRows; rect = _holdBoard;
+        if (grid == null) return false;
+        if (!float.IsFinite(room) || !(room > 0f)) return false;
+        plate = PlateFor(grid, room, header, out visible, out first);
+        if (!(plate > 0f) || !float.IsFinite(plate)) return false;
+        float total = plate + header;
+        if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, total,
+                Plugin.ResultsOffsetX.Value, out LayoutRect candidate, BoardSlack, bottomAligned: true))
+            return false;
+        if (!ResultChromeLayout.PlateInsideBand(candidate, strip.Top, strip.Bottom, Screen.height, BoardSlack))
+            return false;
+        if (!ResultBoardHold.HeldGridFits(_holdStrip, strip, candidate, total, Screen.height, BoardSlack))
+            return false;
+        rect = candidate;
+        return true;
+    }
 
     // The table's own extents at one glyph size, measured without a box to fit into: the box is what is being
     // chosen here, so measuring inside one would only report that box back instead of the table's real size.
@@ -2409,22 +4810,39 @@ internal static class ResultsDisplay
         // 字号下重量一次，矩形按同一个锚点重算——底边中点因此不随人数变化而移动。
         if (_fixedPlaced) return FixedLayoutRefresh(content, board, report, succeeded);
         float boardWidth = Mathf.Max(320f, Screen.width - 48f);
-        PanelGrid measured = HudTable.BuildGrid(content, Mathf.Max(1, Mathf.RoundToInt(_grid.FontPixels)), Plugin.Density, boardWidth, _grid.Height, _fontFloor);
-        if (measured != null && !GridCovers(_grid, measured)
-            && Placement(page, succeeded, out _, out float room, out BoardStrip strip) && room > 0f)
+        // Measured UNBOUNDED at the size the board is drawn at: a bounded build can come back with a smaller glyph, and a
+        // shrunken grid is not evidence that the grid on the page still covers this snapshot.
+        PanelGrid measured = HudTable.BuildGrid(content, Mathf.Max(1, Mathf.RoundToInt(_grid.FontPixels)), Plugin.Density,
+            boardWidth, float.PositiveInfinity, _fontFloor);
+        // Nothing can be measured at the font the board is drawn at, so this snapshot cannot be adopted: the pair already
+        // on the page is kept exactly as it is and this frame is still answered ("handled") - the caller has no reason to
+        // throw a good board away because one poll could not measure its own text.
+        if (measured == null) return true;
+        // The standing grid really covers it - same rows and columns, no field wider than the one it already holds, no
+        // larger glyph. Only then may the text be swapped under the geometry that is already on the page, because the
+        // geometry is not changing.
+        if (GridCovers(_grid, measured))
         {
-            // The strip may have grown since the board arrived, so the same fit the first placement used is run
-            // again rather than reusing the glyph size it happened to land on: a refreshed snapshot re-measures.
-            PanelGrid resized = FitBoard(content, room, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);
-            if (resized != null)
-            {
-                bool fitted = Fit(strip, resized, content, board, report, succeeded);
-                // A rejected larger grid keeps the existing grid on screen; its cells and geometry must stay paired.
-                if (!fitted || !ReferenceEquals(_grid, resized)) return true;
-            }
+            _content = content;
+            return true;
         }
-        _content = content;
-        return true;
+        // The strip is not measurable this repaint (the page is still animating, or it went away between the two reads).
+        // Again: adopt nothing, keep the board that is already on the page, and answer "handled" so the caller does not
+        // reset it for a frame that measured no strip.
+        if (!Placement(page, succeeded, out _, out float room, out BoardStrip strip) || !(room > 0f)) return true;
+        // The strip may have grown since the board arrived, so the same fit the first placement used is run again rather
+        // than reusing the glyph size it happened to land on: a refreshed snapshot re-measures. It reserves the same header
+        // the first placement reserved, out of the same room and into the same `Fit`, so a refreshed board cannot grow its
+        // plate above the strip's top edge.
+        float header = ChromeHeader();
+        float tableRoom = room - header;
+        if (!(tableRoom > 0f)) tableRoom = room;
+        PanelGrid resized = FitBoard(content, tableRoom, boardWidth, succeeded, strip.ButtonHeight, strip.FillCeiling);
+        // Nothing is written here on purpose. `Fit` commits `_grid`/`_content`/`_origin` together and only on a frame it
+        // really placed the board, and its own `true` is the "handled" answer even when it refuses a growth and keeps the
+        // board already on the page (`ResultBoardHold.HeldGridFits`). A grid that could not be measured is not handled at
+        // all, so the caller takes the ordinary re-measure path with the old pair untouched.
+        return resized != null && Fit(strip, resized, content, board, report, succeeded, header);
     }
 
     private static bool GridCovers(PanelGrid current, PanelGrid required)
@@ -2518,30 +4936,67 @@ internal static class ResultsDisplay
     // bound - `TryPlace` refuses a board that would reach it - so nothing here may ever overlap it either.
     // Answers whether a board really went onto the page. A refused fit leaves the caches untouched and answers
     // false, which is what keeps `Refresh` from hiding the game's own blocks for a board nobody will draw.
-    private static bool Fit(BoardStrip strip, PanelGrid grid, TableContent content, ImpactBoardLayout board, ImpactReport report, bool succeeded)
+    private static bool Fit(BoardStrip strip, PanelGrid grid, TableContent content, ImpactBoardLayout board, ImpactReport report, bool succeeded,
+        float header = 0f)
     {
         // The board is placed inside the strip its own measurement produced, not merely inside the window: a
         // board taller than that strip used to be accepted here and then refused at draw time, which is how a
-        // whole table was dropped for a fraction of a pixel of overflow.
-        bool placedStrictly = ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, grid.Height,
-            Plugin.ResultsOffsetX.Value, out LayoutRect origin, BoardSlack, bottomAligned: false);
+        // whole table was dropped for a fraction of a pixel of overflow. The header the close stands in is part
+        // of that board: the placement holds the table plus the header, and the table's own origin is one header
+        // lower, so the close never stands on a figure.
+        if (!(header > 0f) || !float.IsFinite(header)) header = 0f;
+        // 1.19.52 (F2/F4): the two-phase column measurement.
+        //
+        // The band this frame was measured into only ends where the table's own column allows: a wall that stands in
+        // the board's way ends it, one that stands beside the board does not. The board's width is what decides which
+        // of the two a control is, and on the first placement of a page nothing has measured it yet. Rather than
+        // committing a board the next frame would re-align (or, as 1.19.51 did, falling back to the page's footer and
+        // drawing an eight-row plate), the fit records the width it really measured for this page's content and
+        // refuses this frame: the vanilla page stays exactly as the game drew it, the next repaint resolves the band
+        // against the table's own column, and one extra frame is the whole cost. The budget is bounded per page, and
+        // a page whose table keeps changing width spends it and then proceeds with what it has.
+        LayoutColumn measuredColumn = BoardColumn();
+        if (succeeded && !measuredColumn.Known && grid != null && grid.Width > 0f && _columnProbes < MaximumColumnProbes)
+        {
+            _columnProbes++;
+            _widthProbe = grid.Width;
+            if (HeadingReports.Add("success-column-probe"))
+                Plugin.Logger?.LogInfo($"[DIAG] result board measured its own column: {grid.Width:0}x{grid.Height:0} px at the "
+                    + $"{grid.FontPixels:0}px glyph this page's table really needs, so the band can be resolved against the "
+                    + $"column the board will occupy instead of the page's footer control (probe {_columnProbes}/{MaximumColumnProbes}). "
+                    + "Nothing is committed and nothing is painted on this frame - the vanilla page is kept, and the next "
+                    + "repaint measures the strip against this width.");
+            return false;
+        }
+        float plateHeight = PlateFor(grid, strip.Bottom - strip.Top, header, out int scrollVisible, out int scrollFirst);
+        float total = plateHeight + header;
+        bool placedStrictly = ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, total,
+            Plugin.ResultsOffsetX.Value, out LayoutRect plate, BoardSlack, bottomAligned: true);
         // 1.19.21 (the hard band invariant): a board is never placed taller than its band and merely faded. The grid
         // handed in here is already fitted to the strip's own room (`FitBoard` steps the glyph down until it fits), so
         // the strip's top-aligned placement is the whole answer for both the strict and the fail-open board; the band
         // the fail-open path was given is the band the fit slid the grid into. `ResultFallbackLayout.TryPlaceInBand`
         // stands in only for the fraction-of-a-pixel case the strip's own probe refused, and only when the grid really
         // does not exceed the band - a taller-than-band board is refused and reported, never drawn faint.
-        if (!placedStrictly && _fallbackPlaced && grid.Height <= strip.Bottom - strip.Top + 0.5f)
+        if (!placedStrictly && _fallbackPlaced && total <= strip.Bottom - strip.Top + 0.5f)
             placedStrictly = ResultFallbackLayout.TryPlaceInBand(Screen.width, Screen.height, strip.Top, strip.Bottom,
-                grid.Width, grid.Height, Plugin.ResultsOffsetX.Value, out origin);
+                grid.Width, total, Plugin.ResultsOffsetX.Value, out plate);
         if (placedStrictly)
         {
+            // The table's own origin sits under the reserved header; the plate is the whole board.
+            LayoutRect origin = new LayoutRect(plate.X, plate.Y + header, grid.Width, plateHeight);
             _origin = origin;
+            // The window this placement really drew: the wheel moves these rows, and the plate they are drawn into
+            // is what the next frame's hit rectangle is measured from.
+            _scrollVisible = scrollVisible; _scrollFirst = scrollFirst; _scrollPlate = plateHeight;
             _content = content; _grid = grid;
             // The place the board was measured into, kept for as long as this page is up: the F8 write, the hot
             // reload that follows it and the page's own button animation all come back through here, and none of
             // them may cost the board the strip it was already given.
-            _holdValid = true; _holdBoard = origin; _holdOpacity = _fallbackPlaced ? _fallbackOpacity : 0f;
+            _holdValid = true; _holdBoard = plate; _holdOpacity = _fallbackPlaced ? _fallbackOpacity : 0f;
+            // The page this place belongs to, recorded with the place itself (review #2: the failure page used to get
+            // this pre-set on `OnEnable`, which is not where a hold is made).
+            _holdPage = _page != null ? _page.Pointer : IntPtr.Zero;
             // The strip itself is kept next to the place, because a page that later offers a different one is a
             // page this board no longer fits: `ResultAnchorDrift` compares the strip's upper edge and the room it
             // gave against what the page measures from now on, and asks for one bounded re-measure when they have
@@ -2560,7 +5015,7 @@ internal static class ResultsDisplay
                 float blankBelow = Math.Max(0f, strip.Bottom - origin.Bottom);
                 // The placed frame prints the band the board was really fitted into - its own two edges and the
                 // source word - so a log alone settles where a board stands and which measurement put it there.
-                Plugin.Logger.LogInfo($"[DIAG] influence board {board.ColumnCount} columns x {board.Rows} rows ({report.Entries.Count} players), {grid.Width:0}x{grid.Height:0} px at ({x:0},{y:0}) of a {Screen.width}x{Screen.height} window, {(succeeded ? "success" : "failure")} screen, anchorSource={(succeeded ? "completion-section" : "failure-strip")}, blankAbove={blankAbove:0}px, blankBelow={blankBelow:0}px, band=({strip.Top:0}..{strip.Bottom:0}), bandSource={strip.FooterSource}, glyph {grid.FontPixels:0}px filling {grid.Height * 100f / stripHeight:0}% of the {stripHeight:0}px strip between the completion section and the lobby button ({grid.Width * 100f / Math.Max(1f, Screen.width - 48f):0}% of the {Screen.width - 48}x width it was fitted to); drawn by IMGUI, no vanilla report card was modified.");
+                Plugin.Logger.LogInfo($"[DIAG] influence board {board.ColumnCount} columns x {board.Rows} rows ({report.Entries.Count} players), {grid.Width:0}x{grid.Height:0} px at ({x:0},{y:0}) of a {Screen.width}x{Screen.height} window, {(succeeded ? "success" : "failure")} screen, anchorSource={(succeeded ? "completion-section" : "failure-strip")}, blankAbove={blankAbove:0}px, blankBelow={blankBelow:0}px, band=({strip.Top:0}..{strip.Bottom:0}), bandSource={strip.FooterSource}, glyph {grid.FontPixels:0}px filling {grid.Height * 100f / stripHeight:0}% of the {stripHeight:0}px strip between the completion section and the lobby button ({grid.Width * 100f / Math.Max(1f, Screen.width - 48f):0}% of the {Screen.width - 48}x width it was fitted to); rows shown {Math.Min(scrollVisible, grid.Rows):0} of {grid.Rows} in a {plateHeight:0}px plate under the {header:0}px header (first row {scrollFirst:0}, {grid.RowHeight:0.##}px row pitch - the plate is the height that clips the table, so this is the count a player really sees); drawn by IMGUI, no vanilla report card was modified.");
             }
             else if (_relayoutPending && HeadingReports.Add("board-relaid"))
                 Plugin.Logger?.LogInfo($"[DIAG] result board re-fitted: the page was measured again ({_relayoutReason}) and the board now stands at {grid.Width:0}x{grid.Height:0} px at ({x:0},{y:0}) of a {Screen.width}x{Screen.height} window, band=({strip.Top:0}..{strip.Bottom:0}), bandSource={strip.FooterSource}, glyph {grid.FontPixels:0}px, role={ResultPageRolePolicy.Name(Role())}; the placement before it was laid out before this page's own wall could be read, so this line is the size and place the player really ends up with (one line per page - the re-measure itself stays inside `ResultAnchorRecovery` and `ResultAnchorDrift`).");
@@ -2584,18 +5039,53 @@ internal static class ResultsDisplay
         // both result pages, and a refused growth keeps the grid/content pair already on screen.
         if (_holdValid && _page != null && ResultVisibility.SamePage(_holdPage, _page.Pointer))
         {
-            if (!ResultBoardHold.HeldGridFits(_holdStrip, strip, _holdBoard, grid.Height, Screen.height, BoardSlack))
+            // 1.19.46 (UI review F2): what a refreshed grid may occupy is the *plate* it would be drawn into, measured from
+            // this strip with the same `PlateFor` the fit uses - never `grid.Height`, the table's unscrolled height, which
+            // nothing paints. Judging by the unscrolled table refused every refresh of a board taller than its strip; worse,
+            // it left `_scrollVisible`/`_scrollPlate` describing the grid that *was* on the page while `_grid` was already
+            // the new one, i.e. stale content drawn at the old plate. Plate, visible rows and first row are therefore
+            // computed once, judged together with the header, and committed together.
+            // 1.19.59: the room the refreshed plate is measured into is the *larger* of this frame's strip and the strip the
+            // standing board was placed into. 1.19.58 used this frame's strip alone, and `HeldGridFits` only ever checks the
+            // bottom edge - so every repaint whose measurement came back a little shorter wrote a shorter plate, and a page
+            // whose footer kept breathing ratcheted the table down one row at a time. That is the recorded "布局越来越短".
+            //
+            // The larger room never means "draw over the wall". The plate it produces is re-placed against *this* frame's
+            // strip with the same bottom-aligned placement the first one used, and committed only when it really sits inside
+            // both bands and clears the wall the held board has to stay above (`TryFitHeld`). When it does not - the footer
+            // really rose, another control arrived - the smaller room this frame offers is tried, which is the "re-adapt to a
+            // wall that tightened" case; only a frame in which neither fits keeps the plate already on the page, and
+            // `BoardStillSafe` then defers it. A tightened wall can therefore never be walked through.
+            float headerNow = ChromeHeader();
+            float heldRoom = _holdStrip.Bottom > _holdStrip.Top ? _holdStrip.Bottom - _holdStrip.Top : 0f;
+            float frameRoom = strip.Bottom - strip.Top;
+            bool standing = TryFitHeld(grid, Math.Max(heldRoom, frameRoom), headerNow, strip,
+                    out float keptPlate, out int keptVisible, out int keptFirst, out LayoutRect keptRect)
+                || TryFitHeld(grid, frameRoom, headerNow, strip,
+                    out keptPlate, out keptVisible, out keptFirst, out keptRect);
+            if (!standing)
             {
                 if (HeadingReports.Add("board-growth-refused"))
-                    Plugin.Logger?.LogInfo($"[DIAG] result board kept at its measured size: a refreshed {grid.Width:0}x{grid.Height:0} board would cross the wall the held grid has to stay above (wall={(float.IsFinite(strip.ButtonTop) ? strip.ButtonTop.ToString("0") : "unmeasurable")}, source={DescribeBand(strip.FooterSource)}) or run past the strip it was measured into ({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), so the grid already on the page is kept and the next snapshot asks again.");
+                    Plugin.Logger?.LogInfo($"[DIAG] result board kept at its measured size: a refreshed {grid.Width:0}x{grid.Height:0} board cannot be placed inside this frame's strip "
+                        + $"({strip.Top:0}..{strip.Bottom:0}, source={DescribeBand(strip.FooterSource)}, wall={(float.IsFinite(strip.ButtonTop) ? strip.ButtonTop.ToString("0") : "unmeasurable")}) "
+                        + $"nor inside the strip it was measured into ({_holdStrip.Top:0}..{_holdStrip.Top + heldRoom:0}), so the grid already on the page is kept and the next snapshot asks again.");
                 _relayoutPending = false;
                 return true;
             }
-            _origin = _holdBoard;
             _content = content; _grid = grid;
+            // The plate the judge just measured is the plate the next repaint draws: the new grid's own visible rows and
+            // first row travel with it, so nothing is left describing the previous table.
+            _scrollVisible = keptVisible; _scrollFirst = keptFirst;
+            _scrollPlate = keptPlate;
             _relayoutPending = false;
-            if (HeadingReports.Add("board-held"))
-                Plugin.Logger?.LogInfo($"[DIAG] result board kept: the strip measured {strip.Top:0}..{strip.Bottom:0} cannot hold the {grid.Width:0}x{grid.Height:0} board that is already up, so it keeps the place it was measured into at ({_holdBoard.X:0},{_holdBoard.Y:0}), and only the lobby button is read from here on.");
+            // The board stands where the placement put it: the table's own origin is that plate's top plus the header it
+            // reserved, and the rectangle is the one the per-repaint scan judges.
+            _holdBoard = keptRect;
+            _origin = new LayoutRect(keptRect.X, keptRect.Y + headerNow, _grid.Width, keptPlate > 0f ? keptPlate : _grid.Height);
+            if (HeadingReports.Add("board-kept"))
+                Plugin.Logger?.LogInfo($"[DIAG] result board kept: the strip measured {strip.Top:0}..{strip.Bottom:0} cannot hold the {grid.Width:0}x{grid.Height:0} board whole, so the refreshed rows are drawn into a "
+                    + $"{keptPlate:0}px plate at ({keptRect.X:0},{keptRect.Y:0}) of this page's own strip (rows {keptFirst}..{keptFirst + keptVisible - 1}, {keptVisible} whole rows), "
+                    + "and only the lobby button is read from here on - the plate is never grown through a wall the page has drawn.");
             return true;
         }
         // The one line a refused fit must never be silent about, and must never dress up: the real strip, the real height
@@ -2771,19 +5261,87 @@ internal static class ResultsDisplay
         // budget) answers at once, and F8 is the player's own answer and never waits (`ResultRevealGate`). The
         // per-repaint safety checks (`BoardStillSafe`, `HeldGridFits`) deliberately do not ask this question: a board
         // that is already standing is never taken away because the page's reveal moved on.
+        // 1.19.55 (user contract D): the board may enter *before* the page has proven its final boundary.
+        //
+        // The gate below is unchanged for the mature board: while the completion ledger can still finish, the page's own
+        // reveal has not said where the section ends, and a table hung from a half-revealed row is a table that moves. What
+        // is new is the way out that does not require F8, a frame count or an empty scan. When this machine holds real
+        // settlement data, the page's completion section has been *laid out* (its slot edge, which is final from the frame
+        // the page laid it out), the interaction scan finished, nothing it can see reaches the strip, and that strip holds the
+        // table's own readable floor, the board enters as an **early, non-interactive** board (`ResultEarlyBoardPolicy`):
+        // drawn, no wheel, no press, and not one of the game's own blocks put away. The mature placement below then takes
+        // over on the frame the page's own edges are proven, with no key and no pointer involved.
+        bool early = false;
+        // 1.19.60 (review F1): is the strip this frame measured a *final* strip? One production predicate answers it,
+        // `ResultRevealStatePolicy`, from the page's own ledger - never from a frame count, a budget or an empty scan:
+        //   * `Finished` - the reveal answered: it finished, or it proved that nothing of its own is still running, or
+        //     every target it was handed was proved unscheduled. Only this state is final on the ledger's word alone;
+        //   * `Unobservable` - the page has been watched through the whole bounded observation budget and has handed the
+        //     ledger nothing at all. This is the bounded retry F1 asked for: it still has to prove the page's own
+        //     geometry (`FinalLayout.Ready`, the same two-agreeing-readings latch the fail-open path already uses), and it
+        //     has its own name in the log so nobody can read it as "the reveal finished";
+        //   * `NotStarted` / `Running` - the live page whose targets have not all arrived. `Required == 0` on the first
+        //     frames of a page is exactly this state and never "settled": the native `BlinkIn` fills the ledger, so a page
+        //     that is about to register six targets looks the same as one that never will - until the budget says which.
+        // The lower wall must also be a control the page really measured (`ResultFooterProvenance.MeasuredLowerWall`):
+        // `None` is a strip that ran to the foot of the window, and the client's fixed page geometry is a statement about
+        // the screen rather than about what the page drew, so neither may stand in for a final edge.
+        int revealRequired = CompletionTargets.Ledger.Required;
+        if (revealRequired <= 0 && _revealObservations < ResultRevealStatePolicy.UnobservableObservations)
+            _revealObservations++;
+        RevealObservation revealState = ResultRevealStatePolicy.Observe(revealDone, revealRequired,
+            CompletionTargets.Ledger.Count, CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.InFlight,
+            CompletionTargets.Ledger.MayStillComplete,
+            CompletionTargets.Ledger.Settled, _revealObservations);
+        bool revealSettled = ResultRevealStatePolicy.Answered(revealState)
+            || (revealState == RevealObservation.Unobservable && FinalLayout.Ready);
+        bool clientBoundsFinal = revealSettled && ResultFooterProvenance.MeasuredLowerWall(footerSource);
+        if (revealState != RevealObservation.Finished && HeadingReports.Add("success-reveal-state"))
+            Plugin.Logger?.LogInfo("[DIAG] success reveal state: " + ResultRevealStatePolicy.Name(revealState)
+                + " (required=" + revealRequired + ",counted=" + CompletionTargets.Ledger.Count
+                + ",completed=" + CompletionTargets.Ledger.Completed + ",inFlight=" + CompletionTargets.Ledger.InFlight
+                + ",unscheduled=" + CompletionTargets.Ledger.Unscheduled
+                + ",observationsWithoutTargets=" + _revealObservations + " of "
+                + ResultRevealStatePolicy.UnobservableObservations
+                + ",pageGeometryReady=" + FinalLayout.Ready.ToString().ToLowerInvariant()
+                + ",revealFinished=" + RevealFinished.ToString().ToLowerInvariant()
+                + ",role=" + ResultPageRolePolicy.Name(Role()) + ",lowerWall=" + footerSource
+                + "); this names what the page's own ledger has answered so far - `unobservable` is the bounded retry for "
+                + "a page whose native callback never came, and it still requires the page's geometry to read the same twice.");
         if (ResultRevealGate.BlocksPlacement(revealDone, CompletionTargets.Ledger.MayStillComplete,
                 CompletionTargets.Ledger.InFlight, Forced))
         {
-            if (HeadingReports.Add("success-reveal-pending"))
-                Plugin.Logger?.LogInfo("[DIAG] success board held back: "
-                    + ResultRevealGate.Why(CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,
-                        CompletionTargets.Ledger.Names, CompletionTargets.Ledger.Artwork, CompletionTargets.Ledger.InFlight)
-                    + ", completion=" + WallText(Completion.Edge)
-                    + ", boardTop=" + (area.Fits ? area.Top.ToString("0") : "unmeasurable")
-                    + ", role=" + ResultPageRolePolicy.Name(Role())
-                    + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
-                    + "; vanilla is retained, and the section is measured again on the frame the ledger completes.");
-            return false;
+            ImpactReport earlyReport = BuildReport(succeeded);
+            bool earlyAllowed = ResultEarlyBoardPolicy.Allows(earlyReport != null && earlyReport.Entries.Count > 0,
+                completionMeasured, successControls.Complete, successControls.OverlapsBoard, area.Height, _boardFloor,
+                HostProven(), clientBoundsFinal);
+            if (!earlyAllowed)
+            {
+                if (HeadingReports.Add("success-reveal-pending"))
+                    Plugin.Logger?.LogInfo("[DIAG] success board held back: "
+                        + ResultRevealGate.Why(CompletionTargets.Ledger.Completed, CompletionTargets.Ledger.Count,
+                            CompletionTargets.Ledger.Names, CompletionTargets.Ledger.Artwork, CompletionTargets.Ledger.InFlight)
+                        + ", completion=" + WallText(Completion.Edge)
+                        + ", boardTop=" + (area.Fits ? area.Top.ToString("0") : "unmeasurable")
+                        + ", role=" + ResultPageRolePolicy.Name(Role())
+                        + ", early=" + (earlyReport != null ? earlyReport.Entries.Count.ToString() : "0") + "rows,"
+                        + "room=" + (float.IsFinite(area.Height) ? area.Height.ToString("0") : "unmeasurable")
+                        + ", floor=" + (_boardFloor.ToString("0"))
+                        + ",wallPending=" + ResultClientPageActionPolicy.Pending(float.NaN, float.NaN).ToString().ToLowerInvariant() + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
+                        + "; vanilla is retained, and the section is measured again on the frame the ledger completes.");
+                return false;
+            }
+            early = true;
+            if (HeadingReports.Add("success-early-entry"))
+                Plugin.Logger?.LogInfo("[DIAG] success board entered early (noninteractive): the page is live and this machine"
+                    + " holds its own settlement rows, so the table is drawn from the completion section's laid-out edge while"
+                    + " the page's native reveal is still running (completed=" + CompletionTargets.Ledger.Completed + "/"
+                    + CompletionTargets.Ledger.Count + ", revealFinished=" + RevealFinished.ToString().ToLowerInvariant() + "),"
+                    + " strip=(" + area.Top.ToString("0") + ".." + area.Bottom.ToString("0") + ") role="
+                    + ResultPageRolePolicy.Name(Role()) + ", floor=" + _boardFloor.ToString("0")
+                    + "px; this is not a claim that the page settled - Ready/Proven stay the strict path's own words - the wheel"
+                    + " stays the page's, a press belongs to whatever the game drew, and none of the game's own blocks is put away."
+                    + " The mature board replaces it on the frame its own boundary is proven.");
         }
 
         // The ledger answered "no further reveal can arrive" rather than "finished" (`RevealImpossible`: a routine that
@@ -2800,7 +5358,7 @@ internal static class ResultsDisplay
                 + ", completion=" + WallText(Completion.Edge)
                 + ", boardTop=" + (area.Fits ? area.Top.ToString("0") : "unmeasurable")
                 + ", role=" + ResultPageRolePolicy.Name(Role())
-                + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
+                + ",wallPending=" + ResultClientPageActionPolicy.Pending(float.NaN, float.NaN).ToString().ToLowerInvariant() + ", forcedByF8=" + Forced.ToString().ToLowerInvariant()
                 + "; vanilla was retained for the frames the reveal was still legible, and the board is placed from the layout edge alone.");
         // The completion settle gate is fed for the drawn-pixel route's diagnostics and counters only: the layout edge
         // above has already satisfied the placement for this frame, and the gate cannot hold it back any more.
@@ -2834,14 +5392,20 @@ internal static class ResultsDisplay
             bool successNoFooterReady = SuccessNoFooter.Observe(Time.frameCount,
                 ResultPageRolePolicy.UsesNoFooterSafeArea(Role()), completionMeasured,
                 page != null, successNativeFooterVisible, successControls.Complete, successControls.Count, successControls.Unmeasurable);
-            if (!successNoFooterReady && GuestClient())
+            // 1.19.60: a client whose own strip is already final is not held back by the no-footer proof. That proof
+            // answers "may this page be read as having no footer at all", and the recorded client page never proved it -
+            // which is why the board used to enter on the moving strip instead. Once the ledger has answered and the
+            // lower wall is a control the page really measured, the strip is the one the mature board would be fitted
+            // into, so the page takes the same early route below and the player gets one table at one size. While the
+            // geometry can still move, nothing changes: vanilla is kept and the page is measured again.
+            if (!successNoFooterReady && GuestClient() && !clientBoundsFinal)
             {
                 // Guest no-footer readiness and fixed geometry are unchanged; a client never uses the host band proof.
                 if (Footer.Exhausted && HeadingReports.Add("success-footer-unsettled"))
                     Plugin.Logger?.LogInfo($"[DIAG] success board held back: role={ResultPageRolePolicy.Name(Role())}, no stable native footer edge was measured; "
                         + $"noFooterProof=available (ready={SuccessNoFooter.Ready}, samples={SuccessNoFooter.Samples}), "
                         + $"count={successControls.Count},unmeasurable={successControls.Unmeasurable},complete={successControls.Complete},nativeVisible={successNativeFooterVisible},footerTop={(float.IsFinite(successControls.FooterTop) ? successControls.FooterTop.ToString("0") : "unmeasurable")} "
-                        + $"need={_boardFloor:0}px; vanilla is kept and the page is measured again at the bounded cadence.");
+                        + $"need={_boardFloor:0}px; boundsFinal=false (revealFinished={RevealFinished.ToString().ToLowerInvariant()},mayStillComplete={CompletionTargets.Ledger.MayStillComplete.ToString().ToLowerInvariant()},inFlight={CompletionTargets.Ledger.InFlight},footerSource={footerSource}); vanilla is kept and the page is measured again at the bounded cadence.");
                 return false;
             }
             if (!successNoFooterReady)
@@ -2850,7 +5414,38 @@ internal static class ResultsDisplay
                     successControls.Complete, successControls.ParentCoverageComplete, successControls.Count,
                     successControls.Unmeasurable, successNativeFooterVisible, measuredButton,
                     successControls.OverlapsBoard, successBand);
-                if (successBandProof != SuccessBandProofState.Proven)
+                // 1.19.55: an unproven band is what the early board is waiting for, not a reason to withdraw it. The early
+                // placement already required a complete scan, no overlap and a strip that holds the table's own floor; the
+                // mature board - the one that may put the page's blocks away and take the wheel - is the one that must prove
+                // the footer.
+                // 1.19.56 (review 6/12): an unprovable footer is exactly what the early board exists for. A success page
+                // whose return button never becomes visible - or which has no footer at all - used to refuse every board
+                // for ever, so seeing all the data required F8. The early board is allowed here on the same measured
+                // facts as in the reveal branch, and it is *replaced* (never repeated) on the frame the footer/band is
+                // proven, because the mature placement sets `_earlyBoard = false` from this same measurement.
+                if (successBandProof != SuccessBandProofState.Proven && !early)
+                {
+                    ImpactReport footerless = BuildReport(succeeded);
+                    if (ResultEarlyBoardPolicy.Allows(footerless != null && footerless.Entries.Count > 0,
+                            completionMeasured, successControls.Complete, successControls.OverlapsBoard, area.Height, _boardFloor,
+                            HostProven(), clientBoundsFinal))
+                    {
+                        early = true;
+                        if (HeadingReports.Add("success-early-entry-nofooter"))
+                            Plugin.Logger?.LogInfo("[DIAG] success board entered early (noninteractive) because this page has no"
+                                + " provable footer: revealFinished=" + RevealFinished.ToString().ToLowerInvariant()
+                                + ", completed=" + CompletionTargets.Ledger.Completed + "/" + CompletionTargets.Ledger.Count
+                                + ", nativeFooterVisible=" + successNativeFooterVisible.ToString().ToLowerInvariant()
+                                + ", buttonMeasured=" + measuredButton.ToString().ToLowerInvariant()
+                                + ", strip=(" + area.Top.ToString("0") + ".." + area.Bottom.ToString("0") + ")"
+                                + ", room=" + area.Height.ToString("0") + "px, floor=" + _boardFloor.ToString("0")
+                                + "px, role=" + ResultPageRolePolicy.Name(Role())
+                                + "; every row this machine holds is drawn, the wheel and every press stay the page's, and no"
+                                + " vanilla block is put away. The mature board replaces it the frame the page proves its own"
+                                + " footer - this is not a claim that the page settled (1.19.56).");
+                    }
+                }
+                if (successBandProof != SuccessBandProofState.Proven && !early)
                 {
                     if (HeadingReports.Add("success-band-proof-state"))
                         Plugin.Logger?.LogInfo($"[DIAG] success band proof refused: nativeFooterVisible={successNativeFooterVisible},buttonMeasured={measuredButton},active={successControls.Count},unmeasurable={successControls.Unmeasurable},scanComplete={successControls.Complete},parentCoverageComplete={successControls.ParentCoverageComplete},{ResultSuccessBandProofPolicy.Describe(successBandProof, successBand)}; vanilla is kept and placement is retried.");
@@ -2911,6 +5506,11 @@ internal static class ResultsDisplay
         bool successFootIsWall = ResultsFontGrowth.FootIsTheWall(area.Bottom, successControls.FooterTop, MessageGap);
         strip = new BoardStrip(top, top + room, GuestClient() || belowActions ? false : measuredButton, measuredTop, measuredHeight, completionMeasured, footerSource,
             ResultsFontGrowth.FillCeiling(footerSource, successFootIsWall));
+        // 1.19.55: which mode this frame's strip was measured for. A mature placement clears the flag, so the board that
+        // stands after the page's own boundary is proven is the ordinary one - interactive, and the one that puts the page's
+        // blocks away. The switch is decided by this frame's measurement alone: no pointer, no key and no frame count takes
+        // part in it, which is what keeps the early-to-mature change from following the mouse.
+        _earlyBoard = early;
         return room > 0f;
     }
     // 1.19.21: `Footer` is fed every frame the placement runs - its settle counters and `Exhausted` state keep the
@@ -2952,10 +5552,36 @@ internal static class ResultsDisplay
     }
 
     private static string _completionState;
+    // Which settlement the result page is showing. The game keeps both result pages alive for the whole session
+    // and raises them again for every expedition, so a page object can be the *same* one two settlements running:
+    // this counter is what tells the settlement controls that the second one is a new layout. It is bumped where a
+    // visit really begins (the page's own OnEnable), never by a repaint, a key or a configuration reload.
+    private static int _settlementGeneration;
+
+    // A new generation of the result screen. The fail-open override (`Forced`) belongs to *that settlement's own
+    // press*, so it is dropped here rather than leaking into the next screen: a player who pressed F8 on one
+    // settlement must not silently get the next one forced on, and a pending "this press owes a line" flag from a
+    // previous screen must never be spent by a repaint of the new one. Nothing here writes the player's visibility
+    // switches - `Plugin.PersistToggle` is not called, and the "a new settlement starts shown" rule still gives back
+    // only what this mod itself turned off, where it always did (`Refresh` -> `Session.OweRestore`).
+    private static void ClearTransientForced()
+    {
+        Forced = false;
+        _forcedOutcomePending = false;
+        _boardDrawnFrame = -1;
+        _safeFrames = 0; _safeFrame = -1; _safePlate = default;
+    }
 
     internal static void BeginSuccessPage(CM_PageExpeditionSuccess page)
     {
-        RestoreHidden();
+        FailureSequence.BeginPage(page != null ? page.Pointer : IntPtr.Zero);
+        // `_holdPage` is deliberately *not* pre-set here. It is the page a real placement was recorded for
+        // (`Fit` / the failure page's first placement), and `Refresh`'s "a new settlement is a new page" block reads
+        // the difference between it and the page now up to decide whether this mod owes the game's own switches a
+        // restore (`Session.OweRestore`). Pre-setting it made the failure page look like "the same page", so the
+        // restore that the success page gets never ran on it - the recorded asymmetry of review #2.
+        _settlementGeneration++;
+        ClearTransientForced();
         ResetPlacement();
         ForgetPage();
         HeadingReports.Clear();
@@ -2972,12 +5598,18 @@ internal static class ResultsDisplay
     internal static void BeginFailurePage(CM_PageExpeditionFail page)
     {
         RestoreHidden();
+        _settlementGeneration++;
         ResetPlacement();
+        ClearTransientForced();
         ForgetPage();
         HeadingReports.Clear();
         Fail = page;
         FailureSequence.BeginPage(page != null ? page.Pointer : IntPtr.Zero);
-        _holdPage = page != null ? page.Pointer : IntPtr.Zero;
+        // `_holdPage` is deliberately *not* pre-set here (1.19.47 review #2). It is the page a real placement was recorded
+        // for - `Fit` and the failure page's first placement write it - and `Refresh`'s "a new settlement is a new page" block
+        // reads the difference between it and the page now up to decide whether this mod owes the game's own switches a
+        // restore (`Session.OweRestore`). Pre-setting it here made the failure page look like "the same page", so the restore
+        // the success page gets never ran on it.
     }
 
     internal static void FailureSequenceStarted(CM_PageExpeditionFail page, Il2CppSystem.Collections.IEnumerator sequence)
@@ -3012,7 +5644,13 @@ internal static class ResultsDisplay
             _completionState = state;
             Plugin.Logger?.LogInfo("[DIAG] success native reveal: " + state);
         }
-        if (ready) Plugin.Logger?.LogInfo("[DIAG] success board released after the game's sector BlinkIn routines completed; no timeout or alpha threshold bypass.");
+        // 1.19.55: one line per page, not one per repaint. This sentence was written on every frame the latch already
+        // answered "ready" - 895 lines in one recorded session - because `Readiness.Forget()` ran on every repaint (see
+        // `Refresh`: `_holdPage` was only ever written by a *successful* placement, so a page that was still being refused
+        // looked like a new page for ever). The latch below is the same fact stated once; the root cause is fixed in
+        // `Refresh`/`ForgetPage`, and this line can no longer be produced by a repaint at all.
+        if (ready && HeadingReports.Add("success-board-released"))
+            Plugin.Logger?.LogInfo("[DIAG] success board released after the game's sector BlinkIn routines completed; no timeout or alpha threshold bypass.");
         return ready;
     }
 
@@ -3044,6 +5682,9 @@ internal static class ResultsDisplay
         // are needed after it, so they are declared here and only filled there.
         LayoutRect lobbyRect = default;
         ResultsRegion.LobbyEdgeReading wall = default;
+        // 1.19.51: the column the board stands in (see `LayoutColumn`) - filled inside the guarded block from
+        // this page's own readings, and read by the scan and by the line at the end of this method.
+        LayoutColumn boardColumn = LayoutColumn.None;
         try
         {
             // 1.19.21: whether a laid-out part counts is the completion ledger's answer, not a draw state - the part
@@ -3083,6 +5724,19 @@ internal static class ResultsDisplay
             // has read the same twice. Otherwise the container stands, exactly as before.
             bool contentSettled = ContentSettled;
             completion = CompletionFinalBounds.Placed(parts, RevealFinished, contentSettled, out int finalDeepest, out _finalUndrawn);
+            // 1.19.52 (F1): the strip may hang from the laid-out section edge, but it may never hang above content this
+            // page has already painted. `Placed` answers with a *container* for any part whose child set is not a
+            // complete measurement - the recorded page's icon part read own=198, visual=333, hidden=14, drawn=6 - and
+            // the band then hung from 233 while the captions reached 333, so the board's top edge covered them. The
+            // drawn floor is a floor only: it never claims the section is complete, it never re-uses a container that
+            // reserves blank space, and a NaN/inactive/undrawn part contributes nothing.
+            float drawnFloor = CompletionFinalBounds.DrawnFloor(parts);
+            _drawnFloorCompletion = drawnFloor;
+            if (float.IsFinite(drawnFloor) && (!float.IsFinite(completion) || drawnFloor > completion + 0.5f))
+            {
+                completion = drawnFloor;
+                completionSource += ", drawn floor";
+            }
             ReportCompletionParts(parts, completion, finalDeepest, contentSettled);
             drawnEdge = CompletionBounds.Deepest(parts, out int drawnDeepest); // diagnostics only
             int named = float.IsFinite(completion) ? finalDeepest : drawnDeepest;
@@ -3094,7 +5748,13 @@ internal static class ResultsDisplay
             bool buttonActive = ButtonActive(success.m_btnLeaveExpedition);
             bool pressRead = VisibleRect(success.m_btnLeaveExpedition, out LayoutRect pressed);
             bool layoutRead = TryScreenRect(success.m_btnLeaveExpedition, out lobbyRect);
-            controls = ScanFooterControls(page, completion, MessageGap, null, board, inspectBoard);
+            // 1.19.52 (F2/F6): the column this page's board really stands in, from what this page can measure. The
+            // footer button is *not* the board - a 440 px button under a 330 px table is not evidence for the table's
+            // width - so the reading is the board's own placed rectangle, else the width the fit really measured for
+            // this page (`_widthProbe`), and nothing else. A page that has neither keeps the column unknown, which
+            // fills every rectangle and keeps the band this build had before the rule existed.
+            boardColumn = BoardColumn();
+            controls = ScanFooterControls(page, completion, MessageGap, null, board, inspectBoard, boardColumn);
             bool pressInStrip = pressRead && float.IsFinite(controls.BoardTop)
                 && pressed.Y >= controls.BoardTop - 0.5f && pressed.Bottom > controls.BoardTop;
             bool layoutInStrip = layoutRead && float.IsFinite(controls.BoardTop)
@@ -3227,17 +5887,32 @@ internal static class ResultsDisplay
         // measured free band under the page's actions (1.19.16) is left exactly as it was measured, because its own two
         // edges are the whole contract.
         float iconRow = IconRowBottom(success, RevealFinished, ContentSettled);
-        if (float.IsFinite(iconRow)) _iconRowBottom = iconRow;
+        bool iconRowCurrent = float.IsFinite(iconRow);
+        if (iconRowCurrent) _iconRowBottom = iconRow;
         float waitingText = FooterTextTop(success, out ResultBoundSource waitingTextSource);
-        float bandAnchor = float.IsFinite(iconRow) ? iconRow : _iconRowBottom;
-        ResultBoundSource bandAnchorSource = float.IsFinite(iconRow) ? ResultBoundSource.IconRow
-            : float.IsFinite(_iconRowBottom) ? ResultBoundSource.LastTrustedIconRow
-            : ResultBoundSource.ScreenSafeArea;
+        // 1.19.53: the band hangs from the same combined anchor the per-repaint safety check protects - `max(icon row,
+        // drawn floor)` when this frame really measured the row, and never a last-trusted value passed off as a current
+        // one. Without this the region line printed 349 while the band was resolved from 249, and the board was then
+        // refused on every repaint for standing above the captions the very same frame had painted.
+        float bandAnchor;
+        ResultBoundSource bandAnchorSource;
+        if (ResultSuccessBandAnchor.Resolve(iconRowCurrent, iconRow, _drawnFloorCompletion, out float anchoredRow, out bool anchorFromDrawn))
+        {
+            bandAnchor = anchoredRow;
+            bandAnchorSource = ResultBoundSource.IconRow;
+            if (anchorFromDrawn) completionSource += ", band hangs from the drawn floor";
+        }
+        else
+        {
+            bandAnchor = _iconRowBottom;
+            bandAnchorSource = float.IsFinite(_iconRowBottom) ? ResultBoundSource.LastTrustedIconRow
+                : ResultBoundSource.ScreenSafeArea;
+        }
         if (ResultsBounds.TryResolve(Screen.height, bandAnchor, bandAnchorSource,
                 buttonMeasured ? buttonTop : float.NaN, waitingText, waitingTextSource, controls.FooterTop, out ResultsBand band))
         {
             pageBand = band;
-            ReportBand("success", band, iconRow, waitingText, _boardFloor);
+            ReportBand("success", band, bandAnchor, waitingText, _boardFloor);
             if (band.Fits && footerSource != ResultFooterSource.BelowActions)
             {
                 // The band is the whole answer when the page handed nothing else, and it tightens the page's own strip
@@ -3245,6 +5920,39 @@ internal static class ResultsDisplay
                 float bandBottom = area.Fits ? Math.Min(band.Bottom, area.Bottom) : band.Bottom;
                 if (!(bandBottom > band.Top)) bandBottom = band.Bottom;
                 area = new ResultsSafeArea(band.Top, bandBottom);
+            }
+        }
+        // ---- F5: the band below the page's actions, when the strip above cannot show the whole table --------------
+        //
+        // 1.19.52. A control that really stands in the board's column may not be covered, but it is also not the end of
+        // the page: the recorded page put an interaction at y=455 (which one, the 1.19.50 log does not say) and the
+        // strip above it had to hold the whole table. When it cannot, and the free band the scan measured *below*
+        // every interaction shows strictly more of the same table at the same glyph, the board belongs there - not
+        // squeezed into the short strip with the player left to find a wheel, and not forced into a band that cannot
+        // hold it either (`ResultSuccessBandChoice` compares rows, never forces a height). Both bands come from the
+        // page's own measured geometry, the footer wall still bounds the lower one, and a page whose bands are both
+        // too short keeps its rows on the wheel exactly as before. Host only and success only: the client strip is its
+        // fixed geometry and the failure page's band is not this rule's business.
+        if (Role() == ResultPageRole.Host && footerSource != ResultFooterSource.BelowActions
+            && area.Fits && controls.BelowActions.Fits && controls.BelowActions.Height > area.Height + 0.5f)
+        {
+            float targetGlyph = ResultAutoBoardContract.TargetGlyphPixels(Screen.height);
+            float targetRow = ResultsBandFit.RowHeight(targetGlyph, Plugin.Density);
+            int wholeRows = ImpactBoard.RowCount(true);
+            float upperTop = area.Top, upperBottom = area.Bottom, upperHeight = area.Height;
+            if (ResultSuccessBandChoice.PrefersBelow(upperHeight, controls.BelowActions.Height, wholeRows,
+                    ChromeHeader(), targetRow, out int rowsAbove, out int rowsBelow))
+            {
+                area = new ResultsSafeArea(controls.BelowActions.Top, controls.BelowActions.Bottom);
+                footerSource = ResultFooterSource.BelowActions;
+                if (HeadingReports.Add("success-band-below-for-whole-table"))
+                    Plugin.Logger?.LogInfo($"[DIAG] success strip cannot show the whole table: the strip above the page's "
+                        + $"actions ({upperTop:0}..{upperBottom:0} is {upperHeight:0}px, {rowsAbove} of {wholeRows} rows at the "
+                        + $"{targetGlyph:0}px glyph this window aims at) is shorter than the free band below them "
+                        + $"({controls.BelowActions.Top:0}..{controls.BelowActions.Bottom:0} is {controls.BelowActions.Height:0}px, "
+                        + $"{rowsBelow} of {wholeRows} rows), so the board stands there instead - the same table at the same "
+                        + $"glyph, more of it on the page, and every control the scan measured stays outside that band. "
+                        + $"role={ResultPageRolePolicy.Name(Role())}, screen={Screen.width}x{Screen.height}.");
             }
         }
         if (!controls.ProvenEmpty || nativeFooterVisible) SuccessNoFooter.Forget();
@@ -3265,12 +5973,16 @@ internal static class ResultsDisplay
         // a true field name over a false number. `ResultFooterProvenance.LobbyWall` is the only place that spells out
         // either name, so the per-repaint refusal in `BoardStillSafe` prints that same figure under that same field. A
         // page that handed over no strip at all says `boardTop=unmeasurable`, not a zero box.
+        string wallControl = controls.Wall != null && controls.Wall.Length > 0 ? controls.Wall : "none";
         if (HeadingReports.Add("success-region"))
             Plugin.Logger?.LogInfo($"[DIAG] success region: anchorSource={completionSource}, completion={(completionMeasured ? completion.ToString("0") : "unmeasurable")} (deepest part of the completion section's final layout - the pixels a part draws, or its own laid-out rectangle while it has not drawn yet (laidOutParts={_finalUndrawn}), drawnEdge={(float.IsFinite(drawnEdge) ? drawnEdge.ToString("0") : "none")}, gap={MessageGap:0}px), "
                 + $"{DescribeLobbyWall(wall)}, lobbyEdge={DescribeLobbyEdge(wall)}, "
                 + (area.Fits ? $"boardTop={area.Top:0}, room={area.Height:0}" : "boardTop=unmeasurable, room=unmeasurable")
                 + $" of a {Screen.height} window, "
-                + $"boardBand={DescribeBand(_holdValid ? _holdStrip.FooterSource : footerSource)}, boardFloor={(_boardFloor):0}, role={ResultPageRolePolicy.Name(Role())}; "
+                + $"boardBand={DescribeBand(_holdValid ? _holdStrip.FooterSource : footerSource)}, boardFloor={(_boardFloor):0}, "
+                + (float.IsFinite(_drawnFloorCompletion) ? $"drawnFloor={_drawnFloorCompletion:0}, " : "drawnFloor=none, ")
+                + (boardColumn.Known ? $"boardColumn=({boardColumn.Left:0}..{boardColumn.Right:0}), " : "boardColumn=unmeasurable, ")
+                + $"besideColumn={controls.BeyondColumn}, wallControl={wallControl}, role={ResultPageRolePolicy.Name(Role())}; "
                 + "the strip is bounded by this page's own final-layout geometry - the completion section's laid-out parts above and, below, the lobby button's upper edge or the free band under the page's measured actions - "
                 + "never by a hidden, transparent or off-page control, and never by how much of the section has drawn. All four players scale into whichever band is used, "
                 + "and the fit that decides whether the table is drawn into it reports its own line when it is not.");
@@ -3279,6 +5991,44 @@ internal static class ResultsDisplay
         // through `ResultsUpperBound.Decide`, so a section that could not be read and a strip that cannot hold the
         // table stay two different answers instead of one false.
         return completionMeasured;
+    }
+
+    // 1.19.52 (F2/F6): the horizontal column this page's settlement board occupies, from what this page can really
+    // measure.
+    //
+    // 1.19.51 read it from the board's placed rectangle and, before the first placement, from the page's centred
+    // footer control. Both halves were wrong in a way the tests could not see: a footer button is not the board (a
+    // 440 px button under a 330 px table describes the button, not the table, and a wider table could not be proven at
+    // all), and a first placement with no width fell back to `LayoutColumn.None` - the old band and the eight-row plate
+    // this round exists to remove.
+    //
+    // The width is now the table's own, in this order and nothing else:
+    //   1. the rectangle a board really stands in on this page (`_holdBoard`, the same rect `OverlapsBoard` judges);
+    //   2. the width the fit really measured for this page's content (`_widthProbe`, taken on the frame the fit ran
+    //      without a column - the bounded first phase of the two-phase measurement);
+    //   3. nothing: `LayoutColumn.None`, which fills every rectangle and answers the band this build had before the
+    //      rule existed.
+    // A column is never widened by the footer, never clamped to `Screen.width - 48` behind the placement's back, and
+    // never derived from the window alone.
+    private static LayoutColumn BoardColumn()
+    {
+        if (_holdValid && _holdBoard.Width > 0f && _holdPage != IntPtr.Zero && _page != null
+            && ResultVisibility.SamePage(_holdPage, _page.Pointer))
+            return new LayoutColumn(_holdBoard.X, _holdBoard.Right);
+        if (float.IsFinite(_widthProbe) && _widthProbe > 0f && Screen.width > 0)
+        {
+            // 1.19.53 (F6): the width the fit measured is the width this column uses - no implicit `min(width,
+            // screen - 48)`, which described a box the placement never used. The rectangle is the one `TryPlace`
+            // computes for it (centred plus the player's offset, clamped to the window the same way `ResultsPlacement`
+            // clamps), so the column and the board can only agree.
+            float width = _widthProbe;
+            float offset = Plugin.ResultsOffsetX.Value;
+            if (!float.IsFinite(offset)) offset = 0f;
+            float x = (Screen.width - width) * 0.5f + offset;
+            x = Math.Max(0f, Math.Min(x, Screen.width - width));
+            return new LayoutColumn(x, x + width);
+        }
+        return LayoutColumn.None;
     }
 
     // Which measurement produced the strip's lower bound, spelled out once so a log line is enough to tell the
@@ -3587,11 +6337,12 @@ internal static class ResultsDisplay
         footerSource = ResultFooterSource.None;
         footIsWall = false;
         band = ResultsBand.None;
-        // 1.19.37: what each of the strip's two edges was really produced by, so the page's own band can be named as
-        // the proof it is (`ResultFailureBandProofPolicy`). The upper edge is always this page's mission-failed
-        // title's own layout rectangle - `anchorSettled` above refuses the page without it - and the lower edge is
-        // the window's foot until something below the board was measured.
-        ResultBoundSource bandTopSource = ResultBoundSource.TitleAnchor, bandBottomSource = ResultBoundSource.ScreenFoot;
+        // 1.19.47: the upper edge of this page's band is the window's own safe top margin, on a host and on a client
+        // alike - `ResultAutoBoardContract.TryUpperAnchor` answers it together with the source, and both branches below
+        // assign that source to `bandTopSource`, so the recorded provenance can never drift from the edge it names. The
+        // lower edge is still the wall this role really has: the leave/restart button, the waiting-status line, or a
+        // pressable control above either.
+        ResultBoundSource bandTopSource = ResultBoundSource.ScreenTopMargin, bandBottomSource = ResultBoundSource.ScreenFoot;
         try
         {
             var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
@@ -3723,7 +6474,8 @@ internal static class ResultsDisplay
             {
                 // 客机：本页没有「返回大厅」按钮，只有一行等待厅主的状态文字——而它自己会被扫描当成一个
                 // 受保护的下边界控件，所以旧的 buttonMeasured 在客机上几乎恒为真，绝不能拿它当分支条件。
-                // 上界 = 锚点（任务失败标题）实测底边 + 玩家配置的纵向偏移，再按 1080p 等比缩放补一个 gap。
+                // 上界 = 窗口自己的上沿安全留边 + 玩家配置的纵向偏移（1.19.47：不再是任务失败标题的实测底边），
+                // 之后再由 `ResultsGuestPageGeometry` 按 1080p 等比补一个 gap。
                 //
                 // 1.19.45（用户纠正，覆盖 1.19.38 的相反口径）：下界就是那行不可点击提示文字自己的上沿，和主机
                 // 页拿按钮上沿做下界是同一个道理——「他的下界不过是从主机的可点击按钮变成了客机的不可点击提示
@@ -3742,26 +6494,47 @@ internal static class ResultsDisplay
                 // 已经站在页面上的板（`inspectBoard`）不过稳定门：一堵还没读到两次的墙不能把板撤掉。
                 float configuredOffset = Plugin.ResultsOffsetY.Value;
                 if (!float.IsFinite(configuredOffset) || configuredOffset < 0f) configuredOffset = 0f;
-                float guestAnchor = titleBottom + configuredOffset;
-                // 墙的两路读数：等待文字自己的布局上沿，与真正可按的控件（扫描的 `PressableTop` 已排除受保护文字，
-                // 命名按钮按自己的布局矩形加进来）。两者都是墙，条带取更靠上的那一堵。
+                // 1.19.60：客机的上界与主机页同一条规则——本页自己的屏幕上沿安全留边，与「活着的任务失败标题」实测底边
+                // 取更靠下的那一个，再由本页**真的量到**的、比它更深的交互控件收紧。1.19.47 把客机页的标题从上界里拿掉，
+                // 代价是有证据的：同一张 1440p 客机页上严格路径的带顶退到窗口留边（10.67→+gap=32），fail-open 路径却仍从
+                // 标题底边（467）走 `ResultsBounds`——同一页两个说法，相差约 456px，而严格路径的板是**底对齐墙、向上生长**
+                // 的，于是板顶落在 380~425，压住玩家正在读的标题下半段 40~90px。
+                //
+                // 1.19.60（独立评审 F2）：控件那一路必须交**未经间距的原始边**。扫描是带着 `MessageGap` 跑的
+                // （扫描就是上面那次、带着 `MessageGap` 跑的那一次），所以 `controls.BoardTop` 已经是
+                // `anchorBottom + gap`，或者在真有控件抬过它时是 `control.Bottom + gap`——把整条 `BoardTop` 当成
+                // 「量到的控件」交给 `TryFailureAnchor`，会让 `ResultClientFailureStrip` 在它之上再加一次
+                // `MessageGap * scale`，1440p 上于是变成 467+16+21.33 = 504.33，比兜底的 488.33 多了一个间距；而且没有
+                // 任何控件的时候也会被标成 `MeasuredControl`，那是假造。减去同一个 `MessageGap` 得到的就是这条基准本身
+                // （没有控件时正是 `titleBottom`，有控件时是那个控件的下沿），间距因此只由条带自己加**一次**。
+                float rawControlTop = float.IsFinite(controls.BoardTop) ? controls.BoardTop - MessageGap : float.NaN;
+                if (!ResultAutoBoardContract.TryFailureAnchor(Screen.height, titleBottom, rawControlTop,
+                        out float guestAnchor, out bandTopSource))
+                    guestAnchor = Math.Max(ResultsBounds.ScreenMargin, ResultAutoBoardContract.TopMargin(Screen.height));
+                guestAnchor += configuredOffset;
+                // 墙的两路读数：真正可按的控件（扫描的 `PressableTop` 已排除受保护文字，命名按钮按自己的布局矩形
+                // 加进来）只用来收紧；**权威**只有「同一个原生返回位置」的几何——客机上 `m_btnGoToLobby` 自己的
+                // 已布局矩形（主机页量的就是这同一个对象）与 `m_returnToLobby_text` 真正渲染出来的字形，
+                // 两者取更靠上的那一堵（`ResultClientSlotPolicy`）。
                 float pressableTop = ResultsRegion.HighestTop(namedTop, controls.PressableTop);
-                // 1.19.45：这一页一堵墙都还没量到吗（等待文字与可按控件都不可测）？这是这条门唯一读的「没有
-                // 证据」状态。本页动作的 active 状态曾经是入参，但在客机上「回大厅」永久 inactive、
-                // `HiddenPageActions` 常 ≥1，那一条恒真、不携带逐帧信息——所以它只进日志。
-                bool wallPending = ResultClientPageActionPolicy.Pending(waitingTextTop, pressableTop);
+                ResultClientSlotEvidence slot = ClientSlot(page);
+                float clientSlotTop = slot.Top;
+                // 1.19.61（评审 #3）：没有槽位权威时这一页没有可以落板的边界。布局框（1.19.60 的 1338）、别的可按控件、
+                // 页面自己从屏幕推出来的下界都不授权首显，F8 也一样；这一页保留原版并按既有节流重测。
+                bool wallPending = ResultClientPageActionPolicy.Pending(slot.HostSlotTop, slot.HintGlyphTop);
                 if (wallPending && ResultFallbackPolicy.ShouldFallback(_strictMisses, Forced)
                     && HeadingReports.Add("failure-client-wall-pending-to-fail-open"))
-                    Plugin.Logger?.LogWarning($"[DIAG] failure board: this client page has stayed pending until the fail-open budget "
+                    Plugin.Logger?.LogWarning($"[DIAG] failure board: this client page has shown no slot evidence until the fail-open budget "
                         + $"({ResultFallbackPolicy.MissBudget} refusals, misses={_strictMisses}, forcedByF8={Forced}); hidden={controls.Hidden},"
-                        + $"hiddenPageActions={controls.HiddenPageActions},waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")},"
+                        + $"hiddenPageActions={controls.HiddenPageActions},hostSlot={(float.IsFinite(slot.HostSlotTop) ? slot.HostSlotTop.ToString("0") : "unmeasurable")},"
+                        + $"hintGlyph={(float.IsFinite(slot.HintGlyphTop) ? slot.HintGlyphTop.ToString("0") : "unmeasurable")},"
                         + $"pressable={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")},"
                         + $"scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},"
-                        + $"unmeasurable={controls.Unmeasurable}; no frame of this page measured the waiting-status line's own rectangle or a pressable control, so this page has shown no wall at all - "
-                        + $"the fail-open path's own gate decides from here (`ResultFailureWallPolicy.WallMeasured`): only the player's own F8 can answer a client failure page without a wall, the band's foot is then the screen's own geometry, and no frame count or timeout may do it.");
+                        + $"unmeasurable={controls.Unmeasurable}; neither the native return slot on this page nor the waiting line's rendered glyphs could be read, so this page has no lower bound at all - "
+                        + $"the fail-open path's own gate decides from here (`ResultFailureWallPolicy.WallMeasured`): a client failure page without a readable slot is kept vanilla and measured again, the player's F8 authorises a board only once this page has a bound, and no frame count or timeout may do it.");
                 var clientEvidence = new ResultClientFailureEvidence(guestAnchor, Screen.width, Screen.height,
-                    MessageGap, MinimumGuestStripHeight, waitingTextTop, pressableTop,
-                    controls.Complete, controls.ParentCoverageComplete, controls.Unmeasurable);
+                    MessageGap, MinimumGuestStripHeight, clientSlotTop, pressableTop,
+                    controls.Complete, controls.ParentCoverageComplete, controls.Unmeasurable, slot.Source);
                 ResultClientBandReading clientBand;
                 ResultsSafeArea guestArea;
                 ResultClientStripState clientState = inspectBoard
@@ -3774,7 +6547,7 @@ internal static class ResultsDisplay
                     // 回答」；等不到就交给既有的 60 帧拒收预算与 fail-open 板，那一条从不声称这一页被证明过。
                     // 这一行走 `HeadingReports`，每页一次：一次诊断，不刷屏。
                     if (HeadingReports.Add("failure-client-wall-not-settled"))
-                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: this client page's lower wall has not read the same value on two complete scans yet (wallSoFar={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")}, thisFrame={(float.IsFinite(clientEvidence.WallTop) ? clientEvidence.WallTop.ToString("0") : "unmeasurable")}, waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")}, pressable={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")}, samples={ClientWall.Samples} seen, state={ResultClientFailureStrip.Name(clientState)}, scanComplete={controls.Complete.ToString().ToLowerInvariant()}, parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()}, hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},unmeasurable={controls.Unmeasurable},wallPending={wallPending.ToString().ToLowerInvariant()}); no frame count authorises this placement, so the board is not fitted against a wall the page is still revealing and is never withdrawn a frame later. wallPending=true means neither the waiting-status line nor a pressable control was measurable this frame, so this is not a page without a wall - hidden/hiddenPageActions are printed for the record only (the go-to-lobby button is permanently inactive on a client). If it never settles the existing refusal budget answers with the fail-open board, which steps around every measured control instead of claiming the page was proven.");
+                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: this client page's lower wall has not read the same value on two complete scans yet (wallSoFar={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")},wallSource={ResultClientSlotPolicy.Name(ClientWall.WallSource)},thisFrame={(float.IsFinite(clientEvidence.WallTop) ? clientEvidence.WallTop.ToString("0") : "unmeasurable")},hostSlot={(float.IsFinite(slot.HostSlotTop) ? slot.HostSlotTop.ToString("0") : "unmeasurable")},hintGlyph={(float.IsFinite(slot.HintGlyphTop) ? slot.HintGlyphTop.ToString("0") : "unmeasurable")},slot={(float.IsFinite(clientSlotTop) ? clientSlotTop.ToString("0") : "unmeasurable")},slotSource={ResultClientSlotPolicy.Name(slot.Source)},wall={(float.IsFinite(clientEvidence.WallTop) ? clientEvidence.WallTop.ToString("0") : "unmeasurable")},{ResultFooterProvenance.LobbyWall(ResultFooterSource.ClientNoFooterSafeArea, clientEvidence.WallTop, float.IsFinite(clientEvidence.WallTop))},pressable={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")},samples={ClientWall.Samples} seen,state={ResultClientFailureStrip.Name(clientState)},scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},unmeasurable={controls.Unmeasurable},wallPending={wallPending.ToString().ToLowerInvariant()}); no frame count authorises this placement, so the board is not fitted against a wall the page is still revealing and is never withdrawn a frame later. wallPending=true means neither this page's own return slot nor the waiting line's rendered glyphs were measurable, so this is not a page without a wall - hidden/hiddenPageActions are printed for the record only (the go-to-lobby control is permanently inactive on a client, and that is not read as 'absent'). If it never settles the existing refusal budget answers with the fail-open board, which steps around every measured control instead of claiming the page was proven.");
                     return false;
                 }
                 if (clientState == ResultClientStripState.GeometryUnusable)
@@ -3787,7 +6560,7 @@ internal static class ResultsDisplay
                 {
                     // 量到了墙，但那堵墙上方留不出客机最小板高：这是「保留原版 + 重测」，不是把板压在墙上面。
                     if (HeadingReports.Add("failure-guest-band-unusable"))
-                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: the client page's band cannot hold the minimum board above the wall this frame (fixedPage=({guestArea.Top:0}..{guestArea.Bottom:0}), waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")}, pressableTop={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")}, wall={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")}, minimum={MinimumGuestStripHeight:0}px) on a {Screen.height} window; vanilla is retained and the page is measured again.");
+                        Plugin.Logger?.LogInfo($"[DIAG] failure board held back: the client page's band cannot hold the minimum board above the wall this frame (fixedPage=({guestArea.Top:0}..{guestArea.Bottom:0}),hostSlot={(float.IsFinite(slot.HostSlotTop) ? slot.HostSlotTop.ToString("0") : "unmeasurable")},hintGlyph={(float.IsFinite(slot.HintGlyphTop) ? slot.HintGlyphTop.ToString("0") : "unmeasurable")},slot={(float.IsFinite(clientSlotTop) ? clientSlotTop.ToString("0") : "unmeasurable")},slotSource={ResultClientSlotPolicy.Name(slot.Source)},wall={(float.IsFinite(ClientWall.Wall) ? ClientWall.Wall.ToString("0") : "unmeasurable")},wallSource={ResultClientSlotPolicy.Name(ClientWall.WallSource)},{ResultFooterProvenance.LobbyWall(ResultFooterSource.ClientNoFooterSafeArea, clientSlotTop, float.IsFinite(clientSlotTop))},pressableTop={(float.IsFinite(pressableTop) ? pressableTop.ToString("0") : "unmeasurable")},minimum={MinimumGuestStripHeight:0}px) on a {Screen.height} window; vanilla is retained and the page is measured again.");
                     return false;
                 }
                 // 扫描看不见这一页：它不能断言「这一页没有墙」，也不是「页面把控件关掉了」。客机失败页在生产里
@@ -3808,20 +6581,47 @@ internal static class ResultsDisplay
                 // 下界来自一堵量到的墙（等待文字或可按控件）时，这条条带就是它自己的承诺（与主机同一条 ceiling
                 // 规则，`ResultsFontGrowth.FootIsTheWall` 的回答）；一堵墙都没有时它根本不会走到这里。
                 footIsWall = clientBand.WallMeasured;
-                // 客机的「页脚」是这一页真正画出来的墙：等待文字自己的上沿，或更靠上的可按控件。这里报的是本页
-                // 见过的最高那堵墙，也就是条带自己用的那一堵：条带与它的下限永远说同一个数。
-                float clientWall = ClientWall.Wall;
+                // 客机的「页脚」是这一页真正画出来的墙：槽位的布局上沿、槽位里真的画出来的字形、或更靠上的可按控件。
+                // 1.19.61：这里报的是**条带自己用的那一堵**（`clientBand.WallTop`）——1.19.60 报的是门保留的墙
+                // （`ClientWall.Wall`），于是条带可能按一个数落位、`BoardStillSafe` 的页脚校验却按另一个数判它，
+                // 同一张页面两个边界（2026-11-25 快照 L4881 条带下沿 1371 / L4883 footerTop=1338）。一个边界
+                // 同时喂测量与绘制，这一条才是「板站得住」的前提。
+                float clientWall = clientBand.WallTop;
                 buttonTop = clientWall;
                 buttonMeasured = float.IsFinite(clientWall);
                 buttonHeight = restartInStrip && Math.Abs(namedTop - restartTop) <= 0.5f ? restartRect.Height
                     : goInStrip && Math.Abs(namedTop - goTop) <= 0.5f ? goRect.Height : float.NaN;
                 if (HeadingReports.Add("failure-client-fixed-geometry"))
-                    Plugin.Logger?.LogInfo($"[DIAG] failure footerSource=client-fixed-page-geometry: native lobbyVisible={nativeFooterVisible.ToString().ToLowerInvariant()}, anchor=settled-mission-title, nativeFooterMeasured={buttonMeasured.ToString().ToLowerInvariant()}, waitingText={(float.IsFinite(waitingTextTop) ? waitingTextTop.ToString("0") : "unmeasurable")},waitingTextCovered={clientBand.WaitingTextCovered.ToString().ToLowerInvariant()}, waitingTextTightened={clientBand.WaitingTextTightened.ToString().ToLowerInvariant()}, pressableTightened={clientBand.PressableTightened.ToString().ToLowerInvariant()}, wallSettled={ClientWall.Settled.ToString().ToLowerInvariant()},wallSamples={ClientWall.Samples}, hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},wallPending={wallPending.ToString().ToLowerInvariant()}, strip=({top:0}..{bottom:0}) of a {Screen.height} window; this page's lower bound is the top edge of what the page really draws under the board - the client's non-clickable waiting-status line (the same role the host's pressable button plays), or a pressable control when that reaches higher - and never the page's own screen-derived foot, which only caps the band.");
+                    Plugin.Logger?.LogInfo($"[DIAG] failure footerSource=client-fixed-page-geometry: native lobbyVisible={nativeFooterVisible.ToString().ToLowerInvariant()}, anchor=settled-mission-title, nativeFooterMeasured={buttonMeasured.ToString().ToLowerInvariant()}, hostSlot={(float.IsFinite(slot.HostSlotTop) ? slot.HostSlotTop.ToString("0") : "unmeasurable")},hintGlyph={(float.IsFinite(slot.HintGlyphTop) ? slot.HintGlyphTop.ToString("0") : "unmeasurable")},slot={(float.IsFinite(clientSlotTop) ? clientSlotTop.ToString("0") : "unmeasurable")},slotSource={ResultClientSlotPolicy.Name(slot.Source)},wall={(float.IsFinite(clientWall) ? clientWall.ToString("0") : "unmeasurable")},slotCovered={clientBand.WaitingTextCovered.ToString().ToLowerInvariant()}, slotTightened={clientBand.WaitingTextTightened.ToString().ToLowerInvariant()}, pressableTightened={clientBand.PressableTightened.ToString().ToLowerInvariant()}, wallSettled={ClientWall.Settled.ToString().ToLowerInvariant()},wallSource={ResultClientSlotPolicy.Name(ClientWall.WallSource)},wallSamples={ClientWall.Samples}, hidden={controls.Hidden},hiddenPageActions={controls.HiddenPageActions},wallPending={wallPending.ToString().ToLowerInvariant()}, strip=({top:0}..{bottom:0}) of a {Screen.height} window; this page's lower bound is the same native return slot the host page measures (its own `m_btnGoToLobby` layout geometry, unclickable here but present) or the waiting line's actually rendered glyphs when they reach higher - never the layout box, never another pressable control and never the page's own screen-derived foot, which only caps the band. An empty slot reading keeps the vanilla page and is measured again.");
             }
             else
             {
-                // 主机：与 1.19.14 完全一致。
-                top = Math.Max(ResultsPlacement.Top(titleBottom, Plugin.ResultsOffsetY.Value, MessageGap), controls.BoardTop);
+                // 主机：上界同时受本页自己的屏幕上沿留边与「活着的任务失败标题」约束，下界是本页真正画出来的那堵墙
+                // （返回大厅 / 重开检查点按钮）。
+                //
+                // 1.19.55（用户实测，r5 1920x1080）：1.19.47 把标题从这条带的上界里完全拿掉，理由是「标题是说明文字、
+                // 会把表压到下半页」。代价是那一次失败页的带顶退回 `screen-top-margin`=24，板子先落在 (795,315)、
+                // 再被二次量测抬到 (825,110) —— 两次都压在标题上（标题下沿 350，日志 `failure native anchor ready
+                // ... edge=350`），玩家看到的正是「板子压着任务标题」。标题是这一页上唯一读得出的原生文字，它的底边
+                // 是**保护**而不是装饰：带顶永远不低于「标题底边 + MessageGap」，除非标题本身量不到（那时仍是本页
+                // 自己的屏幕留边，不发明一个数）。带被压短时由 `ResultsBandFit` 收字号、由滚轮到达余下的行；真的
+                // 装不下一块可读的表时这条路径照旧保留原版页面，不把板子挪到标题上面去。
+                ResultAutoBoardContract.TryUpperAnchor(false, Screen.height, float.NaN, out float screenAnchor, out bandTopSource);
+                // 1.19.56 (review 7): one title gap, applied once. `ResultsBounds.TryResolve` below adds this page's own
+                // clearance to whatever upper anchor it is handed, so adding `MessageGap` here as well put the title at
+                // `350 + 16 + clearance`; the F8/fail-open path resolves its band through the same `ResultsBounds` from
+                // the same `top`, so it repeated the same double gap. The anchor is now the deeper of the page's own
+                // screen margin and the live mission-failed title's bottom edge, and the gap comes from the one rule that
+                // owns it. The measured-control override keeps working on the same anchor, and the client branch above is
+                // untouched - a client's waiting-status line is still its own stable lower wall.
+                float titleAnchor = float.IsFinite(titleBottom) && titleBottom > screenAnchor ? titleBottom : screenAnchor;
+                top = Math.Max(0f, titleAnchor) + OffsetY();
+                if (float.IsFinite(titleBottom) && titleBottom >= screenAnchor) bandTopSource = ResultBoundSource.TitleAnchor;
+                if (controls.BoardTop > top + 0.5f)
+                {
+                    top = controls.BoardTop;
+                    bandTopSource = ResultBoundSource.MeasuredControl;
+                }
                 if (buttonMeasured)
                 {
                     bottom = Math.Min(buttonTop - MessageGap, Screen.height - 8f);
@@ -3831,19 +6631,25 @@ internal static class ResultsDisplay
             }
             // ---- the agreed band, on the failure page too ----------------------------------------------------
             //
-            // Upper: the page's own mission-failed title layout edge. Lower: the wall the player's role really has.
+            // Upper: the window's own safe top margin on this page (1.19.47 - the mission-failed title is a caption and
+            // no longer bounds the table). Lower: the wall the player's role really has.
             //
             // 1.19.45（用户纠正）：客机失败页的下界由上面那个客机分支给出，来自「等待文字自己的上沿」或更靠上的可按
             // 控件，页面固定几何只做封顶——和主机页「按钮上沿减 clearance」是同一条规则的两张面孔。这里因此只把这一页
-            // 的 band 报一次（`ReportBand` 的 `waitingText=` 字段就是那堵墙的读数）。主机这一行没有变：它的下界仍然取
-            // 「按钮 / 量到的控件 / 屏幕脚」里最高的那堵墙。
+            // 的 band 报一次（`ReportBand` 的 `waitingText=` 字段就是那堵墙的读数）。主机页的下界与它完全相同：仍然取
+            // 「按钮 / 量到的控件 / 屏幕脚」里最高的那堵墙，只有上界换成了本页自己的屏幕上沿。
             if (GuestClient())
             {
-                // 客机：条带的两个边界已经由上面那个客机分支决定，这里只把这一页的 band 报一次。
+                // 客机：条带的两个边界已经由上面那个客机分支决定，这里只把这一页的 band 报一次；`waitingText=`
+                // 报的是这条带用的那条槽位边界（`buttonTop` 在这里就是 `clientBand.WallTop`），不是那个比字形低
+                // 155px 的布局框。
                 ReportBand("failure", new ResultsBand(top, bottom, bandTopSource, bandBottomSource, false),
-                    float.NaN, waitingTextTop, _boardFloor);
+                    float.NaN, buttonTop, _boardFloor);
             }
-            else if (ResultsBounds.TryResolve(Screen.height, titleBottom, ResultBoundSource.TitleAnchor,
+            // 1.19.47（最新用户合同）：这条带的上界已经是本页自己的屏幕上沿安全留边，所以这里交给 `ResultsBounds`
+            // 的就只剩它自己的 clearance 与那一堵真实下界。标题的布局仍然是扫描的切分依据（`ScanFooterControls` 的
+            // anchorBottom），但它不再参与这条带的任何一个边界。
+            else if (ResultsBounds.TryResolve(Screen.height, top, bandTopSource,
                     buttonMeasured ? buttonTop : float.NaN, waitingTextTop, controls.FooterTop, out ResultsBand pageBand))
             {
                 ReportBand("failure", pageBand, float.NaN, waitingTextTop, _boardFloor);
@@ -3877,10 +6683,10 @@ internal static class ResultsDisplay
 
             LayoutRect candidateBoard = new LayoutRect(0f, top, Screen.width, Math.Max(0f, bottom - top));
             bool overlapsLobby = controls.OverlapsBoard;
-            float blankAbove = Math.Max(0f, candidateBoard.Y - titleBottom);
+            float stripTopFromWindow = candidateBoard.Y;
             float blankBelow = Math.Max(0f, (float.IsFinite(buttonTop) ? buttonTop : candidateBoard.Bottom) - candidateBoard.Bottom);
             if (HeadingReports.Add("failure-strip"))
-                Plugin.Logger?.LogInfo($"[DIAG] failure strip: anchorSource={titleSource},messageBottom={titleBottom:0},edgeFrom={(drawnRoute ? "drawn-text" : "layout")},titleAlpha={(float.IsFinite(alpha) ? alpha.ToString("0.00") : "unreadable")},opaqueReadings={Title.OpaqueFrames},sequenceFinished={sequenceFinished.ToString().ToLowerInvariant()},boardTop=({candidateBoard.Y:0}..{candidateBoard.Bottom:0}),blankAbove={blankAbove:0}px,blankBelow={blankBelow:0}px,footerTop={(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")},waitingStatusProtected={protectWaitingStatus.ToString().ToLowerInvariant()},scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},unmeasurable={controls.Unmeasurable},boardOverlapsControl={overlapsLobby.ToString().ToLowerInvariant()},screen={Screen.width}x{Screen.height}.");
+                Plugin.Logger?.LogInfo($"[DIAG] failure strip: titleSource={titleSource},messageBottom={titleBottom:0},edgeFrom={(drawnRoute ? "drawn-text" : "layout")},titleAlpha={(float.IsFinite(alpha) ? alpha.ToString("0.00") : "unreadable")},opaqueReadings={Title.OpaqueFrames},sequenceFinished={sequenceFinished.ToString().ToLowerInvariant()},boardTop=({candidateBoard.Y:0}..{candidateBoard.Bottom:0}),bandTopSource={bandTopSource},stripTopFromWindow={stripTopFromWindow:0}px,blankBelow={blankBelow:0}px,footerTop={(float.IsFinite(buttonTop) ? buttonTop.ToString("0") : "unmeasurable")},waitingStatusProtected={protectWaitingStatus.ToString().ToLowerInvariant()},scanComplete={controls.Complete.ToString().ToLowerInvariant()},parentCoverage={controls.ParentCoverageComplete.ToString().ToLowerInvariant()},unmeasurable={controls.Unmeasurable},boardOverlapsControl={overlapsLobby.ToString().ToLowerInvariant()},screen={Screen.width}x{Screen.height}.");
             // The strip the caller is handed, with the fact that produced each of its edges: this is the shape
             // `ResultFailureBandProofPolicy` is asked about, and it is read here because here is the only place that
             // knows which of the page's own measurements the two figures came from.
@@ -3968,10 +6774,14 @@ internal static class ResultsDisplay
     // the page's own result actions: sibling clones (including unregistered CM_Item controls)
     // live there without requiring a whole-scene scan.
     private static FooterControls ScanFooterControls(Component page, float anchorBottom, float gap,
-        Component protectedPageText = null, LayoutRect board = default, bool inspectBoard = false)
+        Component protectedPageText = null, LayoutRect board = default, bool inspectBoard = false,
+        LayoutColumn column = default)
     {
         if (page == null) return new FooterControls(float.NaN, float.NaN, 0, 0, false, false, false, 0, 0, "page-missing");
         var actions = new List<ResultActionBounds>();
+        // 1.19.51: the owner of each entry in `actions`, same order, so the line can name the interaction that ended
+        // the band (`ResultFixedBlocker.Describe`). Only the strip's lower wall is looked up here.
+        var owners = new List<Component>();
         var seen = new HashSet<IntPtr>();
         var parentSeen = new HashSet<IntPtr>();
         // Every control the scan sees is added to this tally, and the three answers it can give are kept apart on
@@ -3984,6 +6794,9 @@ internal static class ResultsDisplay
         // 身份不会改变它的任何决定；记的是**第一个**相交控件（日志用它说清"压到了谁"）和相交的个数。
         ResultFixedBlocker blocker = ResultFixedBlocker.None;
         int blockers = 0;
+        // 1.19.57: which result page this scan is looking at, read from the live page the caller handed in - the
+        // classifier must not depend on the `_page`/`_succeeded` cache, which `ResetPlacement` clears on the same frame.
+        bool succeeded = page.TryCast<CM_PageExpeditionSuccess>() != null;
         // The client flag decides which result action the page is expected to have hidden, so an unreadable one is
         // a coverage edge of the scan itself and keeps the vanilla page up rather than being guessed at.
         try { client = ResultPageRolePolicy.IsClient(ResultPageRolePolicy.Of(SNet.IsMaster)); } catch { complete = false; reason = "client-state-unreadable"; }
@@ -4024,6 +6837,12 @@ internal static class ResultsDisplay
                 tally = tally.HiddenControl(client && IsKnownClientHiddenLobbyAction(page, control));
                 return;
             }
+            // 1.19.56 (A): the same classifier the hide asks decides whether this entry can be a wall at all. A
+            // decoration inside one of this page's known presentational blocks is drawn by the page, never pressed by
+            // the player: it must not refuse the board (the recorded "the board never appears" / false-wall point), and
+            // because the hide asks the same question it can still be put away. Anything this build cannot describe is a
+            // wall and is counted exactly as before.
+            try { if (ResultVanillaClassify.Hideable(KindOf(control, page, succeeded))) return; } catch { }
             tally = tally.ActiveControl();
             if (!TryScreenRect(control, out LayoutRect rect))
             {
@@ -4039,6 +6858,7 @@ internal static class ResultsDisplay
                 return;
             }
             actions.Add(new ResultActionBounds(rect));
+            owners.Add(control);
             if (inspectBoard && ResultInteractionStripPolicy.OverlapsBoard(rect, board, ResultBoardHold.ButtonClearance))
             {
                 overlaps = true;
@@ -4149,6 +6969,7 @@ internal static class ResultsDisplay
                 else
                 {
                     actions.Add(new ResultActionBounds(rect, protectedPageText: true));
+                    owners.Add(protectedPageText);
                     // 1.19.38: 客机上这一行等待状态文字不是可交互控件，也不再是条带的下界——固定页面几何才是。
                     // 它因此不能触发 `OverlapsBoard` 的遮挡拒绝：那条拒绝会走 `DeferBoardForInteraction`，
                     // 把板子整体撤下来，于是客机页面上完全没有板子。主机上它仍然是页脚文字，遮挡拒绝保持原样。
@@ -4168,7 +6989,7 @@ internal static class ResultsDisplay
         // is a verdict about this one frame rather than about the page. The scan therefore no longer refuses the
         // page for it: the strip is resolved from the rectangles that could be read, and `BoardStillSafe` asks
         // again on the next repaint.
-        if (!ResultInteractionStripPolicy.TryResolve(anchorBottom, gap, actions, out ResultInteractionStrip strip))
+        if (!ResultInteractionStripPolicy.TryResolve(anchorBottom, gap, actions, out ResultInteractionStrip strip, column))
         { complete = false; strip = default; if (reason.Length == 0) reason = "strip-unresolved"; }
         if (!parentCoverageComplete) complete = false;
         // A scan that refused the page for a structural reason and also saw an unmeasurable control states the
@@ -4188,9 +7009,24 @@ internal static class ResultsDisplay
         // be used - and a scan that found no control gets no band, which is the same answer as "the strip is the page".
         float bandAnchor = float.IsFinite(strip.BoardTop) ? strip.BoardTop : anchorBottom + gap;
         ResultBoardBands.TryBelowActions(bandAnchor, Screen.height, actions, gap, out ResultBoardBand belowActions);
+        // 1.19.51: which interaction ended this band, named with its own type, object name and rectangle. The recorded
+        // success page could not answer that question at all - it printed a 190 px strip and nothing else - and the
+        // answer is what tells a reader whether the wall is the page's own footer (a control that really spans the
+        // board's column) or something standing beside it. Bounded: the first control whose own top *is* the wall.
+        string wallIdentity = string.Empty;
+        if (float.IsFinite(strip.FooterTop))
+        {
+            for (int index = 0; index < actions.Count && index < owners.Count; index++)
+            {
+                ResultActionBounds action = actions[index];
+                if (Math.Abs(action.Bounds.Y - strip.FooterTop) > 0.5f) continue;
+                wallIdentity = Blocker(owners[index], action.Bounds, pressable: !action.IsProtectedPageText).Describe();
+                break;
+            }
+        }
         return new FooterControls(strip.FooterTop, strip.BoardTop, tally.Active, tally.Hidden + tally.Active, complete, parentCoverageComplete, overlaps,
             tally.Hidden, tally.HiddenPageActions, reason, tally.Unmeasurable, belowActions, strip.PressableTop,
-            blocker, blockers);
+            blocker, blockers, strip.BeyondColumn, wallIdentity);
     }
     // 一个相交控件在日志里要有的身份：它是什么组件、对象叫什么名字、它自己的真实矩形。名字读不出来不算结构故障
     // ——它只是这一行的措辞少一段，决定本身不受影响。
@@ -4265,9 +7101,15 @@ internal static class ResultsDisplay
                 // Behind the camera: there is no screen position for this corner, and half a box is not a box.
                 if (camera != null && camera.WorldToScreenPoint(world).z <= 0f) return false;
                 Vector2 screen = RectTransformUtility.WorldToScreenPoint(camera, world);
-                if (!float.IsFinite(screen.x) || !float.IsFinite(screen.y)) return false;
-                xs.Add(screen.x);
-                ys.Add(Screen.height - screen.y);
+                // 1.19.55: `WorldToScreenPoint` answers in the camera's own raster, and this rectangle has to be in the window
+                // pixels the board is drawn and hit in. One conversion, the same one the pointer asks for
+                // (`ResultPointerSpace`), so a camera that does not render the whole window - the letterboxed 1280x960 case the
+                // session could not explain - can never move a control without moving the pointer with it.
+                ResultPointerViewport viewport = PointerViewport(camera, out _);
+                if (!ResultPointerSpace.TryWindow(viewport, screen.x, screen.y, 1f, out float windowX, out float windowY, out _))
+                    return false;
+                xs.Add(windowX);
+                ys.Add(windowY);
             }
             return ScreenBounds.TryFromCorners(xs, ys, Screen.width, Screen.height, out rect);
         }
@@ -4313,6 +7155,175 @@ internal static class ResultsDisplay
         return camera;
     }
 
+    // 客机失败页的页脚槽位：只认「同一个原生返回位置」的两路几何，各自是自己的对象、自己的相机换算。
+    //
+    // 评审 #3/#4 否掉了 1.19.61 的第一次尝试（父容器子树扫描 + `textBounds` 代理）：那既会把无关/隐藏文本算进来，
+    // 也仍然不是这一行字真正画出来的顶点。现在的权威只有两路，都来自页面自己：
+    //
+    //   * `m_btnGoToLobby` 的已布局矩形——主机页量的就是这同一个原生对象（`ButtonActive` + `TryScreenRect`），
+    //     客机上它永久不可点，但它存在、也占着那个槽位，所以这里**不读 active**，只要求有效布局证据；
+    //   * `m_returnToLobby_text` 自己的字形 mesh 顶点（`textInfo.meshInfo[..].vertices` 中可见字符的四个角），
+    //     不是容器、不是别的文本的代理。
+    //
+    // 两者取更靠上的那一堵；都量不到时**没有权威**——调用方保留原版并按既有节流重测，F8 也不会拿到一条从布局框、
+    // 别的可按控件或屏幕下界编出来的带。
+    private static ResultClientSlotEvidence ClientSlot(Component page)
+    {
+        int frame = Time.frameCount;
+        IntPtr pointer = page != null ? page.Pointer : IntPtr.Zero;
+        if (frame == _slotFrame && pointer == _slotPage) return _slot;
+        _slotFrame = frame; _slotPage = pointer;
+        _slot = MeasureClientSlot(page);
+        return _slot;
+    }
+
+    private static ResultClientSlotEvidence MeasureClientSlot(Component page)
+    {
+        float hostSlot = float.NaN, glyph = float.NaN, titleBottom = float.NaN;
+        try
+        {
+            var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
+            if (fail != null)
+            {
+                TextMeshPro title = fail.m_missionFailed_text;
+                if (title != null && TryScreenRect(title, out LayoutRect titleRect)) titleBottom = titleRect.Bottom;
+                TextMeshPro slotText = fail.m_returnToLobby_text;
+                bool glyphExpected = SlotTextExpected(slotText);
+                glyph = HintGlyphTop(slotText, titleBottom);
+                hostSlot = HostSlotTop(fail, slotText, titleBottom, glyphExpected, float.IsFinite(glyph));
+            }
+        }
+        catch { }
+        float top = ResultClientSlotPolicy.Authority(hostSlot, glyph, out ResultClientWallSource source);
+        return new ResultClientSlotEvidence(hostSlot, glyph, top, source);
+    }
+
+    // 槽位那行字此刻**应该正在画**：存在、可见（`ResultFooterTextPolicy.Counts` 的规则）、文本非空。
+    // 只用来判断「该画的字没量到」这个状态——不用来区分主客，也不问能不能点。
+    private static bool SlotTextExpected(TextMeshPro text)
+    {
+        if (text == null) return false;
+        try
+        {
+            bool active = text.gameObject.activeInHierarchy;
+            if (!ResultFooterTextPolicy.Counts(active, HeadingAlpha(text))) return false;
+            return !string.IsNullOrWhiteSpace(text.text);
+        }
+        catch { return false; }
+    }
+
+    // 客机上「返回大厅」按钮的槽位读数。
+    //
+    // 评审 #3 的残口：`TryScreenRect` 在没有可用 renderer 时会退回裸 RectTransform，于是「550x100 的布局盒」也能当权威
+    // （1.19.60 的 1338 就是这么来的）。现在只有三种读数算数（判据在 `ResultClientSlotPolicy.HostSlotAuthorised`）：
+    //   * 按钮自己的**实体几何**（renderer 包围盒路线，与能不能点无关）；
+    //   * 槽位那行字自己的**字形**（`HintGlyphTop` 已经量到）；
+    //   * 该画的字本来就不在时，**同一个节点**的布局矩形（预制件里 TMP 90058 与 CM_Item 93181 共用 RectTransform 86911）。
+    // 该画的字此刻应该在画却没量到 → 一律不授权：保留已证的边界（`Measure` 仍用门保留的墙）或原版重测，F8 同样不给。
+    private static float HostSlotTop(CM_PageExpeditionFail fail, TextMeshPro slotText, float titleBottom,
+        bool glyphExpected, bool glyphMeasured)
+    {
+        if (fail == null || fail.m_btnGoToLobby == null) return float.NaN;
+        try
+        {
+            bool entity = EntityBoundsMeasured(fail.m_btnGoToLobby);
+            bool sameEntity = SameSlotEntity(fail.m_btnGoToLobby, slotText);
+            if (!ResultClientSlotPolicy.HostSlotAuthorised(entity, glyphExpected, glyphMeasured, sameEntity))
+                return float.NaN;
+            if (!TryScreenRect(fail.m_btnGoToLobby, out LayoutRect rect)) return float.NaN;
+            if (!(rect.Height > 0.5f) || !(rect.Width > 0.5f)) return float.NaN;
+            if (rect.Y < ResultsBounds.ScreenMargin) return float.NaN;
+            if (rect.Bottom > Screen.height - ResultsBounds.ScreenMargin) return float.NaN;
+            if (float.IsFinite(titleBottom) && rect.Y < titleBottom) return float.NaN;
+            return rect.Y;
+        }
+        catch { return float.NaN; }
+    }
+
+    // `TryScreenRect` 的路线选择逐字复制：有 renderer、有相机、包围盒非退化 → 它量的是实体几何，而不是布局矩形。
+    private static bool EntityBoundsMeasured(Component entity)
+    {
+        if (entity == null) return false;
+        try
+        {
+            Renderer renderer = entity.GetComponent<Renderer>();
+            return renderer != null && PageCamera(entity, out _) != null
+                && renderer.bounds.size.sqrMagnitude > 0.0001f;
+        }
+        catch { return false; }
+    }
+
+    // 同一个节点：预制件里 `m_returnToLobby_text`(TMP 90058) 与 `m_btnGoToLobby`(CM_Item 93181) 在同一个 GameObject 上、
+    // 共用同一个 RectTransform 86911（`native-slot-evidence.md` §1.2/§2）。这才是「同一个槽位」的可验证证明。
+    private static bool SameSlotEntity(Component button, Component text)
+    {
+        if (button == null || text == null) return false;
+        try
+        {
+            Transform left = button.transform, right = text.transform;
+            if (left == null || right == null) return false;
+            if (left.Pointer == right.Pointer) return true;
+            return left.gameObject.Pointer == right.gameObject.Pointer;
+        }
+        catch { return false; }
+    }
+
+    // `m_returnToLobby_text` 真正画出来的字形的上沿：逐个可见字符的四个顶点，经同一个相机阶梯投到窗口像素。
+    // 这是评审要求的「渲染顶点/实际 mesh」，不是 `textBounds` 也不是容器代理。
+    private static float HintGlyphTop(TextMeshPro text, float titleBottom)
+    {
+        if (text == null) return float.NaN;
+        try
+        {
+            TMP_TextInfo info = text.textInfo;
+            if (info == null || info.characterCount <= 0 || info.meshInfo == null) return float.NaN;
+            Transform transform = text.transform;
+            if (transform == null) return float.NaN;
+            Camera camera = PageCamera(text, out _);
+            ResultPointerViewport viewport = PointerViewport(camera, out _);
+            var xs = new List<float>(8);
+            var ys = new List<float>(8);
+            for (int i = 0; i < info.characterCount; i++)
+            {
+                TMP_CharacterInfo character = info.characterInfo[i];
+                if (!character.isVisible) continue;
+                int material = character.materialReferenceIndex;
+                if (material < 0 || material >= info.meshInfo.Length) continue;
+                Vector3[] vertices = info.meshInfo[material].vertices;
+                if (vertices == null) continue;
+                for (int corner = 0; corner < 4; corner++)
+                {
+                    int index = character.vertexIndex + corner;
+                    if (index < 0 || index >= vertices.Length) continue;
+                    Vector3 world = transform.TransformPoint(vertices[index]);
+                    if (camera != null && camera.WorldToScreenPoint(world).z <= 0f) return float.NaN;
+                    Vector2 screen = RectTransformUtility.WorldToScreenPoint(camera, world);
+                    if (!ResultPointerSpace.TryWindow(viewport, screen.x, screen.y, 1f, out float windowX, out float windowY, out _))
+                        return float.NaN;
+                    xs.Add(windowX);
+                    ys.Add(windowY);
+                }
+            }
+            if (xs.Count == 0) return float.NaN;
+            if (!ScreenBounds.TryFromCorners(xs, ys, Screen.width, Screen.height, out LayoutRect rect)) return float.NaN;
+            if (float.IsFinite(titleBottom) && rect.Y < titleBottom) return float.NaN;
+            return rect.Y;
+        }
+        catch { return float.NaN; }
+    }
+
+    // 一帧的槽位读数（同帧只量一次：`FailureStrip` 一次 repaint 里会被落位、逐帧校验与兜底各问一次）。
+    private readonly struct ResultClientSlotEvidence
+    {
+        public readonly float HostSlotTop, HintGlyphTop, Top;
+        public readonly ResultClientWallSource Source;
+        public ResultClientSlotEvidence(float hostSlotTop, float hintGlyphTop, float top, ResultClientWallSource source)
+        {
+            HostSlotTop = hostSlotTop; HintGlyphTop = hintGlyphTop; Top = top; Source = source;
+        }
+        public bool Fits { get { return float.IsFinite(Top); } }
+    }
+
     // The rectangle a TextMeshPro text really draws, in window pixels.
     //
     // `textBounds` is the text's own laid-out extent in its local space, and it is the same figure for the world-space
@@ -4341,9 +7352,14 @@ internal static class ResultsDisplay
                 // Behind the camera: there is no screen position for this corner, and half a box is not a box.
                 if (camera != null && camera.WorldToScreenPoint(world).z <= 0f) return false;
                 Vector2 screen = RectTransformUtility.WorldToScreenPoint(camera, world);
-                if (!float.IsFinite(screen.x) || !float.IsFinite(screen.y)) return false;
-                xs.Add(screen.x);
-                ys.Add(Screen.height - screen.y);
+                // 1.19.55: the same one conversion the pointer and `TryScreenRect` use - a text block measured on a different
+                // grid from the board it is protected against is exactly how a control ends up "not overlapping" the table
+                // that covers it.
+                ResultPointerViewport viewport = PointerViewport(camera, out _);
+                if (!ResultPointerSpace.TryWindow(viewport, screen.x, screen.y, 1f, out float windowX, out float windowY, out _))
+                    return false;
+                xs.Add(windowX);
+                ys.Add(windowY);
             }
             return ScreenBounds.TryFromCorners(xs, ys, Screen.width, Screen.height, out rect);
         }
@@ -4366,7 +7382,10 @@ internal static class ResultsDisplay
     // turned back on, the page changes or the results screen is left, every block this mod moved is put
     // back at the exact position and in the exact active state it had before - which is what the previous
     // release could not do, because it only ever moved them off the page.
-    private static void ApplyVanillaBlocks(Component page, bool succeeded)
+    // `visualOnly` is the early board's own frame (1.19.59): the page's blocks make way for a board that is painted, but
+    // a picture on the page may not move or switch anything off - it may only stop drawing what it replaces. The mature
+    // board takes the same blocks the rest of the way on the frame it really places.
+    private static void ApplyVanillaBlocks(Component page, bool succeeded, bool visualOnly = false)
     {
         if (page == null) return;
         // Both switches are positive and off by default: the block is put away unless the player asked for
@@ -4380,6 +7399,10 @@ internal static class ResultsDisplay
         _appliedSuccessBlocks = successBlocks; _appliedPrisonerReports = prisonerReports; _appliedFailBlocks = failBlocks;
         _appliedAny = successBlocks || prisonerReports || failBlocks;
         if (!_appliedAny) return;
+        _vanillaHiddenAt = Time.realtimeSinceStartup;
+        // A board really drew on this frame, so the refusals that came before it are answered: the next refusal starts the
+        // count again from zero (this is what keeps a page that alternates draw/refuse from ever tripping the give-back).
+        _vanillaRefusals = 0; _vanillaRefusalFrame = -1;
 
         if (succeeded)
         {
@@ -4387,27 +7410,41 @@ internal static class ResultsDisplay
             if (success == null) return;
             if (successBlocks)
             {
-                Hide(success.m_ArtifactInventoryDisplay, "artifact inventory");
-                Hide(success.m_artifactInfo_text, "artifact summary");
-                Hide(success.m_checkpointUsage, "checkpoint usage");
+                Hide(success.m_ArtifactInventoryDisplay, "artifact inventory", page, succeeded, visualOnly);
+                Hide(success.m_artifactInfo_text, "artifact summary", page, succeeded, visualOnly);
+                Hide(success.m_checkpointUsage, "checkpoint usage", page, succeeded, visualOnly);
             }
             if (prisonerReports)
             {
                 var reports = success.m_playerReports;
                 int count = reports == null ? 0 : reports.Length;
-                for (int index = 0; index < count; index++) Hide(reports[index], "prisoner report " + index);
+                for (int index = 0; index < count; index++) Hide(reports[index], "prisoner report " + index, page, succeeded, visualOnly);
                 var anchors = success.m_playerReportAligns;
                 int anchors_ = anchors == null ? 0 : anchors.Length;
-                for (int index = 0; index < anchors_; index++) Hide(anchors[index], "prisoner report anchor " + index);
+                for (int index = 0; index < anchors_; index++) Hide(anchors[index], "prisoner report anchor " + index, page, succeeded, visualOnly);
             }
         }
         else
         {
             var fail = page.TryCast<CM_PageExpeditionFail>();
             if (fail == null) return;
-            Hide(fail.m_ArtifactInventoryDisplay, "artifact inventory");
-            Hide(fail.m_artifactInfo_text, "artifact summary");
+            Hide(fail.m_ArtifactInventoryDisplay, "artifact inventory", page, succeeded, visualOnly);
+            Hide(fail.m_artifactInfo_text, "artifact summary", page, succeeded, visualOnly);
         }
+    }
+
+    // The page's own blocks are given back when this mod has really stopped standing in for them: no board has been drawn
+    // for `VanillaHideGrace` seconds while a result page is still up (a page that never places, another mod's control that
+    // keeps deferring it, a fit the page refuses). Called once per attached repaint; it reads a clock, never a frame count,
+    // so the answer is the same at 30 and at 240 FPS.
+    private static void VanillaHideExpired()
+    {
+        if (Hidden.Count == 0) return;
+        if (Time.realtimeSinceStartup - _vanillaHiddenAt <= VanillaHideGrace) return;
+        RestoreHidden();
+        if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-blocks-given-back"))
+            Plugin.Logger?.LogInfo("[DIAG] the page's own blocks were given back because this board stopped standing in for them: no board has been drawn for "
+                + VanillaHideGrace.ToString("0.0") + "s on this page, so the vanilla screen is the honest one - the next board that really places puts them away again (1.19.59).");
     }
 
     // How far off the page a hidden block is put: past any resolution, still a valid position.
@@ -4415,45 +7452,639 @@ internal static class ResultsDisplay
 
     // Everything this mod moved goes back, exactly. An entry is written the first time a block is touched
     // and never rewritten, so the recorded position is the page's own and not this mod's own displacement.
+    //
+    // 1.19.55 (A): the way back is written down. The recorded session had one `moved off the page` line and no line at
+    // all for the restore, so "the blocks come back when hiding is switched off, when F8 hides the board, when the page
+    // changes and when the results screen is left" could not be checked from a log. The line carries how many entries
+    // were put back and whether any of them refused, and it is written only when something really was put back - the
+    // frames that ask a page with nothing hidden print nothing at all.
     private static void RestoreHidden()
     {
-        foreach (KeyValuePair<IntPtr, HiddenBlock> entry in Hidden)
+        int restored = 0, refused = 0;
+        foreach (ResultVanillaHold block in Hidden.Holds)
         {
-            HiddenBlock block = entry.Value;
             try
             {
-                if (block.Target != null) block.Target.localPosition = block.Position;
-                if (block.Host != null) block.Host.SetActive(block.Active);
+                if (PutBack(block)) restored++;
             }
             catch (Exception error)
             {
+                refused++;
                 Plugin.Logger?.LogWarning("[DIAG] a vanilla block could not be put back where it was: " + error.Message);
             }
         }
         Hidden.Clear();
-        _appliedSuccessBlocks = _appliedPrisonerReports = _appliedFailBlocks = _appliedAny = false;
+        _vanillaHiddenAt = float.NegativeInfinity;
+        _vanillaRefusals = 0; _vanillaRefusalFrame = -1;
+        if (restored == 0 && refused == 0) return;
+        if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-blocks-restored"))
+            Plugin.Logger?.LogInfo("[DIAG] the page's own blocks were put back where the game drew them: restored="
+                + restored + ",refused=" + refused + ",pageActive=" + PageActive(_page)
+                + "; every block this mod touched - moved whole, moved branch by branch when the block carried an action,"
+                + " or only switched off at the drawing when it carried one this build may not move - stands at the"
+                + " position, in the active state and at the alpha that were recorded before the first write, and this same"
+                + " record answers the F8 hide, the switch being turned back on, the page changing, the results screen being"
+                + " left, and a board that stopped standing in for the page (1.19.59).");
     }
 
-    private static void Hide(Component block, string what)
+    // One record, put back - and *only* the state this mod really took (M3). The answers come from the ledger, not from
+    // this file: `TryRestorePosition` and `TryRestoreActive` are true only for a record whose move half was really taken,
+    // so a block whose drawing alone was switched off can never be switched on by the way back, and the position written
+    // is the one the page had before the first move (H1) instead of whatever `localPosition` this mod last left behind.
+    // Nothing about raycasts appears here either: alpha and renderer enablement are the whole of the drawing half, so a
+    // press the page hung inside a hidden block answers exactly as it did before (H2).
+    private static bool PutBack(ResultVanillaHold block)
+    {
+        bool any = false;
+        if (block.TryRestorePosition(out float x, out float y, out float z))
+        {
+            var target = block.Target as Transform;
+            if (target != null) { target.localPosition = new Vector3(x, y, z); any = true; }
+        }
+        if (block.TryRestoreActive(out bool active))
+        {
+            var host = block.Host as GameObject;
+            if (host != null && host.activeSelf != active) { host.SetActive(active); any = true; }
+        }
+        if (!block.VisualHeld) return any;
+        if (block.TryRestoreGroup(out float alpha) && block.Group is CanvasGroup group)
+        {
+            group.alpha = alpha;
+            any = true;
+        }
+        for (int index = 0; index < block.Renderers.Length; index++)
+        {
+            if (!(block.Renderers[index] is Renderer renderer) || renderer == null) continue;
+            if (renderer.enabled == block.RendererEnabled[index]) continue;
+            renderer.enabled = block.RendererEnabled[index];
+            any = true;
+        }
+        for (int index = 0; index < block.Canvas.Length; index++)
+        {
+            if (!(block.Canvas[index] is CanvasRenderer canvas) || canvas == null) continue;
+            try { canvas.SetAlpha(block.CanvasAlpha[index]); any = true; } catch { }
+        }
+        return any;
+    }
+    // Whether a block is the result page itself, or something the page hangs from. Compared by native pointer first
+    // (the interop wrappers are not reference-equal across calls) and then by ancestry; a read that throws is
+    // treated as "shared" because the safe answer for a block this mod cannot place is to leave the page alone.
+    private static bool SharedOrRoot(Component block)
+    {
+        if (block == null) return true;
+        try
+        {
+            if (_page != null && block.Pointer == _page.Pointer) return true;
+            Transform host = block.transform;
+            Transform page = _page != null ? _page.transform : null;
+            if (host == null || page == null) return false;
+            // True when the page hangs under this transform, i.e. the block is a shared ancestor of the screen.
+            return page.IsChildOf(host);
+        }
+        catch { return true; }
+    }
+
+    // Whether this block's own subtree holds a control the player can press. `CM_Item` is the result pages' own action
+    // type - the interaction scan reads exactly that type out of the page's registrations (`m_allItems`) and out of
+    // each control's parent - so a "content" block that carries one is not content: switching it off takes the page's
+    // own button with it, and a settlement page whose button does nothing is what that looks like from the player's
+    // side. A read that throws answers true: a subtree this build cannot describe is left alone, the same way
+    // `SharedOrRoot` treats an unreadable block.
+    //
+    // 1.19.55: `CM_Item` alone is not that question. The result pages hang *unregistered, switched-off* `CM_Item`
+    // components inside their presentational blocks, and answering "yes" for one of those left `artifact summary` on the
+    // page although the player had asked for it to be hidden (the recorded 7442/13753/20050/24656). A live action is one the
+    // page can dispatch to (registered in `m_allItems`) or one that can take the pointer right now (active in the
+    // hierarchy); everything else belongs to the block and may be put away with it (`ResultVanillaHidePolicy`).
+    // 1.19.56 (A): the one classifier both halves of the question ask. A decoration inside one of this page's known
+    // presentational blocks is *not* a wall for the scan and *is* hideable for the hide - because both call `KindOf`. The
+    // node facts come from the page's own fields and components only: registration (`m_allItems`), active state, a
+    // `UnityEngine.UI.Button` in the subtree, and a Renderer/CanvasRenderer for the block's own drawing.
+    //
+    // 1.19.57 (independent review of 1.19.56 A): the page is handed in, never read from the `_page`/`_succeeded` cache.
+    // `ResetPlacement` clears that cache on the same frame the scan and the hide run, and the two are asked at different
+    // moments of it, so asking the cache meant a live page could be described as "this page has no decoration block".
+    private static VanillaNodeKind KindOf(Component node, Component page, bool succeeded)
+    {
+        if (node == null) return VanillaNodeKind.Unknown;
+        try
+        {
+            bool inside = InsideDecorationBlock(node, page, succeeded, out bool root);
+            bool active = node.gameObject.activeInHierarchy;
+            bool button = HasButton(node);
+            bool visual = HasVisual(node);
+            var facts = new VanillaNodeFacts(inside, root, false, active, button, visual);
+            // Registration is only meaningful for a `CM_Item`, and it is the page's own word.
+            var item = node.TryCast<CM_Item>();
+            if (item != null)
+                facts = new VanillaNodeFacts(inside, root, RegisteredInPage(item, page), active, button, visual);
+            return ResultVanillaClassify.Of(facts);
+        }
+        catch { return VanillaNodeKind.Unknown; }
+    }
+
+    // The block's *own* answer, which is what the plan is decided from. A `Button` in one of its branches belongs to that
+    // branch, not to the whole block: reading the subtree's `Button` into the root is what turned every mixed block into
+    // `Nothing` in 1.19.56, i.e. it made the player's switch do nothing on the one page the switch exists for.
+    private static VanillaNodeKind RootKindOf(Component block, Component page, bool succeeded)
+    {
+        if (block == null) return VanillaNodeKind.Unknown;
+        try
+        {
+            bool inside = InsideDecorationBlock(block, page, succeeded, out bool root);
+            bool active = block.gameObject.activeInHierarchy;
+            bool button = OwnButton(block);
+            bool visual = HasVisual(block);
+            return ResultVanillaClassify.Of(new VanillaNodeFacts(inside, root, RegisteredInPage(block, page), active, button, visual));
+        }
+        catch { return VanillaNodeKind.Unknown; }
+    }
+
+    private static bool OwnButton(Component node)
+    {
+        try { return node.GetComponent<Button>() != null; }
+        catch { return true; }
+    }
+
+    private static bool HasButton(Component node)
+    {
+        try
+        {
+            Button[] buttons = node.GetComponentsInChildren<Button>(true);
+            return buttons != null && buttons.Length > 0;
+        }
+        catch { return true; }
+    }
+
+    private static bool HasVisual(Component node)
+    {
+        try { return node.GetComponent<Renderer>() != null || node.GetComponent<CanvasRenderer>() != null; }
+        catch { return false; }
+    }
+
+    // Whether this node lives inside one of the result pages' own presentational blocks, and whether it *is* that block.
+    // The blocks are named by the native fields the hide path already used - never by text, never by a coordinate - and
+    // only the ones the player's own switches ask this mod to put away count (`ResultVanillaBlockPolicy`).
+    private static bool InsideDecorationBlock(Component node, Component page, bool succeeded, out bool containerRoot)
+    {
+        containerRoot = false;
+        try
+        {
+            Transform transform = node != null ? node.transform : null;
+            if (transform == null) return false;
+            for (int step = 0; step < 8 && transform != null; step++)
+            {
+                if (IsDecorationBlock(transform, page, succeeded))
+                {
+                    if (step == 0) containerRoot = true;
+                    return true;
+                }
+                transform = transform.parent;
+            }
+            return false;
+        }
+        catch { return false; }
+    }
+
+    // Whether this node is one of the blocks this mod is really about to put away on the page handed in. 1.19.56 walked
+    // the ancestors and compared each ancestor's *component* pointer with the page's fields directly, which can never be
+    // equal: `m_artifactInfo_text` is a text component and `m_ArtifactInventoryDisplay` a display component, while the
+    // walk arrives with the node's `Transform` - three different native objects on the same GameObject. `SameNode` aligns
+    // both sides onto the node they belong to, and the switches decide whether that node is a decoration at all.
+    private static bool IsDecorationBlock(Transform node, Component page, bool succeeded)
+    {
+        if (node == null || page == null) return false;
+        bool hideArtifacts = Plugin.HideVanillaArtifacts;
+        bool hideReports = Plugin.HideVanillaReports;
+        bool hideFailBlocks = Plugin.HideVanillaFailBlocks != null && Plugin.HideVanillaFailBlocks.Value;
+        try
+        {
+            if (succeeded)
+            {
+                var success = page.TryCast<CM_PageExpeditionSuccess>();
+                if (success == null) return false;
+                if (ResultVanillaBlockPolicy.IsDecoration(true, hideArtifacts, hideReports, hideFailBlocks, VanillaBlockKind.ArtifactInventory)
+                    && SameNode(success.m_ArtifactInventoryDisplay, node)) return true;
+                if (ResultVanillaBlockPolicy.IsDecoration(true, hideArtifacts, hideReports, hideFailBlocks, VanillaBlockKind.ArtifactSummary)
+                    && SameNode(success.m_artifactInfo_text, node)) return true;
+                if (ResultVanillaBlockPolicy.IsDecoration(true, hideArtifacts, hideReports, hideFailBlocks, VanillaBlockKind.CheckpointUsage)
+                    && SameNode(success.m_checkpointUsage, node)) return true;
+                if (ResultVanillaBlockPolicy.IsDecoration(true, hideArtifacts, hideReports, hideFailBlocks, VanillaBlockKind.PlayerReport))
+                {
+                    var reports = success.m_playerReports;
+                    if (reports != null)
+                        for (int index = 0; index < reports.Length; index++)
+                            if (SameNode(reports[index], node)) return true;
+                }
+                if (ResultVanillaBlockPolicy.IsDecoration(true, hideArtifacts, hideReports, hideFailBlocks, VanillaBlockKind.PlayerReportAnchor))
+                {
+                    var anchors = success.m_playerReportAligns;
+                    if (anchors != null)
+                        for (int index = 0; index < anchors.Length; index++)
+                            if (SameNode(anchors[index], node)) return true;
+                }
+                return false;
+            }
+            var fail = page.TryCast<CM_PageExpeditionFail>();
+            if (fail == null) return false;
+            if (ResultVanillaBlockPolicy.IsDecoration(false, hideArtifacts, hideReports, hideFailBlocks, VanillaBlockKind.ArtifactInventory)
+                && SameNode(fail.m_ArtifactInventoryDisplay, node)) return true;
+            return ResultVanillaBlockPolicy.IsDecoration(false, hideArtifacts, hideReports, hideFailBlocks, VanillaBlockKind.ArtifactSummary)
+                && SameNode(fail.m_artifactInfo_text, node);
+        }
+        catch { return false; }
+    }
+
+    // Two objects are the same node when they are anchored on the same native object. A field can name a component and a
+    // walk arrives with that object's `Transform`, so the `Transform` is read first and the `GameObject` second - the two
+    // anchors every wrapper of one node shares - and the comparison itself is `ResultNodeIdentity.Same`, the same rule a
+    // test can ask with the distinct ids a page's three wrappers really have (1.19.57).
+    private static bool SameNode(Component block, Transform node)
+    {
+        if (block == null || node == null) return false;
+        IntPtr blockTransform = IntPtr.Zero, blockObject = IntPtr.Zero;
+        try { Transform own = block.transform; if (own != null) blockTransform = own.Pointer; } catch { }
+        try { GameObject mine = block.gameObject; if (mine != null) blockObject = mine.Pointer; } catch { }
+        IntPtr nodeTransform = IntPtr.Zero, nodeObject = IntPtr.Zero;
+        try { nodeTransform = node.Pointer; } catch { }
+        try { GameObject other = node.gameObject; if (other != null) nodeObject = other.Pointer; } catch { }
+        return ResultNodeIdentity.Same(blockTransform, blockObject, nodeTransform, nodeObject);
+    }
+
+    // The plan for one block, from the classifier - this is the production decision, not a policy that is only
+    // exercised by a test.
+    private static VanillaHidePlan PlanOfBlock(Component block, Component page, bool succeeded)
+    {
+        if (block == null) return VanillaHidePlan.Nothing;
+        try
+        {
+            VanillaNodeKind root = RootKindOf(block, page, succeeded);
+            CM_Item[] items = block.GetComponentsInChildren<CM_Item>(true);
+            int count = items == null ? 0 : items.Length;
+            int actions = 0, visuals = 0, branchesWithAction = 0;
+            for (int index = 0; index < count; index++)
+            {
+                if (items[index] == null) continue;
+                // An entry nobody can describe counts as an action: it is not a proven part of the page's own drawing, so
+                // it is never one of the parts a mixed block may put away (1.19.57).
+                if (KindOf(items[index], page, succeeded) == VanillaNodeKind.Visual) visuals++;
+                else actions++;
+            }
+            Transform root_ = block.transform;
+            int children = root_ != null ? root_.childCount : 0;
+            for (int index = 0; index < children; index++)
+            {
+                Transform branch = root_.GetChild(index);
+                Component node = branch != null ? branch.TryCast<Component>() : null;
+                if (node == null) continue;
+                if (HasButton(node) || LiveActionIn(node, page)) branchesWithAction++;
+            }
+            // 1.19.59 second pass: the subtree's own `Button` is handed in, so a block that really carries one can never be
+            // answered with the drawing-only plan (that would leave an invisible-but-pressable control where the page drew it).
+            return ResultVanillaClassify.PlanForBlock(root, actions, visuals, branchesWithAction, HasButton(block));
+        }
+        catch { return VanillaHidePlan.Nothing; }
+    }
+
+    private static bool LiveActionIn(Component node, Component page)
+    {
+        try
+        {
+            CM_Item[] items = node.GetComponentsInChildren<CM_Item>(true);
+            if (items == null) return false;
+            for (int index = 0; index < items.Length; index++)
+                if (items[index] != null && RegisteredInPage(items[index], page)) return true;
+            return false;
+        }
+        catch { return true; }
+    }
+
+    // Whether this subtree carries one of the page's own actions, asked of the same classifier the scan uses. A read that
+    // throws answers true: a subtree this build cannot describe is never moved.
+    private static bool CarriesAction(Component block, Component page, bool succeeded)
+    {
+        try { return KindOf(block, page, succeeded) == VanillaNodeKind.Action; }
+        catch { return true; }
+    }
+
+    // Whether the page itself dispatches to this entry: `CM_PageBase.m_allItems` is the registry the interaction scan and
+    // `UpdateButtonPress` both read.
+    //
+    // 1.19.57: a registry this build cannot read is *not* "not registered". 1.19.56 answered false for a null registry
+    // while its own doc comment promised the opposite, which turned every entry of a page whose registry could not be read
+    // into an unregistered decoration - the one answer that lets the hide path move a control the player needs.
+    // "Unreadable" is answered true (registered), so an entry the page might dispatch to is protected, and the scan's own
+    // `complete` flag keeps the board off a page whose registry it could not read.
+    private static bool RegisteredInPage(CM_Item item, Component page)
+    {
+        try
+        {
+            if (item == null) return true;
+            var menu = page != null ? page.TryCast<CM_PageBase>() : null;
+            var registered = menu != null ? menu.m_allItems : null;
+            if (registered == null) return true;
+            IntPtr pointer = item.Pointer;
+            for (int index = 0; index < registered.Length; index++)
+            {
+                var entry = registered[index];
+                if (entry == null) continue;
+                CM_Item native = entry.TryCast<CM_Item>();
+                if (native != null && native.Pointer == pointer) return true;
+            }
+            return false;
+        }
+        catch { return true; }
+    }
+
+    private static bool RegisteredInPage(Component node, Component page)
+    {
+        var item = node != null ? node.TryCast<CM_Item>() : null;
+        return item != null && RegisteredInPage(item, page);
+    }
+
+    // One `CM_Item` seen inside a block: `true` when the page can really press it.
+    private static bool LiveAction(CM_Item item, Component page)
+    {
+        try
+        {
+            if (item == null) return true;
+            bool active = item.gameObject.activeInHierarchy;
+            return ResultVanillaHidePolicy.IsLiveAction(active, RegisteredInPage(item, page));
+        }
+        catch { return true; }
+    }
+
+    // A branch that really draws something of the page's own. Only such a branch may be put away: one that draws nothing
+    // is not worth touching, and one this build cannot describe is left exactly where the game put it (1.19.57).
+    private static bool ProvenVisual(Component node, Component page, bool succeeded)
+    {
+        try
+        {
+            if (KindOf(node, page, succeeded) == VanillaNodeKind.Visual) return true;
+            Renderer[] renderers = node.GetComponentsInChildren<Renderer>(true);
+            if (renderers != null && renderers.Length > 0) return true;
+            CanvasRenderer[] canvas = node.GetComponentsInChildren<CanvasRenderer>(true);
+            return canvas != null && canvas.Length > 0;
+        }
+        catch { return false; }
+    }
+
+    // A mixed subtree: content that happens to carry a decoration `CM_Item` somewhere. The branch(es) that carry a live
+    // action are left untouched and the branch(es) that carry none are put away by the same discipline the whole block used
+    // to take - moved off the page, switched off, the page's own position and active state recorded before anything moved, so
+    // `RestoreHidden` puts them back exactly. Answers false when there is nothing that can be put away safely: a block whose
+    // whole body is one branch, an unreadable child list, or a branch list in which every branch carries an action. The caller
+    // then leaves the block exactly where the game put it.
+    //
+    // 1.19.57: a branch is only ever put away when three things are proven about it - it is inside this page's own declared
+    // block (so an icon another mod parked beside it is never mistaken for the page's own drawing), no part of it is an
+    // action the page can dispatch to or that can take the pointer now, and it really renders something. The block itself
+    // and every ancestor of the page are refused before any of that (`SharedOrRoot`), so a move can never take a late
+    // button's carrier off the page.
+    // 1.19.58: `CarriesAction` answers the classifier, which asks "is *this node* an action"; a branch whose own node is a
+    // plate with a renderer while a *descendant* is a registered `CM_Item` therefore came back as a proven visual and was
+    // moved. `LiveActionIn(node, page)` is the second, independent question - does anything below this branch sit in the
+    // page's registry - and it answers true when the registry or the subtree cannot be read, so an unreadable read can only
+    // ever leave a branch where the game put it.
+    private static bool HideSafeBranches(Component block, string what, Component page, bool succeeded)
+    {
+        int hidden = 0;
+        try
+        {
+            Transform root = block != null ? block.transform : null;
+            if (root == null) return false;
+            int children = root.childCount;
+            // One branch is the block itself: there is no "safe part" to take away that is not the whole of it.
+            if (children <= 1) return false;
+            for (int index = 0; index < children; index++)
+            {
+                Transform branch = root.GetChild(index);
+                Component node = branch != null ? branch.TryCast<Component>() : null;
+                if (node == null) continue;
+                if (SharedOrRoot(node)) continue;
+                if (CarriesAction(node, page, succeeded)) continue;
+                if (LiveActionIn(node, page)) continue;
+                if (!InsideDecorationBlock(node, page, succeeded, out _)) continue;
+                if (!ProvenVisual(node, page, succeeded)) continue;
+                var host = node.gameObject;
+                IntPtr key = node.Pointer;
+                // The branch's own position and active state, read at its first *move* and never before: a branch whose
+                // drawing was switched off elsewhere has no move recorded yet, and `HoldMove` answers with the position
+                // and state the page had the first time it was asked - every later ask reads the same page state back
+                // (H1), so the write below is idempotent and the way back cannot land on a position this mod invented.
+                Vector3 at = branch.localPosition;
+                ResultVanillaHold record = Hidden.HoldMove(key, branch, host, at.x, at.y, at.z, host != null && host.activeSelf);
+                branch.localPosition = new Vector3(record.X, AwayY, record.Z);
+                if (host != null && host.activeSelf) host.SetActive(false);
+                hidden++;
+            }
+        }
+        catch (Exception error)
+        {
+            Plugin.Logger?.LogWarning("[DIAG] the vanilla block '" + what + "' could not be put away branch by branch: " + error.Message);
+        }
+        if (hidden == 0) return false;
+        if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-block-branches-" + what))
+            Plugin.Logger?.LogInfo("[DIAG] the vanilla block '" + what + "' holds a control the player can press, so only the "
+                + hidden + " branch(es) of it that carry none of the page's own actions were moved off the page and switched off: "
+                + "the branch that carries the action is untouched, its own position and state were recorded before anything moved, "
+                + "and every branch comes back the moment hiding is switched off, the page changes or the results screen is left (1.19.55).");
+        return true;
+    }
+
+    // The page this frame really shows, asked of the page objects themselves: the draw path runs after the repaint that may
+    // have cleared `_page`, and a block the player asked to hide must not depend on that cache (1.19.57).
+    private static Component LivePage(out bool succeeded)
+    {
+        succeeded = _succeeded;
+        if (_page != null) return _page;
+        try
+        {
+            if (Success != null && Success.gameObject.activeInHierarchy) { succeeded = true; return Success; }
+            if (Fail != null && Fail.gameObject.activeInHierarchy) { succeeded = false; return Fail; }
+        }
+        catch { }
+        return null;
+    }
+
+    private static void Hide(Component block, string what, Component page, bool succeeded, bool visualOnly = false)
     {
         if (block == null) return;
+        // 1.19.59 (independent review L4): a block this mod has already taken is not measured again. Everything below -
+        // `PlanOfBlock`, the `GetComponentsInChildren<CM_Item>` walk and the branch-by-branch pass - costs a full walk of
+        // the block, and this method runs from two entry points on every repaint, so a page with eight blocks walked its
+        // own tree sixteen times a frame to learn the same answer. The ledger holds everything needed to keep a block
+        // away; the one question that still has to be asked every frame is whether a control of the player's has appeared
+        // inside it since. `HoldStillApplies` asks exactly that, re-applies the writes it already owns from the record
+        // alone, and answers false - falling through to the classifier below - for any block it has not taken, so a
+        // native control that appears later is still seen on the first frame it exists. There is no permanent skip list:
+        // the record is what is skipped, and only while it is still true.
+        if (HoldStillApplies(block, what)) return;
+        // A board only ever puts away a leaf it stands in front of. The result page itself - or anything the page
+        // hangs from - is never switched off, because that is the whole screen: the recorded "the vanilla settlement
+        // page disappeared and came back" is one frame of exactly that failure mode, and no board is allowed to
+        // produce it.
+        if (SharedOrRoot(block))
+        {
+            if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-block-shared-" + what))
+                Plugin.Logger?.LogWarning("[DIAG] the vanilla block '" + what + "' is the result page itself or something the page hangs from, so it is left switched on: "
+                    + "the board only puts away a block it stands in front of, and the page root belongs to the game.");
+            return;
+        }
+        // 1.19.43: nor is a block that carries a control the player has to press. The hide list is made of content -
+        // the artifact summary, the checkpoint line, the prisoner report cards - but on a page whose layout hangs one of
+        // the page's own actions inside one of those blocks, hiding it hides the action, and the mod's board is the
+        // reason a button stopped answering.
+        //
+        // 1.19.55: a *mixed* subtree is answered branch by branch rather than left whole.
+        // 1.19.56/1.19.57: the plan is the production decision, asked with the live page; an unreadable answer is
+        // `Nothing` - never a whole block put away on the strength of an answer nobody could read.
+        // 1.19.59: the plan's last two answers are both "the drawing goes away":
+        //   * `SafeBranches` moves the branches that carry no action, and
+        //   * `VisualOnly` - and a `SafeBranches` that could not move anything - switches the block's own drawing off
+        //     without moving, deactivating or unregistering a single object (`SuppressVisual`).
+        // The recorded defect this closes: `artifact summary holds a control the player can press, so it is left exactly
+        // where the page put it` (r2 5845, r3 10703, r4 15978) left the red-crystal block and its `[i]`/`1.0` line drawn
+        // under a board that was already on the page.
+        //
+        // `visualOnly` is the early board's own frame: it may only switch the drawing off, never move or deactivate
+        // anything, because an early board is a picture and the page's own presses and wheel still belong to the page.
+        VanillaHidePlan plan = PlanOfBlock(block, page, succeeded);
+        if (plan == VanillaHidePlan.Nothing)
+        {
+            if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-block-action-" + what))
+                Plugin.Logger?.LogInfo("[DIAG] the vanilla block '" + what + "' is the page's own control or an entry this build cannot describe, so it is left exactly where the page put it: "
+                    + "nothing here may take a control off the page. The board does not depend on the space it would have freed.");
+            return;
+        }
+        if (!visualOnly && plan == VanillaHidePlan.WholeBlock)
+        {
+            MoveOffPage(block, what);
+            return;
+        }
+        if (!visualOnly && plan == VanillaHidePlan.SafeBranches && HideSafeBranches(block, what, page, succeeded)) return;
+        // 1.19.59 second pass: the drawing-only half is never applied over a real `Button`. A block whose body carries one, and
+        // whose branch could not be moved away from it, stays exactly where the game put it - a visible decoration is a worse
+        // picture than no board, an *invisible but pressable* control is a worse control.
+        if (HasButton(block))
+        {
+            if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-block-button-kept-" + what))
+                Plugin.Logger?.LogInfo("[DIAG] the vanilla block '" + what + "' carries a control of the player's that cannot be moved away from it, so the block is left visible exactly where the page put it: "
+                    + "switching its drawing off would leave that control invisible but still pressable, which is worse than the decoration it replaces (1.19.59).");
+            return;
+        }
+        SuppressVisual(block, what);
+    }
+
+    // Whether this frame's `Hide` has nothing left to decide: the block is already held, and holding it is still the right
+    // answer. The per-frame cost is the point of the method (L4), so it reads the record and nothing else - except for the
+    // one question that must survive every deduplication: has a control of the player's appeared inside a block this mod
+    // already put away? A moved block is switched off and off the page, so a `Button` that appears in it can never be
+    // pressed and the player would lose it silently; an invisible-but-pressable one is no better. Either way the block is
+    // given back exactly where the page put it and this frame's classifier is allowed to answer again.
+    //
+    // What is deliberately *not* here: the classifier (`PlanOfBlock`), the `CM_Item` walk, and any list that would skip a
+    // block for the rest of the page's life. A block this mod has not taken, or one whose record no longer describes what
+    // is on the page, falls through to `Hide`'s ordinary path - so newly appearing native controls and a structural change
+    // are still seen, and the only thing that is skipped is work whose answer cannot have changed.
+    private static bool HoldStillApplies(Component block, string what)
+    {
+        if (!Hidden.TryGetValue(block.Pointer, out ResultVanillaHold record)) return false;
+        try
+        {
+            if (HasButton(block))
+            {
+                GiveBack(block, record, what);
+                return false;
+            }
+            if (record.MoveHeld)
+            {
+                // Cheap verification of the two writes this record owns: the block is still off the page and still
+                // switched off, and it is put back there only if the game moved or re-enabled it behind this mod.
+                var target = record.Target as Transform;
+                if (target != null && target.localPosition.y != AwayY) target.localPosition = new Vector3(record.X, AwayY, record.Z);
+                var host = record.Host as GameObject;
+                if (host != null && host.activeSelf) host.SetActive(false);
+                return true;
+            }
+            if (record.VisualHeld)
+            {
+                ReapplyDrawing(record);
+                return true;
+            }
+        }
+        catch (Exception error)
+        {
+            // A record this frame cannot keep is not a record that may keep a block away: give it back and let the
+            // classifier answer again, which is the same order of preference every other read here follows.
+            Plugin.Logger?.LogWarning("[DIAG] the vanilla block '" + what + "' could not be kept away this frame: " + error.Message);
+            GiveBack(block, record, what);
+        }
+        return false;
+    }
+
+    // One block given back in place, from the record alone: the drawing half's alpha and renderer states, then the move
+    // half's position and active state - and only the halves that were really taken. Used when the block turns out to hold
+    // a control of the player's after all (H2), which is the one thing a deduplicated hide may not go on ignoring.
+    private static void GiveBack(Component block, ResultVanillaHold record, string what)
+    {
+        try
+        {
+            PutBack(record);
+            Hidden.Drop(record.Key);
+            if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-block-given-back-" + what))
+                Plugin.Logger?.LogInfo("[DIAG] the vanilla block '" + what + "' carries a control the player can press after all, so it is given back exactly where the page put it: "
+                    + "its recorded position, active state, alpha and renderers are put back from the record alone, the block stays visible and pressable where the game drew it, and the board steps around it (1.19.59).");
+        }
+        catch (Exception error)
+        {
+            Plugin.Logger?.LogWarning("[DIAG] the vanilla block '" + what + "' could not be given back: " + error.Message);
+        }
+    }
+
+    // The drawing half, re-asserted from the record: one group write, one loop over the renderers that were really
+    // switched off, one over the canvas renderers whose alpha was really taken. No search of the block, no classifier, and
+    // never a raycast flag (H2) - the drawing half owns the pixels and nothing else.
+    private static void ReapplyDrawing(ResultVanillaHold record)
+    {
+        if (record.Group is CanvasGroup group)
+        {
+            if (group.alpha != 0f) group.alpha = 0f;
+        }
+        for (int index = 0; index < record.Renderers.Length; index++)
+        {
+            if (!(record.Renderers[index] is Renderer renderer) || renderer == null) continue;
+            try { if (renderer.enabled) renderer.enabled = false; } catch { }
+        }
+        for (int index = 0; index < record.Canvas.Length; index++)
+        {
+            if (!(record.Canvas[index] is CanvasRenderer canvas) || canvas == null) continue;
+            try { canvas.SetAlpha(0f); } catch { }
+        }
+    }
+
+    // A block put away outright: moved past any resolution and switched off, with the position and active state the page
+    // had recorded before anything moved. Only a block the classifier proved carries no control of the player's is ever
+    // taken this way (`VanillaHidePlan.WholeBlock`).
+    //
+    // 1.19.59 (independent review H1): the capture belongs to the *move*, not to the first touch of any kind. A block whose
+    // drawing was switched off first (`SuppressVisual`) used to hand this method a record with `Target = null` and
+    // `Position = (0,0,0)`, which the move then reused - so F8, a page change or leaving the screens put the block back at
+    // the origin instead of the place the page drew it, for the rest of the run. `HoldMove` answers with the page's own
+    // position and state the first time it is asked and with that same answer every time after, so this write is
+    // idempotent and the way back always lands on a position this mod really read off the page.
+    private static void MoveOffPage(Component block, string what)
+    {
         try
         {
             var target = block.transform;
             var host = block.gameObject;
             IntPtr key = block.Pointer;
-            if (!Hidden.TryGetValue(key, out HiddenBlock record))
-            {
-                // First touch: this is the page's own position and state, recorded before anything moves.
-                record = new HiddenBlock
-                {
-                    Target = target, Host = host,
-                    Position = target != null ? target.localPosition : default,
-                    Active = host != null && host.activeSelf
-                };
-                Hidden[key] = record;
-            }
-            if (target != null) target.localPosition = new Vector3(record.Position.x, AwayY, record.Position.z);
+            // Nothing can be moved and nothing can be put back without the transform: no record is written for it.
+            if (target == null) return;
+            Vector3 at = target.localPosition;
+            ResultVanillaHold record = Hidden.HoldMove(key, target, host, at.x, at.y, at.z, host != null && host.activeSelf);
+            target.localPosition = new Vector3(record.X, AwayY, record.Z);
             if (host != null && host.activeSelf) host.SetActive(false);
             if (!_loggedHidden)
             {
@@ -4464,6 +8095,85 @@ internal static class ResultsDisplay
         catch (Exception error)
         {
             Plugin.Logger?.LogWarning("[DIAG] the vanilla " + what + " block could not be hidden: " + error.Message);
+        }
+    }
+
+    // The drawing half of hiding: the block stops being painted and nothing else about it changes.
+    //
+    // This is the answer to a block this build may not *move* - one whose own body carries a `Button`, one the page hangs
+    // an action inside, one whose answer could not be read past the root. Switching it off (`SetActive(false)`), moving it
+    // or unregistering it would take that control off the page; zero alpha takes only the pixels. Three routes, because a
+    // GTFO result block is drawn three ways and none of them covers the others:
+    //   * the block's *own* `CanvasGroup` at zero alpha for everything on a UI canvas (and it keeps the children's own
+    //     alpha untouched),
+    //   * `Renderer.enabled` for a world-space `TextMeshPro`/sprite - the artifact summary and the crystal are world text,
+    //     not canvas graphics, so a CanvasGroup alone would leave them on the screen,
+    //   * `CanvasRenderer.SetAlpha(0)` for a `Graphic` with no CanvasGroup above it.
+    // Every one of them is recorded before it is written and put back by `RestoreHidden`, and none of them changes a
+    // collider, an event handler, a `CM_Item` registration or a `Button`, so a press the page hung inside the block still
+    // answers (it simply answers in the place a hidden control occupies).
+    //
+    // 1.19.59 (independent review, H2/M3):
+    //   * H2 - `CanvasGroup.interactable`/`blocksRaycasts` are not read, not recorded and not written. A hidden block answers
+    //     its presses exactly as the one the page drew, so a mixed subtree that really holds an action keeps its hit - and
+    //     `Hide` never reaches this method at all for a block whose body carries a `Button`.
+    //   * M3 - no `CanvasGroup` is ever added. A component added to the game's own object would be a permanent change
+    //     nothing here may undo (a destroy that lands a frame late races the next frame's re-add), and the three routes
+    //     above switch the drawing off without it: only a group the block already had is used, and only its alpha. A block
+    //     with no group is drawn by its renderers and its canvas renderers, which are taken directly.
+    //   * Only the state this mod really changed is recorded: a renderer that was already switched off, and a canvas
+    //     renderer whose alpha was already zero, are left alone and are not part of the record.
+    private static void SuppressVisual(Component block, string what)
+    {
+        try
+        {
+            IntPtr key = block.Pointer;
+            if (!Hidden.TryGetValue(key, out ResultVanillaHold record) || !record.VisualHeld)
+            {
+                CanvasGroup group = null;
+                try { group = block.GetComponent<CanvasGroup>(); } catch { group = null; }
+                Renderer[] renderers = block.GetComponentsInChildren<Renderer>(true);
+                var drawn = new List<Renderer>();
+                if (renderers != null)
+                {
+                    for (int index = 0; index < renderers.Length; index++)
+                    {
+                        Renderer renderer = renderers[index];
+                        if (renderer == null) continue;
+                        bool on;
+                        try { on = renderer.enabled; } catch { on = false; }
+                        if (on) drawn.Add(renderer);
+                    }
+                }
+                CanvasRenderer[] canvas = block.GetComponentsInChildren<CanvasRenderer>(true);
+                var painted = new List<CanvasRenderer>();
+                var alphas = new List<float>();
+                if (canvas != null)
+                {
+                    for (int index = 0; index < canvas.Length; index++)
+                    {
+                        CanvasRenderer renderer = canvas[index];
+                        if (renderer == null) continue;
+                        float alpha;
+                        try { alpha = renderer.GetAlpha(); } catch { alpha = 1f; }
+                        if (alpha == 0f) continue;
+                        painted.Add(renderer); alphas.Add(alpha);
+                    }
+                }
+                var enabled = new bool[drawn.Count];
+                for (int index = 0; index < enabled.Length; index++) enabled[index] = true;
+                record = Hidden.HoldVisual(key, group, group != null ? group.alpha : 1f,
+                    drawn.ToArray(), enabled, painted.ToArray(), alphas.ToArray());
+            }
+            ReapplyDrawing(record);
+            if (ResultReportPolicyStrict.OncePerPage(HeadingReports, "vanilla-block-drawing-" + what))
+                Plugin.Logger?.LogInfo("[DIAG] the vanilla block '" + what + "' was switched off at the drawing only: it is still on the page, still registered and still pressable where the game put it - "
+                    + "only its pixels are gone (alpha 0, its own renderers off) - because moving or deactivating it would take a control the page hung inside it with it. "
+                    + "The exact alpha and renderer states are recorded and put back the moment hiding is switched off, the page changes or the results screen is left; no CanvasGroup was added to the game's object and no raycast flag was touched (1.19.59).");
+        }
+        catch (Exception error)
+        {
+            Plugin.Logger?.LogWarning("[DIAG] the vanilla " + what + " block could not have its drawing switched off: " + error.Message);
         }
     }
 }
@@ -4509,5 +8219,30 @@ internal static class FailureSequenceFinishedPatch
     {
         if (__result) return;
         ResultsDisplay.FailureSequenceFinished(__instance.__4__this, __instance.Pointer);
+    }
+}
+
+// 1.19.44: the game's own press dispatch, skipped only while this mod owns the press.
+//
+// `CM_PageBase.UpdateButtonPress` is what turns the page's main button into presses for the page's own menu items. A
+// click this mod answered on its toggle or close has already been spent on that control, and letting the same press run
+// through the page's dispatch is exactly how one click would press two things. The prefix keeps no state of its own: it
+// asks `ResultsDisplay` the one question, and that question is answered from the *frame's* decision - the same decision
+// this mod's own `Update` makes, made here when the page's dispatch runs first (1.19.46, UI review F1 close-out), so the
+// press that starts on one of this mod's controls is claimed before the page can act on it. Every answer that is not
+// provably ours is `true`, so the game keeps every press that is not this mod's: another page, an inactive page, a window
+// without focus, a released press, and a press older than the bounded fallback all pass.
+//
+// It is registered by the same `PatchAll()` as every other patch in this assembly, and it is safe on builds that do not
+// have the dispatch point at all: Harmony simply never calls it there.
+[HarmonyPatch(typeof(CM_PageBase), "UpdateButtonPress", new Type[0])]
+internal static class SettlementPressPatch
+{
+    [HarmonyPrefix]
+    [HarmonyPriority(Priority.First)]
+    private static bool Prefix(CM_PageBase __instance)
+    {
+        try { return !ResultsDisplay.ShouldSuppressNativePress(__instance); }
+        catch { return true; }
     }
 }

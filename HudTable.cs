@@ -348,9 +348,29 @@ internal static class HudTable
     }
 
     internal static void Draw(PanelGrid grid, float originX, float originY, TableContent content, float opacity = 1f)
+        => Draw(grid, originX, originY, content, opacity, 0, 0, 0f);
+
+    // The settlement board's scrolled repaint.
+    //
+    // `firstRow` is the first *scrollable* row on screen and `visibleRows` the number of rows the plate really
+    // holds; `plateHeight` is that many rows in pixels. The frozen rows (`ResultsScroll.FrozenRows`, the column
+    // header that carries the four player names) are drawn from the table's own head on every frame, the rows
+    // below them are drawn from `firstRow` downwards, and the whole plate is clipped to its own rectangle - so
+    // nothing is drawn below the plate, nothing is drawn beside it, and the button under it is never reached
+    // however tall the table is. A call with no window (`visibleRows == 0`, or a table that fits) is the
+    // historical draw, byte for byte: the settlement board only takes this path when it really overflows.
+    internal static void Draw(PanelGrid grid, float originX, float originY, TableContent content, float opacity,
+        int firstRow, int visibleRows, float plateHeight)
     {
         if (grid == null || grid.Columns == 0 || content == null) return;
         int rows = Math.Min(grid.Rows, content.Rows);
+        // A table that fits, or a caller that asked for no window, is the historical draw; only a board that
+        // really overflows takes the clipped path below.
+        if (visibleRows > 0 && (firstRow > ResultsScroll.FrozenRows || visibleRows < rows))
+        {
+            DrawWindow(grid, originX, originY, content, opacity, firstRow, visibleRows, plateHeight, rows);
+            return;
+        }
         GUIStyle style = Style(Mathf.Max(1, Mathf.RoundToInt(grid.FontPixels)));
         if (style == null) return;
 
@@ -358,31 +378,37 @@ internal static class HudTable
         if (backdrop != null)
         {
             Color previous = GUI.color;
-            // A dark plate so the numbers stay readable over bright geometry, a hairline border so the
-            // board reads as one surface, banding for scanning across a row, and a hairline above each
-            // section. Everything here is a flat tint of the same white texture: no atlas, no state.
             // How heavy the in-level plate is, is the player's setting (`[Layout] PanelOpacity`); the
             // settlement board keeps its own approved value. Both are read here, on every draw, so an edit
             // to the file - or a hot reload - is on screen the next frame with no rebuild.
             float plate = PanelAppearance.Plate(Plugin.PanelOpacity != null ? Plugin.PanelOpacity.Value : float.NaN, content.Kinds != null);
-            GUI.color = content.Kinds != null ? new Color(0.035f, 0.045f, 0.055f, plate * opacity) : new Color(0.04f, 0.05f, 0.06f, plate * opacity);
-            GUI.DrawTexture(new Rect(originX, originY, grid.Width, grid.Height), backdrop);
-            for (int row = 1; content.Kinds != null && row < rows; row += 2)
+            if (content.Kinds != null)
             {
-                GUI.color = new Color(1f, 1f, 1f, ResultsAppearance.RowBandOpacity * opacity);
-                GUI.DrawTexture(new Rect(originX, originY + row * grid.RowHeight, grid.Width, grid.RowHeight), backdrop);
+                SettlementSurface(backdrop, grid, rows, content, originX, originY, plate * opacity);
             }
-            for (int row = 0; row < rows; row++)
+            else
             {
-                if (content.Dividers == null || row >= content.Dividers.Length || !content.Dividers[row]) continue;
-                GUI.color = new Color(1f, 1f, 1f, ResultsAppearance.RuleOpacity * opacity);
-                GUI.DrawTexture(new Rect(originX, originY + row * grid.RowHeight, grid.Width, 1f), backdrop);
+                // The in-level HUD is untouched: its own plate, its banding, its rules and its frame are the
+                // shapes they have always had.
+                GUI.color = new Color(0.04f, 0.05f, 0.06f, plate * opacity);
+                GUI.DrawTexture(new Rect(originX, originY, grid.Width, grid.Height), backdrop);
+                for (int row = 1; row < rows; row += 2)
+                {
+                    GUI.color = new Color(1f, 1f, 1f, ResultsAppearance.RowBandOpacity * opacity);
+                    GUI.DrawTexture(new Rect(originX, originY + row * grid.RowHeight, grid.Width, grid.RowHeight), backdrop);
+                }
+                for (int row = 0; row < rows; row++)
+                {
+                    if (content.Dividers == null || row >= content.Dividers.Length || !content.Dividers[row]) continue;
+                    GUI.color = new Color(1f, 1f, 1f, ResultsAppearance.RuleOpacity * opacity);
+                    GUI.DrawTexture(new Rect(originX, originY + row * grid.RowHeight, grid.Width, 1f), backdrop);
+                }
+                GUI.color = new Color(1f, 1f, 1f, PanelAppearance.Frame(plate) * opacity);
+                GUI.DrawTexture(new Rect(originX, originY, grid.Width, 1f), backdrop);
+                GUI.DrawTexture(new Rect(originX, originY + grid.Height - 1f, grid.Width, 1f), backdrop);
+                GUI.DrawTexture(new Rect(originX, originY, 1f, grid.Height), backdrop);
+                GUI.DrawTexture(new Rect(originX + grid.Width - 1f, originY, 1f, grid.Height), backdrop);
             }
-            GUI.color = new Color(1f, 1f, 1f, (content.Kinds != null ? ResultsAppearance.RuleOpacity : PanelAppearance.Frame(plate)) * opacity);
-            GUI.DrawTexture(new Rect(originX, originY, grid.Width, 1f), backdrop);
-            GUI.DrawTexture(new Rect(originX, originY + grid.Height - 1f, grid.Width, 1f), backdrop);
-            GUI.DrawTexture(new Rect(originX, originY, 1f, grid.Height), backdrop);
-            GUI.DrawTexture(new Rect(originX + grid.Width - 1f, originY, 1f, grid.Height), backdrop);
             GUI.color = previous;
         }
 
@@ -418,6 +444,119 @@ internal static class HudTable
         }
     }
 
+    // The scrolled plate.
+    //
+    // One drawing pass, clipped to the plate's own rectangle: the frozen header row on slot 0, the scrollable
+    // rows from `firstRow` in the slots under it. Every cell is still placed by the grid the table was measured
+    // with (`FieldRect` / `FieldRectAligned`), so the columns do not move when the rows do, and `GUI.BeginClip`
+    // is what makes "nothing outside the table" a fact of the drawing rather than a promise about the numbers.
+    private static void DrawWindow(PanelGrid grid, float originX, float originY, TableContent content, float opacity,
+        int firstRow, int visibleRows, float plateHeight, int rows)
+    {
+        float rowHeight = grid.RowHeight;
+        if (!(rowHeight > 0f)) return;
+        var view = new ScrollViewport(rows, ResultsScroll.FrozenRows, visibleRows, firstRow);
+        float height = plateHeight > 0f ? Mathf.Min(plateHeight, view.Visible * rowHeight) : view.Visible * rowHeight;
+        if (!(height > 0f) || !(grid.Width > 0f)) return;
+        GUIStyle style = Style(Mathf.Max(1, Mathf.RoundToInt(grid.FontPixels)));
+        if (style == null) return;
+        Texture2D backdrop = Backdrop();
+        GUI.BeginClip(new Rect(originX, originY, grid.Width, height));
+        try
+        {
+            float left = 0f, top = 0f;
+            if (backdrop != null)
+            {
+                Color previous = GUI.color;
+                float plate = PanelAppearance.Plate(Plugin.PanelOpacity != null ? Plugin.PanelOpacity.Value : float.NaN, true);
+                GUI.color = ToColor(ResultChromeTheme.Ground, plate * opacity);
+                GUI.DrawTexture(new Rect(left, top, grid.Width, height), backdrop);
+                Color rowBand = ToColor(ResultChromeTheme.GroundRaised, ResultChromeTheme.RowBandShare * plate * opacity);
+                Color sectionBand = ToColor(ResultChromeTheme.GroundRaised, ResultChromeTheme.SectionBandShare * plate * opacity);
+                for (int slot = 0; slot < view.Visible; slot++)
+                {
+                    int row = view.RowAt(slot);
+                    if (row < 0) continue;
+                    bool section = content.Dividers != null && row < content.Dividers.Length && content.Dividers[row];
+                    if (!section && (row & 1) == 0) continue;
+                    GUI.color = section ? sectionBand : rowBand;
+                    GUI.DrawTexture(new Rect(left, top + slot * rowHeight, grid.Width, rowHeight), backdrop);
+                }
+                // The one accent on the surface stays the line the plate ends on, so a scrolled board still ends
+                // the way an unscrolled one does.
+                GUI.color = ToColor(ResultChromeTheme.Accent, 0.55f * plate * opacity);
+                GUI.DrawTexture(new Rect(left, top + height - ResultChromeTheme.FocusRule, grid.Width, ResultChromeTheme.FocusRule), backdrop);
+                GUI.color = previous;
+            }
+            for (int slot = 0; slot < view.Visible; slot++)
+            {
+                int row = view.RowAt(slot);
+                if (row < 0) continue;
+                float rowTop = slot * rowHeight;
+                for (int column = 0; column < grid.Columns; column++)
+                {
+                    string[] fields = content.Cell(row, column);
+                    Color color = content.Colors != null ? content.Colors[row, column] : Color.white;
+                    color.a *= opacity;
+                    style.normal.textColor = color;
+                    style.alignment = PanelAlignmentPolicy.IsRightAligned(content.Kinds != null, grid.IsRightAligned(column))
+                        ? TextAnchor.UpperRight : TextAnchor.UpperLeft;
+                    style.fontStyle = content.Kinds != null && row < content.Kinds.Length &&
+                        (content.Kinds[row] == ImpactRowKind.Score || content.Kinds[row] == ImpactRowKind.PlayerName || content.Kinds[row] == ImpactRowKind.Separator)
+                        ? FontStyle.Bold : FontStyle.Normal;
+                    if (content.FieldSeparator != null)
+                    {
+                        LayoutRect cell = grid.FieldRect(row, column, 0);
+                        GUI.Label(new Rect(left + cell.X, top + rowTop, cell.Width, cell.Height),
+                            string.Join(content.FieldSeparator, fields), style);
+                        continue;
+                    }
+                    for (int field = 0; field < fields.Length; field++)
+                    {
+                        string text = fields[field];
+                        if (string.IsNullOrEmpty(text)) continue;
+                        LayoutRect cell = grid.FieldRectAligned(row, column, fields.Length, field);
+                        GUI.Label(new Rect(left + cell.X, top + rowTop, cell.Width, cell.Height), text, style);
+                    }
+                }
+            }
+        }
+        finally { GUI.EndClip(); }
+    }
+
+    // The settlement board's own surface, and the whole of the redesign: one graphite ground, ivory
+    // figures, one accent. Hierarchy is a step of tone - a raised section band, a quieter row band - and
+    // not a hairline, a border, a gradient or a shadow; the only rule on the surface is the accent line
+    // the board ends on. The in-level HUD never reaches this method.
+    private static void SettlementSurface(Texture2D backdrop, PanelGrid grid, int rows, TableContent content,
+        float originX, float originY, float plate)
+    {
+        GUI.color = ToColor(ResultChromeTheme.Ground, plate);
+        GUI.DrawTexture(new Rect(originX, originY, grid.Width, grid.Height), backdrop);
+        Color rowBand = ToColor(ResultChromeTheme.GroundRaised, ResultChromeTheme.RowBandShare * plate);
+        for (int row = 1; row < rows; row += 2)
+        {
+            GUI.color = rowBand;
+            GUI.DrawTexture(new Rect(originX, originY + row * grid.RowHeight, grid.Width, grid.RowHeight), backdrop);
+        }
+        // A section is a raised band over its whole row, which is what makes the board read as sections of
+        // one surface instead of as a block with lines through it.
+        Color sectionBand = ToColor(ResultChromeTheme.GroundRaised, ResultChromeTheme.SectionBandShare * plate);
+        for (int row = 0; content.Dividers != null && row < rows && row < content.Dividers.Length; row++)
+        {
+            if (!content.Dividers[row]) continue;
+            GUI.color = sectionBand;
+            GUI.DrawTexture(new Rect(originX, originY + row * grid.RowHeight, grid.Width, grid.RowHeight), backdrop);
+        }
+        // The one accent on the surface: the line the board ends on.
+        GUI.color = ToColor(ResultChromeTheme.Accent, 0.55f * plate);
+        GUI.DrawTexture(new Rect(originX, originY + grid.Height - ResultChromeTheme.FocusRule, grid.Width, ResultChromeTheme.FocusRule), backdrop);
+    }
+
+    // A theme token as the tint this renderer draws with: the same float triplets the offline preview and
+    // the headless assertions read, so the picture and the game cannot drift apart.
+    private static Color ToColor(ResultInk ink, float alpha)
+        => new Color(ink.R, ink.G, ink.B, ink.A * (float.IsFinite(alpha) ? Mathf.Clamp01(alpha) : 1f));
     private static Texture2D Backdrop()
     {
         if (_backdrop != null && _backdrop.Pointer != IntPtr.Zero) return _backdrop;

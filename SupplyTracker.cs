@@ -51,10 +51,26 @@ internal static class SupplyTracker
     private static readonly SupplyGiveLedger Gives = new SupplyGiveLedger();
     private static readonly Dictionary<ulong, SNet_Player> PackUsers = new Dictionary<ulong, SNet_Player>();
 
+    // 1.19.41: the medical pack count. A pack is consumed by the native *application* bracket - `ApplyPack()`
+    // for a human, `ApplyPackBot(owner, receiver, item)` for a bot - and never by a heal arriving.
+    // `ReceiveAddHealth` cannot tell a health pack from a syringe, a disinfection pack or another mod's
+    // giver-sourced heal, which is why the recorded expedition counted 1319 "medical packs" against ~1114
+    // units of health that could possibly have been lost. Heals keep their give/receive efficiency
+    // measurement below; only the bracket count is a pack.
+    private static readonly PackApplyLedger Packs = new PackApplyLedger();
+    internal static PackApplyLedger Applications => Packs;
+    // Every player a bracket named - the pack's user and each receiver - so a lookup can be turned back into the
+    // row it belongs to at the end of the bracket. Never used to pick a stand-in: a lookup that is not here is a
+    // row this machine does not know.
+    private static readonly Dictionary<ulong, SNet_Player> PackPlayers = new Dictionary<ulong, SNet_Player>();
+    // The one credit rule, with its own record of which applications it already paid out.
+    private static readonly MedicalPackCredit Credit = new MedicalPackCredit();
+
+
     [ThreadStatic] private static AmmoScope _ammo;
     private static readonly HashSet<string> Logged = new HashSet<string>();
 
-    internal static void Reset() { _ammo = null; Gives.Clear(); PackUsers.Clear(); Logged.Clear(); }
+    internal static void Reset() { _ammo = null; Gives.Clear(); PackUsers.Clear(); PackPlayers.Clear(); Credit.Clear(); Logged.Clear(); Packs.Clear(); }
 
     // Every give the pack user's own machine makes, in the order it makes them. This is the only place the
     // ammo path still knows who the pack belonged to.
@@ -77,6 +93,117 @@ internal static class SupplyTracker
             Note("ammo-give", $"an ammo give was recorded on the pack user's machine: giver={giverOwner.Lookup:X}, receiver={receiverOwner.Lookup:X}, shares={standard:0.###}/{special:0.###}/{tool:0.###}; the replicated pickup names only the receiver, so this pair is what will name the giver.");
         }
         catch (Exception error) { Note("ammo-give-error", "supply give capture skipped: " + error.Message); }
+    }
+
+    // 1.19.41: the native application bracket. `owner` is the pack user on this machine (`ApplyPack()` reads it
+    // off the weapon instance, `ApplyPackBot(owner, receiver, item)` carries it as the first argument), and
+    // `bot` says which entry point opened it. One bracket, however many receivers it heals, is one pack.
+    // A bracket whose user could not be read is still opened and still *returned*: the finalizer pops exactly the
+    // bracket the prefix pushed, so an unreadable owner can never leave a stale window open that the next heal -
+    // or the next application - would be counted inside. It closes with no pack for any row.
+    internal static PackBracket BeginApply(PlayerAgent owner, bool bot)
+    {
+        try
+        {
+            if (GameStateManager.CurrentStateName != eGameStateName.InLevel) return null;
+            SNet_Player user = owner != null ? owner.Owner : null;
+            if (user == null)
+            {
+                Note("pack-apply-unowned", "a pack was applied and the user could not be read; the bracket is still opened and closed, and it is credited as a pack of no row.");
+                return Packs.Begin(0UL, bot);
+            }
+            if (CombatTracker.ShouldTrack(user)) PackUsers[user.Lookup] = user;
+            PackPlayers[user.Lookup] = user;
+            Note("pack-apply", "the pack application bracket fired for the first time: a pack is counted by this bracket, never by the heals that follow it.");
+            return Packs.Begin(user.Lookup, bot);
+        }
+        catch (Exception error) { Note("pack-apply-begin", "pack application skipped: " + error.Message); return null; }
+    }
+
+    // One `PlayerAgent.GiveHealth(giverAgent, amountRel)` inside the bracket. The receiver is the agent the call
+    // landed on, so the same receiver twice inside one application is one give, and one pack stays one pack
+    // however many teammates it heals. Two things are never evidence for this pack: a give whose *named* giver is
+    // somebody else (rejected and counted as a mismatch), and a give that arrives with no bracket open at all
+    // (recorded as an unbracketed heal - a syringe or another mod - never as a pack).
+    internal static void NoteHealthGive(PackBracket bracket, PlayerAgent receiver, PlayerAgent giver, float amountRel)
+    {
+        try
+        {
+            SNet_Player receiverOwner = receiver != null ? receiver.Owner : null;
+            if (receiverOwner == null) return;
+            if (bracket == null)
+            {
+                if (Packs.NoteUnbracketedGive(receiverOwner.Lookup, amountRel))
+                    Note("heal-without-application", "a giver-sourced heal arrived with no pack application open; it is measured for efficiency and never counted as a health pack.");
+                return;
+            }
+            SNet_Player giverOwner = giver != null ? giver.Owner : null;
+            // A named giver that is not the pack's user means this heal did not come from this application.
+            bool giverAgrees = giverOwner == null || bracket.Owner == 0UL || giverOwner.Lookup == bracket.Owner;
+            if (!Packs.NoteGive(bracket, receiverOwner.Lookup, amountRel, giverAgrees))
+            {
+                if (!giverAgrees) Note("pack-give-mismatch", "a give named a giver other than the pack's user, so it is not counted as this pack's health.");
+                return;
+            }
+            // The receiver's own row is what the pack is credited to when the bracket closes.
+            PackPlayers[receiverOwner.Lookup] = receiverOwner;
+        }
+        catch (Exception error) { Note("pack-give", "pack give skipped: " + error.Message); }
+    }
+
+    // Disinfection shares the medical slot and its denominator and is not a health pack. It is recorded as an
+    // exclusion, so the exclusion is a number in the ledger instead of a comment beside the patch.
+    internal static void NoteExcludedGive(PlayerAgent receiver, float amountRel)
+    {
+        try
+        {
+            SNet_Player receiverOwner = receiver != null ? receiver.Owner : null;
+            Packs.NoteExcludedGive(receiverOwner != null ? receiverOwner.Lookup : 0UL, amountRel);
+            Note("pack-excluded", "a disinfection give reached the pack ledger: it is counted as an excluded give and never as a health pack.");
+        }
+        catch (Exception) { }
+    }
+
+    // The bracket closes. This is the production write: one successful application hands each proven receiver
+    // exactly one medical pack on the receiver's own row, through `MedicalPackCredit` - the same function the test
+    // suite exercises - and credits the player who applied it nothing. A→B therefore reads A = 0 / B = 1. The
+    // item itself was consumed once, which is `Packs`; a pack that healed three teammates is one pack used and
+    // three packs received, and the two figures are kept apart on purpose.
+    internal static void EndApply(PackBracket bracket, Exception error)
+    {
+        if (bracket == null) return;
+        try
+        {
+            PackApplyResult result = Packs.End(bracket, error);
+            if (result.Outcome != PackApplyOutcome.Applied)
+            {
+                Note("pack-apply-" + result.Outcome, "a pack application ended with outcome=" + result.Outcome
+                    + (!ReferenceEquals(error, null) ? " (native error)" : string.Empty) + "; gives=" + result.Gives
+                    + ", mismatches=" + result.Mismatches
+                    + "; the pack is not counted and no efficiency is fabricated for it.");
+                return;
+            }
+            int credited = Credit.Apply(result, CandidateFor);
+            Note("pack-apply-credited", "one pack application: gives=" + result.Gives + ", creditedReceivers=" + credited
+                + ", skippedReceivers=" + Credit.LastSkipped + ", mismatchedGives=" + result.Mismatches
+                + ", duplicates=" + result.Duplicates + ", intendedRel=" + result.IntendedRel.ToString("0.####")
+                + "; the pack's user is credited nothing and each receiver's own row gets one pack.");
+        }
+        catch (Exception captureError) { Note("pack-apply-end", "pack application result skipped: " + captureError.Message); }
+    }
+
+    // The row a proven receiver's pack is written to. The bracket already proved the receiver, so this only has to
+    // answer two questions: is there a row for that lookup, and is the lookup still a slotted player? It is
+    // deliberately not `ShouldTrack` - on a client that answers true for its own row only, which is why a client's
+    // real application to a remote teammate was dropped instead of shown on that teammate's row. Nothing here
+    // publishes a figure, attributes one to another machine, or credits the pack's user as a stand-in.
+    private static MedicalRowCandidate CandidateFor(ulong lookup)
+    {
+        if (lookup == 0UL || !PackPlayers.TryGetValue(lookup, out SNet_Player owner)) return default;
+        ImpactCounters row = null;
+        try { row = CombatTracker.ObservePlayer(owner).Impact; }
+        catch (Exception) { row = null; }
+        return new MedicalRowCandidate { Known = row != null, InSlot = owner.IsInSlot, Row = row };
     }
 
     internal static AmmoScope BeginAmmo(PlayerAgent receiver, PlayerAgent giver)
@@ -251,17 +378,15 @@ internal static class SupplyTracker
         {
             var use = new SupplyUse();
             use.AddChange(change.Before, receiver.Health, change.Intended);
+            // 1.19.41: a giver-sourced heal keeps its give/receive efficiency measurement - the intended units,
+            // what actually moved, and the overflow that lowers the ratio - and nothing else. It is no longer
+            // counted as a pack of any kind: `ReceiveAddHealth` is the channel medkits, syringes, disinfection
+            // and other mods' heals all travel on, so calling it a health pack was the fabrication that turned
+            // one expedition into 1319 "medical packs" against ~1114 units of health that could be lost at all.
+            // The pack count comes from the native application bracket in `EndApply`.
             Record(change.Giver, use, "medical");
-            if (!CombatTracker.ShouldTrack(change.Receiver)) return;
-            // 1.19.39: the kind of this heal is what the packet's `source` said, not who is measuring it. 1.19.35 read
-            // "a player this machine tracks" into the kind, and that conflation is provable: `ShouldTrack` is
-            // `isInSlot && (isMaster || isLocal)`, so on a client it is true for its own row only - a teammate's pack
-            // really does resolve to a `PlayerAgent`, and was still counted as a pack of no name there while the host
-            // called the same heal a 血包. One event had two answers. `SourceIsPlayer` is decided where the source is
-            // read, so the kind now travels with the event; the tracked-player test keeps its own job - where the
-            // efficiency is credited, which is `Record` above, and whose row this machine may touch at all.
-            var counters = CombatTracker.ObservePlayer(change.Receiver).Impact;
-            use.RecordHealthConsumption(counters, change.SourceIsPlayer);
+            if (change.SourceIsPlayer && !Packs.Observed)
+                Note("heal-without-application", "a giver-sourced heal reached this machine with no pack application bracket observed; it is measured for efficiency and never counted as a health pack.");
         }
         catch (Exception error) { Note("health-after", "medical supply skipped: " + error.Message); }
     }
@@ -294,4 +419,9 @@ internal static class SupplyTracker
     {
         if (Logged.Add(key)) Plugin.Logger?.LogInfo("[DIAG] " + message);
     }
+
+    // The reflection-installed pack hooks report their failures through the same once-per-key channel, so a
+    // broken entry point is one diagnostic line and never a per-frame error.
+    internal static void NoteDiagnostic(string key, Exception error)
+        => Note(key, "a native pack hook was skipped: " + (error != null ? error.Message : "unknown error"));
 }

@@ -382,10 +382,15 @@ internal static class Release11923Scenarios
         check(plugin.Contains("ScoringFileLocation.Resolve(persistentDataPath, PluginDirectory())")
             && plugin.Contains("ResultsSaver.Initialize();"),
             "the plugin resolves the scoring file through the stable-location policy and prepares the archive root at load");
-        check(info.Contains("Version = \"1.19.40\""),
-            "the version carrier says 1.19.40");
-        check(manifest.Contains("\"version_number\": \"1.19.40\""),
-            "the Thunderstore manifest carries version_number 1.19.40");
+        // 1.19.49: one number covers the plugin, the manifest and the docs, so the carrier is read and compared with the
+        // manifest rather than frozen at this round's own value.
+        const string carrierMark = "internal const string Version = \"";
+        int carrierAt = info.IndexOf(carrierMark);
+        string carrier = carrierAt < 0 ? string.Empty
+            : info.Substring(carrierAt + carrierMark.Length,
+                info.IndexOf('"', carrierAt + carrierMark.Length) - carrierAt - carrierMark.Length);
+        check(carrier.Length > 0 && manifest.Contains("\"version_number\": \"" + carrier + "\""),
+            "the version carrier and the Thunderstore manifest carry one number: " + carrier);
         check(!plugin.Contains("ScoringFiles.Resolve(PluginDirectory())"),
             "the old scoring resolution from the plugin folder is gone");
         Console.WriteLine("WIRING: RELEASE_11923_SETTLEMENT_RECORDS_SURVIVE (static source check; not a runtime behaviour test)");

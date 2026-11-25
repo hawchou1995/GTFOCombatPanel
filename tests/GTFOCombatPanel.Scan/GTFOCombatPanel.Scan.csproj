@@ -9,5 +9,6 @@
   <ItemGroup>
     <Compile Include="..\..\RemoteScanPatches.cs" Link="RemoteScanPatches.cs" />
     <Compile Include="..\..\ScanTagLedger.cs" Link="ScanTagLedger.cs" />
+    <Compile Include="..\..\ScannerCooldown.cs" Link="ScannerCooldown.cs" />
   </ItemGroup>
 </Project>

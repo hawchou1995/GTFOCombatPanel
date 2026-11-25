@@ -415,6 +415,44 @@ public readonly struct ResultActionBounds
     { Bounds = bounds; IsProtectedPageText = protectedPageText; }
 }
 
+// The horizontal column a result page's board stands in, as the page measured it.
+//
+// 1.19.51: the success page's band used to be shortened by *any* interaction the scan measured below the
+// completion section, whatever its horizontal extent. On the recorded 1080p success page the only thing in
+// that gap was the left-hand booster/artifact notice (canvas x ~217..720), which stands entirely beside the
+// board (x ~795..1125): the table can never be painted over it, yet its upper edge was taken as the page's
+// lower wall. The board was then fitted into 249..439 (190 px) while the page really offered 249..966
+// (717 px) down to its own waiting line, kept its 30 rows at a 12 px glyph, and the plate that clips it held
+// eight of them - the incomplete panel a player photographed at 1080p while the 1K/2K failure pages were fine.
+//
+// A control that does not reach the column is still a collision the scan keeps: `OverlapsBoard` is asked
+// against the board's own rectangle on every repaint, so a control that really is under the board defers the
+// frame instead of being covered. What a column decides here is only which measured edge may end the band.
+//
+// `Known == false` is the fail-closed default and answers "every rectangle reaches": a page whose board
+// column could not be read keeps exactly the band it had before this rule existed.
+public readonly struct LayoutColumn
+{
+    public readonly float Left, Right;
+    public readonly bool Known;
+
+    public LayoutColumn(float left, float right)
+    {
+        Left = left; Right = right;
+        Known = float.IsFinite(left) && float.IsFinite(right) && right > left + 0.5f;
+    }
+
+    public static LayoutColumn None { get { return default; } }
+
+    // Whether a control can be in the column's way at all: the two horizontal extents share at least half a
+    // pixel of column - the same tolerance the vertical comparisons in this file already use.
+    public bool Reaches(LayoutRect rect)
+    {
+        if (!Known) return true;
+        return rect.Right > Left + 0.5f && Right > rect.X + 0.5f;
+    }
+}
+
 public readonly struct ResultInteractionStrip
 {
     public readonly float BoardTop;
@@ -425,10 +463,15 @@ public readonly struct ResultInteractionStrip
     // `FooterTop`; on every other page the two are the same number whenever the text is not the highest wall.
     public readonly float PressableTop;
     public readonly int FooterActionCount;
+    // How many of the scan's measured controls the board's column left out of this strip (1.19.51): a control
+    // that stands beside the board cannot be covered by it, so its edge neither raised `BoardTop` nor ended
+    // the band. Reported so a log line can say why a band did not end at the page's lower-left widget.
+    public readonly int BeyondColumn;
     public bool HasFooter { get { return float.IsFinite(FooterTop); } }
 
-    public ResultInteractionStrip(float boardTop, float footerTop, int footerActionCount, float pressableTop = float.NaN)
-    { BoardTop = boardTop; FooterTop = footerTop; FooterActionCount = footerActionCount; PressableTop = pressableTop; }
+    public ResultInteractionStrip(float boardTop, float footerTop, int footerActionCount, float pressableTop = float.NaN,
+        int beyondColumn = 0)
+    { BoardTop = boardTop; FooterTop = footerTop; FooterActionCount = footerActionCount; PressableTop = pressableTop; BeyondColumn = beyondColumn; }
 }
 
 // The trusted title/completion edge divides unrelated controls from the strip the board may use. Controls
@@ -437,12 +480,27 @@ public readonly struct ResultInteractionStrip
 // interaction scan still feeds OverlapsBoard independently before every draw.
 public static class ResultInteractionStripPolicy
 {
+    // `column` is the horizontal extent the settlement board occupies on this page (`LayoutColumn`). A control
+    // that does not reach it cannot be painted over by the board, so neither its own bottom (which would push the
+    // strip's start down) nor its own top (which would end the band) is a wall here. An unknown column - the
+    // fail-closed default - fills every rectangle, so a page whose board column was not read answers exactly the
+    // band it answered before this parameter existed. Collision rejection is untouched: `OverlapsBoard` is still
+    // asked against the board's own rectangle on every repaint, with its own horizontal test.
     public static bool TryResolve(float anchorBottom, float gap, IReadOnlyList<ResultActionBounds> controls,
-        out ResultInteractionStrip strip)
+        out ResultInteractionStrip strip, LayoutColumn column = default)
     {
         strip = default;
         if (!float.IsFinite(anchorBottom) || anchorBottom < 0f || !float.IsFinite(gap) || gap < 0f || controls == null)
             return false;
+
+        // Counted before anything is decided, so the figure describes the scan rather than one pass of the loop.
+        int beyondColumn = 0;
+        for (int index = 0; index < controls.Count; index++)
+        {
+            LayoutRect measured = controls[index].Bounds;
+            if (!Valid(measured)) return false;
+            if (!column.Reaches(measured)) beyondColumn++;
+        }
 
         float top = anchorBottom + gap;
         for (int pass = 0; pass <= controls.Count; pass++)
@@ -452,6 +510,7 @@ public static class ResultInteractionStripPolicy
             {
                 LayoutRect rect = controls[index].Bounds;
                 if (!Valid(rect)) return false;
+                if (!column.Reaches(rect)) continue;
                 if (rect.Bottom <= anchorBottom || rect.Y >= top) continue;
                 float nextTop = rect.Bottom + gap;
                 if (nextTop > top + 0.5f) { top = nextTop; raised = true; }
@@ -465,6 +524,7 @@ public static class ResultInteractionStripPolicy
         {
             ResultActionBounds action = controls[index];
             LayoutRect rect = action.Bounds;
+            if (!column.Reaches(rect)) continue;
             if (rect.Y < top - 0.5f || rect.Bottom <= top) continue;
             footerTop = ResultsRegion.HighestTop(rect.Y, footerTop);
             if (!action.IsProtectedPageText)
@@ -473,7 +533,7 @@ public static class ResultInteractionStripPolicy
                 pressableTop = ResultsRegion.HighestTop(rect.Y, pressableTop);
             }
         }
-        strip = new ResultInteractionStrip(top, footerTop, footerActionCount, pressableTop);
+        strip = new ResultInteractionStrip(top, footerTop, footerActionCount, pressableTop, beyondColumn);
         return float.IsFinite(top);
     }
 
@@ -1083,6 +1143,71 @@ public readonly struct ResultTableSize
     public ResultTableSize(float width, float height) { Width = width; Height = height; }
     public static ResultTableSize None { get { return new ResultTableSize(0f, 0f); } }
     public bool Usable => float.IsFinite(Width) && float.IsFinite(Height) && Width > 0f && Height > 0f;
+}
+
+// 1.19.52 (F5): whether the success page's board belongs in the free band *below* the page's measured actions.
+//
+// The rule this answers: a control that really stands in the board's column may not be covered, but it is also not the
+// end of the page. When the strip above it cannot show the whole table and the free band below it shows strictly more
+// rows at the same glyph, the board belongs below rather than squeezed into the short strip with the player left to
+// find a wheel. The decision is made from two measured heights, the row pitch and the header - never from a role, a
+// name, a resolution or a control's identity - and it never forces a table into a band that cannot hold it: a page
+// whose bands are both too short keeps its rows on the wheel, exactly as before.
+public static class ResultSuccessBandChoice
+{
+    // How many rows a band of this height shows once its header has been reserved. Zero for a height or a row pitch
+    // nobody could read, so an unmeasured band never wins the comparison.
+    public static int RowsIn(float height, float header, float rowHeight)
+    {
+        if (!float.IsFinite(height) || !float.IsFinite(rowHeight) || rowHeight <= 0f) return 0;
+        float room = height - (float.IsFinite(header) && header > 0f ? header : 0f);
+        if (!(room > 0f)) return 0;
+        return (int)Math.Floor(room / rowHeight + 0.0001f);
+    }
+
+    // Whether the band below the page's actions is the better one: the strip above cannot show the whole table, and
+    // the band below shows strictly more rows of it at the same glyph.
+    public static bool PrefersBelow(float upperHeight, float belowHeight, int rows, float header, float rowHeight,
+        out int rowsAbove, out int rowsBelow)
+    {
+        rowsAbove = RowsIn(upperHeight, header, rowHeight);
+        rowsBelow = RowsIn(belowHeight, header, rowHeight);
+        if (rows < 1) return false;
+        if (!float.IsFinite(belowHeight) || !(belowHeight > 0f)) return false;
+        // The strip above already shows the whole table: nothing to gain, and the strip is the page's own answer.
+        if (rowsAbove >= rows) return false;
+        return rowsBelow > rowsAbove;
+    }
+}
+
+// 1.19.53 (F1, the remaining half): the band anchor the success page is measured from, from the two readings the page
+// already has of the same section.
+//
+// `IconRowBottom` answers "where does the section end" and, for a part whose child set is not a complete measurement, it
+// answers with that part's *container* (the recorded page: own=198). The band therefore hung from 233+16=249 while the
+// part that had really drawn six children reached 333 - the board's top edge and its plate sat on captions the page had
+// already painted, and the per-repaint check (which knows the drawn floor) then refused that very band for ever.
+//
+// This is the one place the two are combined, so the first placement, the held board and the fail-open band cannot
+// disagree: `max(iconRow, drawnFloor)` when the row was measured *this frame*, otherwise exactly the reading the caller
+// had. A last-trusted value or an unmeasured row is never dressed up as a current measurement, a NaN drawn floor
+// contributes nothing, and the answer never rises above the row's own edge on its own.
+public static class ResultSuccessBandAnchor
+{
+    // `current` is the caller's own answer to "was the row measured this frame". `fromDrawnFloor` tells a log line (and
+    // a regression) which of the two numbers won.
+    public static bool Resolve(bool current, float iconRow, float drawnFloor, out float anchor, out bool fromDrawnFloor)
+    {
+        anchor = iconRow;
+        fromDrawnFloor = false;
+        if (!current || !float.IsFinite(iconRow)) return false;
+        if (float.IsFinite(drawnFloor) && drawnFloor > iconRow + 0.5f)
+        {
+            anchor = drawnFloor;
+            fromDrawnFloor = true;
+        }
+        return true;
+    }
 }
 
 public static class ResultsFontGrowth

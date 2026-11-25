@@ -71,6 +71,27 @@ public static class ResultReportPolicy
     }
 }
 
+// 1.19.49: the press answers only for the lines it owes.
+//
+// `OncePerPage`'s forced exception exists for the one line a press is entitled to: the frame that owes an answer ends with
+// either "board drawn" or a refusal naming the real missing fact. That exception is handed to every call site as a pair of
+// arguments, so a diagnostic that merely describes the page - the vanilla block that carries a control, the block that is
+// the page root - was re-printed on every press as well. The recorded 2026-11-23 settlement page is what that costs: `the
+// vanilla block 'artifact summary' holds a control the player can press...` (268 B) was written fourteen times, once for each
+// F8 press-and-release of that page, for 3,766 B of a line that had not changed. Nothing about the F8 answer itself is touched
+// here, and no other call site changes: this is the strict answer, used where a line describes the page rather than answering
+// a press.
+public static class ResultReportPolicyStrict
+{
+    // Once per page per reason, with no exception at all: a press never re-arms it, and a repaint never repeats it.
+    public static bool OncePerPage(HashSet<string> reports, string key)
+    {
+        if (reports != null && reports.Contains(key)) return false;
+        if (reports != null) reports.Add(key);
+        return true;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Which side of the squad the settlement page is running on
 // ---------------------------------------------------------------------------------------------------
@@ -361,6 +382,14 @@ public static class ResultFooterProvenance
             : wall.Measured ? ResultFooterSource.InteractiveBand
             : ResultFooterSource.None;
 
+    // 1.19.60 (independent review F1): may this lower wall stand in for a *final* edge? Only a control the page really
+    // measured may: the named control the player can press, or the drawn band of the page's own interactions. `None` is a
+    // strip that ran to the foot of the window, the client's fixed page geometry is a statement about the screen rather
+    // than about what the page drew, and a fail-open screen safe area is the fallback's own invention - none of the three
+    // is evidence that this page's lower edge has stopped moving, so none of them may be called final.
+    public static bool MeasuredLowerWall(ResultFooterSource source)
+        => source == ResultFooterSource.NamedControl || source == ResultFooterSource.InteractiveBand;
+
     public static string LobbyWall(ResultsRegion.LobbyEdgeReading wall) => LobbyWall(Of(wall), wall.Top, wall.Measured);
 
     // The button's own upper edge when there is a button to name, and otherwise the wall the strip was really built
@@ -384,5 +413,341 @@ public static class ResultFooterProvenance
             case ResultFooterSource.ScreenSafeArea: return "fail-open-screen-safe-area";
             default: return "none";
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 1.19.55: the board may enter before the page has proven its final boundary
+// ---------------------------------------------------------------------------------------------------
+//
+// The recorded 2026-11-23 session never showed the success board on its own: every page needed F8 or a second look, because
+// the only way past the reveal gate was a *proven* boundary and a host success page whose return button the page never
+// made visible can never prove one. The player's own contract is narrower than that gate: as soon as the page is live and
+// this machine holds real settlement data, a readable table may stand - drawn from the page's own measured completion edge,
+// *non-interactive* (no wheel, no press) and without touching the game's own blocks - and it may be replaced by the mature
+// board the moment the page's own boundary is proven. Nothing here claims the page settled: `Ready`/`Proven` stay the
+// strict path's own words, and no timeout, frame count or empty scan is turned into one.
+//
+//   room     the strip the page itself measured this frame, from its completion section down to its measured foot. It is
+//            the same `ResultsSafeArea` the strict path uses, so the early board can never stand outside it.
+//   floor    the height a table of this row count really draws at (`ResultsFontGrowth.DrawableBoardHeight`). A strip that
+//            cannot hold it is not a place for any board, early or mature.
+//   overlap  an active control the scan can see reaching the placed plate. That refusal stays absolute: the early board
+//            never covers something the player can press.
+public static class ResultEarlyBoardPolicy
+{
+    // The one answer this policy gives. `localData` is this machine's own retained roster (the board has something true to
+    // print), `completionMeasured` is the page's own upper edge read this frame, `scanComplete` is the whole interaction
+    // scan having seen the page, and `overlapsControl` is the refusal that no mode may pass.
+    //
+    // 1.19.60 (the recorded 2026-11-24 client success page): `hostProven` and `boundsFinal` are the pair that answers
+    // the question this policy used to leave out - *is the strip the early board is fitted into the one the mature board
+    // will be fitted into?* On a client page it was not. The page's completion section is still revealing itself when
+    // the early board enters, so the strip was measured from a moving edge: the recording placed the table into a
+    // 626 px strip at 12 px and, once the reveal had drawn the captions its layout does not include, re-fitted it into
+    // a 534 px strip at 10 px, 123 px lower - the "jump and the type got smaller" the player reported. The two edges
+    // of that page only stop moving when the page's own reveal has answered, so a page without the host's privilege
+    // now requires `boundsFinal`. Nothing here counts frames, spends a budget or caps the glyph: the strip is the
+    // page's final one, so the first board and the mature board are the same table at the same size, and the only thing
+    // the mature placement can still do is grow it.
+    //
+    // `hostProven` is a *positive* reading of the host flag, not `!client`. 1.19.60 (independent review F1): the role
+    // this page runs as is answered by `ResultPageRolePolicy.Unreadable` when the native flag throws, and that value is
+    // deliberately the host's *measuring* path - a page whose role nobody could read must measure and refuse rather than
+    // hand out a client's fixed safe area. It must not inherit the host's early-display privilege as well: an unreadable
+    // role gets the stricter answer below, exactly as a client does, and keeps its board until its own bounds are final.
+    // A proven host keeps the 1.19.55 behaviour unchanged (its strip already hangs from the button it can read), and a
+    // page that never proves its own edges still gets its board the moment the ledger answers - the route is the same,
+    // only the measurement it is handed is a final one.
+    public static bool Allows(bool localData, bool completionMeasured, bool scanComplete, bool overlapsControl,
+        float room, float floor, bool hostProven, bool boundsFinal)
+    {
+        if (!localData || !completionMeasured || !scanComplete || overlapsControl) return false;
+        if (!float.IsFinite(room) || !float.IsFinite(floor) || !(floor > 0f)) return false;
+        if (room + 0.5f < floor) return false;
+        return hostProven || boundsFinal;
+    }
+
+    // An early board is a *picture* of the settlement, not a control surface: a press belongs to whatever the game drew
+    // under the pointer. The wheel is a different question and it is asked separately (`_scrollValid`): a picture whose
+    // table overflows is still a table the player has to be able to read to its last row.
+    public static bool Interactive(bool early) => !early;
+    // The game's own blocks make way for a board that is really on the page - early or mature.
+    //
+    // 1.19.59: this used to answer `!early && placed`, i.e. an early board put *nothing* away, and the recorded success
+    // page never matured (`nativeFooterVisible=false` for the whole page), so the red artifact block and the four
+    // prisoner cards stayed on the screen under a table that was already drawn - the defect the player reported as
+    // "1.19.40 的视觉替换没了". The two questions are now separated instead of being traded against each other:
+    //   * `HidesVanilla` says the page's own blocks make way, for any board that is painted;
+    //   * the *kind* of making way is the caller's (`ApplyVanillaBlocks(..., visualOnly: early)`), and an early board
+    //     may only switch the block's drawing off - never move it and never deactivate it - so every control the page
+    //     hung inside it keeps answering, and the page's own wheel and presses stay the page's.
+    public static bool HidesVanilla(bool early, bool placed) => placed;
+
+    // 1.19.57 (review of 1.19.56 D): a standing early board is *kept* while the page has not handed over what the mature
+    // board still needs. `Refresh` used to answer every re-measure of the same page with `ResetPlacement()` and
+    // `RestoreHidden()`, which threw the grid that was on the screen away before the page was read again - so a page that
+    // never proved its own footer lost and regained the table on the retry cadence, and `_scrollVisible`/`_scrollPlate`
+    // described a board that was no longer on the page for that frame. Keeping it is not a claim about the page: the
+    // measurement still runs every retry, and the moment it really places the mature board the same call overwrites the
+    // early one exactly once (`_earlyBoard` is written by that same measurement).
+    //
+    // `samePage` is the pointer the standing board was placed for against the page this repaint really holds, so a new
+    // settlement on the same reused page object is still a new screen and starts from nothing.
+    public static bool KeepsStanding(bool early, bool placed, bool samePage, bool flavourMatches, bool pageLive,
+        bool gridReady, bool contentReady)
+        => early && placed && samePage && flavourMatches && pageLive && gridReady && contentReady;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 1.19.55: which part of a vanilla block may be put away
+// ---------------------------------------------------------------------------------------------------
+//
+// `CM_Item` is not by itself a control the player can press: the result pages hang unregistered `CM_Item` components inside
+// their presentational blocks (an artifact summary entry, a decorative row), and treating every one of them as an action is
+// what left `artifact summary` sitting on the page although the player had asked for it to be hidden (recorded lines
+// 7442/13753/20050/24656). The question this policy answers is the one the hide path really means: does this subtree hold an
+// action *the page can dispatch to* - `registered` in `CM_PageBase.m_allItems` - or one that can take the pointer this moment
+// (`activeInHierarchy`)? Everything else is a decoration belonging to the block, and a block whose only `CM_Item`s are
+// decorations may be put away exactly as it always was.
+//
+// A mixed subtree is not one question but two: the branches that carry a live action stay, and the branches that carry none
+// are put away, so the player's own setting is honoured without taking a button off the page. `Nothing` is the honest
+// answer for a block whose whole visual body carries an action: it is left exactly where the game put it.
+public enum VanillaHidePlan
+{
+    Nothing = 0,        // the block itself is still on the page, unchanged
+    WholeBlock = 1,     // no live action anywhere in it: the block is put away as before (moved off, switched off)
+    SafeBranches = 2,   // a mixed tree: only the branches with no live action are put away
+    // 1.19.59: the parts this build may not move - a branch that really carries a `Button`, a subtree it cannot read, a
+    // block the page hangs one of its own controls inside - but whose drawing must still make way, because the player
+    // asked for this block to be replaced and the board is already painted over it. Nothing is moved, nothing is
+    // deactivated and no press is taken away: the block's CanvasGroup is switched to zero alpha, which is the one
+    // suppression that leaves every GameObject, every collider and every event handler exactly where the page put them.
+    VisualOnly = 3
+}
+
+public static class ResultVanillaHidePolicy
+{
+    // One `CM_Item` seen inside the block.
+    public static bool IsLiveAction(bool activeInHierarchy, bool registered) => activeInHierarchy || registered;
+
+    // The plan for one block, from the counts the hide path measured: how many `CM_Item`s live in it, how many of those are
+    // live actions, and how many of its own child branches really contain a live action.
+    public static VanillaHidePlan Plan(int controls, int liveActions, int branchesWithAction)
+    {
+        if (controls <= 0) return VanillaHidePlan.WholeBlock;
+        if (liveActions <= 0) return VanillaHidePlan.WholeBlock;
+        return branchesWithAction > 0 ? VanillaHidePlan.SafeBranches : VanillaHidePlan.Nothing;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 1.19.56 (A): one classifier for both halves of the same question
+// ---------------------------------------------------------------------------------------------------
+//
+// The scan asks "is this a wall the board must never cover" and the hide asks "may this be put away". 1.19.55 answered
+// those two questions with two different pieces of code, and that is how a decoration could be *too dangerous to hide*
+// (so the player's switch was ignored and the red-crystal prompt stayed) while still being counted as a wall (so the
+// board was never drawn, or was driven into a false band). Both now ask the same three-way answer, from facts the page
+// itself provides:
+//
+//   Action   a `UnityEngine.UI.Button` anywhere in the subtree, or a `CM_Item` the page actually dispatches to
+//            (`CM_PageBase.m_allItems`). Never hidden, always a wall.
+//   Visual   a Renderer/CanvasRenderer - the block's own text, plate or icon - with no Button below it. Inside one of the
+//            page's *known* decoration blocks it is a decoration: hideable, and not a wall. Outside them a `CM_Item` that
+//            is switched on is still treated as a wall (the 1.19.54 fail-safe): this release does not decide by itself
+//            that a control the page registered elsewhere is decoration.
+//   Unknown  an entry this build could not describe. It is a wall and it is never hidden - the fail-safe answer both
+//            paths already gave.
+//
+// "Active" alone is deliberately not an action: the recorded page hung *active* decorative `CM_Item`s in its artifact
+// block, and calling every active one a button is exactly what made the block impossible to hide. Registration is the
+// page's own statement; a Button is the player's own control. Nothing here looks at text, at a coordinate or at a
+// language.
+public readonly struct VanillaNodeFacts
+{
+    public readonly bool InsideDecorationBlock;
+    public readonly bool ContainerRoot;
+    public readonly bool Registered;
+    public readonly bool Active;
+    public readonly bool HasButton;
+    public readonly bool VisualOnly;
+
+    public VanillaNodeFacts(bool insideDecorationBlock, bool containerRoot, bool registered, bool active,
+        bool hasButton, bool visualOnly)
+    {
+        InsideDecorationBlock = insideDecorationBlock; ContainerRoot = containerRoot;
+        Registered = registered; Active = active; HasButton = hasButton; VisualOnly = visualOnly;
+    }
+}
+
+public enum VanillaNodeKind
+{
+    Action = 0,   // a control the player can press: protected, always a wall
+    Visual = 1,   // the page's own drawing: hideable, never a wall when it lives in a decoration block
+    Unknown = 2   // this build cannot describe it: a wall, and never hidden
+}
+
+public static class ResultVanillaClassify
+{
+    // 1.19.59: `Registered` no longer outranks the block a node lives in. The recorded pages hang *registered*
+    // `CM_Item`s inside their own presentational blocks - the artifact summary's `i` and its `1.0` line are the ones the
+    // player named - and `CM_PageBase.m_allItems` is a list of everything the page can draw a hover for, not a list of
+    // playable buttons: the page's real controls (the lobby/restart buttons) are its own fields (`m_btnGoToLobby`,
+    // `m_btnRestartCheckpoint`, `m_btnLeaveExpedition`) and they live *outside* these blocks. Treating the internal
+    // registration as "a control the player can press" is what left the red-crystal block on the page (recorded
+    // `artifact summary holds a control ... only the 2 branches were moved`) and, worse, what made those decorations walls
+    // in the interaction scan - so the board was compressed around them and the hover scan deferred the board for them.
+    //
+    // The order is therefore: a `Button` anywhere in the subtree is a control (always, inside or out); the block's *own*
+    // node, when the page really registered it as an item, is a control too (the page dispatches to the block itself, so
+    // putting it away takes that dispatch with it); outside one of the page's own named decoration blocks nothing changed
+    // from 1.19.54/1.19.57 (a registered or switched-on `CM_Item` is a wall); and *inside* one of them the block's own
+    // drawing - its renderer, and a registered entry nested under it - is the block's picture.
+    //
+    // 1.19.59 second pass: "nested" is the operative word. Not every registered `CM_Item` is decoration - the block's own
+    // root and every container root keep the old answer - so this never turns a page control into wallpaper. What it does
+    // turn into wallpaper is the recorded case: a registered entry *under* a declared presentational block, which the page
+    // keeps a hover entry for and nothing else. Anything this build cannot describe is still `Unknown` (a wall, never
+    // hidden), and a `Button` is never decoration at any depth.
+    public static VanillaNodeKind Of(VanillaNodeFacts facts)
+    {
+        // A `UnityEngine.UI.Button` anywhere in the subtree is the player's own control: never hidden, always a wall.
+        if (facts.HasButton) return VanillaNodeKind.Action;
+        // The block's own node (or any container root): registered means the page dispatches to it as an item, and a
+        // registered container is a control whatever it looks like. Unregistered, it is the plate the block is drawn on.
+        if (facts.ContainerRoot)
+            return facts.Registered ? VanillaNodeKind.Action : VanillaNodeKind.Visual;
+        if (!facts.InsideDecorationBlock)
+        {
+            // Outside a known decoration block nothing changed from 1.19.54: the page dispatches to it, or it is switched
+            // on, and it is a wall; an entry nobody could read stays one too.
+            if (facts.Registered) return VanillaNodeKind.Action;
+            return facts.Active ? VanillaNodeKind.Action : VanillaNodeKind.Unknown;
+        }
+        // Nested inside one of the page's known presentational blocks: a node that really renders something, and a `CM_Item`
+        // the page merely keeps a hover entry for, are the block's own drawing. A bare transform or an entry whose facts
+        // could not be read stays `Unknown` - never hidden, still a wall - so an unreadable node can only ever leave the
+        // block where the game put it.
+        if (facts.VisualOnly || facts.Registered) return VanillaNodeKind.Visual;
+        return VanillaNodeKind.Unknown;
+    }
+
+    public static bool IsWall(VanillaNodeKind kind) => kind != VanillaNodeKind.Visual;
+
+    public static bool Hideable(VanillaNodeKind kind) => kind == VanillaNodeKind.Visual;
+
+    // The plan for one whole block, from the kinds its own tree answered - the production decision, shared with the scan.
+    //
+    // `rootKind` is the *block's own* answer (its own `Button`, its own registration, its own renderer), never the
+    // subtree answer: a mixed block whose root is a plate with a control in one of its branches is exactly the case
+    // this policy exists for, and reading the subtree's `Button` into the root is what turned every mixed block into
+    // "leave the whole thing alone".
+    // A root this build cannot describe is left where the game put it. It is never *WholeBlock*: putting a whole block
+    // away on the strength of an answer nobody could read is the one direction this policy must not take, and 1.19.56
+    // took it whenever such a block happened to hold no `CM_Item` the scan could read.
+    //
+    // 1.19.59: the last answer is no longer `Nothing`. A block the player asked to replace, whose body carries a control in
+    // one of its branches, used to stay on the page *whole* - so the red crystal and the prisoner cards were still drawn
+    // under a board that was already painted over them (`artifact summary holds a control the player can press, so it is
+    // left exactly where the page put it`). The page's own drawing now makes way in the one way that cannot take a control
+    // away: `VisualOnly` switches the block's alpha and renderers off and leaves every GameObject, collider and handler
+    // exactly where the game put it, and `SafeBranches` still moves the branches that carry no action at all.
+    //
+    // `hasButton` is the second pass of the same release, and it is a *safety* gate rather than a convenience: a block whose
+    // body really contains a `UnityEngine.UI.Button` must never be answered with `VisualOnly`, because zeroing a parent's
+    // alpha disables that button's drawing while leaving it pressable - an invisible control, which is worse than a visible
+    // decoration. Such a block gives up its safe branches and otherwise stays exactly where the game put it.
+    public static VanillaHidePlan PlanForBlock(VanillaNodeKind rootKind, int actionNodes, int visualNodes, int branchesWithAction,
+        bool hasButton = false)
+    {
+        if (rootKind == VanillaNodeKind.Unknown) return VanillaHidePlan.Nothing;
+        if (rootKind == VanillaNodeKind.Action) return VanillaHidePlan.Nothing;
+        // No action anywhere in the tree: the whole block is the page's own drawing and is put away as it always was.
+        if (actionNodes <= 0) return VanillaHidePlan.WholeBlock;
+        // A mixed block gives up the parts that are *proven* to be the page's own drawing, branch by branch.
+        if (branchesWithAction > 0 && visualNodes > 0) return VanillaHidePlan.SafeBranches;
+        // Nothing can be moved. A block that really carries a `Button` is left visible (an invisible-but-pressable control
+        // is not an improvement); one whose only "actions" are the page's own hover registrations gives up its drawing.
+        return hasButton ? VanillaHidePlan.Nothing : VanillaHidePlan.VisualOnly;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 1.19.57: which blocks of the page are decoration *for this player's configuration*
+// ---------------------------------------------------------------------------------------------------
+//
+// The classifier in 1.19.56 asked the static `_page`/`_succeeded` cache which blocks existed, which is the wrong
+// question twice over: that cache is cleared by `ResetPlacement` on the frames the scan and the hide run through it, so
+// a live page could answer "no decoration block at all"; and it ignored the player's switches, so a block the player
+// had explicitly asked to keep (`ShowSuccessArtifacts`, `ShowSuccessPlayerReports`, `HideVanillaFailBlocks` off) was
+// still treated as decoration - its `CM_Item`s were exempted from the scan as "drawing" while nothing was going to
+// hide them. The answer below is about one block of one page and the three switches, so the hide and the scan can be
+// asked with the page the caller really holds, at whatever moment the caller asks.
+public enum VanillaBlockKind
+{
+    ArtifactInventory = 0,  // `m_ArtifactInventoryDisplay`
+    ArtifactSummary = 1,    // `m_artifactInfo_text`
+    CheckpointUsage = 2,    // `m_checkpointUsage` (success page only)
+    PlayerReport = 3,       // `m_playerReports[]`
+    PlayerReportAnchor = 4  // `m_playerReportAligns[]`
+}
+
+public static class ResultVanillaBlockPolicy
+{
+    // Whether this mod is really about to put this block away on this page. Only such a block is a decoration block:
+    // the one the player asked to hide. A block the player asked to keep is left outside the classifier, keeps the
+    // 1.19.54 fail-safe (its active `CM_Item`s are walls), and the board steps around it - the player gets what the
+    // switch promised, and nothing the player wants to read is ever reported as "decoration to be ignored".
+    public static bool IsDecoration(bool succeeded, bool hideArtifacts, bool hideReports, bool hideFailBlocks,
+        VanillaBlockKind block)
+    {
+        if (succeeded)
+        {
+            switch (block)
+            {
+                case VanillaBlockKind.ArtifactInventory:
+                case VanillaBlockKind.ArtifactSummary:
+                case VanillaBlockKind.CheckpointUsage:
+                    return hideArtifacts;
+                case VanillaBlockKind.PlayerReport:
+                case VanillaBlockKind.PlayerReportAnchor:
+                    return hideReports;
+                default:
+                    return false;
+            }
+        }
+        // The failure page has no report cards and no checkpoint line: its artifact block is the whole question.
+        switch (block)
+        {
+            case VanillaBlockKind.ArtifactInventory:
+            case VanillaBlockKind.ArtifactSummary:
+                return hideFailBlocks;
+            default:
+                return false;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// 1.19.57: the one identity rule the hide path and the scan ask
+// ---------------------------------------------------------------------------------------------------
+//
+// Two objects are the same node when they are anchored on the same native object. A native field can name a component
+// (`m_artifactInfo_text` is a text, `m_ArtifactInventoryDisplay` a display) while an ancestor walk arrives with that
+// object's `Transform`, and those are different native objects: the component pointer, the transform pointer and the
+// GameObject pointer of one node are three distinct values, so comparing a component's pointer with a transform's can
+// never answer true - which is exactly what 1.19.56 did, and why no node was ever "inside" a decoration block.
+//
+// The comparison therefore uses only the two anchors every wrapper of one node shares: the `Transform` and the
+// `GameObject`. It is a pure function so a test can hand it the distinct ids a real page's three wrappers have.
+public static class ResultNodeIdentity
+{
+    public static bool Same(IntPtr blockTransform, IntPtr blockObject, IntPtr nodeTransform, IntPtr nodeObject)
+    {
+        if (nodeTransform == IntPtr.Zero) return false;
+        if (blockTransform != IntPtr.Zero && blockTransform == nodeTransform) return true;
+        return blockObject != IntPtr.Zero && nodeObject != IntPtr.Zero && blockObject == nodeObject;
     }
 }

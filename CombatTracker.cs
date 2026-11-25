@@ -114,6 +114,7 @@ internal static class CombatTracker
         CombatSync.ResetExpedition();
         _loneSurvivorAwarded = false;
         _loggedScan = _loggedBotScan = _loggedBotScanUnresolved = _loggedScanRepeat = _loggedBotAction = false;
+        _loggedBotScanUse = _loggedBotScanStart = false;
         _loggedReviveState = _loggedReviveUnmatched = false;
         Plugin.Logger.LogInfo("[DIAG] New expedition: counters reset; success/failure screens retain the final counters.");
     }
@@ -507,7 +508,7 @@ internal static class CombatTracker
 
     // A blow this machine dealt that the game will not hand back to it. The host applies every blow and
     // every other machine is told the result, but a machine is not sent its own damage back: that is why a
-    // client in a lobby whose host runs no panel of its own used to show no damage of its own at all, and
+    // client that has received no usable host data for the run used to show no damage of its own at all, and
     // with it no share and no kill of its own.
     //
     // The amount is the health the enemy lost across the call whenever that loss is readable - the damage
@@ -554,7 +555,11 @@ internal static class CombatTracker
             if (!_loggedOutgoing)
             {
                 _loggedOutgoing = true;
-                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client whose host runs no panel of its own, so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry?.Name ?? "unknown weapon"}, from healthBefore={healthBefore:0.0}, healthAfter={healthAfter:0.0}, dam={dam:0.0} - because the game never sends a machine its own damage back. The health the enemy lost across the call is used whenever it moved; when it did not, the figure the weapon carried in is used instead and capped by the health the limb had left. Either way the figure is marked as an estimate, and a host that does run this mod replaces it with the blow it applied.");
+                // The claim is the one this machine can actually make: `HostRunsMod` is `SNet.IsMaster || Exchange.HostAnswered`,
+                // so what was observed is that no usable host data arrived for this run - never that the host runs no panel.
+                // A host that runs the panel but was never reached looks identical here, and the log must not tell the
+                // two apart on this machine's behalf.
+                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client that has received no usable host data for this run (the host has not answered on this build's protocol, so it is not the authority this machine is reading), so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry?.Name ?? "unknown weapon"}, from healthBefore={healthBefore:0.0}, healthAfter={healthAfter:0.0}, dam={dam:0.0} - because the game never sends a machine its own damage back. The health the enemy lost across the call is used whenever it moved; when it did not, the figure the weapon carried in is used instead and capped by the health the limb had left. Either way the figure is marked as an estimate, and a host that does answer this build's protocol replaces it with the blow it applied.");
             }
         }
         catch (Exception error) { LogImpact("local outgoing damage", error); }
@@ -711,12 +716,14 @@ internal static class CombatTracker
     // scanner's own ledger, so this one never takes a first mark away from the scanner doing the sweep.
     private static readonly ScanReveals ScanRevealed = new ScanReveals();
     // The bot whose scan action is currently on the stack: its call to the static BotTag arrives
-    // inside that window, which is what makes the attribution exact rather than a guess.
-    [ThreadStatic] private static SNet_Player _botScanning;
+    // inside that window, which is what makes the attribution exact rather than a guess. Since 1.19.42 the
+    // scope also carries the action's own scan start, so the one scan this window belongs to is named: the
+    // same action instance really scanning twice publishes two different starts.
+    [ThreadStatic] private static BotScanScope _botScan;
     private static int NearbyBotCandidates;
     private static float NearbyBotDistance = float.PositiveInfinity;
     private static bool _loneSurvivorAwarded;
-    private static bool _loggedStagger, _loggedKill, _loggedReviveState, _loggedReviveUnmatched, _loggedScan, _loggedScanRepeat, _loggedDown, _loggedLone, _loggedAttackState, _loggedBotScan, _loggedBotScanUnresolved, _loggedBotAction, _loggedOutgoing, _loggedEwcDamage;
+    private static bool _loggedStagger, _loggedKill, _loggedReviveState, _loggedReviveUnmatched, _loggedScan, _loggedScanRepeat, _loggedDown, _loggedLone, _loggedAttackState, _loggedBotScan, _loggedBotScanUnresolved, _loggedBotAction, _loggedBotScanUse, _loggedBotScanStart, _loggedOutgoing, _loggedEwcDamage;
     // Which weapon classes this build has already reported a firing window for. One line per class is what
     // turns "this weapon's shots are missing" into a decision: either the class reaches a hooked `Fire` and
     // the window is here (so the figures are missing for another reason), or it never appears - which means
@@ -1148,6 +1155,27 @@ internal static class CombatTracker
         }
     }
 
+    // 1.19.41: the scanner's own native cooldown, read off the instance the holder has equipped. `null` for a
+    // `m_recharging` and `m_rechargeStartTime` are interop *properties* on `Gear.EnemyScanner` (verified in the
+    // Survival profile's own `Modules-ASM.dll`: `get_m_recharging`, `get_m_rechargeStartTime`), which is why they are
+    // read directly here and never looked up as fields - a field lookup silently returns null on a property, and an
+    // always-unreadable cooldown would have left every scan count "unknown" for the rest of the expedition. Each
+    // read is guarded on its own: a transient interop failure is an unusable sample, not an idle edge.
+    internal static void ObserveCooldown(EnemyScanner scanner, ScanSession session, ImpactCounters counters)
+    {
+        if (scanner == null || session == null) return;
+        bool rechargingKnown = false, recharging = false, startKnown = false;
+        float start = float.NaN;
+        try { recharging = scanner.m_recharging; rechargingKnown = true; }
+        catch (Exception error) { LogImpact("scanner recharging", error); }
+        if (rechargingKnown)
+        {
+            try { start = scanner.m_rechargeStartTime; startKnown = float.IsFinite(start); }
+            catch (Exception error) { LogImpact("scanner recharge start", error); }
+        }
+        session.ObserveRecharge(rechargingKnown, recharging, startKnown, start, counters);
+    }
+
     internal static void ObserveHumanScan(EnemyScanner scanner)
     {
         try
@@ -1157,43 +1185,94 @@ internal static class CombatTracker
             if (!ShouldTrack(owner) || owner.IsBot) return;
             ScanProbe probe = Ledger(owner);
             var player = ObservePlayer(owner);
+            // The tag flag opens the sweep window the cumulative marks belong to; it counts no activation.
             bool started = probe.Session.ObserveTagging(scanner.m_tagging, player.Impact);
+            // The activation is the native cooldown session: `m_recharging` true with a `m_rechargeStartTime`
+            // later than the last one this holder showed. Repeated samples of one session add nothing, and a
+            // scanner whose cooldown this build cannot read leaves the figure unknown rather than at 0.
+            ObserveCooldown(scanner, probe.Session, player.Impact);
             // Taggable entries are candidates, not evidence of successful marks.
             // ToolSyncManager request/execution hooks supply completed marks independently of this poll.
             if (!probe.Announced && (scanner.m_tagging || ListCount(scanner.m_enemiesDetected) > 0))
             {
                 probe.Announced = true;
-                Plugin.Logger.LogInfo($"[DIAG] scan probe: {player.Name} tagging={scanner.m_tagging}, detected={ListCount(scanner.m_enemiesDetected)}, taggable={ListCount(scanner.m_taggableEnemies)}; instance owner, tag-attempt ledger.");
+                Plugin.Logger.LogInfo($"[DIAG] scan probe: {player.Name} tagging={scanner.m_tagging}, detected={ListCount(scanner.m_enemiesDetected)}, taggable={ListCount(scanner.m_taggableEnemies)}; the cooldown session is the activation source, tag windows are not.");
             }
-            if (started && !_loggedScan)
+            if (!_loggedScan && probe.Session.CooldownObservable)
             {
                 _loggedScan = true;
-                Plugin.Logger.LogInfo($"[DIAG] scan attempt credited: {player.Name}; uses={player.Impact.ScanUses}, first marks={player.Impact.ScanFirstMarks}.");
+                Plugin.Logger.LogInfo($"[DIAG] scan cooldown observed: {player.Name}; activations={probe.Session.CooldownActivations}, completions={probe.Session.CooldownCompletions}, repeats={probe.Session.CooldownRepeats}, unusable={probe.Session.CooldownUnusable}; first marks={player.Impact.ScanFirstMarks}.");
             }
+            else if (started) { /* the tag window only; no activation is credited for it */ }
         }
         catch (Exception error) { LogImpact("human scan", error); }
     }
 
-    // The tagging bot's own scan action brackets its call to the static BotTag, so the owner it
-    // publishes here is exactly the bot that swept. It is cleared the moment the action returns.
-    internal static void BeginBotScanAction(PlayerBotActionUseEnemyScanner action)
+    // The tagging bot's own scan action brackets its call to the static BotTag, so the owner published here is
+    // exactly the bot that swept, and the scan start published beside it is the one scan that window belongs to.
+    // The scope is popped when the action returns - including when it throws - so nothing reads it afterwards.
+    internal sealed class BotScanScope
     {
+        internal SNet_Player Owner;
+        internal bool StartKnown;
+        internal float Start;
+        internal BotScanScope Previous;
+    }
+
+    internal static BotScanScope BeginBotScanAction(PlayerBotActionUseEnemyScanner action)
+    {
+        var scope = new BotScanScope { Previous = _botScan };
+        _botScan = scope;
         try
         {
-            _botScanning = action != null && action.m_agent != null ? action.m_agent.Owner : null;
-            if (ShouldTrack(_botScanning) && !_loggedBotAction)
+            scope.Owner = action != null && action.m_agent != null ? action.m_agent.Owner : null;
+            // The bot's own scan start names the sweep this call belongs to; no duration is read for it. A build
+            // that does not expose the member leaves `StartKnown` false, and that bot's activation figure then
+            // stays unknown - exactly the figure it had before this hook existed.
+            if (ShouldTrack(scope.Owner) && scope.Owner.IsBot) scope.StartKnown = ReadBotScanStart(action, out scope.Start);
+            if (ShouldTrack(scope.Owner) && !_loggedBotAction)
             {
                 _loggedBotAction = true;
                 Plugin.Logger.LogInfo("[DIAG] bot scan action observed: the tagging bot is read from its own scan action instance, so bot scans no longer depend on a proximity guess.");
             }
+            return scope;
         }
-        catch (Exception error) { _botScanning = null; LogImpact("bot scan action", error); }
+        catch (Exception error) { scope.Owner = null; scope.StartKnown = false; LogImpact("bot scan action", error); return scope; }
     }
 
-    internal static void EndBotScanAction()
+    internal static void EndBotScanAction(BotScanScope scope)
     {
-        if (_botScanning != null && ScanLedger.TryGetValue(_botScanning.Lookup, out ScanProbe probe)) probe.Session.EndBotTag();
-        _botScanning = null;
+        try
+        {
+            if (scope?.Owner != null && ScanLedger.TryGetValue(scope.Owner.Lookup, out ScanProbe probe)) probe.Session.EndBotTag();
+        }
+        catch (Exception error) { LogImpact("bot scan end", error); }
+        // The previous scope comes back, so a nested or re-entrant update cannot leave a stale owner or a stale
+        // scan start behind for the next BotTag to be credited to.
+        finally { if (scope != null && ReferenceEquals(_botScan, scope)) _botScan = scope.Previous; }
+    }
+
+    // The action's own scan start. The slot is pinned by the disassembly: `StartScanning` (RVA 0x17DB430) writes
+    // `[action+0x70]` from `Time.time` as the scan begins (0x17DB490, right after 0x17DB484 zeroes `[action+0x74]`
+    // and just before 0x17DB495 sets the scan state), and `UpdateStateScan` (RVA 0x17DBA90) subtracts that same
+    // slot from `Time.time` for its elapsed test (0x17DBB20/0x17DBB4D), so one scan carries one value. The
+    // member's name is not in this build's verified member list, so it is looked up by name instead of being
+    // guessed at: a build that does not expose it returns false and counts nothing.
+    private const string BotScanStartMember = "m_scanStartTime";
+    private static bool ReadBotScanStart(object action, out float start)
+    {
+        start = float.NaN;
+        if (action == null) return false;
+        try
+        {
+            if (OptionalProjectileEvents.Read(action, BotScanStartMember) is float value && float.IsFinite(value))
+            {
+                start = value;
+                return true;
+            }
+        }
+        catch (Exception error) { LogImpact("bot scan start", error); }
+        return false;
     }
 
     // Static bot tagging carries no owner, but it is called from inside the tagging bot's own scan
@@ -1204,7 +1283,9 @@ internal static class CombatTracker
         try
         {
             if (!SNet.IsMaster || GameStateManager.CurrentStateName != eGameStateName.InLevel || found == null) return;
-            SNet_Player owner = ShouldTrack(_botScanning) ? _botScanning : BotOwnerNear(centre);
+            BotScanScope scope = _botScan;
+            bool fromAction = ShouldTrack(scope?.Owner) && scope.Owner.IsBot;
+            SNet_Player owner = fromAction ? scope.Owner : BotOwnerNear(centre);
             if (owner == null)
             {
                 if (!_loggedBotScanUnresolved)
@@ -1219,6 +1300,24 @@ internal static class CombatTracker
             var player = ObservePlayer(owner);
             bool started = probe.Session.BeginBotTag(Time.time, EnemyScanner.s_tagDuration, player.Impact);
             LogScanRepeats(player, MarkEnemies(found, probe.Session, player.Impact, true));
+            // 1.19.42: the scan itself, counted once per real scan and only from evidence this machine can show.
+            // `fromAction` is what makes the owner exact, and it is also the only case that publishes a scan
+            // start, so the proximity fallback keeps its marks and gains no use. `BotTag` returning normally is
+            // the success this callback *is*: a native tag that throws never reaches a postfix. Nothing here
+            // reads `s_tagDuration` - an estimated window is not a scan.
+            float scanStart = fromAction ? scope.Start : float.NaN;
+            bool startKnown = fromAction && scope.StartKnown;
+            BotScanSignal scan = probe.Session.ObserveBotScan(startKnown, scanStart, player.Impact);
+            if (scan == BotScanSignal.Started && !_loggedBotScanUse)
+            {
+                _loggedBotScanUse = true;
+                Plugin.Logger.LogInfo($"[DIAG] bot scan counted: {player.Name}; uses={player.Impact.ScanUses}; source=the bot action's own scan start {scanStart:0.###}s, one per scan.");
+            }
+            else if (fromAction && !startKnown && !_loggedBotScanStart)
+            {
+                _loggedBotScanStart = true;
+                Plugin.Logger.LogInfo($"[DIAG] bot tag returned with no readable scan start: {player.Name}; its marks are kept and no use is counted, so the figure stays unknown instead of being estimated from a window.");
+            }
             if (started && !_loggedBotScan)
             {
                 _loggedBotScan = true;

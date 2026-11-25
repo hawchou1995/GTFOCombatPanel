@@ -168,8 +168,11 @@ public static class CombatMerge
             impact.GlueHits = snap.GlueHits;
             impact.GluedEnemies = snap.GluedEnemies;
         }
-        if (!own)
+        if (!own && !impact.ScanUsesKnown)
         {
+            // 1.19.41: only a row whose scanner this machine cannot read is filled from a snapshot. Where the cooldown
+            // was observed here the local figure is the authoritative one, so an older peer's (or an echo of this
+            // machine's own broadcast) larger number cannot overwrite it.
             impact.ScanUses = MergeCount(impact.ScanUses, snap.ScanUses);
             impact.ScanFirstMarks = MergeCount(impact.ScanFirstMarks, snap.ScanFirstMarks);
             impact.ScanMarks = MergeCount(impact.ScanMarks, snap.ScanMarks);
@@ -198,6 +201,8 @@ public static class CombatMerge
                 && (snap.SelfSupplyUses != impact.SelfSupplyUses || snap.SelfAmmoUses != impact.SelfAmmoUses))
             {
                 impact.SelfToolUses = 0; impact.SelfMedicalUses = 0; impact.SelfSupplyKindsKnown = false;
+                // 1.19.41: the medical figure goes with the split it belonged to, so the "confirmed" bit goes too.
+                impact.SelfMedicalKnown = false;
             }
             impact.SelfSupplyUses = snap.SelfSupplyUses;
             impact.SelfAmmoUses = snap.SelfAmmoUses;

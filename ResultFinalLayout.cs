@@ -203,6 +203,44 @@ public static class CompletionFinalBounds
         return band;
     }
 
+    // 1.19.52 (F1, the recorded 1080p success page): the floor the band may never rise above.
+    //
+    // `Placed` answers "where does the section end", and it answers with a *container* for every part whose child set
+    // is not a complete measurement (`ContentComplete`), because a caption that has not been switched on yet may still
+    // appear inside that container. That is the right answer for an edge and the wrong answer for a floor: the
+    // recorded page read
+    //
+    //   sectorHeader  own=233 visual=233 hidden=0  drawn=5 complete=true
+    //   sectorIconMain own=198 visual=333 hidden=14 drawn=6 complete=false
+    //
+    // so the band hung from 233 while the part that had really drawn six children reached 333 - the board's top edge
+    // (249) and its whole plate (238..424) sat on icon captions the page had already painted, which is the
+    // 主要/精英 block the player measured down to ~334. A container is not the only thing that can be wrong in that
+    // direction: it can also end far below everything it draws, and taking `max` against every container would bring
+    // back the 275 px blank slot this build already removed. The floor is therefore built from drawn pixels alone, and
+    // only for a part that is on the page, switched on, measured, drew at least one child and has a visible alpha:
+    // what such a part draws is on the screen now, whatever else it may still add.
+    //
+    // It is a floor and never the section's edge: the caller takes `max(Placed, DrawnFloor)`, so nothing here claims
+    // the section is complete, and a NaN, an inactive part, a part that drew nothing or a hidden one contributes
+    // nothing at all.
+    public static float DrawnFloor(IReadOnlyList<CompletionPart> parts)
+    {
+        float floor = float.NaN;
+        if (parts == null) return floor;
+        for (int index = 0; index < parts.Count; index++)
+        {
+            CompletionPart part = parts[index];
+            if (!part.Present || !part.Active || !part.Measured) continue;
+            if (part.Drawn <= 0) continue;
+            if (!float.IsFinite(part.VisualBottom)) continue;
+            if (float.IsFinite(part.Alpha) && part.Alpha <= CompletionBounds.VisibleAlpha) continue;
+            if (float.IsFinite(floor) && part.VisualBottom <= floor) continue;
+            floor = part.VisualBottom;
+        }
+        return floor;
+    }
+
     // The per-part reading the page prints once, so a live log alone can say which part produced the band and why:
     // its container, the pixels it draws, whether those were a complete measurement, how many children were switched
     // off, and the edge that was used. `[DIAG] success completion part: ...`
@@ -403,6 +441,97 @@ public static class ResultRevealGate
             + "slots the page laid out and never from pixels a reveal that ended did not draw; this is not a settled "
             + "reveal and not a timeout - a routine that ended is not a routine that is still coming, and F8 is untouched";
 }
+
+// -----------------------------------------------------------------------------------------------------------
+// 1.19.60 (independent review F1): what this page's ledger has actually told us, in four states
+// -----------------------------------------------------------------------------------------------------------
+//
+// The 1.19.60 delivery asked "may anything on this page still move the reveal?" with
+//
+//     revealDone || (!MayStillComplete && InFlight == 0) || (Count == 0 && FinalLayout.Ready)
+//
+// and the third term could not tell two completely different pages apart:
+//
+//   * `Required == 0` - this page has handed the ledger **nothing yet**. The native `BlinkIn` runs inside `OnEnable`
+//     and the ledger is filled from in there, so the first frames of a live page legitimately read 0/0 while its six
+//     targets are still to come. Answering "settled" there let a client's early board stand on a page whose reveal had
+//     not started - the recorded defect, one frame earlier.
+//   * `Required > 0 && Count == 0` - the page handed targets over and every one of them was proved *unscheduled*.
+//     Nothing on this page can animate, so that really is its final geometry (`ContentSettled` has trusted it since
+//     1.19.41).
+//
+// The four states below are the whole answer, and every branch that asks it reads it from this one place:
+//
+//   NotStarted    `Required == 0` and the page has not been watched long enough to say nothing is coming;
+//   Running       something of the ledger's own still has to happen (a routine in flight, or a target that can still
+//                 finish);
+//   Finished      every counted target is done, or every handed-over target was proved unscheduled, and nothing of the
+//                 ledger's own is still running;
+//   Unobservable  `Required == 0` right across the bounded observation budget: this page's native callback never came.
+//
+// `Unobservable` is a bounded *retry* answer and never a claim: it has its own name in the log, it still demands the
+// page's geometry latch (`ResultFinalGate.Ready`) before an edge is called final, and it never pretends a reveal
+// completed. A page that registers its targets a moment later simply leaves this state on the frame they arrive,
+// because the budget only counts observations in which `Required == 0` - it is "looked and saw nothing", not elapsed
+// time.
+public enum RevealObservation
+{
+    NotStarted = 0,
+    Running = 1,
+    Finished = 2,
+    Unobservable = 3
+}
+
+public static class ResultRevealStatePolicy
+{
+    // How many live observations of `Required == 0` a page gets before its native callback is called unobservable. The
+    // success page registers its targets from inside `BlinkIn`, which the page calls as it comes up, so a live page
+    // that is still at zero after this many *observations* is not "about to start". The number is a poll count, not a
+    // duration, because the panel's poll cadence is the only thing that decides how often this question is asked.
+    public const int UnobservableObservations = 40;
+
+    // The state this frame's ledger answers. Every argument is a reading of the ledger itself (`BlinkCompletionLedger`)
+    // except `observationsWithoutTargets`, which the caller counts for the `Unobservable` bound and resets per page.
+    public static RevealObservation Observe(bool revealFinished, int required, int count, int completed, int inFlight,
+        bool mayStillComplete, bool settled, int observationsWithoutTargets)
+    {
+        if (revealFinished) return RevealObservation.Finished;
+        if (required <= 0)
+            return observationsWithoutTargets >= UnobservableObservations
+                ? RevealObservation.Unobservable
+                : RevealObservation.NotStarted;
+        // The ledger can no longer finish and nothing of its own is running: the release path 1.19.43 named.
+        if (!mayStillComplete && inFlight <= 0) return RevealObservation.Finished;
+        // Every handed-over target was proved unscheduled. `InFlight` still has the last word, because a routine can
+        // start late and would then be a target this answer has not seen yet.
+        if (count <= 0) return inFlight > 0 ? RevealObservation.Running : RevealObservation.Finished;
+        // Targets exist and none of them has finished: this is the recorded `0/6`, and the frame a page registers its six
+        // targets on. Nothing but the ledger's own completion count may call that finished.
+        if (inFlight > 0 || !settled) return RevealObservation.Running;
+        return completed >= count ? RevealObservation.Finished : RevealObservation.Running;
+    }
+
+    // The reveal has answered: it finished, or it proved nothing of its own is still running. Only this state may be
+    // called final on the ledger's word alone.
+    public static bool Answered(RevealObservation state) => state == RevealObservation.Finished;
+
+    // `Unobservable` is the bounded retry: the caller must still prove the page's geometry (its own two-agreeing-readings
+    // latch), so this answers "there is nothing more to wait for", never "the edges are final".
+    public static bool Bounded(RevealObservation state)
+        => state == RevealObservation.Finished || state == RevealObservation.Unobservable;
+
+    public static string Name(RevealObservation state)
+    {
+        switch (state)
+        {
+            case RevealObservation.Finished: return "finished";
+            case RevealObservation.Running: return "running";
+            case RevealObservation.Unobservable: return "unobservable";
+            default: return "not-started";
+        }
+    }
+}
+
 
 // How long the success page's own reveal may make **no progress at all** before the fail-open path is allowed to answer.
 //

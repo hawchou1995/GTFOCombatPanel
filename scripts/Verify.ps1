@@ -111,15 +111,10 @@ try {
         throw 'Settlement tool rows must carry the equipped GearClass identity into ImpactInput.'
     }
     Write-Host 'SETTLEMENT_TOOL_PROJECTION: PASS'
-    # The settlement board's upper bound: the completion section is measured as the visible pixels it draws, and
-    # the table hangs from that edge instead of being bottom-aligned against the lobby button. Both are
-    # behavioural properties the headless suite cannot reach (they need the real page), so the wiring is checked
-    # here and the policy itself is asserted in tests/GTFOCombatPanel.Smoke.
-    $usesVisibleCompletion = $resultsSource.Contains('CompletionBounds.Deepest(')
-    $anchorsOnUpperEdge = $resultsSource.Contains('bottomAligned: false') -and -not $resultsSource.Contains('bottomAligned: true')
-    # The failure strip names which native fact produced its upper bound through `titleSource`, the same way the
-    # success page names its completion part, so the log line alone can tell a measured title from a
-    # post-sequence layout; the anchor name is still printed as `anchorSource=`.
+    # The real completion edge still protects the success page even though the board is bottom-aligned.
+    $usesVisibleCompletion = $resultsSource.Contains('CompletionBounds.Deepest(') -and $resultsSource.Contains('Completion.Observe(Time.frameCount, true, area.Top)')
+    $anchorsOnLowerEdge = $resultsSource.Contains('bottomAligned: true') -and -not $resultsSource.Contains('bottomAligned: false')
+    # Failure logs the title used for readiness separately from the actual placement edge.
     $namesTheAnchor = $resultsSource.Contains('titleSource={titleSource}') -and $resultsSource.Contains('anchorSource=')
     # The failure page's own title is now gated by `ResultTitleGate` (full opacity over a still edge) and there is no
     # bounded give-up that ends in a placement: the strip is refused until the gate answers settled.
@@ -131,9 +126,9 @@ try {
     # runtime actually calls them.
     $measuresRendererBounds = $resultsSource.Contains('ScreenBounds.TryFromCorners(') -and $resultsSource.Contains('renderer.bounds')
     $defersWithoutMeasuredSection = $resultsSource.Contains('ResultsUpperBound.Decide(') -and -not $resultsSource.Contains('ResultsRegion.Resolve(false')
-    $upperBoundBroken = (-not $usesVisibleCompletion) -or (-not $anchorsOnUpperEdge) -or (-not $namesTheAnchor) -or (-not $refusesUnsettledTitle) -or (-not $measuresRendererBounds) -or (-not $defersWithoutMeasuredSection)
+    $upperBoundBroken = (-not $usesVisibleCompletion) -or (-not $anchorsOnLowerEdge) -or (-not $namesTheAnchor) -or (-not $refusesUnsettledTitle) -or (-not $measuresRendererBounds) -or (-not $defersWithoutMeasuredSection)
     if ($upperBoundBroken) {
-        throw 'The result board must measure the completion section by its visible pixels (renderer bounds projected through ScreenBounds, never behind a RectTransform), hang the table from that edge, defer instead of guessing when that edge is unmeasurable, name its anchor and refuse the failure strip until its title gate is settled.'
+        throw 'The result board must preserve the measured completion section, bottom-align inside the safe strip, defer if the completion edge is unreadable, identify its anchors, and keep the failure-page readiness gate.'
     }
     Write-Host 'RESULT_BOARD_UPPER_BOUND: PASS'
     # Neither settlement page may be measured before its own anchors are real, and no number of frames may turn a

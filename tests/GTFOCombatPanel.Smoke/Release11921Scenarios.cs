@@ -391,9 +391,14 @@ internal static class Release11921Scenarios
         check(display.Contains("protectWaitingStatus = guestStatus != null;")
               && !display.Contains("guestStatus != null && guestStatus.gameObject.activeInHierarchy\n                    && TryScreenRect(guestStatus"),
             "the waiting block's laid-out rectangle is the lower wall without an activeInHierarchy or non-empty-text test");
-        check(display.Contains("grid.Height <= strip.Bottom - strip.Top + 0.5f")
-              && !display.Contains("_fallbackOpacity = Math.Min(_fallbackOpacity, ResultFallbackLayout.OverlapOpacity);"),
-            "1.19.22 re-point: the hard band invariant now covers the page's own band - no path places a taller-than-band board into it and merely lowers its opacity; the invented fail-open band is sized from the board instead, so a forced board is never refused for room (see the 1.19.22 suite)");
+        // 1.19.47 (review #4): the fade moved into the per-repaint fail-open re-check (`FadeInPlace`), so the "never
+        // placed and merely faded" invariant is asked of the *fit* body - the one path that places into the page's own band.
+        int fitStart = display.IndexOf("private static bool Fit(BoardStrip strip", StringComparison.Ordinal);
+        int fitEnd = display.IndexOf("private static bool Placement(Component page, bool succeeded", StringComparison.Ordinal);
+        string fitBody = fitStart >= 0 && fitEnd > fitStart ? display.Substring(fitStart, fitEnd - fitStart) : string.Empty;
+        check(display.Contains("total <= strip.Bottom - strip.Top + 0.5f")
+              && fitBody.Length > 0 && !fitBody.Contains("ResultFallbackLayout.OverlapOpacity"),
+            "1.19.22 re-point: the hard band invariant covers the page's own band - the fit never places a taller-than-band board into it and merely lowers its opacity; the invented fail-open band is sized from the board instead, and the faint tier now belongs to the fail-open re-check (`FadeInPlace`, review #4)");
         check(display.Contains("band=({strip.Top:0}..{strip.Bottom:0}), bandSource={strip.FooterSource}")
               && display.Contains("boardBand={DescribeBand(_holdValid ? _holdStrip.FooterSource : footerSource)}"),
             "a placed frame prints the band it really used, never `boardBand=unresolved`");

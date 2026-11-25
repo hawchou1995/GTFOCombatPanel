@@ -514,10 +514,16 @@ public static class SyncProtocol
         impact.GlueShots = snap.GlueShots; impact.GlueHits = snap.GlueHits; impact.GluedEnemies = snap.GluedEnemies;
         impact.SupplyUses = snap.SupplyUses;
         impact.SupplyEfficiencySum = snap.SupplyEfficiencySum;
-        impact.ScanUses = snap.ScanUses;
+        // 1.19.41: a row whose scanner cooldown this machine read holds an exact activation count, so a snapshot -
+        // which may carry an older peer's window count, or an echo of this machine's own broadcast - does not
+        // overwrite it. The marks still travel: they are per-confirmation evidence, not a native cooldown.
+        if (!impact.ScanUsesKnown)
+        {
+            impact.ScanUses = snap.ScanUses;
+            impact.ScanEstimated = snap.Has(SyncFlags.ScanEstimated);
+        }
         impact.ScanFirstMarks = snap.ScanFirstMarks;
         impact.ScanMarks = snap.ScanMarks;
-        impact.ScanEstimated = snap.Has(SyncFlags.ScanEstimated);
         // v7 fields, restored exactly like the counters above: a snapshot is the whole truth about that
         // player, so these are written, never added. "Could not tell" is restored as its own figure rather
         // than being folded into either the awake counters or the sleeping ones.
@@ -537,6 +543,9 @@ public static class SyncProtocol
             && (snap.SelfSupplyUses != impact.SelfSupplyUses || snap.SelfAmmoUses != impact.SelfAmmoUses))
         {
             impact.SelfToolUses = 0; impact.SelfMedicalUses = 0; impact.SelfSupplyKindsKnown = false;
+            // 1.19.41: the split (and the medical figure in it) is dropped here, so the local "confirmed" bit goes with
+            // it - a confirmed flag beside a zeroed count is exactly the fabricated zero this release removes.
+            impact.SelfMedicalKnown = false;
         }
         impact.SelfSupplyUses = snap.SelfSupplyUses;
         impact.SelfAmmoUses = snap.SelfAmmoUses;

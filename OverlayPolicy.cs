@@ -59,4 +59,22 @@ public static class ResultTogglePolicy
     public static ResultBoardToggle Next(bool boardUp)
         => boardUp ? ResultBoardToggle.Hide : ResultBoardToggle.Show;
 
+    // What this page is *asked* to show - from the user's own explicit state, never from what the last repaint
+    // happened to paint.
+    //
+    // `switchesShown` is the four visibility switches as they stand (a player who turned the board off in the file is
+    // asking for nothing), `hiddenByPress` is this mod's own hide on this page, and `forcedShow` is the show request a
+    // press already left behind and that no repaint has answered yet. The recorded host pages are why the distinction
+    // matters: 45 presses answered "show" because the *painted* frame said "not up" - each one asked again, and the
+    // 46th line was another deferral. A request is a statement about what the player wants, not about what the last
+    // frame managed to draw.
+    public static bool RequestedShown(bool switchesShown, bool hiddenByPress, bool forcedShow)
+        => forcedShow || (switchesShown && !hiddenByPress);
+
+    // One press: the request flips. A page asked to show is asked to hide, and the other way about - whether or not
+    // the previous answer has painted anything yet, which is what makes consecutive presses meaningful instead of
+    // repeated.
+    public static ResultBoardToggle Press(bool requestedShown)
+        => requestedShown ? ResultBoardToggle.Hide : ResultBoardToggle.Show;
+
 }

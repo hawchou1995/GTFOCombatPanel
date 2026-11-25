@@ -34,7 +34,23 @@ internal static class SupplyGiverScenarios
             LedgerStaysBounded();
             OverflowAndBackwardsReadings();
             HealthKindFollowsThePacketNotTheObserver();
+            OneApplicationIsOnePack();
+            MedicalCreditGoesToTheReceiver();
+            ClientCreditsARemoteTeammateRow();
+            AGiveFromElsewhereIsNotThisPacksHealth();
+            AnUnattributableApplicationStillCloses();
+            NestedAndThrowingApplicationsReleaseTheirBracket();
+            AGroupApplicationIsOneItemAndOnePackPerReceiver();
+            AnEmptyApplicationIsNoPack();
+            AHealWithoutAnApplicationIsNeverAPack();
+            DisinfectionIsExcludedFromThePackCount();
+            AnApplicationThatThrewIsNoPack();
+            NativeUnitsFollowTheSlotCap();
+            TheApplicationBracketIsWiredIntoTheTracker();
             TheHealthKindRuleIsWiredIntoTheTracker();
+            // The registration itself: the pack bracket's finalizer has to reach Harmony's *finalizer* slot, not
+            // its transpiler slot - the recorded Survival run's `resolved=2/4` and TargetParameterCountException.
+            HarmonyPatchSlotScenarios.Run(Check);
             Console.WriteLine($"PASS {_assertions} supply giver assertions");
         }
         catch (Exception error)
@@ -292,9 +308,291 @@ internal static class SupplyGiverScenarios
             + mixedRow.SelfSupplyUses + " uses beside " + mixedRow.SelfMedicalUses + " medical");
     }
 
-    // The rule above only decides anything if the native path asks it. `SupplyTracker` binds game types and cannot be
-    // linked here, so its lines are read as source - the same static wiring check the release suites use, with the
-    // comments stripped so a comment may still name a call this build must not make.
+    // 1.19.41: one native pack application is one pack, however many teammates it heals. The recorded expedition
+    // reported 1319 medical packs against ~1114 units of health that could possibly have been lost, because a
+    // heal (`ReceiveAddHealth`) was counted as a pack. This is the shape that replaces it: a bracket, its gives,
+    // and the receivers inside it deduplicated.
+    private static void OneApplicationIsOnePack()
+    {
+        var packs = new PackApplyLedger();
+        PackBracket bracket = packs.Begin(Client, false);
+        Check(packs.NoteGive(bracket, Host, 0.2), "the first receiver of one application is one give");
+        Check(packs.NoteGive(bracket, Mate, 0.2), "a second receiver is a second give of the same pack");
+        Check(packs.NoteGive(bracket, 0x4DUL, 0.2), "a third receiver is a third give of the same pack");
+        Check(!packs.NoteGive(bracket, Host, 0.2), "the same receiver inside one application is one give, not two");
+        PackApplyResult result = packs.End(bracket, null);
+        Check(result.Outcome == PackApplyOutcome.Applied, "an application that healed somebody is one applied pack");
+        Check(packs.Packs == 1 && packs.GivesFor(Client) == 3 && packs.Duplicates == 1,
+            "one pack, three receivers, one repeated give: the pack count is 1, not 3 (packs=" + packs.Packs + ", gives=" + packs.GivesFor(Client) + ", duplicates=" + packs.Duplicates + ")");
+        Check(packs.PacksFor(Client) == 1 && packs.PacksFor(Host) == 0,
+            "the item consumption is one application by the player who applied it; the packs it handed out are not his");
+        Check(result.Receivers != null && result.Receivers.Count == 3, "the result names the three receivers it really healed");
+        Check(Math.Abs(result.IntendedRel - 0.6) < 1e-9, "the application sums the relative amounts it really gave");
+        Check(packs.ObservedBrackets == 1, "one application was observed, so a zero count on this machine would be a counted zero");
+    }
+
+    // 1.19.41 fix, the point of the review: the pack is credited to the player who was *healed*, exactly as the ammo
+    // path credits the receiver of `GiveAmmoRel`. This exercises `MedicalPackCredit.Apply` - the function
+    // `SupplyTracker.EndApply` calls - so the rule under test is the shipped one, not a parallel copy.
+    private static void MedicalCreditGoesToTheReceiver()
+    {
+        var packs = new PackApplyLedger();
+        var applier = new ImpactCounters();
+        var receiver = new ImpactCounters();
+        var rows = new Dictionary<ulong, ImpactCounters> { { Host, receiver } };
+        var credit = new MedicalPackCredit();
+        PackBracket bracket = packs.Begin(Client, false);
+        packs.NoteGive(bracket, Host, 0.2);
+        PackApplyResult applied = packs.End(bracket, null);
+
+        Check(credit.Apply(applied, lookup => Candidate(rows, lookup)) == 1,
+            "one applied pack credits exactly one receiver row");
+        Check(applier.SelfSupplyUses == 0 && applier.SelfMedicalUses == 0 && !applier.SelfMedicalKnown,
+            "the player who applied the pack is credited nothing: A giving B a medkit reads A = 0");
+        Check(receiver.SelfSupplyUses == 1 && receiver.SelfMedicalUses == 1 && receiver.SelfMedicalKnown,
+            "and B reads one medical pack, on a figure this machine proved");
+        Check(credit.Apply(applied, lookup => Candidate(rows, lookup)) == 0
+              && receiver.SelfSupplyUses == 1,
+            "replaying the same result adds nothing: the same pack and the same receiver are one pack");
+
+        PackBracket stranger = packs.Begin(Client, false);
+        packs.NoteGive(stranger, Mate, 0.2);
+        PackApplyResult unknownRow = packs.End(stranger, null);
+        Check(credit.Apply(unknownRow, lookup => default(MedicalRowCandidate)) == 0 && applier.SelfSupplyUses == 0 && receiver.SelfSupplyUses == 1,
+            "a receiver whose row this machine does not hold is skipped, never credited to the pack's user or to anyone else");
+        Check(credit.LastSkipped == 1, "and the skip is counted, so the diagnostic can say a proven receiver was not shown");
+
+        PackBracket empty = packs.Begin(Client, false);
+        Check(credit.Apply(packs.End(empty, null), lookup => Candidate(rows, lookup)) == 0,
+            "an application that healed nobody credits no medical pack anywhere");
+
+        // The row that only saw ammo packs cannot claim "no medical pack" when this machine never confirmed one.
+        string unconfirmed = CombatStrings.SupplyCell("50.0%", 1, 1, 0, 0, false, false);
+        Check(unconfirmed.EndsWith("0 / " + CombatStrings.Unknown, StringComparison.Ordinal),
+            "a row with ammo packs and no readable medical evidence prints `?` for the medical figure, never 0: " + unconfirmed);
+        string confirmed = CombatStrings.SupplyCell("50.0%", 1, 1, 0, 0, false, true);
+        Check(confirmed.EndsWith("0 / 0", StringComparison.Ordinal),
+            "and a row whose medical packs this machine confirmed prints the counted zero: " + confirmed);
+    }
+
+    // The review's case: a client whose own pack healed a remote teammate. `ShouldTrack` is `isInSlot && (isMaster ||
+    // isLocal)`, so it answers true for the client's own row only - gating the credit on it dropped the very row the
+    // settlement shows for that teammate. The bracket proved the receiver; the row only has to exist and still belong
+    // to a slotted player. Written through `MedicalPackCredit.Apply`, the function `SupplyTracker.CandidateFor` feeds.
+    private static void ClientCreditsARemoteTeammateRow()
+    {
+        var packs = new PackApplyLedger();
+        var clientRow = new ImpactCounters();
+        var teammateRow = new ImpactCounters();
+        var rows = new Dictionary<ulong, ImpactCounters> { { Client, clientRow }, { Mate, teammateRow } };
+        var credit = new MedicalPackCredit();
+        PackBracket bracket = packs.Begin(Client, false);   // the client is the pack user
+        packs.NoteGive(bracket, Mate, 0.2);                 // ... and the teammate is the receiver
+        PackApplyResult applied = packs.End(bracket, null);
+
+        // The candidate a client builds for a remote teammate: a row exists and the lookup is in a slot. It is *not*
+        // "trackable" here - that is the point.
+        Check(credit.Apply(applied, lookup => Candidate(rows, lookup)) == 1 && teammateRow.SelfSupplyUses == 1,
+            "a client's real application is written to the remote teammate's own row, which is the row the settlement shows");
+        Check(clientRow.SelfSupplyUses == 0 && !clientRow.SelfMedicalKnown,
+            "and the client's own row is not credited for a pack it gave away");
+
+        // The same receiver after the seat is gone: the pack still happened, but there is no row to write now.
+        var left = new ImpactCounters();
+        var staleRows = new Dictionary<ulong, ImpactCounters> { { Mate, left } };
+        PackBracket second = packs.Begin(Client, false);
+        packs.NoteGive(second, Mate, 0.2);
+        PackApplyResult afterSeat = packs.End(second, null);
+        Check(credit.Apply(afterSeat, lookup => Candidate(staleRows, lookup, inSlot: false)) == 0
+              && left.SelfSupplyUses == 0,
+            "a lookup that no longer belongs to a slotted player is not written to, and nothing is re-attributed to another row");
+    }
+
+    // A give whose named giver is somebody other than the pack's user is not this pack's health. It is rejected at
+    // the ledger (never a receiver, never a credited pack) and counted as a mismatch.
+    private static void AGiveFromElsewhereIsNotThisPacksHealth()
+    {
+        var packs = new PackApplyLedger();
+        PackBracket bracket = packs.Begin(Client, false);
+        Check(!packs.NoteGive(bracket, Host, 0.2, giverAgrees: false), "a mismatching give is refused by the ledger");
+        Check(bracket.Mismatches == 1 && bracket.Gives == 0 && bracket.Order.Count == 0, "and it is not a receiver of this pack");
+        Check(packs.NoteGive(bracket, Mate, 0.2), "a give from the pack's own user is still counted");
+        PackApplyResult applied = packs.End(bracket, null);
+        Check(applied.Outcome == PackApplyOutcome.Applied && applied.Gives == 1 && applied.Mismatches == 1,
+            "the pack is the one real give, and the mismatch travels with the result instead of being silently credited");
+        Check(applied.Receivers.Count == 1 && applied.Receivers[0] == Mate, "only the agreeing receiver is credited");
+        Check(packs.MismatchedGives == 1, "the ledger counts the refusal, so an exclusion is evidence rather than a comment");
+    }
+
+    // An application whose user could not be read must still close: the prefix returns a real bracket so the finalizer
+    // pops exactly what it pushed. Otherwise the window stays open and the next heal - with no bracket of its own -
+    // would be counted inside a pack nobody can name.
+    private static void AnUnattributableApplicationStillCloses()
+    {
+        var packs = new PackApplyLedger();
+        PackBracket anonymous = packs.Begin(0UL, true);
+        Check(anonymous != null && ReferenceEquals(packs.Current, anonymous), "the unowned bracket is real and is the current one");
+        Check(packs.NoteGive(anonymous, Host, 0.2), "a give inside it is seen (and deduplicated)");
+        PackApplyResult result = packs.End(anonymous, null);
+        Check(result.Outcome == PackApplyOutcome.Invalid && packs.Packs == 0, "closing it credits no pack to any row");
+        Check(packs.Current == null, "and the stack is empty again: no window is left open for the next heal");
+
+        Check(packs.NoteUnbracketedGive(Mate, 0.2) && packs.UnbracketedGives == 1 && packs.Packs == 0,
+            "a heal that arrives with no bracket at all is an unbracketed heal, never a pack");
+    }
+
+    // Nested applications close in order, and an application that threw releases its bracket the same way.
+    private static void NestedAndThrowingApplicationsReleaseTheirBracket()
+    {
+        var packs = new PackApplyLedger();
+        PackBracket outer = packs.Begin(Client, false);
+        PackBracket inner = packs.Begin(Host, false);
+        Check(ReferenceEquals(packs.Current, inner) && packs.Depth == 2, "the innermost application is the one a give belongs to");
+        Check(packs.NoteGive(inner, Mate, 0.2), "the give lands inside the inner application");
+        PackApplyResult innerResult = packs.End(inner, null);
+        Check(innerResult.Outcome == PackApplyOutcome.Applied && packs.PacksFor(Host) == 1 && packs.PacksFor(Client) == 0,
+            "the inner pack is counted for its own user");
+        Check(ReferenceEquals(packs.Current, outer), "closing the inner application returns to the outer one");
+
+        PackApplyResult broken = packs.End(outer, new InvalidOperationException("native failed"));
+        Check(broken.Outcome == PackApplyOutcome.Invalid && packs.Packs == 1, "an application that threw is no pack");
+        Check(packs.Current == null && packs.Depth == 0, "and it leaves no bracket behind");
+    }
+
+    private static MedicalRowCandidate Candidate(Dictionary<ulong, ImpactCounters> rows, ulong lookup, bool inSlot = true)
+    {
+        if (!rows.TryGetValue(lookup, out ImpactCounters row)) return default;
+        return new MedicalRowCandidate { Known = true, InSlot = inSlot, Row = row };
+    }
+
+    // The item and the received packs are two different questions: one pack used, one pack received by each of the
+    // three teammates it healed - and one teammate given health twice in the same application is still one pack.
+    private static void AGroupApplicationIsOneItemAndOnePackPerReceiver()
+    {
+        var packs = new PackApplyLedger();
+        var rows = new Dictionary<ulong, ImpactCounters>
+        {
+            { Host, new ImpactCounters() },
+            { Mate, new ImpactCounters() },
+            { 0x4DUL, new ImpactCounters() },
+        };
+        var credit = new MedicalPackCredit();
+        PackBracket bracket = packs.Begin(Client, false);
+        packs.NoteGive(bracket, Host, 0.2);
+        packs.NoteGive(bracket, Host, 0.2);
+        packs.NoteGive(bracket, Mate, 0.2);
+        packs.NoteGive(bracket, 0x4DUL, 0.2);
+        PackApplyResult result = packs.End(bracket, null);
+        Check(packs.Packs == 1, "a pack that heals three teammates is still one item consumed");
+        Check(credit.Apply(result, lookup => Candidate(rows, lookup)) == 3,
+            "each of the three receivers is credited one pack");
+        Check(rows[Host].SelfMedicalUses == 1 && rows[Mate].SelfMedicalUses == 1 && rows[0x4DUL].SelfMedicalUses == 1,
+            "the teammate given health twice inside the one application receives it once");
+        Check(rows[Host].SelfSupplyUses == 1 && rows[Mate].SelfSupplyUses == 1 && rows[0x4DUL].SelfSupplyUses == 1,
+            "and every receiver's own total grows by exactly one");
+    }
+
+    private static void AnEmptyApplicationIsNoPack()
+    {
+        var packs = new PackApplyLedger();
+        PackBracket bracket = packs.Begin(Client, false);
+        Check(packs.End(bracket, null).Outcome == PackApplyOutcome.Empty && packs.Packs == 0,
+            "an application that healed nobody consumed nothing this machine can claim");
+        Check(packs.ObservedBrackets == 1 && packs.EmptyBrackets == 1,
+            "and the zero is a counted zero: the application was observed, it simply gave nobody health");
+
+        var unowned = new PackApplyLedger();
+        PackBracket anonymous = unowned.Begin(0UL, true);
+        unowned.NoteGive(anonymous, Host, 0.2);
+        Check(unowned.End(anonymous, null).Outcome == PackApplyOutcome.Invalid && unowned.Packs == 0,
+            "an application whose user could not be read is credited to no row at all, instead of to a guessed one");
+    }
+
+    private static void AHealWithoutAnApplicationIsNeverAPack()
+    {
+        var packs = new PackApplyLedger();
+        Check(packs.NoteUnbracketedGive(Host, 0.3), "a giver-sourced heal with no application window is still recorded");
+        Check(packs.Packs == 0 && packs.UnbracketedGives == 1,
+            "and it is never counted as a health pack: this is the bucket the 1319 recorded heals belong in");
+        Check(!packs.NoteUnbracketedGive(0UL, 0.3) && !packs.NoteUnbracketedGive(Host, double.NaN) && !packs.NoteUnbracketedGive(Host, 0),
+            "a heal without a receiver, without an amount or with a zero amount proves nothing");
+    }
+
+    private static void DisinfectionIsExcludedFromThePackCount()
+    {
+        var packs = new PackApplyLedger();
+        PackBracket bracket = packs.Begin(Client, false);
+        packs.NoteExcludedGive(Host, 0.2);
+        Check(packs.End(bracket, null).Outcome == PackApplyOutcome.Empty && packs.Packs == 0,
+            "a disinfection give inside an application window is not a health pack and does not make the window one");
+        Check(packs.ExcludedGives == 1, "the exclusion is a number in the ledger, so it is evidence and not a comment beside a patch");
+    }
+
+    private static void AnApplicationThatThrewIsNoPack()
+    {
+        var packs = new PackApplyLedger();
+        PackBracket bracket = packs.Begin(Client, false);
+        packs.NoteGive(bracket, Host, 0.2);
+        Check(packs.End(bracket, new InvalidOperationException("native failed")).Outcome == PackApplyOutcome.Invalid && packs.Packs == 0,
+            "an application that threw did not complete, so the gives it already saw do not become a pack");
+    }
+
+    private static void NativeUnitsFollowTheSlotCap()
+    {
+        Check(Math.Abs(PackApplyLedger.Units(0.2, 100) - 20) < 1e-9, "one original pack use at the native 100 cap is 20 units");
+        Check(Math.Abs(PackApplyLedger.Units(0.0333, 600) - 19.98) < 1e-6,
+            "the same 20 units at a raised 600 cap is a relative 0.0333, which is the `intended=3.331` the fixed report measured");
+        Check(Math.Abs(PackApplyLedger.Relative(20, 600) - 1.0 / 30) < 1e-9, "the relation is invertible, which is what the efficiency scale relies on");
+        Check(double.IsNaN(PackApplyLedger.Units(0.2, 0)) && double.IsNaN(PackApplyLedger.Units(double.NaN, 100))
+              && double.IsNaN(PackApplyLedger.Relative(20, -1)),
+            "an unreadable cap or amount yields no unit count instead of an invented one");
+    }
+
+    // The rule above only decides anything if the native path asks it. `SupplyTracker` and the reflection-installed
+    // hooks bind game types and cannot be linked here, so their lines are read as source - the same static wiring
+    // check the release suites use, with the comments stripped so a comment may still name a call this build must
+    // not make.
+    private static void TheApplicationBracketIsWiredIntoTheTracker()
+    {
+        string root = SourceRoot();
+        if (root == null) return;
+        string tracker = Code(File.ReadAllText(Path.Combine(root, "SupplyTracker.cs")));
+        string hooks = Code(File.ReadAllText(Path.Combine(root, "PackApplicationPatches.cs")));
+        Check(tracker.Contains("if (!Packs.NoteGive(bracket, receiverOwner.Lookup, amountRel, giverAgrees))"),
+            "a give inside the application window reaches the ledger, deduplicated by receiver and gated on the named giver");
+        Check(tracker.Contains("bool giverAgrees = giverOwner == null || bracket.Owner == 0UL || giverOwner.Lookup == bracket.Owner;"),
+            "a give whose named giver is known to be somebody else is refused instead of being credited as this pack's health");
+        Check(tracker.Contains("int credited = Credit.Apply(result, CandidateFor);"),
+            "the production write goes through the one credit rule the suite exercises, not a copy of it");
+        Check(!tracker.Contains("PackUsers.TryGetValue(result.Owner") && tracker.Contains("private static MedicalRowCandidate CandidateFor(ulong lookup)"),
+            "the pack's user is never credited: only the receivers' own rows are resolved, and a row this machine does not hold is skipped");
+        // The review's gate: the credit path must not ask whether this machine may *track* that player. On a client
+        // `ShouldTrack` is true for its own row only, which dropped a real application to a remote teammate.
+        Check(!tracker.Contains("ShouldTrack(owner)"),
+            "the receiver row is not gated on ShouldTrack, so a client's application still reaches the teammate's own settlement row");
+        Check(tracker.Contains("return new MedicalRowCandidate { Known = row != null, InSlot = owner.IsInSlot, Row = row };"),
+            "what is required of a receiver row is only that it exists and belongs to a slotted player");
+        // An application whose user could not be read still returns its bracket, so the finalizer can pop it.
+        Check(tracker.Contains("return Packs.Begin(0UL, bot);"),
+            "an unowned application returns the bracket it opened instead of leaving a stale window open");
+        Check(tracker.Contains("if (Packs.NoteUnbracketedGive(receiverOwner.Lookup, amountRel))"),
+            "a heal with no bracket open is recorded as an unbracketed heal, never as a pack");
+        Check(tracker.Contains("Packs.NoteExcludedGive("),
+            "disinfection is handed to the exclusion counter instead of the give counter");
+        Check(hooks.Contains("SupplyTracker.BeginApply(") && hooks.Contains("SupplyTracker.EndApply("),
+            "the bracket is opened and closed around the native application, bot entry point included");
+        Check(hooks.Contains("nameof(ResourcePackFirstPerson.ApplyPackBot)") && hooks.Contains("nameof(PlayerAgent.GiveDisinfection)"),
+            "both the bot application and the disinfection call are bound statically by name, so neither path is silently lost");
+        // The interop exposes ApplyPackBot as a *static* method; a prefix that took `__instance` from it would be
+        // patched onto an instance method and silently never run.
+        Check(hooks.Contains("private static void ApplyPackBotPrefix(PlayerAgent ownerAgent, PlayerAgent receiverAgent, ref PackBracket __state)"),
+            "the bot application prefix takes its arguments and no instance, which is what the static native signature has");
+        Check(!hooks.Contains("TypeByName") && !hooks.Contains("GetField("),
+            "nothing in the pack hooks is resolved by reflection: the type, the method and its parameters are all static");
+        Check(!tracker.Contains("ShouldTrack(change.Giver)"),
+            "the tracked-player test still decides only where efficiency is credited, never what the heal was");
+    }
+
     private static void TheHealthKindRuleIsWiredIntoTheTracker()
     {
         string root = SourceRoot();
@@ -304,10 +602,10 @@ internal static class SupplyGiverScenarios
             "the tracker measures a heal only when the packet named a source agent at all, so a heal with no resolvable source never becomes a pack");
         Check(tracker.Contains("bool sourceIsPlayer = giver != null;"),
             "the tracker records whether the packet's source resolved to a player agent at all");
-        Check(tracker.Contains("use.RecordHealthConsumption(counters, change.SourceIsPlayer);"),
-            "and hands that fact to the one kind rule, so the kind travels with the heal instead of with the observer");
-        Check(!tracker.Contains("ShouldTrack(change.Giver)") && !tracker.Contains("SupplyPackKind.Medical"),
-            "and neither the tracked-player test nor the medical kind is named in this file at all: a client that does not track the giver still cannot turn that player's pack into an unknown one, and a heal of a source that is not a player cannot be promoted to a 血包 here either");
+        Check(tracker.Contains("Record(change.Giver, use, \"medical\");"),
+            "the heal keeps its give/receive efficiency measurement, which is the semantic this release must not lose");
+        Check(!tracker.Contains("RecordHealthConsumption"),
+            "and a giver-sourced heal is never turned into a pack of any kind by the tracker: `ReceiveAddHealth` is the channel medkits, syringes, disinfection and other mods' heals all travel on");
     }
 
     private static string Code(string text)

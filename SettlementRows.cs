@@ -52,8 +52,16 @@ internal sealed class SettlementRows
         { a.ScoutDamage = b.ScoutDamage; a.ScoutDamageObserved = b.ScoutDamageObserved; a.ScoutDamageEstimated = b.ScoutDamageEstimated; }
         a.Stagger = Math.Max(a.Stagger, b.Stagger); a.Revives = Math.Max(a.Revives, b.Revives);
         if (a.SupplyUses < b.SupplyUses) { a.SupplyUses = b.SupplyUses; a.SupplyEfficiencySum = b.SupplyEfficiencySum; }
-        if (a.ScanUses < b.ScanUses || a.ScanUses == b.ScanUses && a.ScanMarks < b.ScanMarks)
-        { a.ScanUses = b.ScanUses; a.ScanFirstMarks = b.ScanFirstMarks; a.ScanMarks = b.ScanMarks; a.ScanEstimated = b.ScanEstimated; }
+        // 1.19.41: `ScanUses` is exact only on the machine that read the holder's scanner cooldown, so a row this
+        // machine observed (`ScanUsesKnown`) is never maxed over by a figure it did not observe - an older build's
+        // window count reaches this row through a snapshot and is not evidence. A row nobody observed keeps the
+        // released rule (the larger reported figure wins) and takes the observation flag from the side that has it.
+        if (!a.ScanUsesKnown
+            && (a.ScanUses < b.ScanUses || a.ScanUses == b.ScanUses && a.ScanMarks < b.ScanMarks))
+        {
+            a.ScanUses = b.ScanUses; a.ScanFirstMarks = b.ScanFirstMarks; a.ScanMarks = b.ScanMarks;
+            a.ScanEstimated = b.ScanEstimated; a.ScanUsesKnown = b.ScanUsesKnown;
+        }
         // 1.19.34: the pack split moves as one block, like the glue triple. A side that never split its use (an older peer, a
         // row rebuilt from a v8 snapshot) must not be maxed field by field into a block that no longer adds up to its own
         // total, so one side's block is taken whole and the other is left alone. The larger total wins, because a split can
@@ -65,11 +73,19 @@ internal sealed class SettlementRows
             a.SelfSupplyUses = b.SelfSupplyUses; a.SelfAmmoUses = b.SelfAmmoUses;
             a.SelfToolUses = b.SelfToolUses; a.SelfMedicalUses = b.SelfMedicalUses;
             a.SelfSupplyKindsKnown = true;
+            // 1.19.41: the block arrives with a medical figure the other side counted, so it also carries whether that
+            // machine could confirm it. A row may know its split from a peer and still have no readable medical
+            // evidence of its own; the two flags are not the same fact.
+            a.SelfMedicalKnown |= b.SelfMedicalKnown;
         }
         else if (a.SelfSupplyKindsKnown && b.SelfSupplyUses > a.SelfSupplyUses)
         {
             a.SelfSupplyUses = b.SelfSupplyUses; a.SelfAmmoUses = b.SelfAmmoUses;
             a.SelfToolUses = 0; a.SelfMedicalUses = 0; a.SelfSupplyKindsKnown = false;
+            // 1.19.41: the medical figure is dropped with the split it belonged to, so the flag that said "this
+            // machine confirmed it" is dropped too. A confirmed flag beside a zeroed count is the fabricated zero
+            // this release removes - the row now prints `?` for it instead.
+            a.SelfMedicalKnown = false;
         }
         else if (!a.SelfSupplyKindsKnown)
         {
@@ -86,6 +102,8 @@ internal sealed class SettlementRows
             }
             if (a.SelfAmmoUses > a.SelfSupplyUses) a.SelfAmmoUses = a.SelfSupplyUses;
             a.SelfToolUses = 0; a.SelfMedicalUses = 0;
+            // 1.19.41: an unsplit pair carries no medical figure either, so it cannot leave one marked as confirmed.
+            a.SelfMedicalKnown = false;
         }
         a.Downs = Math.Max(a.Downs, b.Downs); a.FriendlyFireDeaths = Math.Max(a.FriendlyFireDeaths, b.FriendlyFireDeaths);
         a.LoneSurvivor = Math.Max(a.LoneSurvivor, b.LoneSurvivor); a.HealthLost = Math.Max(a.HealthLost, b.HealthLost);

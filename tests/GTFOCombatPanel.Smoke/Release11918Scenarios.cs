@@ -243,8 +243,14 @@ internal static class Release11918Scenarios
         {
             bool placed = ResultFallbackLayout.TryPlaceInBand(2560f, 1440f, 400f, 400f + bandHeight, 1200f, 270f, 0f,
                 out LayoutRect rect);
-            check(placed && rect.Y >= 400f - 0.5f,
-                $"a {bandHeight:0} px band never lets the board climb above its upper edge: y={(placed ? rect.Y : float.NaN):0.##}");
+            // 1.19.47 (review #4): the band's foot binds exactly as its top does. A band that cannot hold the board refuses
+            // the placement (the caller then fits a smaller legal grid into the same band); a band that can hold it keeps the
+            // board between its two edges and never lets it climb above the top.
+            bool holds = bandHeight + 0.5f >= 270f;
+            check(placed == holds,
+                $"a {bandHeight:0} px band {(holds ? "holds" : "refuses")} a 270 px board - the band's own foot is a bound, not a guess (placed={placed})");
+            check(!placed || (rect.Y >= 400f - 0.5f && rect.Bottom <= 400f + bandHeight + 0.5f),
+                $"and a placed board stays between the band's two edges: y={(placed ? rect.Y : float.NaN):0.##}, bottom={(placed ? rect.Bottom : float.NaN):0.##}");
         }
 
         // Required change 3 (the waiting block's reading). The failure page has always counted its waiting text only
@@ -333,14 +339,19 @@ internal static class Release11918Scenarios
         check(ResultFallbackTier.AcceptsPageBand(smallest, ResultFallbackLadder.Floor(floor, smallest, ladder)),
             "so the band that was refused at the measured floor is accepted once the ladder has stepped down");
         // The wheel over a forced board: F8 outranks the switches for the draw, so it has to for the wheel too.
+        // 1.19.59: the wheel's gates moved into `WheelShown`/`WheelApplies` (the same four switches, the F8 override first),
+        // and the scroll itself is settled by `PollWheel` from the game's own readings rather than from an IMGUI event.
         string root = SourceRoot();
         if (root == null) { check(false, "the 1.19.18 regression locates the production sources"); return; }
         string results = File.ReadAllText(Path.Combine(root, "ResultsDisplay.cs"));
-        string zoom = MethodBody(results, "internal static bool ZoomAt(");
-        check(zoom != null && zoom.Contains("if (!Forced)"),
-            "ZoomAt reads the F8 override before the three visibility switches");
-        check(zoom != null && zoom.Contains("PanelBehaviour.ToggleState") && zoom.Contains("ShowImpactBoard"),
+        string wheelShown = MethodBody(results, "private static bool WheelShown()");
+        check(wheelShown != null && wheelShown.Contains("if (Forced) return true;"),
+            "the wheel reads the F8 override before the three visibility switches");
+        check(wheelShown != null && wheelShown.Contains("PanelBehaviour.ToggleState") && wheelShown.Contains("ShowImpactBoard"),
             "and keeps every switch it used to read inside that guard");
+        check(MethodBody(results, "internal static void PollWheel()") != null
+              && results.Contains("if (!WheelApplies(out bool succeeded, out ScrollViewport viewport, out float pitch, out float maxPixels))"),
+            "and the scroll itself is settled by the frame's own sample, not by an IMGUI event");
         // The refusal count belongs to the fit, not to the placement.
         check(results.Contains("bool placed = strict && TryFit("),
             "Prepare decides the frame from TryFit's answer");
@@ -355,9 +366,16 @@ internal static class Release11918Scenarios
         check(bandPolicy.Contains("ResultFallbackTier.AcceptsPageBand(room, boardFloor)")
               && results.Contains("if (!ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,"),
             "the fail-open band is gated on the board's own floor - a band that cannot hold it is refused inside the one policy this path calls, where the fallback board's floor is asked rather than assumed");
-        check(!results.Contains("_fallbackOpacity = Math.Min(_fallbackOpacity, ResultFallbackLayout.OverlapOpacity);")
-              && results.Contains("grid.Height <= strip.Bottom - strip.Top + 0.5f"),
+        string fitBody = MethodBody(results, "private static bool Fit(BoardStrip strip");
+        check(fitBody != null && !fitBody.Contains("ResultFallbackLayout.OverlapOpacity")
+              && results.Contains("total <= strip.Bottom - strip.Top + 0.5f"),
             "1.19.22 re-point: a board taller than the *page's own* band is refused and reported with need/have, never placed and merely faded - the fit's fallback placement is reached only for a board that really fits that band; the invented fail-open band is instead sized from the board, which the 1.19.22 suite drives");
+        // 1.19.47 (review #4): the one place that keeps a board and fades it is the per-repaint fail-open re-check, and it
+        // commits the place together with the strip it was just measured against - never "a new place against the old band".
+        string recheck = MethodBody(results, "private static void RefreshFallbackSafety()");
+        check(recheck != null && recheck.Contains("FadeInPlace(") && recheck.Contains("_holdStrip = strip;")
+              && recheck.Contains("if (!FitsBand(total, strip))"),
+            "and the fail-open re-check is where a board keeps its place and goes faint, with the place and the strip it was re-measured into committed in one block (review #4)");
         string fallback = File.ReadAllText(Path.Combine(root, "FallbackLayout.cs"));
         check(fallback.Contains("band=extended"),
             "and the invented band reports itself as extended when it grows past the measured wall");
@@ -407,14 +425,23 @@ internal static class Release11918Scenarios
         // The strict paths are bounded by the same policy.
         check(results.Contains("ResultsBounds.TryResolve(Screen.height, bandAnchor, bandAnchorSource"),
             "the success page's strip is replaced by the band");
-        check(results.Contains("ResultsBounds.TryResolve(Screen.height, titleBottom, ResultBoundSource.TitleAnchor"),
-            "and the failure page's strip is tightened by it");
+        // 1.19.47（最新用户合同）：失败页的条带仍然由 `ResultsBounds` 收紧，但收紧的依据换成了窗口自己的上沿安全留边
+        // ——原生「任务失败」标题只是说明文字，不再卡位置也不再卡字号（`ResultAutoBoardContract`）。标题仍然留给扫描的
+        // 切分（`ScanFooterControls` 的 anchorBottom）和它自己的闸门，所以那条路径一个字都没动。
+        check(results.Contains("ResultsBounds.TryResolve(Screen.height, top, bandTopSource,")
+              && !results.Contains("ResultsBounds.TryResolve(Screen.height, titleBottom, ResultBoundSource.TitleAnchor"),
+            "the failure page's strip is still tightened by `ResultsBounds`, now from the window's own safe top margin and never from the mission-failed title");
         // The icon row is the row and nothing else: the plate behind it is not an anchor.
         check(!IconRowReadsThePlate(results),
             "the upper anchor reads the icon row only - the white plate behind the icons is not the row's bottom edge");
-        // Band height decides the glyph size.
-        check(results.Contains("ResultsBandFit.FloorForBand(room, content.Rows, Plugin.Density, requested, out bool squeezed)"),
-            "the fit takes its floor from the band's own height");
+        // Band height decides the glyph size - and the band the *table* gets is the strip minus the header the board
+        // reserves above it (1.19.53): fitting against the whole strip answered glyphs whose board the placement then
+        // refused, and the rows one whole-pixel step lower would have shown were lost.
+        // 1.19.54（输入契约）：`FitBoard` 只收**正文高度**（调用方恰好扣一次标题），函数内部不再扣；两个严格调用点
+        // 传的仍是 1.19.50 的 `tableRoom = room - header`，fail-open 的重拟合在成功页补扣一次、失败页原样传整条带。
+        check(results.Contains("ResultsBandFit.FloorForBand(bodyRoom, content.Rows, Plugin.Density, requested, out bool squeezed)")
+              && results.Contains("private static PanelGrid FitBoard(TableContent content, float bodyRoom,"),
+            "the fit takes its floor from the body height the caller hands it, and nothing is reserved inside");
         Console.WriteLine("WIRING: RESULT_BAND (static source check; not a runtime behaviour test)");
     }
 

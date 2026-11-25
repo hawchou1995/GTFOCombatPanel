@@ -71,6 +71,19 @@ public sealed class SquadCapability
     // state, not configuration - `Forget` and `ResetEvidence` clear an entry, and `ResetProbes` renews every
     // one of them for a new expedition.
     private readonly Dictionary<ulong, int> _probes = new Dictionary<ulong, int>();
+    // 1.19.43: the one late greeting a client may reserve for this expedition's *host*.
+    //
+    // Three packets are what a machine that runs no mod pays for, so three stay the ordinary budget and the burst
+    // they buy is spent inside the first seconds of an expedition - which is exactly when the host may still be
+    // loading this build. After that the client was silent for the rest of the run, and a host that runs the panel
+    // but was never reached was indistinguishable from one that runs nothing at all. One further greeting, asked for
+    // late and at a low rate by `SquadExchange.Tick` (never by the probe loop, which is bounded by the three above),
+    // is the recovery. It is reserved here exactly like the others and handed over by the same wire gate, so it costs
+    // one physical packet and cannot exceed `LateProbeBudget`; nothing else about the probe changes - an unproven peer
+    // is still sent no row, and sharing off still means silence.
+    public const int LateProbeBudget = 1;
+    private readonly Dictionary<ulong, int> _lateProbes = new Dictionary<ulong, int>();
+    private readonly Dictionary<ulong, int> _lateDelivered = new Dictionary<ulong, int>();
     // Of those reserved greetings, the ones the wire gate has actually handed to the transport.
     //
     // The two counters exist because one had two meanings and that is what this pair replaces: `Tick` wrote
@@ -99,8 +112,8 @@ public sealed class SquadCapability
         _broadcast = broadcast;
         if (broadcast || !changed) return;
         // Sharing switched off: a peer whose only evidence was the bounded probe is owed nothing, so the
-        // greetings still reserved for it go with the switch. A proved or named peer keeps everything: its
-        // evidence was never the probe.
+        // greetings still reserved for it go with the switch - the late one included. A proved or named peer keeps
+        // everything: its evidence was never the probe.
         var owed = new List<ulong>();
         foreach (ulong peer in _probes.Keys)
         {
@@ -108,7 +121,17 @@ public sealed class SquadCapability
             if (_allowlist.Contains(peer)) continue;
             owed.Add(peer);
         }
-        foreach (ulong peer in owed) { _probes.Remove(peer); _delivered.Remove(peer); }
+        foreach (ulong peer in _lateProbes.Keys)
+        {
+            if (_evidence.TryGetValue(peer, out SquadEvidence evidence) && evidence != SquadEvidence.Nothing) continue;
+            if (_allowlist.Contains(peer)) continue;
+            if (!owed.Contains(peer)) owed.Add(peer);
+        }
+        foreach (ulong peer in owed)
+        {
+            _probes.Remove(peer); _delivered.Remove(peer);
+            _lateProbes.Remove(peer); _lateDelivered.Remove(peer);
+        }
     }
 
     // How many greeting packets this machine has *decided* to spend on an unproven peer. The packet that
@@ -187,18 +210,58 @@ public sealed class SquadCapability
         // Reserved greetings are only owed while this machine still shares with its slot list, and never to a
         // peer that answered with a protocol this build does not speak.
         if (peer == 0UL || !_broadcast || _incompatible.Contains(peer)) return SquadEvidence.Nothing;
-        if (ProbesDelivered(peer) >= ProbesSent(peer)) return SquadEvidence.Nothing;
-        _delivered[peer] = ProbesDelivered(peer) + 1;
-        why = SquadEvidence.Probe;
-        return SquadEvidence.Probe;
+        // An ordinary reservation first: the three greetings the probe loop asks for.
+        if (ProbesDelivered(peer) < ProbesSent(peer))
+        {
+            _delivered[peer] = ProbesDelivered(peer) + 1;
+            why = SquadEvidence.Probe;
+            return SquadEvidence.Probe;
+        }
+        // Then the one late reservation, on the same terms: it is a greeting, it is handed over exactly once, and it
+        // cannot exist for a peer `SquadExchange.Tick` did not reserve it for.
+        if (LateProbesDelivered(peer) < LateProbesSent(peer))
+        {
+            _lateDelivered[peer] = LateProbesDelivered(peer) + 1;
+            why = SquadEvidence.Probe;
+            return SquadEvidence.Probe;
+        }
+        return SquadEvidence.Nothing;
+    }
+
+    // How many late greetings this machine has reserved for this peer, and how many of them the wire gate handed over.
+    public int LateProbesSent(ulong peer)
+    {
+        if (peer == 0UL) return 0;
+        return _lateProbes.TryGetValue(peer, out int sent) ? sent : 0;
+    }
+
+    public int LateProbesDelivered(ulong peer)
+    {
+        if (peer == 0UL) return 0;
+        return _lateDelivered.TryGetValue(peer, out int delivered) ? delivered : 0;
+    }
+
+    // Reserve the one late greeting this peer may still cost. Answers false when it has already been reserved, when
+    // sharing is off, or for a lookup of zero - so the caller cannot ask for a second one, and turning
+    // `ShareWithEveryPlayer` off takes the reservation with it exactly as it takes the ordinary ones.
+    public bool NoteLateProbe(ulong peer)
+    {
+        if (peer == 0UL || !_broadcast || _incompatible.Contains(peer)) return false;
+        _lateProbes.TryGetValue(peer, out int sent);
+        if (sent >= LateProbeBudget) return false;
+        _lateProbes[peer] = sent + 1;
+        return true;
     }
 
     // A new expedition: a peer that has still not answered gets its bounded probe again, because the
-    // machine on the other end may only now have finished loading this build.
+    // machine on the other end may only now have finished loading this build. The late reservation is renewed with
+    // it - the recovery belongs to the expedition it was asked in, never to the one that ended.
     public void ResetProbes()
     {
         _probes.Clear();
         _delivered.Clear();
+        _lateProbes.Clear();
+        _lateDelivered.Clear();
     }
 
     public int Allowlisted { get { return _allowlist.Count; } }
@@ -289,7 +352,8 @@ public sealed class SquadCapability
     public bool IsIncompatible(ulong peer) { return peer != 0UL && _incompatible.Contains(peer); }
 
     // The seat changed hands: the next occupant proves itself again rather than inheriting an entry - and
-    // it gets its own bounded probe rather than the previous occupant's spent one.
+    // it gets its own bounded probe rather than the previous occupant's spent one. The late greeting is the seat's too:
+    // a new occupant of the host's seat is a new chance to reach the build behind it.
     public void Forget(ulong peer)
     {
         if (peer == 0UL) return;
@@ -297,6 +361,8 @@ public sealed class SquadCapability
         _incompatible.Remove(peer);
         _probes.Remove(peer);
         _delivered.Remove(peer);
+        _lateProbes.Remove(peer);
+        _lateDelivered.Remove(peer);
     }
     // A new lobby or session: everything learned inside the old one goes, the probe budgets included. The
     // configured list stays, because it describes machines rather than a session.
@@ -306,6 +372,8 @@ public sealed class SquadCapability
         _incompatible.Clear();
         _probes.Clear();
         _delivered.Clear();
+        _lateProbes.Clear();
+        _lateDelivered.Clear();
     }
 
     public bool MaySend(ulong peer) { return MaySend(peer, out _); }
@@ -347,6 +415,9 @@ public sealed class SquadCapability
                 + " still inside the bounded probe of " + ProbeBudget + " greeting(s)";
             default: return _broadcast && ProbesSent(peer) >= ProbeBudget
                 ? "the bounded probe of " + ProbeBudget + " greeting(s) for this peer is spent, so nothing more is sent"
+                    + (LateProbesSent(peer) < LateProbeBudget
+                        ? " except the one late greeting this machine reserves for this expedition's host"
+                        : " - the late greeting for a host is spent as well -")
                     + " until it answers, a new expedition starts or the seat changes hands"
                 : "there is no evidence it runs this build, so it is sent nothing";
         }

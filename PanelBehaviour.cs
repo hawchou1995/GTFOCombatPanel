@@ -4,6 +4,7 @@ using System.Linq;
 using CellMenu;
 using Il2CppInterop.Runtime.Attributes;
 using Player;
+using TMPro;
 using UnityEngine;
 
 namespace HawChow.GTFOCombatPanel;
@@ -29,6 +30,12 @@ namespace HawChow.GTFOCombatPanel;
 // level shows it is not always alive. No third way, and never a guessed coordinate: every answer goes through the same
 // `ScreenBounds` sanity gate and the same settle window, a canvas whose camera is unusable is refused rather than substituted with
 // another one, and sampling once - on the first frame - is what made earlier attempts land hundreds of pixels away.
+//
+// 1.19.41: that row is the *anchor*, not the place. The table hangs below the whole equipment column the row belongs to -
+// the weapon, its ammo figures, the tool, the resource pack and the consumable are separate rows stacked under it - so the
+// column's rows are measured on the same chain, projected by the same proven camera and gated by the same `ScreenBounds`
+// rule, and the table is placed one gap under the last of them (`HudAvoidance.cs`). A bottom edge that arrives late is
+// honoured at once; a column that collapses has to stay collapsed for two readings before the table follows it back.
 public sealed class PanelBehaviour : MonoBehaviour
 {
     private const int MaxPlayers = 4;
@@ -86,6 +93,59 @@ public sealed class PanelBehaviour : MonoBehaviour
     // restarts the settle window rather than being read as movement (and then locked on).
     private readonly AnchorSourceTracker _anchorSource = new AnchorSourceTracker();
     private LayoutRect _anchorRect;
+    // 1.19.41: the equipment *column* the table has to stay clear of, and the camera the anchor row was projected
+    // with. The anchor row is one row of that column - it is not the column's bottom edge - so the rows are read from
+    // the same `m_playerLayer -> Inventory` chain the anchor is read from (`m_iconDisplay` plus every slot the inventory
+    // lists in `m_slotGUIOrder`), projected by the one camera this attempt proved, and gated by the same `ScreenBounds`
+    // rule. `_obstacles` is the one preallocated buffer: the read never allocates anything sized by what it finds, never
+    // walks a hierarchy and never scans a scene, so it costs the same on a full column as on an empty one.
+    private readonly EquipmentBandWatch _bandWatch = new EquipmentBandWatch();
+    private readonly List<HudObstacle> _obstacles = new List<HudObstacle>(EquipmentBand.MaxObstacles);
+    // The camera `ReadAnchor` proved for the element it measured. Written by that read (a static one, like the note it
+    // leaves behind) so the band's later re-reads use the same projection instead of looking for a camera of their own.
+    private static Camera _bandCamera;
+    // 1.19.45: whether `_bandCamera` was really proved for *this* round. The two are not the same fact: a `null` camera
+    // here is the legitimate "the HUD's canvas is a real overlay canvas, project without one" answer, while "no round has
+    // proved a camera since the level changed" must not be read as that same answer and must never re-use the previous
+    // level's rectangle. Written with `_bandCamera` in the anchor read, cleared with the rest of the round below.
+    private static bool _bandCameraProved;
+    // 1.19.45: the *proof type* of `_bandCamera`. True only when this round proved it through the HUD's own manual canvas
+    // (`AnchorCameraChoice.ManualCanvas` -> `AnchorProjection.Rect` with no source lens). That is the one camera Unity may
+    // leave `enabled == false` and still composite into the window, so it is the only kind of disabled camera accepted.
+    private static bool _bandCameraManualCanvas;
+    // The obstacle list is re-read on the same 0.25 s poll the table itself refreshes on, which is four reads a second
+    // while a level is running and nothing at all on a result page.
+    private const float BandInterval = 0.25f;
+    private float _nextBandRead;
+    // The last placement this panel reported. A line is written only when it changes, so the log carries one entry per
+    // real move instead of one per poll.
+    private string _placementNote;
+    // 1.19.49: one ledger for the whole "no proven place" family - the automatic anchor's missing measurement, a column
+    // measured only in part, a page with no free rung, the conservative place that was drawn instead, and the one poll that
+    // still draws nothing. A line joins it under a *semantic* key ("the column is partial", "the place is the right row"),
+    // never under its own numbers, so the same absence is written once however long it lasts: the table's width, the spot's
+    // coordinates, the attempt count, the retry delay, an F8 press and one ordinary poll after another all move inside a line
+    // that has already been written.
+    //
+    // 1.19.50: the vocabulary and the bound live in `HudAbsenceLedger`, not here, because the two have to agree: the family has
+    // ten legitimate keys and the ledger holds exactly ten, so every reason's first line is reportable - the previous cap of
+    // eight silently refused the ninth and tenth, and a round that had already written its anchor absence, a partial column and
+    // four spot answers could lose the one line that says "this poll drew nothing and here is why". A key outside the
+    // vocabulary is refused rather than counted, so nothing can widen the bound either. The ledger is emptied with the round
+    // (`ForgetBandRound`) - the one thing that makes an absence new again - and a *recovery* does not empty it, so a column that
+    // flips complete/partial at the 0.25 s poll rate cannot turn one absence into a line per flip.
+    private readonly HudAbsenceLedger _absence = new HudAbsenceLedger();
+    // 1.19.48 (review): the conservative place is *sticky* once it is drawn, so a column that flips complete/partial at the
+    // 0.25 s poll rate cannot move the table on every other poll. `_bandCompleteStreak` counts consecutive complete readings
+    // and `_fallbackSpotDrawn` says this round has really drawn a conservative place.
+    private bool _fallbackSpotDrawn;
+    private int _bandCompleteStreak;
+    private const int StableCompleteSamples = 2;
+    // The one preallocated buffer of rectangles a conservative place has to clear: the rows this poll really measured, each
+    // one on its own (the union of a column with a hole in it also covers the hole).
+    private readonly List<LayoutRect> _fallbackObstacles = new List<LayoutRect>(EquipmentBand.MaxObstacles + 1);
+    // What the last band read saw, printed beside the placement so a recorded frame can be compared with the HUD.
+    private string _bandRows = "band=not-read";
     private readonly AnchorSamplePolicy _anchorPolicy = new AnchorSamplePolicy();
     // Whether the last frame this component saw was inside a level, so that entering one grants the anchor a
     // fresh measurement round without disturbing an anchor that has already locked.
@@ -126,6 +186,7 @@ public sealed class PanelBehaviour : MonoBehaviour
         ForgetBackgroundFade();
         _loggedBackgroundFade = false;
         _anchorSource.Restart();
+        ForgetBandRound();
         // The resolution baseline is written *here*, and that is the whole of the defect this fixes.
         //
         // `_anchorScreenWidth/_anchorScreenHeight` used to be written in exactly one place: the branch in which the
@@ -138,6 +199,45 @@ public sealed class PanelBehaviour : MonoBehaviour
         // the one thing this method is *for*, and a measurement round now runs to its own end.
         _anchorScreenWidth = Screen.width;
         _anchorScreenHeight = Screen.height;
+    }
+
+    // The equipment column's measurement round: the committed band, the camera it was projected with, the read schedule
+    // and the three lines that reported it.
+    //
+    // 1.19.45: every one of those facts is about one HUD in one window, so they are dropped together. The defect this
+    // replaces is the level change: the anchor branch below deliberately leaves a *locked* anchor alone (that is its
+    // design and it is not touched here), but it also left the band behind - the committed rectangle, the camera that
+    // projected it and the read clock. A new level destroys that HUD and its camera, so the panel went on answering
+    // `_bandWatch.Has` from the previous level's rectangle, projected through a camera that no longer exists: the table
+    // hung under a column that was not there, for the rest of the session. A configuration reload and a resolution change
+    // already dropped exactly these fields (`UnlockAnchor`), so this is the same reset, in one place, called from both.
+    private void ForgetBandRound()
+    {
+        _bandWatch.Restart();
+        _bandCamera = null;
+        _bandCameraProved = false;
+        // The proof travels with the camera it was made for: a new level's camera has not been proved by anything yet, so a
+        // manual-canvas authorization from the previous round must never make a disabled camera of this one look alive.
+        _bandCameraManualCanvas = false;
+        _nextBandRead = 0f;
+        _bandRows = "band=not-read";
+        // 1.19.50: the rows of the last read go with the commit. `ReadEquipmentBand` clears them at the start of its own read,
+        // but between this reset and the next read `TryFallbackSpot` treats every drawn-and-measured row in `_obstacles` as an
+        // obstacle - and the committed band's own window guard (`_anchorScreenWidth == Screen.width`) never covered the rows.
+        // So a new level, a configuration reload or a resolution change left the *previous* scene's rectangles (and, after a
+        // resize, the previous window's pixels) in the list: the conservative place was pushed around a column that no longer
+        // existed, and the line counted it as "known row(s)". Retained geometry is still an obstacle inside one round, which is
+        // what this list is for; it is only no longer inherited across one.
+        _obstacles.Clear();
+        _placementNote = null;
+        // 1.19.49: every absence line of this round goes with the round - a new page, a new level, a configuration reload or a
+        // resolution change is a new absence and earns its own line. `_fallbackSpotDrawn` and the streak belong to the round
+        // too, so a new page starts from "no conservative place has been drawn" and earns its own recovery window.
+        _absence.Clear();
+        _fallbackSpotDrawn = false;
+        // 1.19.46: the camera re-proof budget belongs to the round as well - a new level earns its own attempts.
+        _bandCameraReproofs = 0;
+        _bandCompleteStreak = 0;
     }
 
     private void Update()
@@ -187,6 +287,12 @@ public sealed class PanelBehaviour : MonoBehaviour
                     ForgetBackgroundFade();
                     _loggedBackgroundFade = false;
                     _anchorSource.Restart();
+                    // 1.19.45: and the equipment column's own round goes with it, for the same reason and one worse: the
+                    // camera that projected those rows belonged to the HUD this line change destroyed, so the committed
+                    // band below is a rectangle from a scene that is no longer loaded. It is dropped here through the one
+                    // reset `UnlockAnchor` already uses, so the two paths can never disagree about what a round is. The
+                    // locked anchor itself is deliberately left alone, exactly as before.
+                    ForgetBandRound();
                 }
             }
             bool visible = inLevel ? Plugin.ShowPanel.Value : Plugin.ShowResultOverlay.Value;
@@ -219,6 +325,17 @@ public sealed class PanelBehaviour : MonoBehaviour
                     Plugin.Logger?.LogInfo($"[DIAG] F8 visibility: state={state}, requested={visible}, ShowPanel={Plugin.ShowPanel.Value}, ShowResultOverlay={Plugin.ShowResultOverlay.Value}, ShowResults={Plugin.ShowResults.Value}, ShowImpactBoard={Plugin.ShowImpactBoard.Value}.");
                 }
             }
+            // The settlement page's own two controls are polled here, on the frame, for the same reason the key is:
+            // they are the page's pointer and the board must hide or come back on this frame's next repaint. It
+            // reads the game's pointer and left button and answers for the two rectangles the last repaint really
+            // drew; it never captures, wraps or suppresses any input, so a click that is not on one of them reaches
+            // the page exactly as it did before.
+            ResultsDisplay.PollChromeInput();
+            // 1.19.59: the settlement board's wheel is settled here too, on the frame, from the page's own
+            // `ScrollInput` first and the physical `Input.mouseScrollDelta` as the fallback - the routing the player's
+            // other panel uses. `CM_PageBase.UpdateButtonPress` is the second caller and the router's frame latch keeps
+            // the two to one settlement per frame. Nothing is consumed: a frame this mod does not use is still the page's.
+            ResultsDisplay.PollWheel();
             // Config is the source of truth, including a manual edit made after an F8 toggle.
             _visible = Plugin.ShowPanel.Value;
             ToggleState = visible;
@@ -230,11 +347,10 @@ public sealed class PanelBehaviour : MonoBehaviour
 
     private void OnGUI()
     {
-        // The wheel is the settlement board's own control and IMGUI hands it over as an event of its own, so it is
-        // read here - before the Repaint gate every other event type is still refused by - and `Use()`d, so the page
-        // under the pointer does not scroll as well. Nothing about the Repaint path below changes: it draws exactly
-        // what it drew before, at whatever size the wheel has chosen for the page that is up.
-        if (ResultsZoomEvent()) return;
+        // 1.19.59: `OnGUI` no longer reads the wheel. The settlement board's scroll is settled from the game's own
+        // readings on the frame (`Update` below, and `CM_PageBase.UpdateButtonPress` as the second entry), so this method
+        // is drawing only - and it no longer consumes an IMGUI event to keep the page from scrolling, because it never
+        // took one: the page keeps its own `ScrollInput` (see `ResultWheel.cs`).
         if (Event.current == null || Event.current.type != EventType.Repaint) return;
         try
         {
@@ -263,67 +379,6 @@ public sealed class PanelBehaviour : MonoBehaviour
         }
         catch (Exception error) { LogOnce(error); }
     }
-
-    // The settlement board's wheel.
-    //
-    // A settlement page that is really showing, with the pointer inside the board's own rectangle, is the whole of
-    // the trigger: the in-level table keeps the glyph size its own settings give it, and every other page ignores
-    // the wheel exactly as it did before this existed. The page is decided from the same state the board itself
-    // reads, so the success board and the failure board can only ever move their own preference.
-    //
-    // Once a notch has landed on the board the event is consumed here - `Use()` and handled - whatever writing the
-    // new value does to the layout cache: `ResultsDisplay.ZoomAt` judges the gesture against the rectangle the
-    // board was last drawn at and locks the wheel sequence for this frame, so the rest of one gesture cannot leak
-    // to the page underneath while the board is being rebuilt at its new size.
-    [HideFromIl2Cpp]
-    private static bool ResultsZoomEvent()
-    {
-        Event current = Event.current;
-        if (current == null || current.type != EventType.ScrollWheel) return false;
-        try
-        {
-            var state = GameStateManager.CurrentStateName;
-            bool succeeded = state == eGameStateName.ExpeditionSuccess;
-            if (!succeeded && state != eGameStateName.ExpeditionFail) return false;
-            if (!ResultsZoom.Accepts(current.delta.y)) return false;
-            if (!ResultsDisplay.ZoomAt(current.mousePosition, succeeded, Time.frameCount)) return false;
-            // 固定模式（1.19.45）：滚轮仍然被这块板吃掉（不漏给下面的页面），但它**不改字号**——玩家在 [Results]
-            // FixedFontPixels 里指定的像素值就是这块板的字号，滚轮在这里悄悄乘一个倍率正是这个模式不允许的事。
-            if (ResultsDisplay.FixedLayoutActive())
-            {
-                current.Use();
-                if (!_loggedFixedWheel)
-                {
-                    _loggedFixedWheel = true;
-                    Plugin.Logger?.LogInfo("[DIAG] settlement board wheel: this page is drawn with the fixed layout the player configured "
-                        + "([Results] FixedLayout=true), so the wheel is consumed here and the glyph stays at [Results] FixedFontPixels; "
-                        + "turn FixedLayout off to scale the adaptive board with the wheel again.");
-                }
-                return true;
-            }
-            ResultPageKind page = ResultsZoom.Page(succeeded);
-            float scale = ResultsZoom.Next(Plugin.ResultFontScale(succeeded), current.delta.y);
-            bool changed = Plugin.PersistResultFontScale(page, scale);
-            if (changed)
-                Plugin.Logger?.LogInfo($"[DIAG] settlement board wheel: the {page.ToString().ToLowerInvariant()} page's own font scale is now {scale:0.##}, and the board is rebuilt at that scale inside the strip this page measured - the button below it is never covered.");
-            current.Use();
-            return true;
-        }
-        catch (Exception error) { LogWheelOnce(error); return false; }
-    }
-
-    private static bool _loggedWheel;
-    // 固定模式下滚轮被吃掉但不改字号：这条诊断一局只写一次，免得每滚一格就刷一行。
-    private static bool _loggedFixedWheel;
-
-    [HideFromIl2Cpp]
-    private static void LogWheelOnce(Exception error)
-    {
-        if (_loggedWheel) return;
-        _loggedWheel = true;
-        Plugin.Logger?.LogWarning("[DIAG] the settlement board could not take the mouse wheel and keeps its size: " + error.Message);
-    }
-
     [HideFromIl2Cpp]
     private void Refresh()
     {
@@ -340,18 +395,32 @@ public sealed class PanelBehaviour : MonoBehaviour
         // made a `Background Fade` that appeared after the twelve attempts unreachable without F8, a level change or a manual
         // re-anchor. A locked anchor is still never sampled again.
         if (Plugin.AnchorToFlashlight.Value && !_anchorLocked) SampleAnchor(layer, Time.unscaledTime);
-
+        // 1.19.41: the column is re-read on the same poll, and only once the anchor is locked: before that there is no
+        // proven camera to project its rows with, and `ReadAnchor` writes that camera on the attempt that measures the
+        // anchor. A locked anchor is frozen, but the column is *not* - the HUD expands a slot when a weapon is selected,
+        // grows a row when a pack is picked up and adds one when a throwable is readied - so the band is watched for the
+        // rest of the level, at this poll and never per frame.
+        if (Plugin.AnchorToFlashlight.Value && _anchorLocked) WatchEquipmentBand(layer, Time.unscaledTime);
         var columns = Columns();
         var players = CombatSync.DisplayRows().OrderBy(p => p.DisplaySlot).Take(MaxPlayers).ToList();
         _content = BuildTable(columns, players);
         _grid = HudTable.BuildGrid(_content, FontSize(), Plugin.Density, Screen.width, Screen.height);
         if (_grid == null) { _content = null; return; }
-        if (!TryResolveOrigin(_grid, out var origin)) { _grid = null; _content = null; return; }   // the anchor is still settling; draw nothing rather than jump
+        // 1.19.47: a poll that cannot place the table clears the rectangle this round was drawing it at. `_grid` going
+        // null already stops the paint, but the drawn origin is a fact about *this* poll: leaving the previous one in the
+        // field is what would let a stale rectangle be handed to anything that asks between two repaints (`Draw` also
+        // tests `_grid`, so this is the second of the two locks, not the only one).
+        if (!TryResolveOrigin(_grid, out var origin)) { _grid = null; _content = null; _origin = default; return; }   // the anchor is still settling, or the column is not proven: draw nothing rather than jump
         _origin = origin;
         if (!_loggedDraw)
         {
             _loggedDraw = true;
-            Plugin.Logger.LogInfo($"[DIAG] table {_content.ColumnCount} columns x {_content.Rows} rows, {_grid.Width:0}x{_grid.Height:0} px at ({origin.X:0},{origin.Y:0}) of a {Screen.width}x{Screen.height} window, font {_grid.FontPixels:0}px, density={_grid.Density.Name}, anchor={(_anchorLocked ? "flashlight icon" : "config PositionX/PositionY")}, columns={string.Join("+", columns)}; drawn by IMGUI in screen space, so nothing in the game can move it.");
+            // 1.19.49: `anchor=` names the source of the *drawn* rectangle, not the state of the anchor. The recorded 1.19.48
+            // frame printed `anchor=flashlight icon` on a table that had been drawn at the conservative place, which is the one
+            // thing that line must never be read as: a locked anchor is not a placement under it.
+            string source = _fallbackSpotDrawn ? "conservative place (no proven rung)"
+                : (_anchorLocked ? "flashlight icon" : "config PositionX/PositionY");
+            Plugin.Logger.LogInfo($"[DIAG] table {_content.ColumnCount} columns x {_content.Rows} rows, {_grid.Width:0}x{_grid.Height:0} px at ({origin.X:0},{origin.Y:0}) of a {Screen.width}x{Screen.height} window, font {_grid.FontPixels:0}px, density={_grid.Density.Name}, anchor={source}, columns={string.Join("+", columns)}; drawn by IMGUI in screen space, so nothing in the game can move it.");
         }
     }
 
@@ -430,7 +499,13 @@ public sealed class PanelBehaviour : MonoBehaviour
                     string threw = string.IsNullOrEmpty(sample.Error) ? string.Empty : ", the read itself threw: " + sample.Error;
                     string camera = string.IsNullOrEmpty(_anchorCameraNote) ? string.Empty : ", " + _anchorCameraNote;
                     string background = _backgroundFadeLookup.Describe();
-                    Plugin.Logger.LogWarning($"[DIAG] the flashlight anchor could not be measured yet ({AnchorSamplePolicy.Describe(failure)}{threw}{camera}, attempt {_anchorPolicy.Attempts} of {AnchorSamplePolicy.Budget}, triedBackgroundFade={background}, source=config); the table uses PositionX/PositionY meanwhile and the measurement is retried in {AnchorSamplePolicy.DelayAfter(_anchorPolicy.Failures):0.##}s, {Math.Max(0, AnchorSamplePolicy.Budget - _anchorPolicy.Failures)} retry(s) left.");
+                    // 1.19.49: an automatic measurement that has not arrived yet is the mode's own waiting, not a fault of the
+                    // build, so the line is Info. The one exception is a read that really threw: that message is a genuine error
+                    // of this build or of this HUD, it stays a Warning, and it is what makes the two kinds distinguishable in the
+                    // log again. `FreshWarning` above still bounds this line to the round's distinct failures.
+                    string line = $"[DIAG] the flashlight anchor could not be measured yet ({AnchorSamplePolicy.Describe(failure)}{threw}{camera}, attempt {_anchorPolicy.Attempts} of {AnchorSamplePolicy.Budget}, triedBackgroundFade={background}); automatic HUD placement waits for proof and the measurement is retried in {AnchorSamplePolicy.DelayAfter(_anchorPolicy.Failures):0.##}s, {Math.Max(0, AnchorSamplePolicy.Budget - _anchorPolicy.Failures)} retry(s) left.";
+                    if (string.IsNullOrEmpty(sample.Error)) Plugin.Logger.LogInfo(line);
+                    else Plugin.Logger.LogWarning(line);
                 }
                 _anchorPolicy.Reported();
             }
@@ -448,7 +523,9 @@ public sealed class PanelBehaviour : MonoBehaviour
                 // followed by the authorization the last attempt was working from (`AnchorCameraChoice.Describe`), so the
                 // final line says how the anchor was being measured - a camera proof, the canvas' own geometry, or neither.
                 string camera = string.IsNullOrEmpty(_anchorCameraNote) ? string.Empty : ", " + _anchorCameraNote;
-                Plugin.Logger.LogWarning($"[DIAG] the flashlight anchor was given up on for this level after {_anchorPolicy.Attempts} attempt(s) and {_anchorPolicy.Waited:0.#}s of waiting ({AnchorSamplePolicy.Describe(_anchorPolicy.LastFailure)}{camera}, triedBackgroundFade={_backgroundFadeLookup.Describe()}, source=config); the table keeps the configured PositionX/PositionY. The HUD is still looked at once every {AnchorSamplePolicy.WatchInterval:0.#}s with no budget behind it, so an element or a camera that arrives later is still measured; a new level, a configuration reload or a resolution change starts a full round again.");
+                // 1.19.49: Info, for the same reason as the failure line above - the automatic mode waiting for a proof is a state
+                // of this HUD, and the warning channel is left for what really went wrong.
+                Plugin.Logger.LogInfo($"[DIAG] the flashlight anchor fast retries ended after {_anchorPolicy.Attempts} attempt(s) and {_anchorPolicy.Waited:0.#}s of waiting ({AnchorSamplePolicy.Describe(_anchorPolicy.LastFailure)}{camera}, triedBackgroundFade={_backgroundFadeLookup.Describe()}); automatic HUD placement still waits for proof. The HUD is checked every {AnchorSamplePolicy.WatchInterval:0.#}s for late geometry; a new level, a configuration reload or a resolution change starts a full round again.");
                 _anchorPolicy.Reported();
             }
             return;
@@ -497,11 +574,12 @@ public sealed class PanelBehaviour : MonoBehaviour
             _anchorFallback = false;
             _anchorScreenWidth = Screen.width; _anchorScreenHeight = Screen.height;
             // The figure printed is the *sampling* time this round has spent - one `SampleInterval` per attempt - and never
-            // wall clock: the retry delays between attempts are not part of it, so a round that waited 39.5 s between
+            // wall clock: the retry delays between attempts are not part of it, so a round that backed off 35.5 s between
             // twelve samples reads 3.00 s. The attempt count and the words "sampling time" are what make the line say
-            // that; `AnchorSamplePolicy.Waited` is the field that measures the waiting itself, and the give-up line is the
-            // one that prints it. The source is named on the same line, so "the table locked" can never be read without
-            // saying which of the two native elements it locked onto.
+            // that; `AnchorSamplePolicy.Waited` is the field that accumulates the backoff itself (eleven waited intervals,
+            // 35.5 s for this budget - not a measured wall clock, and never the twelfth delay the spent budget does not
+            // wait for), and the give-up line is the one that prints it. The source is named on the same line, so "the table
+            // locked" can never be read without saying which of the two native elements it locked onto.
             // 1.19.28: the line says *what rectangle* locked, not only which element of the row it came from. "anchor=flashlight"
             // used to be read as "the flashlight icon was measured", and that object is not what this build measures any more: the
             // first source is the icon row's own `PUI_InventoryIconDisplay` layout rectangle, the second is the row's `Background
@@ -613,6 +691,22 @@ public sealed class PanelBehaviour : MonoBehaviour
         // it, so a rule the ladder merely authorized can never be printed as if it had answered (the recorded
         // `anchorSource=canvas-geometry` beside two `gate=refused`s and `iconSource=config`).
         bool measuredAnything = icon.Measured || row.Measured;
+        // 1.19.41: the camera this attempt proved for the rectangle it is about to hang the table under. The equipment
+        // column's rows are projected with it on this attempt and on every later re-read of that column, so the band and
+        // the anchor can never be described in two different pixel grids. A sample that measured nothing writes nothing:
+        // a refused attempt is not evidence about which camera draws the HUD.
+        //
+        // 1.19.45: `_bandCameraProved` travels with it, because a `null` camera is a *proved* answer (the HUD's canvas is a
+        // real overlay canvas and Unity's camera-less projection is the right one) and is not the same fact as "no round
+        // has proved a camera at all" - which is exactly the state a level change leaves behind.
+        _bandCamera = measuredAnything ? decided.Camera : null;
+        _bandCameraProved = measuredAnything;
+        // The one fact `BandCameraAlive` needs to be able to tell a manual canvas' on-demand camera from any other disabled
+        // one. `ManualCanvas()` is the only factory that hands out `Rect` with no source, and it only ever reaches an answer
+        // through the chain `AnchorManualCanvasPolicy` verifies for this window.
+        _bandCameraManualCanvas = measuredAnything
+            && decided.Choice.Projection == AnchorProjection.Rect
+            && decided.Choice.Source == AnchorCameraSource.None;
         // The note the failure and give-up lines print is the same authorization, told whether it answered: a refusal keeps its
         // reason, an answer keeps its sentence.
         _anchorCameraNote = AnchorCameraChoice.Describe(decided.Choice, decided.Measured);
@@ -644,7 +738,10 @@ public sealed class PanelBehaviour : MonoBehaviour
                 string reason = icon.Present
                     ? AnchorSamplePolicy.Describe(icon.Failure) + ", " + AnchorCameraChoice.Describe(icon.Choice, icon.Measured)
                     : "the icon row's layout rectangle could not be read at all";
-                Plugin.Logger?.LogWarning($"[DIAG] the anchor could not be measured from the icon row ({reason}); anchoring on the same HUD "
+                // 1.19.49: Info, like the rest of the automatic-measurement family. The row's own background was found and the
+                // table hangs under a measured rectangle; this line says *which* of the two elements it came from, which is a
+                // diagnosis to keep and not a fault to warn about.
+                Plugin.Logger?.LogInfo($"[DIAG] the anchor could not be measured from the icon row ({reason}); anchoring on the same HUD "
                     + $"row's Background Fade at ({row.Rect.X:0},{row.Rect.Y:0}) size {row.Rect.Width:0}x{row.Rect.Height:0} screen px, "
                     + $"source={AnchorSourceLadder.Name(AnchorElementSource.BackgroundFade)}, measuredFrom={AnchorSourceLadder.GeometryName(AnchorElementSource.BackgroundFade)}"
                     + $" - this is the row's background SpriteRenderer, not the icon row's layout rectangle, and "
@@ -689,14 +786,19 @@ public sealed class PanelBehaviour : MonoBehaviour
         // line used to print `absent` for both, which claims a read of the HUD that never happened. `not-observed` is now its
         // own word.
         public readonly bool ManualObserved;
+        // 1.19.41: the camera this element's rectangle was projected with - `null` for a genuine overlay canvas, which
+        // is the camera-less identity projection Unity itself uses there. Carried on the measurement so the equipment
+        // column's rows are projected by the one camera this attempt already proved, instead of a second lookup that
+        // could answer a different camera (or none) for the same HUD.
+        public readonly Camera Camera;
 
         public AnchorElementMeasurement(bool present, int layer, bool canvasDrawn, AnchorCameraChoice choice, bool measured,
             LayoutRect rect, AnchorSampleFailure failure, string geometry = null, AnchorManualCanvasFacts manual = default,
-            bool manualObserved = false)
+            bool manualObserved = false, Camera camera = null)
         {
             Present = present; Layer = layer; CanvasDrawn = canvasDrawn; Choice = choice;
             Measured = measured; Rect = rect; Failure = failure; Geometry = geometry; Manual = manual;
-            ManualObserved = manualObserved;
+            ManualObserved = manualObserved; Camera = camera;
         }
     }
 
@@ -832,7 +934,7 @@ public sealed class PanelBehaviour : MonoBehaviour
             return new AnchorElementMeasurement(true, layer, canvasDrawn, choice, false, default, AnchorSampleFailure.Unmeasurable,
                 geometry, manual, manualObserved: true);
         return new AnchorElementMeasurement(true, layer, canvasDrawn, choice, true, rect, AnchorSampleFailure.None, geometry, manual,
-            manualObserved: true);
+            manualObserved: true, camera: used);
     }
 
     // The numbers one attempt read, as the diagnostic line prints them (1.19.28). Every value was already read to *make* the
@@ -1798,23 +1900,52 @@ public sealed class PanelBehaviour : MonoBehaviour
     private static List<PanelColumn> Columns()
         => Plugin.VisibleColumns.Count > 0 ? Plugin.VisibleColumns : PanelColumns.Compose(true, true, true, true, true);
 
-    // With the flashlight anchor the table hangs below the icon, right-aligned with it, so it sits
-    // in the right-hand gear column wherever that column happens to be. A negative PositionX/Y
-    // measures from the right/bottom edge, which is the fallback used whenever the icon cannot be
-    // measured - a sample that failed, or a budget that gave up - so the table is on screen either
-    // way. Either way the whole table is clamped inside the window.
+    // Where the table stands.
+    //
+    // Anchored mode used to hang it under the *anchor row* (`anchorRow.Bottom + 8`). The recorded expedition shows what
+    // that really is: the row measured (2336,294) size 211x110 on a 2560x1440 window, so its bottom edge is 404, and the
+    // table (397x60) was placed at (2150,412)-(2547,472) - drawn straight over the weapon, its ammo figures, the tool,
+    // the pack and the consumable, which are rows *below* that one. A later screenshot shows the damage table lying on
+    // exactly those vanilla rows.
+    //
+    // 1.19.41 therefore places it below the whole measured equipment column instead (`HudPlacement`, fed by the rows
+    // `ReadEquipmentBand` measured), with the same gap the mod has always used. A negative PositionX/Y still measures
+    // from the right/bottom edge, and that configured position is still what a round draws while the anchor is settling
+    // and what a round keeps when the anchor gave up - but it is no longer where an anchored table is pushed back to when
+    // the column cannot be measured: a table placed at the anchor row's bottom edge *is* the overlap this round removes,
+    // so a HUD whose column cannot be measured falls back to the player's own configured position (reported once per
+    // round) instead. Either way the whole table is clamped inside the window.
     [HideFromIl2Cpp]
     private bool TryResolveOrigin(PanelGrid grid, out LayoutRect origin)
     {
         origin = default;
-        float x, y;
-        bool anchored = Plugin.AnchorToFlashlight.Value && _anchorLocked;
-        if (anchored)
+        // 1.19.48: assigned here, not only inside the branches. `TryAnchoredOrigin` is called through a short circuit, and an
+        // `out` argument is only definitely assigned when the call itself ran - so `float x, y;` was a compile error, and
+        // these initial values are also the honest answer for a poll that never asked.
+        float x = 0f, y = 0f;
+        bool automatic = Plugin.AnchorToFlashlight.Value;
+        bool anchored = automatic && _anchorLocked;
+        // 1.19.47: a rung is a proof only for a reading that proved the whole column, and 1.19.48 does not make one cheaper.
+        // What 1.19.48 changes is the answer to "no proof": the table is drawn at a conservative place instead of not at all.
+        //
+        // 1.19.48 (review): the proof is also *sticky* once a conservative place was drawn. `recovered` requires
+        // `StableCompleteSamples` consecutive complete readings before the ladder may place again, so a column that flips
+        // complete/partial at the 0.25 s poll rate cannot hand the table back and forth between the rung and the spot - and
+        // cannot write a line at every turn. A round that never fell back is unchanged: the rung is taken on the poll that
+        // proves it.
+        bool recovered = !_fallbackSpotDrawn || _bandCompleteStreak >= StableCompleteSamples;
+        bool proven = anchored && recovered && TryAnchoredOrigin(grid, out x, out y);
+        if (proven)
         {
-            x = _anchorRect.Right - grid.Width + Plugin.OffsetX.Value;
-            y = _anchorRect.Bottom + 8f + Plugin.OffsetY.Value;
+            // Placed against the measured column; `TryAnchoredOrigin` has already reported which rung it used.
         }
-        else if (Plugin.AnchorToFlashlight.Value && !_anchorUnavailable && !_anchorFallback)
+        // 1.19.48: `_bandWatch.Has` is deliberately no longer an unconditional gate. It used to be `return false` for
+        // every automatic poll without a measured band, and the recorded 1920x1080 -> 2560x1440 change is what that costs:
+        // the HUD's manual canvas texture stayed 1080, the anchor round spent its twelve attempts, the column was never
+        // measured - and the table was refused for the rest of the level, at the one moment the player is looking at the
+        // board. A round that is still *settling* keeps its silence (a table may not jump once and then again); a round
+        // that has given up, or an anchor that is locked over a column this build cannot prove, is answered below.
+        else if (!anchored && automatic && !_anchorUnavailable && !_anchorFallback)
         {
             return false;   // still settling: draw nothing rather than jump
         }
@@ -1827,8 +1958,254 @@ public sealed class PanelBehaviour : MonoBehaviour
         }
         x = Mathf.Clamp(x, 0f, Mathf.Max(0f, Screen.width - grid.Width));
         y = Mathf.Clamp(y, 0f, Mathf.Max(0f, Screen.height - grid.Height));
+        // 1.19.42/1.19.47/1.19.48: three different silences, told apart.
+        //
+        //   * No band was ever measured: nothing here can say where the column is, so the configured position is the only
+        //     answer anybody has - and, in the automatic mode, that is exactly why it may not be used (see below).
+        //   * The column *was* measured and this placement covers it: the configured position is not a safe answer on
+        //     this HUD - on the recorded pages `PositionY=0.365` lands inside the right-hand column - so it is not drawn
+        //     there. Drawing it would be the very overlap this round removes, arrived at through the fallback instead of
+        //     through the anchor.
+        //   * The column was measured but only *partly*: same answer, for a stronger reason. The rows this build could not
+        //     project are drawn somewhere this reading does not describe, so "does not touch the band" is a statement about
+        //     the rows that were read and nothing about the ones that were not. `HudFallback.Clear` therefore refuses it.
+        //
+        // 1.19.48 (review): the automatic mode may only use the configured position when a *complete* reading clears it, and
+        // only after the recovery gate above. The recorded 2K page is why: the configured (2024,526,459x120) misses the one
+        // row that was read by 122 px in y, but it sits on that column's x range (2336..2546) where the eleven unread rows
+        // are drawn - so a partial reading, or no reading at all (a canvas texture that stayed 1080), cannot call it safe.
+        // Everything else is answered by `TryFallbackSpot`, whose candidates are all right-aligned to the window's right
+        // margin (1.19.49) - the side the equipment column is drawn on and the edge a proven rung keeps.
+        //
+        // The manual mode (`AnchorToFlashlight=false`) never reaches either test: `automatic` is false there and the
+        // configured position is the player's own explicit answer, overlap or not - that path is byte-for-byte unchanged.
+        float fallbackOverlap = 0f;
+        bool configuredSafe = !automatic || (recovered && _bandWatch.Has && _bandWatch.Complete
+            && HudFallback.Clear(new LayoutRect(x, y, grid.Width, grid.Height), _bandWatch.Has,
+                _bandWatch.Complete, _bandWatch.Committed, out fallbackOverlap));
+        if (!configuredSafe)
+        {
+            if (!TryFallbackSpot(grid, y, out LayoutRect spot, out string spotWhy, out float spotOverlap))
+            {
+                // The one page nothing can be drawn on: a table larger than the window (or a window whose size could not be
+                // read). That is a property of the table, not of the HUD, and it is still reported as it always was.
+                DeferFallback(new LayoutRect(x, y, grid.Width, grid.Height), fallbackOverlap, _bandWatch.Complete);
+                return false;
+            }
+            // 1.19.49: nothing re-arms an absence line here. The poll is answered with a place, and the line that says so is
+            // written once per round under its own semantic key (`ReportFallbackSpot`), not once per answer.
+            _fallbackSpotDrawn = true;
+            ReportFallbackSpot(spot, spotWhy, spotOverlap, fallbackOverlap);
+            origin = spot;
+            return true;
+        }
+        // A placement this poll can answer for - a proven rung, or the configured position of a complete reading - is drawn. The
+        // conservative state goes with it (the table is not on the spot any more), but the *lines* already written for this round
+        // stay written: a page that flips between the two answers would otherwise re-print its absence at the poll rate (1.19.49).
+        _fallbackSpotDrawn = false;
         origin = new LayoutRect(x, y, grid.Width, grid.Height);
         return true;
+    }
+
+    // 1.19.48 (review): the conservative place for a poll no rung of the ladder can pay for.
+    //
+    // The evidence handed over is what was really measured - one rectangle per row, never the band's union (a column whose
+    // middle row could not be read is a union with a hole in it) - plus the band this round committed, and only while that
+    // band belongs to the window on the screen now: retained geometry is an obstacle here, never a completeness claim and
+    // never a prediction. `HudFallbackSpot` then right-aligns every candidate to the window's own right margin (1.19.49): the
+    // side the equipment column is drawn on, so the place stands where the table belongs instead of on the far side of the
+    // screen. Nothing here reads `_anchorRect`, a camera or the attempt budget.
+    [HideFromIl2Cpp]
+    private bool TryFallbackSpot(PanelGrid grid, float preferredY, out LayoutRect spot, out string reason, out float overlap)
+    {
+        _fallbackObstacles.Clear();
+        for (int index = 0; index < _obstacles.Count; index++)
+        {
+            HudObstacle row = _obstacles[index];
+            if (!row.Drawn || !row.Measured) continue;
+            LayoutRect rect = row.Rect;
+            if (!(rect.Width > 1f) || !(rect.Height > 1f)) continue;
+            if (!float.IsFinite(rect.X) || !float.IsFinite(rect.Y)) continue;
+            _fallbackObstacles.Add(rect);
+        }
+        if (_bandWatch.Has && _anchorScreenWidth == Screen.width && _anchorScreenHeight == Screen.height)
+        {
+            LayoutRect committed = _bandWatch.Committed;
+            if (committed.Width > 1f && committed.Height > 1f && float.IsFinite(committed.X) && float.IsFinite(committed.Y))
+                _fallbackObstacles.Add(committed);
+        }
+        return HudFallbackSpot.TryResolve(preferredY, _fallbackObstacles, grid.Width, grid.Height, Screen.width,
+            Screen.height, out spot, out reason, out overlap);
+    }
+
+    // The family's latch lives in `HudAbsenceLedger` (1.19.50): a closed vocabulary of ten keys and a ledger that holds all
+    // ten, so no reason's first line can be crowded out by the reasons before it. This file only names the key.
+
+    // The conservative place costs one line per round, and the line says exactly what it is: the table is drawn, the place is
+    // not a rung, not a proof and not a claim about the anchor - and it is Info, because it is the automatic mode's own
+    // degraded answer rather than a fault of this build.
+    [HideFromIl2Cpp]
+    private void ReportFallbackSpot(LayoutRect spot, string reason, float overlap, float refusedOverlap)
+    {
+        // The key is the candidate that answered - `HudAbsence.Spot` accepts only the five `TryResolve` can answer, so a reason
+        // string invented elsewhere cannot become a key, and the ledger's bound is the vocabulary's own size.
+        if (!_absence.Claim(HudAbsence.Spot(reason))) return;
+        // 1.19.50: `margin=` is the margin this place really kept, from the same calculation that placed it. The recorded line
+        // printed the constant 24 while a 1400 px table on a 1440 px window kept 20, and a 600 px window kept 24 out of the 70 it
+        // could have afforded - so the figure described neither the table nor the page.
+        string note = "conservative=" + reason + " spot=(" + spot.X.ToString("0") + "," + spot.Y.ToString("0") + ","
+            + spot.Width.ToString("0") + "x" + spot.Height.ToString("0") + ") covers=" + overlap.ToString("0")
+            + " window=" + Screen.width + "x" + Screen.height + " margin="
+            + HudFallbackSpot.EffectiveMargin(spot.Width, spot.Height, Screen.width, Screen.height).ToString("0.##")
+            + " clearOf=" + _fallbackObstacles.Count + " known row(s) refusedCovers=" + refusedOverlap.ToString("0");
+        Plugin.Logger?.LogInfo("[DIAG] no rung of the automatic ladder was proven this poll, so the table is drawn at a conservative place ("
+            + note + "): " + _bandRows + "; every candidate is right-aligned to the window's own right margin - the equipment column's side "
+            + "of the screen and the edge a proven rung keeps - and clears every row and retained band this reading knows of. It claims no "
+            + "rung, no proof and no anchor, and the area it covers is printed beside it rather than hidden. The configured PositionX/PositionY "
+            + "is only used when a complete reading clears it; the automatic ladder places the table again after " + StableCompleteSamples
+            + " consecutive complete readings. One line per distinct candidate per round, and never one per poll.");
+    }
+
+    // The one line the deferral costs - the only poll of this family that still draws nothing - and it is written once per round
+    // rather than once per poll. The table is asked for again on the next poll: a column that shrinks, a reading that gets
+    // complete, or a window that grows brings it back without any input, and the manual mode was never in this path.
+    //
+    // The line names *which* of the two answers it is - an overlap it can see (`fallbackCovers=`, the configured position really
+    // lies on the measured band) or a column whose completeness is missing (`complete=no`, the row that could not be projected
+    // can be anywhere, so nothing is claimed about the area the band covers) - and it is Info for the same reason the rest of
+    // the family is: this is a page this build cannot place on, not a failure of this build.
+    [HideFromIl2Cpp]
+    private void DeferFallback(LayoutRect fallback, float overlap, bool complete)
+    {
+        string reason = complete
+            ? "covers=" + overlap.ToString("0") + " of the measured column"
+            : "column-incomplete (the rows this build could not project are drawn where this reading cannot place them)";
+        string note = $"fallbackCovers=" + overlap.ToString("0") + " fallbackComplete=" + (complete ? "yes" : "no") + " "
+            + reason + " fallback=(" + fallback.X.ToString("0") + ","
+            + fallback.Y.ToString("0") + "," + fallback.Width.ToString("0") + "x" + fallback.Height.ToString("0") + ") "
+            + _bandRows;
+        // 1.19.49: two fixed answers, so the same page cannot re-print this line by moving its rectangle or its areas; 1.19.50:
+        // the key comes from the closed vocabulary, so this is the only poll of the family that can say "nothing was drawn".
+        if (!_absence.Claim(complete ? HudAbsence.DeferOverlap : HudAbsence.DeferIncomplete)) return;
+        Plugin.Logger?.LogInfo($"[DIAG] the table's configured position is not drawn this poll ({note}): a measured "
+            + "column with no proven free place is not the same thing as a HUD nobody could measure, and the configured "
+            + "position is not a safe answer on this page. It comes back on the next poll as soon as the column is proven "
+            + "whole, shrinks, or the window leaves room; the manual mode (AnchorToFlashlight=false) is untouched.");
+    }
+
+    // The anchored placement: right-aligned with the anchor row and below the last row of the equipment column.
+    //
+    // Answers false - and says why, once per round - when nothing here can prove a free place: no band was ever measured
+    // for this HUD, the column was measured but not completely, or every rung of the ladder covered the column. The caller
+    // then draws the table at the conservative place (`TryFallbackSpot`) - the configured position when a complete reading
+    // clears it, the window's right margin otherwise (1.19.49) - and never at the anchor row's bottom edge, which is the
+    // overlap this round removes. A refusal here is a statement about proofs; it is no longer a statement about painting.
+    [HideFromIl2Cpp]
+    private bool TryAnchoredOrigin(PanelGrid grid, out float x, out float y)
+    {
+        x = 0f;
+        y = 0f;
+        if (!_bandWatch.Has)
+        {
+            // 1.19.49: one line per round, under a fixed semantic key, and in Info: a column that has not been measured yet is
+            // the automatic mode's own state, not an error of this build. The window, the band's detail and the retry schedule
+            // may all move while the absence lasts - none of them is a new absence.
+            if (_absence.Claim(HudAbsence.AnchorUnmeasured))
+            {
+                Plugin.Logger?.LogInfo($"[DIAG] the equipment column could not be measured, so the table has no proven place "
+                    + $"beside it: {_bandRows}; the automatic mode therefore does not draw the configured PositionX/PositionY - on the "
+                    + "recorded pages that rectangle sits on the equipment column's own x range, and the rows this build cannot "
+                    + "project are drawn there - and is drawn at the window's right conservative place instead (1.19.49), reported "
+                    + "on its own line. The manual mode still uses the configured position exactly as before. The column is read "
+                    + "again on every poll while the anchor stays locked, and a configuration reload or a resolution change starts "
+                    + "a new round.");
+            }
+            return false;
+        }
+        PanelPlacement placement;
+        bool resolved = HudPlacement.TryResolve(_bandWatch.Committed, _bandWatch.Complete, grid.Width, grid.Height, _anchorRect.Right,
+            HudPlacement.Gap, Screen.width, Screen.height, out placement);
+        // 1.19.47: a rung is a *proof* only for a reading that proved the whole column, and `HudPlacement.Proven` is the one
+        // rule that says so. The recorded frame (log 2769) is why this is a gate of its own rather than a note in the
+        // ladder: one row was measured, eleven were stated unread, and the rung above the column drew a 459x60 table at
+        // (2088,226) - on top of the native equipment column the reading had just admitted it could not describe. `overlap=0`
+        // on that line only ever meant "not on the one row that was read", so it is not evidence of anything.
+        if (!resolved || !HudPlacement.Proven(placement, _bandWatch.Complete))
+        {
+            if (!_bandWatch.Complete)
+            {
+                // The column is drawn, and part of it is outside this reading. Nothing here may claim a place: not a rung,
+                // and (in `TryResolveOrigin`) not the configured position either - that one is the same overlap through
+                // another door. 1.19.48: the table is still drawn this poll, at the conservative place, and the line says so.
+                // 1.19.49: the place is on the window's right edge, and the line is Info - a column this build can only read in
+                // part is the state of this HUD, not an error of this build. The ledger bounds it to one line per round: the
+                // window, the table's width, the band's own detail and the retry behind it may all move while it lasts.
+                if (_absence.Claim(HudAbsence.AnchorPartial))
+                {
+                    Plugin.Logger?.LogInfo($"[DIAG] the equipment column was measured only in part on this {Screen.width}x{Screen.height} "
+                        + $"window ({_bandRows}), so the {grid.Width:0}x{grid.Height:0} table has no proven place beside it: the rows "
+                        + "this build could not project are drawn somewhere this reading does not describe, so 'below', 'above' and "
+                        + "'beside' the band would each be measured from an edge it has not proved - and the configured "
+                        + "PositionX/PositionY is inside that same column on this page. No rung is claimed here, so the table is "
+                        + "drawn at the conservative place instead (right-aligned to the window's own right margin and clear of "
+                        + "every row this reading really measured), reported on its own line; the column is re-read on every poll "
+                        + "while the anchor stays locked, and the first reading that proves the whole column places the table by "
+                        + "the automatic ladder again by itself.");
+                }
+                return false;
+            }
+            if (_absence.Claim(HudAbsence.AnchorNoFreePlace))
+            {
+                Plugin.Logger?.LogInfo($"[DIAG] no free place beside the equipment column on a {Screen.width}x{Screen.height} "
+                    + $"window for a {grid.Width:0}x{grid.Height:0} table: {_bandRows}, complete={(_bandWatch.Complete ? "yes" : "no")}; "
+                    + "below, above and beside the column all fail or cover the whole table, so no rung is claimed and the table "
+                    + "is drawn at the window's right conservative place instead - right-aligned to the window's own right margin, "
+                    + "never the configured PositionX/PositionY - which is reported on its own line as conservative and never as a "
+                    + "proof, and the automatic ladder places the table again only after "
+                    + StableCompleteSamples + " consecutive complete readings.");
+            }
+            return false;
+        }
+        // 1.19.49: a proven rung is the answer this whole file is for, and the conservative state is already cleared by the
+        // caller that draws it (`TryResolveOrigin` sets `_fallbackSpotDrawn = false`). The absence lines written earlier in this
+        // round stay written: a page that flips between a rung and a conservative place must not re-print its absence at the
+        // poll rate, and the recovery itself is reported by `ReportPlacement` a few lines below.
+        // 1.19.47: the offset settings still move the table (that is what they are for), but the rectangle that is really
+        // drawn is `offset + clamp`, and that is the one that has to clear the column. An offset - or a clamp at the
+        // window's edge - that pushes the table back onto the band is dropped: the proven rung is what is drawn, and the
+        // line says which of the two happened. Nothing here guesses a place; it only refuses to leave the proven one.
+        x = placement.Rect.X + Plugin.OffsetX.Value;
+        y = placement.Rect.Y + Plugin.OffsetY.Value;
+        LayoutRect final = HudPlacement.ClampInto(new LayoutRect(x, y, grid.Width, grid.Height), Screen.width, Screen.height);
+        bool offsetKept = HudPlacement.OnWindow(final, Screen.width, Screen.height)
+            && HudPlacement.Area(final, _bandWatch.Committed) <= 0f;
+        if (!offsetKept) final = HudPlacement.ClampInto(placement.Rect, Screen.width, Screen.height);
+        x = final.X;
+        y = final.Y;
+        ReportPlacement(placement, grid, final, offsetKept);
+        return true;
+    }
+
+    // One line per real move, and only when the move (or the column it was measured from) changed. Bounded by what the
+    // player did - the same placement is not reported again on the next poll - and it prints the rows the band was built
+    // from, so a recorded frame can be checked against what the HUD really drew.
+    //
+    // 1.19.47: it prints the rectangle that is *really* drawn (`final=`, after the offset and the clamp) beside the rung's
+    // own rectangle, and it says whether the offset survived that re-check. The earlier line printed the rung and the
+    // window clamp only, so a page with a non-zero offset was described by a rectangle nothing painted.
+    [HideFromIl2Cpp]
+    private void ReportPlacement(PanelPlacement placement, PanelGrid grid, LayoutRect final, bool offsetKept)
+    {
+        string note = $"{placement.Describe()} final=({final.X:0.##},{final.Y:0.##},{final.Width:0.##}x{final.Height:0.##}) "
+            + $"offsetKept={(offsetKept ? "yes" : "no")} gap={HudPlacement.Gap:0.#} screen={Screen.width}x{Screen.height} "
+            + $"tablePixels={grid.Width:0}x{grid.Height:0} "
+            + $"anchorRow=({_anchorRect.X:0},{_anchorRect.Y:0},{_anchorRect.Width:0}x{_anchorRect.Height:0}) "
+            + _bandRows
+            + "; the rung is " + PanelPlacement.Name(placement.Kind) + " of a column this reading proved whole, so every row "
+            + "the vanilla HUD draws in that column stays visible.";
+        if (note == _placementNote) return;
+        _placementNote = note;
+        Plugin.Logger?.LogInfo("[DIAG] " + note);
     }
 
     // The glyph size is a reference size at 1080p, scaled by the window height and the density,
@@ -1840,6 +2217,318 @@ public sealed class PanelBehaviour : MonoBehaviour
     }
 
     internal static int FontSizeForSharing => FontSize();
+
+    // Whether the camera this round proved can still project.
+    //
+    // `null` is a *proved* answer - the HUD's canvas is a real overlay canvas and Unity's camera-less projection is the
+    // right one - so it is alive. A wrapper whose native object is gone (the level this HUD belonged to was unloaded)
+    // throws on the first member access, and that is the only way to tell: the interop wrapper is not Unity's own
+    // `Object == null` overload, so a destroyed camera still looks like a live reference until it is asked something.
+    [HideFromIl2Cpp]
+    // Whether the camera this round proved for the column can still project.
+    //
+    // A `null` camera is a *proved* answer - the HUD's canvas is a real overlay canvas and Unity's camera-less projection is
+    // the right one - so it is alive. A wrapper whose native object is gone throws on the first member access, and that is
+    // the only way to tell: the interop wrapper is not Unity's own `Object == null` overload, so a destroyed camera still
+    // looks like a live reference until it is asked something.
+    //
+    // 1.19.45: `isActiveAndEnabled` was the whole test, and on this HUD it is the wrong one for exactly one kind of camera.
+    // The recorded run prints the manual canvas' camera as `enabled=no, activeInHierarchy=yes` (log 2827); a manual canvas is
+    // rendered on demand, so `enabled` says who calls `Render`, not whether the pixels land in the window - the same fact
+    // `AnchorCameraLadder` already acts on ("What this deliberately does *not* use is `camera.enabled`"). Refusing it here made
+    // the column unprovable for the whole level: every poll re-proved the camera (log 2837/2840-2846, eight attempts) and every
+    // row was still recorded `unread` (log 2838), so the table fell back to the configured PositionX/PositionY (log 2839).
+    //
+    // The relaxation is therefore *typed*, never general: a camera is accepted while disabled only when this round proved it
+    // through the manual-canvas chain (`_bandCameraManualCanvas`), and even then only while it is still active in the hierarchy
+    // and still a live object. Any other disabled camera - a HUD torn down inside a level, a candidate the ladder refused, a
+    // camera left over from another level - still answers false, and a destroyed or replaced wrapper is still refused.
+    private static bool BandCameraAlive(Camera camera)
+    {
+        if (camera == null) return true;
+        try
+        {
+            GameObject owner = camera.gameObject;
+            return BandCameraLiveness.Alive(_bandCameraProved, _bandCameraManualCanvas,
+                camera.isActiveAndEnabled, owner != null && owner.activeInHierarchy, readable: true);
+        }
+        catch
+        {
+            // A destroyed or replaced wrapper throws on the first member access: "could not be read" is an input of the
+            // same rule, not a second copy of it, so the decision itself is what the headless scenarios assert.
+            return BandCameraLiveness.Alive(_bandCameraProved, _bandCameraManualCanvas, false, false, readable: false);
+        }
+    }
+
+    // The equipment column, read once per poll while the anchor is locked.
+    //
+    // The anchor itself is frozen after it settles, but the column is not: selecting a weapon expands its row, picking a
+    // pack up shows one, readying a throwable adds another, and each of those moves the column's bottom edge after the
+    // table was placed. `EquipmentBandWatch` decides what such a reading means - a band that *grew* is committed at once,
+    // because a table further from the column cannot overlap it, and a band that *shrank* only once the column has really
+    // stayed that way, so a row flickering open and shut never drags the table up and down.
+    //
+    // 1.19.46 (HUD review closure): the round's camera is re-proved here, from this level's own HUD, whenever the round has
+    // none (`_bandCameraProved` false after a level change dropped it) or the one it had is gone. The locked anchor stays
+    // locked by design, so no anchor read would ever run again - waiting for the player to reload the config or change
+    // resolution was not a fix: the column would have stayed "unproved" for the rest of the session. `ReprooveBandCamera`
+    // runs the one function that is allowed to decide which camera projects this HUD and takes only its camera.
+    [HideFromIl2Cpp]
+    private void WatchEquipmentBand(PlayerGuiLayer layer, float now)
+    {
+        if (!float.IsFinite(now) || now < _nextBandRead) return;
+        _nextBandRead = now + BandInterval;
+        if (!_bandCameraProved || !BandCameraAlive(_bandCamera)) ReprooveBandCamera(layer);
+        EquipmentBandReading reading = ReadEquipmentBand(layer);
+        _bandRows = Rows(reading);
+        _bandWatch.Observe(reading);
+        // 1.19.48 (review): the recovery gate counts consecutive *complete* readings. A poll that measured nothing, or only
+        // part of the column, breaks the run - that is what keeps a flipping page from moving the table every other poll.
+        if (_bandWatch.Has && _bandWatch.Complete) _bandCompleteStreak++;
+        else _bandCompleteStreak = 0;
+    }
+
+    // 1.19.46: re-prove the column's camera from this level's own HUD, without touching the locked anchor.
+    //
+    // `ReadAnchor` is the one read that decides which camera may project this HUD, and it writes `_bandCamera` and
+    // `_bandCameraProved` as part of that decision (a `null` camera it returns is a *proved* overlay answer, not a guess).
+    // Running it here is that same measurement, used for its camera: the rectangle it returns is deliberately ignored, so
+    // the anchor keeps exactly the place it was locked to. The attempts are bounded per round - a HUD that cannot prove a
+    // camera at all must not be walked four times a second for the rest of the level - and the one line says which of the
+    // two happened.
+    private const int BandCameraReproofLimit = 8;
+    private int _bandCameraReproofs;
+
+    [HideFromIl2Cpp]
+    private void ReprooveBandCamera(PlayerGuiLayer layer)
+    {
+        if (_bandCameraReproofs >= BandCameraReproofLimit) return;
+        _bandCameraReproofs++;
+        try { ReadAnchor(layer); } catch { }
+        if (!_bandCameraProved) return;
+        Plugin.Logger?.LogInfo("[DIAG] the equipment column has a proved camera again: it was measured on this level's own "
+            + "HUD (" + (string.IsNullOrEmpty(_anchorCameraNote) ? "the HUD's own camera" : _anchorCameraNote) + ") after the "
+            + "previous level's round was dropped, attempt " + _bandCameraReproofs + " of " + BandCameraReproofLimit
+            + ". The column is read through it from this poll on, and the locked anchor keeps the place it had - the reset "
+            + "drops the camera and the band, never the anchor.");
+    }
+    // Every row of the equipment column, as this HUD really lays it out.
+    //
+    // The chain is the one the anchor already trusts: `m_playerLayer -> Inventory`, and inside it the icon display the
+    // anchor is measured from plus every slot the inventory lists in its own `m_slotGUIOrder`. That is a handful of
+    // objects looked up by key - no hierarchy walk, no scene scan - and the list they are written to is the one
+    // preallocated buffer, so the read costs the same on a full column as on an empty one and allocates nothing sized by
+    // what it finds. Each row is projected by the camera this round proved for the anchor, through the same `ScreenBounds`
+    // gate: a row that cannot be read is recorded as unread, which is what makes the band incomplete, and never as a row
+    // at zero.
+    //
+    // 1.19.47: a row is no longer only its own `m_rectTrans` (`TryRowRect`). The recorded expedition read this column as
+    // `rows=1 skipped=11` on a HUD whose anchor row measured perfectly (log 2769), because this build's
+    // `PUI_InventoryItem` objects carry no rectangle of their own - the row's own native item name text does, and that
+    // text is a rectangle the HUD really laid out for that row.
+    [HideFromIl2Cpp]
+    private EquipmentBandReading ReadEquipmentBand(PlayerGuiLayer layer)
+    {
+        _obstacles.Clear();
+        Camera camera = _bandCamera;
+        // 1.19.45: the rows are only projected through a camera this round really proved. Two facts are asked here and
+        // they are not the same one: `_bandCameraProved` says a round has proved a projection at all (a level change
+        // clears it, and the previous level's rectangle must never come back through it), and `BandCameraAlive` says the
+        // object behind a proved camera still exists (a HUD torn down inside a level leaves a dead wrapper behind). A
+        // `null` proved camera is the legitimate overlay answer and is *not* refused. A row that cannot be projected is
+        // recorded as unread - which is what makes the band incomplete - and never as a row at zero.
+        bool projectable = _bandCameraProved && BandCameraAlive(_bandCamera);
+        RectTransform anchorRow = null;
+        try
+        {
+            var display = layer != null && layer.Inventory != null ? layer.Inventory.m_iconDisplay : null;
+            if (display != null) anchorRow = display.m_rectTrans != null ? display.m_rectTrans : display.transform.TryCast<RectTransform>();
+        }
+        catch { anchorRow = null; }
+        if (anchorRow != null)
+        {
+            // The projection is caught on its own: a HUD object from a level that has already been torn down throws, and
+            // an exception escaping this read would take the whole repaint with it. A throw here is one unread row.
+            LayoutRect row = default;
+            bool read = false;
+            try { if (projectable) read = TryScreenRectFromLayout(anchorRow, camera, out row, out _, out _); }
+            catch { read = false; }
+            if (read) _obstacles.Add(new HudObstacle(AnchorElementNames.Flashlight, row, true));
+            else _obstacles.Add(HudObstacle.Unread(AnchorElementNames.Flashlight, true));
+        }
+        try
+        {
+            var inventory = layer != null ? layer.Inventory : null;
+            var order = inventory != null ? inventory.m_slotGUIOrder : null;
+            var slots = inventory != null ? inventory.m_inventorySlots : null;
+            int known = 0, named = 0;
+            try { known = slots != null ? slots.Count : 0; } catch { known = 0; }
+            if (order != null && slots != null)
+            {
+                // The buffer is bounded by construction: this HUD draws a handful of rows, and a build that ever answered
+                // more is read no further than the ceiling instead of being trusted to be small.
+                int count = order.Length;
+                int ceiling = EquipmentBand.MaxObstacles - _obstacles.Count;
+                if (count > ceiling) count = ceiling;
+                for (int index = 0; index < count; index++)
+                {
+                    // 1.19.43: one row is isolated from every other row, and from the column.
+                    //
+                    // `order[index]`, `"slot:" + slot` and `slots.TryGetValue` all reach into the interop object, and a
+                    // slot whose handle is gone throws on the first of them. Until this round that single throw escaped
+                    // to the catch below and answered `EquipmentBandReading.None`: the whole column vanished - a
+                    // recorded frame logged "band=none rows=0 skipped=0" beside a perfectly measurable flashlight row -
+                    // so `HudPlacement` had nothing to avoid, `TryAnchoredOrigin` returned at its first line, and the
+                    // table fell back to the configured PositionX/PositionY, which on this HUD lands on the right-hand
+                    // column. That is the very overlap 1.19.41 was written to remove, still reachable through this
+                    // seam. The anchor row above has been isolated like this since then; every slot row is isolated
+                    // the same way now, so one bad row costs one unread row - the band stays measured and becomes
+                    // partial, which (1.19.47) is a reading the panel refuses to place from and defers on - instead of
+                    // the whole measurement.
+                    string name = "slot#" + index;
+                    // Until this build says otherwise the row is treated as drawn: a row nobody could read has to be
+                    // able to keep the band open, never to shrink it to the anchor row. Treating an unreadable row as
+                    // "not on the screen" is how a partial reading would be passed off as a complete one.
+                    bool drawn = true;
+                    try
+                    {
+                        InventorySlot slot = order[index];
+                        name = "slot:" + slot;
+                        PUI_InventoryItem item;
+                        if (!slots.TryGetValue(slot, out item) || item == null) continue;   // this inventory has no such row
+                        named++;
+                        // An `IsVisible` that throws is a row this build cannot ask about, so it is kept as drawn.
+                        try { drawn = item.IsVisible; } catch { drawn = true; }
+                        if (projectable && TryRowRect(item, camera, out var slotRect, out var evidence))
+                            _obstacles.Add(new HudObstacle(name + evidence, slotRect, drawn, fullRow: evidence != "(name-text)"));
+                        else if (drawn) _obstacles.Add(HudObstacle.Unread(name, true));
+                    }
+                    catch
+                    {
+                        // The row is stated as unread and the loop moves on to the next one: the reading is partial, and a
+                        // partial reading proves no edge of the column - not its bottom (`below-band`), not its top
+                        // (`above-band`) and not its left (`beside-band`) - so the panel defers on it instead of drawing.
+                        if (drawn) _obstacles.Add(HudObstacle.Unread(name, true));
+                    }
+                }
+            }
+            // 1.19.41: the inventory holds more rows than its GUI order named - an order list that has not been filled in
+            // yet, or one a build answers differently. Those rows are on the screen and this build did not measure them,
+            // so they are *stated* as unread rather than quietly dropped: dropping them would leave the band ending at the
+            // anchor row, and a table placed below that is the very overlap this round removes.
+            for (int index = named; index < known; index++)
+            {
+                if (_obstacles.Count >= EquipmentBand.MaxObstacles) break;
+                _obstacles.Add(HudObstacle.Unread("slot:unnamed" + (index - named), true));
+            }
+        }
+        catch
+        {
+            // A row list that throws is a column this build cannot describe, which is exactly what must not be read as
+            // "the column ended here": the read stops and an unmeasured band is answered, so the caller keeps what it had.
+            return EquipmentBandReading.None;
+        }
+        return EquipmentBand.Read(_obstacles, Screen.width, Screen.height);
+    }
+
+    // The rows one read saw, in the words the placement line prints.
+    [HideFromIl2Cpp]
+    private string Rows(EquipmentBandReading reading)
+    {
+        var text = new System.Text.StringBuilder(192);
+        text.Append(reading.Describe()).Append(" rows:");
+        for (int index = 0; index < _obstacles.Count; index++)
+        {
+            if (index > 0) text.Append(',');
+            text.Append(_obstacles[index].Describe());
+        }
+        return text.ToString();
+    }
+
+    // One row of the equipment column, measured from the elements that row really draws (1.19.47).
+    //
+    // The row's own rectangle is the first answer: `item.m_rectTrans`, then the item's own transform when the interop
+    // answers that field as null. The recorded expedition shows why that cannot be the only answer. On its own HUD the
+    // anchor row measured (`flashlight=(2336.08,294.33,210.59x110.16)`) while every slot row came back unread
+    // (`rows=1 skipped=11`, log 2769/2777), which is what a row without a `RectTransform` of its own looks like: this
+    // build's `PUI_InventoryItem` is not the uGUI object, so the only rectangles its row has are the ones it draws.
+    //
+    // So the row is also read through its own native item name text - `m_selected_archetypeName` / `m_slim_archetypeName`,
+    // the two `TextMeshPro`s this HUD alternates between, chosen by the same active-in-hierarchy rule the sibling HUD
+    // reader already anchors its own labels with (`EquipmentTimers`, `Ui/TimerSlotRow.cs` and
+    // `Ui/TimerController.ResolveName`; same game build, same interop profile, no member invented here). Both answers are
+    // rectangles the HUD laid out for that row, projected through the camera this round proved and gated by the same
+    // `ScreenBounds`; a row that answered both is the union of them. Nothing is derived from a screen fraction or a
+    // per-row pixel constant.
+    //
+    // A name-only rectangle is useful obstacle evidence, not proof of the native row's full size.
+    [HideFromIl2Cpp]
+    private static bool TryRowRect(PUI_InventoryItem item, Camera camera, out LayoutRect rect, out string evidence)
+    {
+        rect = default;
+        evidence = null;
+        if (item == null) return false;
+        LayoutRect row = default;
+        bool rowRead = false;
+        try
+        {
+            RectTransform own = item.m_rectTrans != null ? item.m_rectTrans : item.transform.TryCast<RectTransform>();
+            if (own != null) rowRead = TryScreenRectFromLayout(own, camera, out row, out _, out _);
+        }
+        catch { rowRead = false; }
+        LayoutRect name = default;
+        bool nameRead = false;
+        try
+        {
+            RectTransform label = NativeItemName(item);
+            if (label != null) nameRead = TryScreenRectFromLayout(label, camera, out name, out _, out _);
+        }
+        catch { nameRead = false; }
+        if (rowRead && nameRead)
+        {
+            rect = EquipmentBand.Union(row, name);
+            evidence = "(row+name-text)";
+            return true;
+        }
+        if (rowRead) { rect = row; evidence = "(row-rect)"; return true; }
+        if (nameRead) { rect = name; evidence = "(name-text)"; return true; }
+        return false;
+    }
+
+    // The native item name this row is really drawing, as an object that carries a rectangle.
+    //
+    // The rule is the default branch of the one `EquipmentTimers` resolves its own row anchors with: the selected name
+    // while it is on, otherwise the slim one. Nothing here asks for the state word (`CurrentState`), because the question
+    // this build needs answered is only "which of the two is on the screen" - and the two names are alternated by the HUD
+    // itself, so the active one is the row's own drawn text.
+    [HideFromIl2Cpp]
+    private static RectTransform NativeItemName(PUI_InventoryItem item)
+    {
+        TextMeshPro selected = null, slim = null;
+        try { selected = item.m_selected_archetypeName; } catch { selected = null; }
+        try { slim = item.m_slim_archetypeName; } catch { slim = null; }
+        if (Drawn(selected)) return RectOf(selected);
+        if (Drawn(slim)) return RectOf(slim);
+        return null;
+    }
+
+    // Whether a native text is on the screen this poll. A wrapper whose object is gone throws on the first member, and
+    // "could not be read" is answered as "not drawn": a text this build cannot ask about must not push the table
+    // anywhere, and the row it belongs to is stated as unread instead.
+    [HideFromIl2Cpp]
+    private static bool Drawn(TextMeshPro text)
+    {
+        if (text == null) return false;
+        try { return text.gameObject != null && text.gameObject.activeInHierarchy; }
+        catch { return false; }
+    }
+
+    [HideFromIl2Cpp]
+    private static RectTransform RectOf(TextMeshPro text)
+    {
+        try { return text.transform.TryCast<RectTransform>(); }
+        catch { return null; }
+    }
 
     [HideFromIl2Cpp]
     private void LogOnce(Exception error)

@@ -564,9 +564,15 @@ internal static class CombatSync
 
     // Every row the display may draw: this machine's own measurements, each projected through the cached
     // remote rows. The capture store is read, never written.
+    //
+    // 1.19.60: the authority half of that projection is asked here, where it can actually be read. `SNet.IsMaster`
+    // throwing for a frame - the same frame in which a roster read fails, i.e. the network is closed - must not quietly
+    // turn a host into a client for that frame and take its whole squad off its own screen, so the exchange's own record
+    // of the last role it was told is the fallback. Nothing else about this method changed: one `return`, no catch, and
+    // no branch that answers with the raw capture store.
     internal static List<CombatPlayer> DisplayRows()
     {
-        List<CombatPlayer> rows = Exchange.Project(CombatTracker.Store.Snapshot(), OwnLookup());
+        List<CombatPlayer> rows = Exchange.Project(CombatTracker.Store.Snapshot(), OwnLookup(), LocalIsAuthority());
         foreach (CombatPlayer row in rows) row?.ReconcileDamageLowerBound();
         // A share is only a measurement when the denominator is the squad's. Three denominators are not: a
         // host total that says it covers only the rows that host could measure, the sum of the rows this
@@ -685,6 +691,18 @@ internal static class CombatSync
             return local == null ? 0UL : local.Lookup;
         }
         catch { return 0UL; }
+    }
+
+    // 1.19.60: is this machine the host of this session, asked where the answer lives. The live fact is `SNet.IsMaster`;
+    // a frame in which that read throws is a frame in which the roster read throws too, and answering "client" there
+    // would take every seat this machine measured itself off its own screen - the host losing its squad because the
+    // network went away, which is the one thing the row rule may never do. The fallback is therefore the exchange's own
+    // record of the last role it was told, which is the same fact `SetRoster` was handed on the last tick that could
+    // read it. A client never gains rows this way: its record says client, and only a row this run received is added.
+    private static bool LocalIsAuthority()
+    {
+        try { return SNet.IsMaster; }
+        catch { return Exchange.RoleIsMaster; }
     }
 
     private static bool TryPlayer(ulong lookup, out SNet_Player player)

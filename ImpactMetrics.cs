@@ -130,6 +130,12 @@ public sealed class ImpactCounters
     public long SupplyUses;
     public double SupplyEfficiencySum;
     public long ScanUses, ScanFirstMarks, ScanMarks;
+    // 1.19.41: whether this machine ever read the holder's own native scanner cooldown. `ScanUses` is only a
+    // number on a row whose cooldown was observed here; everywhere else - a teammate's row on the host, a
+    // client's row as published over the v8 pair - the activation figure is unknown, and printing 0 would
+    // claim a scanner that never recharged. The flag is local: it is deliberately not in the v8 snapshot, so
+    // an old peer's figure cannot make it true.
+    public bool ScanUsesKnown;
     public bool ScanEstimated;
     public int LoneSurvivor;
     public int Downs, FriendlyFireDeaths;
@@ -152,6 +158,11 @@ public sealed class ImpactCounters
     // "only the v8 pair arrived from a peer": a row nobody split prints its two kinds as unknown, never as 0.
     public long SelfToolUses, SelfMedicalUses;
     public bool SelfSupplyKindsKnown;
+    // 1.19.41: whether this machine has confirmed a medical pack for this row. A row whose packs were counted on
+    // another machine - a teammate's row here, or a row that arrived over the v8 pair - cannot prove it received
+    // none, so this stays false and the medical figure prints `?` instead of a zero. The flag is local: it does not
+    // travel in the v8 snapshot, so an old peer's figure cannot make it true.
+    public bool SelfMedicalKnown;
     // Lifetime actually lost this expedition. Healing does not offset it and a max-health change is not a
     // loss, so this figure only ever grows.
     public double HealthLost;
@@ -314,7 +325,13 @@ public sealed class ImpactCounters
         switch (kind)
         {
             case SupplyPackKind.Ammo: if (SelfAmmoUses < long.MaxValue) SelfAmmoUses++; break;
-            case SupplyPackKind.Medical: if (SelfMedicalUses < long.MaxValue) SelfMedicalUses++; break;
+            case SupplyPackKind.Medical:
+                if (SelfMedicalUses < long.MaxValue) SelfMedicalUses++;
+                // 1.19.41: this machine just confirmed a medical pack for this row (the receiver of a native
+                // application), so the medical figure is a *counted* one from here on. Every other row keeps
+                // `SelfMedicalKnown` false and prints `?`, never a zero it cannot prove.
+                SelfMedicalKnown = true;
+                break;
             default: if (SelfToolUses < long.MaxValue) SelfToolUses++; break;
         }
         // 1.19.35: `true` only while the split really describes the total. A row that also counted a pack whose kind it could
@@ -354,6 +371,7 @@ public sealed class ImpactCounters
         SupplyEfficiencySum = 0;
         ScanUses = ScanFirstMarks = ScanMarks = 0;
         ScanEstimated = false;
+        ScanUsesKnown = false;
         LoneSurvivor = Downs = FriendlyFireDeaths = 0;
         SentryShots = SentryHits = MineDeployments = MinePickups = MineTriggers = GlueShots = GlueHits = GluedEnemies = 0;
         SentryDamage = MineDamage = 0;
@@ -361,6 +379,7 @@ public sealed class ImpactCounters
         UnknownStateMinorKills = UnknownStateEliteKills = UnknownStateBossKills = UnknownStateMeleeKills = UnknownStateScoutKills = 0;
         SelfSupplyUses = SelfAmmoUses = SelfToolUses = SelfMedicalUses = 0;
         SelfSupplyKindsKnown = false;
+        SelfMedicalKnown = false;
         HealthLost = 0;
         ScoutDamage = 0; ScoutDamageObserved = ScoutDamageEstimated = false;
     }
@@ -372,6 +391,7 @@ public sealed class ImpactCounters
         Stagger = other.Stagger; Revives = other.Revives;
         SupplyUses = other.SupplyUses; SupplyEfficiencySum = other.SupplyEfficiencySum;
         ScanUses = other.ScanUses; ScanFirstMarks = other.ScanFirstMarks; ScanMarks = other.ScanMarks; ScanEstimated = other.ScanEstimated;
+        ScanUsesKnown = other.ScanUsesKnown;
         LoneSurvivor = other.LoneSurvivor; Downs = other.Downs; FriendlyFireDeaths = other.FriendlyFireDeaths;
         SentryShots = other.SentryShots; SentryHits = other.SentryHits; SentryDamage = other.SentryDamage;
         MineDeployments = other.MineDeployments; MinePickups = other.MinePickups; MineTriggers = other.MineTriggers; MineDamage = other.MineDamage;
@@ -384,6 +404,7 @@ public sealed class ImpactCounters
         SelfSupplyUses = other.SelfSupplyUses; SelfAmmoUses = other.SelfAmmoUses;
         SelfToolUses = other.SelfToolUses; SelfMedicalUses = other.SelfMedicalUses;
         SelfSupplyKindsKnown = other.SelfSupplyKindsKnown; HealthLost = other.HealthLost;
+        SelfMedicalKnown = other.SelfMedicalKnown;
         ScoutDamage = other.ScoutDamage; ScoutDamageObserved = other.ScoutDamageObserved; ScoutDamageEstimated = other.ScoutDamageEstimated;
     }
     private static double Clamp01(double value) { return !double.IsFinite(value) || value < 0 ? 0 : value > 1 ? 1 : value; }
@@ -824,7 +845,11 @@ public static class ImpactScoring
             case ImpactMetric.WeakspotRate: return player.Hits > 0;
             case ImpactMetric.Accuracy: return player.ShotsFired > 0;
             case ImpactMetric.SupplyEfficiency: return counters.SupplyUses > 0;
-            case ImpactMetric.ToolEfficiency: return counters.ScanUses > 0;
+            // 1.19.41: the activation figure is now a native cooldown count and is unknown on rows this machine
+            // cannot observe, so availability must not hang on it alone - a scanner whose first marks were
+            // confirmed has still used its tool. Without this the whole utility metric would be dropped for
+            // every row that has marks but no readable cooldown, which changes normalization, not just a cell.
+            case ImpactMetric.ToolEfficiency: return counters.ScanUses > 0 || counters.ScanFirstMarks > 0;
             case ImpactMetric.MeleeKills: return counters.MeleeKills > 0;
             case ImpactMetric.ScoutKills: return counters.ScoutKills > 0;
             default: return true;

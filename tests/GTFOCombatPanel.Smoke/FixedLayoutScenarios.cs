@@ -46,6 +46,9 @@ internal static partial class Program
         EveryRefusalPutsTheVanillaPageBack(Check);
         TheVanillaBlocksFollowTheSamePlanEverywhere(Check);
         TheUnitySideHonoursTheConfiguredNumbers(Check);
+        ATopPinnedThirtyRowBoardKeepsItsCloseOnScreen(Check);
+        AFixedPlateWithoutRoomForItsHeaderRefuses(Check);
+        TheScrollOffsetSurvivesARefreshAndTheWheelNeedsOverflow(Check);
         Console.WriteLine("FIXED-LAYOUT: PASS (production arithmetic and visibility decision plus static Unity wiring; not a live-game pixel test)");
     }
 
@@ -224,18 +227,22 @@ internal static partial class Program
         int rounded = draw != null ? draw.IndexOf("ResultFixedLayout.RoundFontPixels(configured)", StringComparison.Ordinal) : -1;
         check(validated >= 0 && rounded > validated,
             "the draw frame validates the configured numbers before it rounds them, so a hot-reloaded bad value is refused by name on that frame");
-        check(draw != null && draw.Contains("HudTable.Draw(grid, rect.X, rect.Y, _content, draw.Opacity)"),
-            "and it draws at the opacity the visibility decision gave it, not at a hard-coded 1.0");
-        check(draw != null && draw.Contains("if (draw.HidesVanilla) ApplyVanillaBlocks(_page, _succeeded);")
-              && draw.Contains("else RestoreHidden();"),
-            "the vanilla blocks make way only when the decision says this board really replaces them; thin evidence puts them back");
+        check(draw != null && draw.Contains("HudTable.Draw(grid, rect.X, rect.Y, _content, draw.Opacity, _scrollFirst, _scrollVisible, _scrollPlate)"),
+            "and it draws its scroll window at the opacity the visibility decision gave it, not at a hard-coded 1.0");
+        int tableAt = draw != null ? draw.IndexOf("HudTable.Draw(grid, rect.X, rect.Y, _content, draw.Opacity, _scrollFirst, _scrollVisible, _scrollPlate)", StringComparison.Ordinal) : -1;
+        int hideAt = draw != null ? draw.IndexOf("if (draw.HidesVanilla)", tableAt >= 0 ? tableAt : 0, StringComparison.Ordinal) : -1;
+        check(draw != null && draw.Contains("if (!draw.HidesVanilla) RestoreHidden();")
+              && tableAt >= 0 && hideAt > tableAt,
+            "thin evidence puts the game's own blocks back before anything is drawn, and the board takes their place only after this frame's `HudTable.Draw` (1.19.47 review #3: a frame that returns earlier leaves no hole)");
         check(draw != null && draw.Contains("ResultFixedDrawPlan draw = FixedLayoutDecision(rect, out string evidence);"),
             "and the decision is taken again on every drawn frame, so a control that moved under the board changes the opacity rather than the presence of the board");
 
         string place = FixedLayoutMethodBody(display, "private static bool PlaceFixedLayout(TableContent content");
-        check(place != null && FixedLayoutCount(place, "AbandonFixedLayout();") == 3,
-            "every refusal that can still happen (invalid input, unmeasurable grid, off-screen rect) restores the page and drops the grid: "
+        check(place != null && FixedLayoutCount(place, "AbandonFixedLayout();") == 4,
+            "every refusal that can still happen (invalid input, unmeasurable grid, no vertical room for header + rows, off-screen rect) restores the page and drops the grid: "
             + (place == null ? "no body" : FixedLayoutCount(place, "AbandonFixedLayout();") + " call(s)"));
+        check(place != null && place.Contains("TryFixedPlate(grid, anchorY, out int fixedRows, out float plateHeight, out string plateWhy)"),
+            "and the plate is measured after the header band is reserved, so a page without room for it refuses instead of drawing one off the screen");
         check(place != null && place.Contains("ResultFixedLayout.Valid(Screen.width, Screen.height, font, anchorX, anchorY, out refusal)"),
             "with the range bindings gone from the config file, the one place the numbers are judged is still this explicit valid call");
         check(place != null && !place.Contains("FixedLayoutStillSafe") && place.Contains("FixedLayoutDecision(plan.Rect, out string evidence)"),
@@ -327,8 +334,20 @@ internal static partial class Program
             "protected text bounds are recorded separately; actual parent buttons retain interaction collision checks");
 
         // A4b: 这块板不接管鼠标：没有任何点击消费，F8 那一行带上淡淡与原版块的结果。
-        check(!display.Contains("Event.current"),
-            "the settlement display never reads an IMGUI event, so a drawn fixed board consumes no mouse click");
+        //
+        // 1.19.55：`Event.current` 现在只在一个地方被读——每页/每窗口一次的 `settlement space` 观测。它读的是引擎交给本
+        // 次 repaint 的鼠标位置，**不读** `type`、不读按键、不调用 `Use()`，所以一块画出来的板照样不消费任何点击：命中仍然
+        // 只来自 `ResultPointerHit.Inside` 对"本次 repaint 真的画过的矩形"的比较。
+        string displayCode = FixedLayoutCode(display);
+        string spaceObservation = FixedLayoutMethodBody(display,
+            "private static void ReportPointerSpace(Component page, ResultChromeMetrics metrics)");
+        int eventReads = FixedLayoutCount(displayCode, "Event.current");
+        int eventReadsInObservation = spaceObservation != null
+            ? FixedLayoutCount(FixedLayoutCode(spaceObservation), "Event.current") : 0;
+        check(eventReads > 0 && eventReads == eventReadsInObservation
+              && !displayCode.Contains("Event.current.type") && !displayCode.Contains("Event.current.Use(")
+              && !displayCode.Contains("EventType.Mouse"),
+            "1.19.55: the settlement display reads an IMGUI event in exactly one place - the bounded `settlement space` observation, its mouse position only - and never its type, never a button and never `Use()`, so a drawn board consumes no mouse click");
         check(!panel.Contains("EventType.MouseDown") && !panel.Contains("EventType.MouseUp"),
             "and the overlay window consumes no mouse button either - only the wheel, which fixed mode keeps for itself");
         check(display.Contains("opacity={_fixedPlan.Opacity:0.##}") && display.Contains("overlay={_fixedPlan.Reason}")
@@ -340,16 +359,17 @@ internal static partial class Program
         check(display.Contains("\"fixed-layout|\"") && display.Contains("ResultFixedLayout.Attempt("),
             "and the drawn-board line is keyed the same way (fixed rect, glyph, anchor, intersecting control)");
 
-        // A5: 滚轮被吃掉但不改字号，且判断在写配置之前。
-        string wheel = FixedLayoutMethodBody(panel, "private static bool ResultsZoomEvent()");
-        int fixedFirst = wheel != null ? wheel.IndexOf("ResultsDisplay.FixedLayoutActive()", StringComparison.Ordinal) : -1;
-        int persist = wheel != null ? wheel.IndexOf("Plugin.PersistResultFontScale", StringComparison.Ordinal) : -1;
-        check(readme.Contains("`1`–`240`") && readme.Contains("actualglyph=5px"),
-            "and the documented glyph range is 1..240 with 5px named as a value that is drawn, not refused");
-        check(readme.Contains("0.55") && readme.Contains("真实二维矩形相交") && readme.Contains("证据不足"),
-            "and it documents the new behaviour: a real 2D intersection draws the board at 0.55, thin evidence keeps the vanilla blocks");
-        check(fixedFirst >= 0 && persist > fixedFirst,
-            "the wheel is still consumed on the board in fixed mode, and the fixed-mode branch runs before any scale is written to the config");
+        // A5（新版契约）：滚轮只滚动，不写任何配置；固定模式的板和自适应一样走这条滚动路径。
+        // 1.19.59: the wheel is settled on the frame (`ResultsDisplay.PollWheel()`) from the page's own `ScrollInput` first and
+        // the physical wheel as the fallback - the routing the player's other panel uses - and it no longer consumes an IMGUI
+        // event: the page keeps its own reading, and this mod only moves its own table.
+        check(panel.Contains("ResultsDisplay.PollWheel();") && !panel.Contains("ResultsScrollEvent"),
+            "the frame driver settles the wheel, and `PanelBehaviour` no longer reads an IMGUI scroll event");
+        check(!panel.Contains("PersistResultFontScale") && !display.Contains("PersistResultFontScale")
+              && !display.Contains("FixedFontPixels ="),
+            "the wheel writes nothing: a scroll never touches [Results] FixedFontPixels, the anchors, or the manual multipliers");
+        check(display.Contains("FixedPlateRows(") && display.Contains("ResultsScroll.PlateHeight("),
+            "the fixed layout resolves a plate of whole rows inside the window, so its close button and frozen header stay on screen");
 
         // A6: README 有四个键的示例与两条边界说明。
         check(readme.Contains("FixedLayout = false") && readme.Contains("FixedFontPixels = 18")
@@ -357,6 +377,10 @@ internal static partial class Program
             "the README's [Results] block carries the four keys with the documented defaults");
         check(readme.Contains("左上角是 (0,0)") && readme.Contains("底边中点"),
             "and says the coordinates are window fractions measured from the top-left corner, with the bottom-edge midpoint on the anchor");
+        check(readme.Contains("`1`–`240`") && readme.Contains("actualglyph=5px"),
+            "and the documented glyph range is 1..240 with 5px named as a value that is drawn, not refused");
+        check(readme.Contains("0.55") && readme.Contains("真实二维矩形相交") && readme.Contains("证据不足"),
+            "and it still documents the drawn-but-faint rule: a real 2D intersection draws the board at 0.55, thin evidence keeps the vanilla blocks");
         check(readme.Contains("不会被夹") && readme.Contains("fixed-layout-offscreen"),
             "and that the numbers are not clamped: a table that runs off the screen is refused by name");
         check(readme.Contains("不保证任意字体都装得下"),
@@ -566,23 +590,22 @@ internal static partial class Program
             "while a PROVEN intersecting frame still says scan=complete (the two states keep their own wording)");
 
         string refresh = FixedLayoutMethodBody(display, "internal static void Refresh(eGameStateName state)");
-        check(refresh != null
-              && refresh.Contains("if (ResultBoardLatch.HidesVanilla(_placed) && (!FixedLayoutActive() || _fixedPlan.HidesVanilla))"),
-            "M2: the pre-draw hiding entry asks the same plan the draw does, so a placed-but-faint fixed board never moves the vanilla "
-            + "blocks to 6000 before the frame that would have drawn over them");
-        check(refresh != null && !refresh.Contains("if (ResultBoardLatch.HidesVanilla(_placed)) ApplyVanillaBlocks(page, succeeded);"),
-            "and the old unconditional pre-draw call is gone rather than shadowed by a second one");
-        check(refresh != null && FixedLayoutCount(refresh, "ApplyVanillaBlocks(") == 1,
-            "Refresh still has exactly one ApplyVanillaBlocks call, now guarded");
-
-        check(display.Contains("try { if (!FixedLayoutActive() || _fixedPlan.HidesVanilla) ApplyVanillaBlocks(_page, _succeeded); }"),
-            "M2b: the adaptive draw path is guarded too - with FixedLayout on it cannot hide the vanilla blocks behind a plan that says keep them");
-        check(display.Contains("if (draw.HidesVanilla) ApplyVanillaBlocks(_page, _succeeded);")
-              && display.Contains("else RestoreHidden();"),
-            "while the fixed draw path lets the plan decide hide or restore on the same frame");
-        check(FixedLayoutCount(display, "ApplyVanillaBlocks(") == 4,
-            "the file has one declaration and exactly three call sites (" + FixedLayoutCount(display, "ApplyVanillaBlocks(") + " total): "
-            + "pre-draw, adaptive draw, fixed draw - no fourth way to hide the page");
+        check(refresh != null && FixedLayoutCount(refresh, "ApplyVanillaBlocks(") == 0,
+            "M2 -> 1.19.47 (review #3): `Refresh` no longer puts a single block away - the pre-draw hiding entry that could move a block to 6000 on a frame that then refused to draw is gone");
+        string fixedDraw = FixedLayoutMethodBody(display, "private static void FixedLayoutDraw()");
+        check(fixedDraw != null && fixedDraw.Contains("if (!draw.HidesVanilla) RestoreHidden();")
+              && fixedDraw.IndexOf("if (draw.HidesVanilla)", StringComparison.Ordinal)
+                 > fixedDraw.IndexOf("HudTable.Draw(grid", StringComparison.Ordinal),
+            "and the fixed board's plan is asked where it is honoured: thin evidence puts the game's own blocks back before anything is drawn, and a proven board takes their place only after this frame's `HudTable.Draw`");
+        // 1.19.55: the same guard, plus the early-board contract the adaptive path now also asks. An early board (drawn
+        // while the page's own reveal is still running) stands over the page as the game drew it and puts nothing away.
+        check(display.Contains("ResultEarlyBoardPolicy.HidesVanilla(_earlyBoard, true)")
+              && display.Contains("&& (!FixedLayoutActive() || _fixedPlan.HidesVanilla))")
+              && display.Contains("if (vanillaPage != null) ApplyVanillaBlocks(vanillaPage, vanillaSucceeded);"),
+            "M2b -> 1.19.55: the adaptive draw path is still guarded by the fixed layout's plan - with FixedLayout on it cannot hide the blocks behind a plan that says keep them - and it now also asks the early-board contract, so a board drawn before the page proved its own boundary puts none of the page's blocks away; the page it hands over is the live one (`LivePage`, 1.19.57)");
+        check(FixedLayoutCount(display, "ApplyVanillaBlocks(") == 3,
+            "the file has one declaration and exactly two call sites (" + FixedLayoutCount(display, "ApplyVanillaBlocks(") + " total): "
+            + "the adaptive draw and the fixed draw, both after their own `HudTable.Draw` - no third way to hide the page");
     }
 
     // ---- 读生产源码：路径、剥注释、取方法体、数出现次数 ------------------------------------------------
@@ -625,6 +648,123 @@ internal static partial class Program
             text.Append(current);
         }
         return text.ToString();
+    }
+
+    // ---- review #4：贴顶固定板（30 行）的表头与关闭按钮必须在屏幕内 --------------------------------
+    //
+    // 生产算式：底边中点 = anchorY × 窗口高；板高 = 整行 × 行高；**表头画在板之上**（`ResultChromeLayout.BoardOf`），
+    // 所以"放得下"的条件是"表头 + 行"一起放得下。行高用 1080p / 18px 下生产公式给出的 24px
+    // （`nov21-scroll\logs\window-numbers.txt`：rowHeight = max(font×1.45×0.80, font×1.5)），表头取
+    // `ResultChromeMetrics` 自己算出的值 —— 没有一个是猜的。
+    private static void ATopPinnedThirtyRowBoardKeepsItsCloseOnScreen(Action<bool, string> check)
+    {
+        const float width = 1920f, height = 1080f, rowHeight = 24f, margin = 8f;
+        ResultChromeMetrics metrics = ResultChromeMetrics.For(width, height);
+        float header = metrics.HeaderHeight;
+        const int rows = 30;
+        // 表头顶在屏幕顶端 margin 上的那个 anchor：room = margin + header + rows × rowHeight。
+        float anchorY = (margin + header + rows * rowHeight) / height;
+        check(anchorY > 0f && anchorY < 1f, "the anchor that pins a 30-row board to the top is inside the window: anchorY=" + anchorY.ToString("0.####"));
+
+        float room = anchorY * height - margin;
+        check(ResultsScroll.PlateFits(room, rowHeight, header, ResultsScroll.MinimumVisibleRows),
+            "the plate fits once the header is reserved: room=" + room.ToString("0") + "px, header=" + header.ToString("0") + "px");
+
+        int visible = ResultsScroll.VisibleRows(ResultsScroll.RowRoom(room, header), rowHeight);
+        check(visible == rows, "thirty rows fit under the header at this anchor: visible=" + visible);
+        var viewport = new ScrollViewport(rows, ResultsScroll.FrozenRows, visible, ResultsScroll.FrozenRows);
+        check(!viewport.Overflows && viewport.RowAt(viewport.Visible - 1) == rows - 1,
+            "with all thirty rows visible the last row is on the page and nothing is off screen");
+
+        // 更大的字号（行高 36px）时只有部分行放得下：滚到末端时最后一行必须落在最后一个可见槽里。
+        const float bigRow = 36f;
+        int bigVisible = ResultsScroll.VisibleRows(ResultsScroll.RowRoom(room, header), bigRow);
+        var scrolled = new ScrollViewport(rows, ResultsScroll.FrozenRows, bigVisible, ResultsScroll.FrozenRows);
+        check(scrolled.Overflows, "a taller row means the table really scrolls: visible=" + bigVisible);
+        var atEnd = new ScrollViewport(rows, ResultsScroll.FrozenRows, bigVisible, scrolled.MaximumFirst);
+        check(atEnd.AtEnd && atEnd.RowAt(atEnd.Visible - 1) == rows - 1,
+            "and the last row is reachable: the wheel puts it in the plate's last slot (first=" + atEnd.First + ")");
+
+        // 板本身的条带不变式：板顶就在屏幕 margin 上，整块板（表头 + 表格）四面都在屏内且真的点得到。
+        float gridTop = anchorY * height - visible * rowHeight;
+        LayoutRect grid = new LayoutRect(600f, gridTop, 700f, visible * rowHeight);
+        LayoutRect board = ResultChromeLayout.BoardOf(grid, metrics);
+        check(Math.Abs(board.Y - margin) < 0.6f,
+            "the board's own top edge sits at the screen margin: board.Y=" + board.Y.ToString("0.##"));
+        // 1.19.45：没有第二个 Close 需要摆位了。留下来的不变式是整块板 —— 表头 + 表格 —— 必须落在这次量到的条带里，
+        // 而且它问的就是滚轮和绘制用的那同一个矩形。
+        check(ResultChromeLayout.PlateInsideBand(board, margin, height, height),
+            "the board - header included - is inside the band it was placed into: ("
+            + board.X.ToString("0") + "," + board.Y.ToString("0") + "," + board.Width.ToString("0") + "x" + board.Height.ToString("0") + ")");
+        check(ResultChromeLayout.Inside(board, board.X + board.Width * 0.5f, board.Y + board.Height * 0.5f),
+            "and a point in the middle of that plate is on the board's own surface");
+        check(!ResultChromeLayout.Inside(board, board.X + board.Width * 0.5f, board.Y - 2f),
+            "while a point above the board is not a hit");
+    }
+
+    // ---- review #4：放不下"表头 + 两行"时不许声称可见/可点 -----------------------------------------
+    private static void AFixedPlateWithoutRoomForItsHeaderRefuses(Action<bool, string> check)
+    {
+        const float width = 1920f, height = 1080f, rowHeight = 24f, margin = 8f;
+        ResultChromeMetrics metrics = ResultChromeMetrics.For(width, height);
+        float header = metrics.HeaderHeight;
+
+        // 锚点设得很靠上：剩下的高度连表头加两行都装不下。
+        float anchorY = (margin + header + rowHeight * 1.5f) / height;
+        float room = anchorY * height - margin;
+        check(!ResultsScroll.PlateFits(room, rowHeight, header, ResultsScroll.MinimumVisibleRows),
+            "a room that cannot hold the header and two rows reports no plate: room=" + room.ToString("0") + "px, header=" + header.ToString("0") + "px");
+        check(ResultFixedLayout.VerticalRoom.Length > 0 && ResultFixedLayout.VerticalRoom != ResultFixedLayout.OverlapsControl,
+            "and it refuses with a reason of its own, distinct from the overlap state: " + ResultFixedLayout.VerticalRoom);
+
+        // 防御：板顶被算成负值时，条带不变式必须拒绝它（旧实现只看左右）。
+        LayoutRect aboveScreen = new LayoutRect(600f, -header, 700f, 400f);
+        check(!ResultChromeLayout.PlateInsideBand(aboveScreen, margin, height, height),
+            "a plate whose header is above the screen is refused by the band invariant");
+        // 同一块板往下挪一屏距（表头进屏）就恢复合法：拒绝的是"看不见"，不是位置本身。
+        LayoutRect onScreen = new LayoutRect(600f, margin, 700f, 400f);
+        check(ResultChromeLayout.PlateInsideBand(onScreen, margin, height, height),
+            "the same plate one header lower is legal again");
+    }
+
+    // ---- review #4：刷新不得把同一页的滚动位置甩回顶部；滚轮只动真的能滚的表 ---------------------------
+    private static void TheScrollOffsetSurvivesARefreshAndTheWheelNeedsOverflow(Action<bool, string> check)
+    {
+        // 同一页的再量一次（轮询重建、刷新、换分辨率）保留位置；换页回到表头。
+        check(ResultsScroll.OffsetAfterReset(7, samePage: true, rows: 30, frozen: ResultsScroll.FrozenRows, slots: 20) == 7,
+            "a re-measure of the same page keeps the row the player scrolled to");
+        check(ResultsScroll.OffsetAfterReset(29, samePage: true, rows: 30, frozen: ResultsScroll.FrozenRows, slots: 20)
+              == ResultsScroll.MaximumFirst(30, ResultsScroll.FrozenRows, 20),
+            "and a smaller plate clamps it to the new foot instead of leaving it past the table");
+        check(ResultsScroll.OffsetAfterReset(7, samePage: false, rows: 30, frozen: ResultsScroll.FrozenRows, slots: 20)
+              == ResultsScroll.FrozenRows,
+            "a different page starts at its own head, not where the last one was left");
+
+        // 滚轮：表真的超出视口才动。
+        check(!new ScrollViewport(30, ResultsScroll.FrozenRows, 30, ResultsScroll.FrozenRows).Overflows,
+            "a table whose rows all fit has nothing to scroll");
+        check(new ScrollViewport(30, ResultsScroll.FrozenRows, 20, ResultsScroll.FrozenRows).Overflows,
+            "a table taller than its plate does scroll");
+
+        string root = FixedLayoutSourceRoot();
+        check(root != null, "the scroll regression locates the production sources");
+        if (root == null) return;
+        string display = FixedLayoutCode(FixedLayoutSource(root, "ResultsDisplay.cs"));
+        string scroll = FixedLayoutCode(FixedLayoutSource(root, "ResultsScroll.cs"));
+        // 1.19.59: the handler is `PollWheel` now (the frame's own sample), and the "refuse a table that does not overflow"
+        // rule moved into `WheelApplies` rather than sitting inside the scroll maths.
+        check(display.Contains("if (!viewport.Overflows) return false;"),
+            "the wheel handler refuses a table that does not overflow (static source check, not a runtime proof): a board that cannot scroll must not swallow the page's wheel");
+        // 1.19.56 (review 7/8/9): the page is captured *before* the cache is cleared. The old comparison ran after
+        // `_page` had already been set to null, so it could never be true and every re-measure of one page looked like
+        // a new page - the player's scroll position was dropped and the table jumped back to its head.
+        check(display.Contains("Component previousPage = _page;") && display.Contains("ResultsScroll.OffsetAfterReset(_scrollFirst, sameScrollPage,")
+              && display.Contains("bool sameScrollPage = _scrollOwner != null && ReferenceEquals(_scrollOwner, previousPage);"),
+            "the placement reset keeps the offset for the same page object and drops it for a new one, comparing against the page captured before the cache was cleared");
+        check(display.Contains("_scrollOwner = null;"),
+            "and leaving or replacing the page clears the owner, so the next page starts at its head");
+        check(scroll.Contains("public static int OffsetAfterReset(int first, bool samePage, int rows, int frozen, int slots)"),
+            "the rule itself lives in the Unity-free scroll policy, which is what this assertion runs");
     }
 
     private static string FixedLayoutMethodBody(string source, string signature)

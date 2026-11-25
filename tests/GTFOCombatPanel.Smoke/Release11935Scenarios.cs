@@ -221,8 +221,10 @@ internal static class Release11935Scenarios
         string metrics = Code(File.ReadAllText(Path.Combine(root, "ImpactMetrics.cs")));
         check(!supply.Contains("bool ammo") && !metrics.Contains("CreditSelfSupply(bool ammo)") && !metrics.Contains("SupplyPackKind.Tool)"),
             "no one-bit overload is left to read `false` as a tool pack: a kind is named at the call site");
-        check(metrics.Contains("case SupplyPackKind.Medical: if (SelfMedicalUses < long.MaxValue) SelfMedicalUses++; break;"),
-            "and a medical pack has a field of its own, so it cannot land in the tool one");
+        check(metrics.Contains("case SupplyPackKind.Medical:")
+              && metrics.Contains("if (SelfMedicalUses < long.MaxValue) SelfMedicalUses++;")
+              && metrics.Contains("SelfMedicalKnown = true;"),
+            "and a medical pack has a field of its own, so it cannot land in the tool one - and crediting it records that this machine could confirm it");
 
         string rows = Code(File.ReadAllText(Path.Combine(root, "SettlementRows.cs")));
         check(rows.Contains("if (b.SelfSupplyUses > a.SelfSupplyUses)")

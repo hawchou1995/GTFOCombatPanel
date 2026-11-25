@@ -281,7 +281,7 @@ internal static class Release11928Scenarios
             "the panel asks the policy whether this attempt owes a line, and whether that line says anything new");
         check(CountOf(panel, "the flashlight anchor could not be measured yet (") == 1,
             "there is exactly one per-attempt failure line in the panel");
-        check(CountOf(panel, "the flashlight anchor was given up on for this level after") == 1
+        check(CountOf(panel, "the flashlight anchor fast retries ended after") == 1
               && panel.Contains("if (gaveUp)"),
             "and exactly one give-up line, written only on the failure that spent the budget");
         check(panel.Contains("if (_loggedAnchorCamera) return;"),

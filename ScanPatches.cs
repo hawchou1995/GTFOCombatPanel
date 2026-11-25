@@ -38,17 +38,20 @@ internal static class BotTagPatch
 // BotTag is static, so the callback itself can never say which bot tagged. Its one caller is the
 // bot's own "use the enemy scanner" action, an instance whose m_agent is exactly that bot: the
 // action brackets the callback, so the owner published here is taken while it runs and cleared when
-// it returns. That is the attribution the proximity rule was guessing at.
+// it returns. 1.19.42 publishes the action's own scan start beside that owner, which is what lets the
+// callback count one use per real scan instead of guessing a number from tag windows. The scope is
+// carried through Harmony's `__state`, and the finalizer pops it even when the update throws.
 [HarmonyPatch]
 internal static class BotScanActionPatch
 {
     private static IEnumerable<MethodBase> TargetMethods() => ImpactTargets.Methods(typeof(PlayerBotActionUseEnemyScanner), "UpdateStateScan");
 
     [HarmonyPrefix]
-    private static void Prefix(PlayerBotActionUseEnemyScanner __instance) => CombatTracker.BeginBotScanAction(__instance);
+    private static void Prefix(PlayerBotActionUseEnemyScanner __instance, out CombatTracker.BotScanScope __state)
+        => __state = CombatTracker.BeginBotScanAction(__instance);
 
     [HarmonyFinalizer]
-    private static System.Exception Finalizer(System.Exception __exception)
-    { CombatTracker.EndBotScanAction(); return __exception; }
+    private static System.Exception Finalizer(CombatTracker.BotScanScope __state, System.Exception __exception)
+    { CombatTracker.EndBotScanAction(__state); return __exception; }
 }
 

@@ -298,8 +298,8 @@ internal static class Release11916bScenarios
             $"a read that throws on every tick spends the {AnchorSamplePolicy.Budget}-attempt budget instead of polling for ever: attempts={always.Attempts}");
         check(thrown == AnchorSamplePolicy.Budget,
             $"and each of those attempts ran the read exactly once: reads={thrown}");
-        check(always.Waited > 39f && always.Waited < 40f,
-            $"the waiting the give-up line reports is the schedule the budget comment promises (0.5 + 1 + 2 + 4x9 = 39.5 s), not a fraction of it: waited={always.Waited:0.##}s");
+        check(always.Waited > 35f && always.Waited < 36f,
+            $"the waiting the give-up line reports is the backoff that was really waited between the twelve attempts (0.5 + 1 + 2 + 4x8 = 35.5 s over eleven intervals), never the twelfth delay nothing waited through: waited={always.Waited:0.##}s");
         check(always.Abandoned && always.Due(now + 1000f)
               && !always.Due(now + 1000f + AnchorSamplePolicy.WatchInterval * 0.5f),
             $"an abandoned round stays abandoned after a throw as well, and answers only on its watch interval - never on the settle cadence again (watches={always.Watches})");
@@ -404,7 +404,7 @@ internal static class Release11916bScenarios
             $"and the retries left in that first line count down from {AnchorSamplePolicy.Budget - 1}: {string.Join(",", left)}");
 
         // The whole budget, at the same frame rate: the schedule spends it and the give-up closes the round.
-        int frames = 60 * 50;   // fifty seconds, past the 39.5 s the twelve attempts really span
+        int frames = 60 * 50;   // fifty seconds, past the 35.5 s the twelve attempts really back off through
         int full = RunSilentHud(frames, out List<int> fullWritten, out _, out bool fullAbandoned);
         check(full == AnchorSamplePolicy.Budget && fullAbandoned,
             $"fifty seconds of a HUD that answers nothing spends the whole {AnchorSamplePolicy.Budget}-attempt budget and gives up (attempts={full})");
@@ -578,7 +578,7 @@ internal static class Release11916bScenarios
             "the sample is gated by the policy's own due test, so a spent budget costs one comparison per refresh");
         check(panel.Contains("flashlight anchor locked after"),
             "a sample that does succeed still writes the lock line the field log was missing");
-        check(panel.Contains("was given up on for this level after {_anchorPolicy.Attempts} attempt(s) and {_anchorPolicy.Waited:0.#}s of waiting"),
+        check(panel.Contains("fast retries ended after {_anchorPolicy.Attempts} attempt(s) and {_anchorPolicy.Waited:0.#}s of waiting"),
             "giving up is a line of its own: it names the attempt count and the wait");
         check(panel.Contains("the measurement is retried in {AnchorSamplePolicy.DelayAfter(_anchorPolicy.Failures):0.##}s")
               && panel.Contains("{Math.Max(0, AnchorSamplePolicy.Budget - _anchorPolicy.Failures)} retry(s) left"),
