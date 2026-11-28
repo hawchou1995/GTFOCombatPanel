@@ -22,6 +22,10 @@ internal sealed class TableContent
 
     internal int Rows => Text != null ? Text.Length : 0;
     internal int ColumnCount => Columns != null ? Columns.Length : 0;
+    // 1.19.62: the settlement board's one squad-level line - the round's created-enemy figure - as the header band
+    // draws it. It is carried beside the cells, never inside them: the table has the same rows and columns, and the
+    // renderer measures nothing for it here, because the band measures that line with its own font and its own slot.
+    internal string Figure;
     internal string[] Cell(int row, int column)
     {
         if (Text == null || row < 0 || row >= Text.Length) return Array.Empty<string>();

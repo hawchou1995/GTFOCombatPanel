@@ -98,6 +98,16 @@ public sealed class PlayerCombatStats
         EnemyDamage = AddDamage(EnemyDamage, amount);
     }
 
+    // 1.19.65: the mirror image of `AddEnemyDamage`, for the one figure this machine may have to take back - an
+    // estimate it made for its own blow that a later, attributable health reading proved the enemy never lost
+    // (`CombatTracker`'s per-instance balance). It only ever moves the number down and never below zero, and it
+    // is never called for a measurement: a credit this machine read across the call is confirmed.
+    public void WithdrawEnemyDamage(double amount)
+    {
+        if (!double.IsFinite(amount) || amount <= 0 || !(EnemyDamage > 0)) return;
+        EnemyDamage = Math.Max(0, EnemyDamage - amount);
+    }
+
     public void AddFriendlyFireDamage(double amount, bool estimated = false)
     {
         if (!double.IsFinite(amount) || amount < 0) return;
@@ -215,6 +225,53 @@ public static class WeaponRows
         => row.Counters != null
            && (row.Counters.ShotsFired > 0 || row.Counters.Hits > 0 || row.Counters.EnemyDamage > 0
                || row.Counters.FriendlyFireDamage > 0);
+    // 1.19.64: the rows of one slot that the one-row-per-slot projection does not draw, when the slot really held
+    // more than one weapon. The recorded Survival r3 log is why this exists: slot 2 fired `收束器霰弹枪`,
+    // `HEL步枪` and `战斗霰弹枪` in one expedition, the board drew the one `WeaponRows.For` chose, and the other
+    // two rows - which `CombatPlayer.Total` does count - had nowhere to be seen.
+    //
+    // What is *not* another weapon, and never becomes one here:
+    //   * the row the slot was opened with (`ArchetypeId = 0`, name `GearClass`): it has no identity of its own, so
+    //     it is neither counted nor named even when it exists beside a real row;
+    //   * a repeated copy of a weapon somebody already reported: rows are keyed by `(slot, archetype id)`, so a
+    //     second snapshot of the same weapon merges into the row its identity already owns - nothing here adds two
+    //     rows together, and the figure a caller reads stays one measurement;
+    //   * a row that never counted anything: opening a row is not using the weapon, and naming it would invent one;
+    //   * a row whose name is the drawn row's name (`收束器霰弹枪` under two archetype ids is one weapon seen twice).
+    //
+    // Only measured rows are returned, so a caller can print them as the figures they are. Order: damage first,
+    // then name, so the block a reader sees is the same one on every frame.
+    public static List<WeaponCombatStats> Others(IEnumerable<WeaponCombatStats> rows, int slot, WeaponCombatStats drawn)
+    {
+        var others = new List<WeaponCombatStats>();
+        if (rows == null) return others;
+        string drawnName = NameOf(drawn);
+        foreach (WeaponCombatStats row in rows)
+        {
+            if (row == null || ReferenceEquals(row, drawn) || row.Slot != slot) continue;
+            if (row.ArchetypeId == 0 || !Counted(row)) continue;
+            string name = NameOf(row);
+            if (name.Length == 0) continue;
+            if (drawn != null && string.Equals(name, drawnName, StringComparison.OrdinalIgnoreCase)) continue;
+            bool seen = false;
+            for (int index = 0; index < others.Count; index++)
+            {
+                if (!string.Equals(NameOf(others[index]), name, StringComparison.OrdinalIgnoreCase)) continue;
+                seen = true;
+                break;
+            }
+            if (!seen) others.Add(row);
+        }
+        others.Sort((left, right) =>
+        {
+            int byDamage = right.Counters.EnemyDamage.CompareTo(left.Counters.EnemyDamage);
+            return byDamage != 0 ? byDamage : string.CompareOrdinal(NameOf(left), NameOf(right));
+        });
+        return others;
+    }
+
+    private static string NameOf(WeaponCombatStats row)
+        => row == null || string.IsNullOrEmpty(row.Name) ? string.Empty : row.Name.Trim();
 }
 
 public sealed class CombatPlayer
@@ -383,9 +440,8 @@ public static class CombatStatsFormatter
     };
     public static PanelTextRole TextRoleFor(PanelColumn column) => column == PanelColumn.PlayerName ? PanelTextRole.PlayerName : PanelTextRole.Neutral;
     public static bool IsRightAligned(PanelColumn column) => true;
-    // A Steam name may carry TextMeshPro markup: "<#fa0>\"<#0ff>A1pha<#f00>\"" is a real one, read from a live
-    // session's log. The table draws with rich text switched off, so an unhandled tag prints itself and the six
-    // element cut of that name was the literal "<#fa0>". Strip recognised markup first, then cut the visible text.
+    // A Steam name may carry TextMeshPro markup. With rich text disabled, an unhandled tag prints itself.
+    // Strip recognised markup before cutting to six visible text elements.
     private static readonly string[] RichTextTags =
     {
         "color", "b", "i", "u", "s", "smallcaps", "uppercase", "lowercase", "size", "sprite", "align", "indent",

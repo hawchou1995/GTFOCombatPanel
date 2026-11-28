@@ -32,6 +32,8 @@ internal static partial class Program
         RunReviewFixScenarios();
         CaptureRevisionScenarios();
         ScanTagScenarios();
+        RunScanRoundEstimateScenarios();
+        RunScanRoundRepeatScenarios();
         RunScoringRevisionScenarios();
         RunSyncRevisionScenarios();
         var shot = new ShotSample();
@@ -123,7 +125,7 @@ internal static partial class Program
         Check(CombatStatsFormatter.TruncatePlayerName("A😀BCDEF") == "A😀BCDE", "surrogate pairs preserved");
         Check(CombatStatsFormatter.TruncatePlayerName("a\nb\tc") == "abc", "names cannot create new table rows");
         Check(CombatStatsFormatter.TruncatePlayerName("") == "", "empty names are safe");
-        Check(CombatStatsFormatter.TruncatePlayerName("<#fa0>\"<#0ff>A1pha<#f00>\"") == "\"A1pha", "the six element cut of a markup name is the visible text, not the literal tag");
+        Check(CombatStatsFormatter.TruncatePlayerName("<#fa0>\"<#0ff>Brav0<#f00>\"") == "\"Brav0", "the six element cut of a markup name is the visible text, not the literal tag");
         Check(CombatStatsFormatter.TruncatePlayerName("<color=red>Alpha</color>") == "Alpha", "paired colour tags are stripped");
         Check(CombatStatsFormatter.TruncatePlayerName("ab<br>cd") == "abcd", "a line break tag cannot split a table row");
         Check(CombatStatsFormatter.TruncatePlayerName("</color>") == "", "a name that is only markup leaves nothing to print");
@@ -875,11 +877,11 @@ internal static partial class Program
         supplier.Counters.CreditScan(4);
         var supplyBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { supplier }, ImpactScoring.DefaultWeights, 1.0, 1.0), false, true);
         Check(supplyBoard.Joined(21, 1) == "30.0%", "one measured supply use displays its utilization");
-        Check(supplyBoard.Joined(22, 1) == "扫描 1 次 / 首次 4 只", "the scanner cell shows attempts then first marks, and the cumulative clause only when it differs");
+        Check(supplyBoard.Joined(22, 1) == "扫描 1 次 / 首次 4 只 / 累计 4 只", "the scanner cell shows its scans, its first marks and its cumulative marks, whether or not the last two are equal");
         Check(supplyBoard.Tone(21, 1) == ImpactTone.Gold, "the only supplier leads the supply row");
         var dry = new ImpactInput { Name = "Dry", ToolName = "Bio Tracker" };
         var dryBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { dry }, ImpactScoring.DefaultWeights, 1.0, 1.0), false, true);
-        Check(dryBoard.Joined(21, 1) == "—" && dryBoard.Joined(22, 1) == "扫描 —", "unperformed supply and unobserved scanning remain explicit for an equipped scanner");
+        Check(dryBoard.Joined(21, 1) == "—" && dryBoard.Joined(22, 1) == "扫描 — 次 / 首次 — 只 / 累计 — 只", "unperformed supply and unobserved scanning remain explicit for an equipped scanner, in every scan field");
         Check(dryBoard.Joined(23, 1) == "0", "a squad that never split up shows a real zero for lone survivor");
         Check(dryBoard.Joined(24, 1) == "0", "nobody died, so the deaths row is a real zero");
         var failed = ImpactBoard.Build(report, false, false);
@@ -1012,7 +1014,7 @@ internal static partial class Program
         Check(kitReport.Entries[0].Name != kitNames[0], "the board's column order is the score order, not the input order");
 
         // Names are shown whole now; only the markup the game itself would interpret comes off.
-        Check(CombatStatsFormatter.FullPlayerName("<#fa0>\"<#0ff>A1pha<#f00>\"") == "\"A1pha\"", "a full name keeps every visible character and drops only the markup");
+        Check(CombatStatsFormatter.FullPlayerName("<#fa0>\"<#0ff>Brav0<#f00>\"") == "\"Brav0\"", "a full name keeps every visible character and drops only the markup");
         Check(CombatStatsFormatter.FullPlayerName("名字玩家测试完成六七八") == "名字玩家测试完成六七八", "a full name is no longer cut to six elements");
         Check(CombatStatsFormatter.FullPlayerName("a\nb\tc") == "abc", "a full name still cannot start a new table row");
         Check(CombatStatsFormatter.FullPlayerName("1 < 2") == "1 < 2", "a stray angle bracket in a full name stays literal");
@@ -1034,8 +1036,8 @@ internal static partial class Program
         Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "~扫描 2 次 / 首次 5 只 / 累计 9 只",
             "estimated scan counters retain the marker with the unified format");
         scanEntry.Counters.ScanUses = 0; scanEntry.Counters.ScanFirstMarks = 0; scanEntry.Counters.ScanMarks = 0;
-        Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "扫描 —",
-            "an equipped but unobserved scanner keeps an explicit placeholder");
+        Check(ImpactBoard.MetricFields(scanEntry, ImpactMetric.ToolEfficiency, KillTier.Minor, false, true)[0] == "扫描 — 次 / 首次 — 只 / 累计 — 只",
+            "an equipped but unobserved scanner prints each of its three fields as the labelled placeholder");
         // The 总伤害 metric row carries the figure it is named for and its share of the squad total in
         // one cell, and prints the bare figure when no host measured a total to divide by.
         var shareEntry = new ImpactEntry(new ImpactInput { Name = "Share", EnemyDamage = 250 }, null, null, 50, 1, ImpactRating.Damage, (int)ImpactMetric.TotalDamage);
@@ -1110,7 +1112,7 @@ internal static partial class Program
         var estimatedScan = new ImpactInput { Name = "Scout", ToolName = "Bio Tracker" };
         estimatedScan.Counters.CreditScan(3, true);
         var estimatedBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { estimatedScan }, ImpactScoring.DefaultWeights, 1, 1), false, true);
-        Check(estimatedBoard.Joined(22, 1) == "~扫描 1 次 / 首次 3 只", "estimated scan counters keep the estimate marker, and equal cumulative marks are not printed twice");
+        Check(estimatedBoard.Joined(22, 1) == "~扫描 1 次 / 首次 3 只 / 累计 3 只", "estimated scan counters keep the estimate marker, and the cumulative clause is printed even when it equals the first-mark one");
         estimatedScan.Counters.Reset();
         Check(!estimatedScan.Counters.ScanEstimated && estimatedScan.Counters.ScanUses == 0 && estimatedScan.Counters.ScanFirstMarks == 0 && estimatedScan.Counters.ScanMarks == 0, "new expeditions clear both scan counts and estimate flags");
         Check(board.Cell(-1, 1).Length == 0 && board.Cell(0, 999).Length == 0 && board.Tone(999, 999) == ImpactTone.Neutral, "board bounds are safe");
@@ -1207,36 +1209,39 @@ internal static partial class Program
         var cooldown = new ScanSession();
         var cooldownCounters = new ImpactCounters();
         Check(!cooldownCounters.ScanUsesKnown, "a row whose scanner cooldown was never read knows no number of scans");
-        Check(cooldown.ObserveRecharge(true, true, true, 100f, cooldownCounters) == ScannerCooldownSignal.Started, "a readable cooldown session is the activation");
-        Check(cooldownCounters.ScanUses == 1 && cooldownCounters.ScanUsesKnown, "the first session is exactly one scan, and the figure is now a counted number");
-        Check(cooldown.ObserveRecharge(true, true, true, 100f, cooldownCounters) == ScannerCooldownSignal.Continuing && cooldownCounters.ScanUses == 1, "the same start time polled again is the same scan");
+        // 1.19.70: a level can begin with a cooldown already running - the recorded 1.19.69 Test archive did - and that
+        // first sample is the ledger's baseline, not a scan. The activation figure therefore starts at a *counted* zero,
+        // and the one it counts is the next start the scanner really produces.
+        Check(cooldown.ObserveRecharge(true, true, true, 100f, cooldownCounters) == ScannerCooldownSignal.Baseline, "the first cooldown this machine ever read, already running, is the baseline and never a scan");
+        Check(cooldownCounters.ScanUses == 0 && cooldownCounters.ScanUsesKnown, "so that first session is a counted zero, not an unknown figure and not one scan");
+        Check(cooldown.ObserveRecharge(true, true, true, 100f, cooldownCounters) == ScannerCooldownSignal.Continuing && cooldownCounters.ScanUses == 0, "the same start time polled again is still the same, uncounted, session");
         for (int flip = 0; flip < 5; flip++) cooldown.ObserveTagging(flip % 2 == 0, cooldownCounters);
         cooldown.MarkEnemy(31, cooldownCounters);
-        Check(cooldownCounters.ScanUses == 1, "five tag-flag flips and a mark add no scan: the flag is in-sweep progress, not an activation");
+        Check(cooldownCounters.ScanUses == 0, "five tag-flag flips and a mark add no scan: the flag is in-sweep progress, not an activation");
         Check(cooldown.ObserveRecharge(true, false, true, 100f, cooldownCounters) == ScannerCooldownSignal.Completed, "the cooldown leaving is the session's completion edge");
-        Check(cooldown.ObserveRecharge(true, true, true, 200f, cooldownCounters) == ScannerCooldownSignal.Started && cooldownCounters.ScanUses == 2, "a later start time is a second, independent activation");
-        Check(cooldown.ObserveRecharge(true, true, true, 150f, cooldownCounters) == ScannerCooldownSignal.Continuing && cooldownCounters.ScanUses == 2, "an out-of-order older start time never adds an activation");
-        Check(cooldown.ObserveRecharge(false, false, false, float.NaN, cooldownCounters) == ScannerCooldownSignal.Unavailable && cooldownCounters.ScanUses == 2, "an unreadable cooldown counts nothing and keeps the number it had");
+        Check(cooldown.ObserveRecharge(true, true, true, 200f, cooldownCounters) == ScannerCooldownSignal.Started && cooldownCounters.ScanUses == 1, "a later start time after that idle is the first independent activation");
+        Check(cooldown.ObserveRecharge(true, true, true, 150f, cooldownCounters) == ScannerCooldownSignal.Continuing && cooldownCounters.ScanUses == 1, "an out-of-order older start time never adds an activation");
+        Check(cooldown.ObserveRecharge(false, false, false, float.NaN, cooldownCounters) == ScannerCooldownSignal.Unavailable && cooldownCounters.ScanUses == 1, "an unreadable cooldown counts nothing and keeps the number it had");
         var unreadableSession = new ScanSession();
         var unreadableCounters = new ImpactCounters();
         Check(unreadableSession.ObserveRecharge(false, false, false, float.NaN, unreadableCounters) == ScannerCooldownSignal.Unavailable
               && unreadableCounters.ScanUses == 0 && !unreadableCounters.ScanUsesKnown,
             "a scanner whose cooldown cannot be read reports an unknown count, not a precise zero");
-        Check(CombatStrings.ToolScan(false, CombatStrings.Placeholder, "3", "3") == "扫描 — 次 / 首次 3 只",
-            "the cell prints `—` for a count nobody could observe beside the marks it did prove");
+        Check(CombatStrings.ToolScan(false, CombatStrings.Placeholder, "3", "3") == "扫描 — 次 / 首次 3 只 / 累计 3 只",
+            "the cell prints `—` for the count nobody could observe beside both marks it did prove");
         // A holder whose cooldown was read has a *counted* figure even when it is zero - the two states the row must
         // never confuse: nobody observed it (`—`) and observed-with-no-scan (`0`).
         var knownZeroScan = new ImpactInput { Name = "Scout", ToolName = "Bio Tracker" };
         knownZeroScan.Counters.ScanUsesKnown = true;
         var knownZeroBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { knownZeroScan }, ImpactScoring.DefaultWeights, 1, 1), false, true);
-        Check(knownZeroBoard.Joined(22, 1) == "扫描 0 次 / 首次 0 只",
-            "a scanner whose cooldown this machine read prints its counted zero, not a dash: " + knownZeroBoard.Joined(22, 1));
+        Check(knownZeroBoard.Joined(22, 1) == "扫描 0 次 / 首次 0 只 / 累计 0 只",
+            "a scanner whose cooldown this machine read prints its counted zero in all three fields, not a dash: " + knownZeroBoard.Joined(22, 1));
         var unobservedScan = new ImpactInput { Name = "Scout", ToolName = "Bio Tracker" };
         unobservedScan.Counters.ScanFirstMarks = 2;
         unobservedScan.Counters.ScanMarks = 2;
         var unobservedBoard = ImpactBoard.Build(ImpactScoring.Evaluate(new[] { unobservedScan }, ImpactScoring.DefaultWeights, 1, 1), false, true);
-        Check(unobservedBoard.Joined(22, 1) == "扫描 — 次 / 首次 2 只",
-            "and a row nobody could observe prints a dash for the count beside the marks it proved: " + unobservedBoard.Joined(22, 1));
+        Check(unobservedBoard.Joined(22, 1) == "扫描 — 次 / 首次 2 只 / 累计 2 只",
+            "and a row nobody could observe prints a dash for the count beside both marks it proved: " + unobservedBoard.Joined(22, 1));
         estimatedScan.Counters.ScanUses = 0; estimatedScan.Counters.ScanFirstMarks = 3; estimatedScan.Counters.ScanUsesKnown = false;
         Check(ImpactScoring.HasValue(estimatedScan, ImpactMetric.ToolEfficiency),
             "a scanner with first marks but no readable cooldown still has a utility figure, so the scoring normalization is not silently changed");
@@ -1290,37 +1295,43 @@ internal static partial class Program
         Check(!guestScan.ObserveTagging(false, null) && guestCounters.ScanMarks == 3 && guestCounters.ScanUses == 0,
             "the tracker's own flag poll still changes no figure when the flag reads false and there is no counter");
 
-        // The scan cell prints the cumulative figure only when it really differs from the first-mark figure:
-        // while both came out of the same reveal they were always equal, so the third clause repeated the
-        // second one. The separator and the estimate marker are untouched, and a differing pair keeps all
-        // three clauses.
-        Check(CombatStrings.ToolScan(false, "4", "9", "9") == "扫描 4 次 / 首次 9 只"
-            && CombatStrings.ToolScan(true, "4", "9", "9") == "~扫描 4 次 / 首次 9 只",
-            "equal marks print the scan cell as two clauses, with the estimate marker still in front");
+        // 1.19.64: the scan cell always carries all three fields. Until this delivery the cumulative clause was
+        // dropped whenever it equalled the first-mark figure, which is how the user's board lost the figure on the
+        // Dauda row. Equal counts now print the same three clauses as differing ones, and the estimate marker
+        // keeps the position it always had.
+        Check(CombatStrings.ToolScan(false, "4", "9", "9") == "扫描 4 次 / 首次 9 只 / 累计 9 只"
+            && CombatStrings.ToolScan(true, "4", "9", "9") == "~扫描 4 次 / 首次 9 只 / 累计 9 只",
+            "equal marks print the whole three-clause cell, with the estimate marker still in front");
         Check(CombatStrings.ToolScan(false, "4", "9", "13") == "扫描 4 次 / 首次 9 只 / 累计 13 只"
             && CombatStrings.ToolScan(true, "4", "9", "13") == "~扫描 4 次 / 首次 9 只 / 累计 13 只",
             "differing marks keep all three clauses exactly as they were");
 
-        // Each scanner carries its own reveal ledger: an enemy the squad's other bio tracker already
-        // revealed is still a first mark for this tracker, which is what lets two human trackers both
-        // count. A repeat by the same scanner is still a repeat.
-        var firstScanner = new ScanSession();
+        // 1.19.62 (the reversed expectation): one reveal namespace per expedition, shared by every scanner in the
+        // squad. This block used to assert the opposite - "an enemy the squad's other tracker revealed is still a
+        // first mark for this scanner" - because the tracker handed every player a ledger of their own; that is
+        // exactly what made the recorded Survival FX.3 host archive read 78 first marks off a round of 21 created
+        // enemies. `SquadScanLedger` is the production factory `CombatTracker.Ledger` now uses: the enemy is a first
+        // mark for the sweep that really revealed it and a repeat for everybody after, while each scanner keeps its
+        // own cumulative mark inside its own sweep window and still counts no activation from a mark.
+        var team = new SquadScanLedger();
+        var firstScanner = team.For(11UL);
         var firstCounters = new ImpactCounters();
-        var secondScanner = new ScanSession();
+        var secondScanner = team.For(12UL);
         var secondCounters = new ImpactCounters();
         firstScanner.ObserveTagging(true, firstCounters);
         Check(firstScanner.MarkEnemy(41, firstCounters) && firstCounters.ScanFirstMarks == 1 && firstCounters.ScanUses == 0, "the sweep that reveals an enemy first takes the credit, and its tag window is not an activation");
         Check(!firstScanner.MarkEnemy(41, firstCounters) && firstCounters.ScanFirstMarks == 1, "a second sweep of the same enemy by the same scanner is a repeat, not a mark");
         secondScanner.ObserveTagging(true, secondCounters);
-        Check(secondScanner.MarkEnemy(41, secondCounters) && secondCounters.ScanFirstMarks == 1 && secondCounters.ScanUses == 0, "an enemy the squad's other tracker revealed is still a first mark for this scanner, and its tag window is not an activation");
+        Check(!secondScanner.MarkEnemy(41, secondCounters) && secondCounters.ScanFirstMarks == 0 && secondCounters.ScanUses == 0, "an enemy the squad revealed first is a repeat for this tracker, and its tag window is not an activation");
+        Check(secondCounters.ScanMarks == 1, "the second tracker still counts that enemy cumulatively inside its own sweep window");
         Check(secondScanner.Observe(41, secondCounters) == ScanMark.Repeat, "the same scanner sweeping the same enemy again is a repeat");
-        Check(secondScanner.MarkEnemy(42, secondCounters) && secondCounters.ScanFirstMarks == 2, "an enemy nobody had revealed is a first mark");
+        Check(secondScanner.MarkEnemy(42, secondCounters) && secondCounters.ScanFirstMarks == 1, "an enemy nobody had revealed is a first mark for the scanner that reveals it");
         Check(secondScanner.Observe(43, secondCounters) == ScanMark.First, "the tracker can tell a repeat from a first mark");
         secondScanner.ObserveTagging(false, secondCounters);
         Check(secondScanner.Observe(44, secondCounters) == ScanMark.First, "a reveal outside a tag is its own proof of a sweep, not a rejection");
         var sharedReveals = new ScanReveals();
         sharedReveals.Reveal(41); sharedReveals.Reveal(42); sharedReveals.Reveal(43);
-        Check(sharedReveals.Count == 3, "the expedition diagnostic ledger remembers exactly the enemies the squad revealed");
+        Check(sharedReveals.Count == 3, "the expedition's one reveal namespace remembers exactly the enemies the squad revealed");
         sharedReveals.Clear();
         Check(sharedReveals.Count == 0 && new ScanSession(sharedReveals).Observe(41, new ImpactCounters(), true) == ScanMark.First, "a cleared ledger is a fresh expedition");
         if (args.Length == 2 && args[0] == "--preview") BoardPreview.Write(args[1], BoardPreview.Sample());
@@ -2307,6 +2318,50 @@ internal static partial class Program
         //      the fail-open/F8 band reading the same boundary, and late/blind/cross-page paths that keep the slot ----
         Console.WriteLine("---- 1.19.61: one client footer boundary, the slot's drawn glyphs, a tightened standing band ----");
         Release11961Scenarios.RunInto(Check);
+        // ---- 1.19.62: one squad-wide first reveal off the production session factory (the recorded 78 first marks
+        //      off a round of 21 created enemies), and the round's created-enemy figure - one global count, archived
+        //      beside the player rows as a number or as an explicit unknown, with the board's layout untouched ----
+        Console.WriteLine("---- 1.19.62: one squad first reveal, one global created-enemy figure ----");
+        Release11962Scenarios.RunInto(Check);
+        // ---- 1.19.64: the scan cell prints its three figures on every scanner row - equal and zero values
+        //      included, a labelled placeholder where nothing was measured, the board and the archive from one
+        //      text, and the pre-1.19.64 two-clause cell asserted gone ----
+        Console.WriteLine("---- 1.19.64: the scanner cell carries its scans, first marks and cumulative marks ----");
+        Release11964Scenarios.RunInto(Check);
+        // ---- 1.19.65: the client's own blows spent from ONE balance per enemy instance - 25 of 30 credits 25, a
+        //      readable loss of 7 credits 7, five pellets carrying 34 against a 20-health enemy credit 20, a sync
+        //      down to 18 leaves 18 (not 11), a lagging higher snapshot refunds nothing, and death / bad numbers /
+        //      another enemy / a reused pointer / a spawn edge each keep to the enemy's own lifecycle ----
+        Console.WriteLine("---- 1.19.65: one shared health balance per enemy instance for the client's own blows ----");
+        Release11965Scenarios.RunInto(Check);
+        // ---- the host failure page's carved band (1.19.64 Survival 2560x1440, 4 players, failure, run 2): the free band
+        //      the scan carved under the waiting line starts inside the vanilla return-to-lobby button, so that page does
+        //      not offer it; the page's own band, the strip above the measured wall and the faint overlap tier answer
+        //      instead, while the success and client pages keep the carve ----
+        Console.WriteLine("---- host failure: the carved band is not offered, and the record is reproduced by the carve ----");
+        HostFailureCarveBandScenarios.RunInto(Check);
+        // ---- the recorded 1.19.66 host failure page (2560x1440, log 14693-14912): the fit placed its plate 2px below
+        //      the band it had just measured and the draw wall refused it on 49 consecutive repaints. The production
+        //      placement stops on the band's own foot now, the wall keeps its half-pixel tolerance, the recorded old
+        //      plate is still refused, and a button that arrives later still vetoes the held plate ----
+        Console.WriteLine("---- host failure: the plate stops on its own band, and the wall still refuses a late button ----");
+        HostFailurePlacementSlackScenarios.RunInto(Check);
+        // ---- 1.19.67: the all-round sentence says what it is - top of the overall score, no category title.
+        //      The recorded 2K host failure pairs Dauda's single rescue (printed on the board, below the floor
+        //      of two, so unscored) with an exact tie for first: both rows wear 全能中坚 and read the same line,
+        //      which no longer denies the 救援 figure the board itself prints. A unique first reads the same
+        //      line, two rescues still earn 妙手回春 unchanged, the replaced wording is recognised as a default
+        //      (zh and en) while a real custom line is kept in every language ----
+        Console.WriteLine("---- 1.19.67: the all-round line says what the sentence is ----");
+        Release11967Scenarios.RunInto(Check);
+        // ---- the recorded 1.19.68 host success page (2560x1440, 4 players, `snap_test_20261128_132100`, log
+        //      7194-7226 / 7846-7980): the fit placed its 548px board bottom-aligned to 1434 while the strip it was
+        //      measured into ends at the window's own foot 1432, so `HeldGridFits` refused the plate on every repaint
+        //      and the page never drew one frame. A host success strip whose foot is only the screen's edge now stops
+        //      on that edge; a strip ending on a measured footer (the 1.19.67 record's 1287) keeps its exact geometry,
+        //      the late-button and measurement gates are untouched, and the failure/client arithmetic is unchanged ----
+        Console.WriteLine("---- 1.19.68: a host success board stops on the window's edge, not 2px past it ----");
+        Release11968Scenarios.RunInto(Check);
         Console.WriteLine($"PASS: {_assertions} combat-panel assertions");
     }
     // The same slot arithmetic HudTable.BuildGrid performs at runtime, with every geometry constant

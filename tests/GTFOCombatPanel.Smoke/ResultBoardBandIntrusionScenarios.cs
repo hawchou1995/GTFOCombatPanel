@@ -160,8 +160,9 @@ internal static class ResultBoardBandIntrusionScenarios
         string display = Source("ResultsDisplay.cs");
         string repaint = Between(display, "private static void RefreshFallbackSafety()", "internal static bool ToggleForcedFallback()");
         check(repaint.Length > 0, "the fail-open repaint re-check was found in ResultsDisplay");
-        check(repaint.Contains("ResultLateControlPolicy.MustMove(_origin.Y, _origin.Bottom, strip.Top, strip.Bottom)"),
-            "it asks about the rectangle that is on the screen and about both edges of the newly measured band");
+        check(repaint.Contains("ResultLateControlPolicy.MustMove(_origin.Y, _origin.Bottom, strip.Top, strip.Bottom)")
+              && repaint.Contains("hostFailure && !ResultChromeLayout.PlateInsideBand(_holdBoard, strip.Top, strip.Bottom"),
+            "both edges are checked against the current rect, including the header for host failure");
         check(repaint.Contains("bool intrudes = ") && repaint.Contains("bool moved = refitted || sizeChanged || horizontal || (intrudes && vertical);"),
             "a vertical move needs a real intrusion and a destination that really differs; a horizontal re-layout and a re-fit (review #4) keep their own thresholds");
         check(repaint.Contains("_origin = rect;") && repaint.Contains("_holdBoard = plate;") && repaint.Contains("_holdStrip = strip;")
@@ -175,23 +176,24 @@ internal static class ResultBoardBandIntrusionScenarios
             "the fail-open re-check is the branch the strict path's `BoardStillSafe` is *not* used in - the finding's own point");
         check(repaint.Contains("if (_page == null || _grid == null || _content == null) return;"),
             "a page that has gone away - or one whose table content is gone - draws nothing new");
-        check(!repaint.Contains("GuestClient()") && !repaint.Contains("ResultPageRole.Host"),
-            "the rule is the same for host and client pages; the band it follows is the one each page's own scan produced");
+        check(repaint.Contains("bool hostFailure = !_succeeded && !GuestClient();")
+              && repaint.Contains("_holdValid = !hostFailure || ResultChromeLayout.PlateInsideBand("),
+            "only host failure requires the whole visible plate to fit the fresh measured band");
         check(display.Contains("internal static bool ToggleForcedFallback()"),
             "F8 still reaches this path through the same placement, so the fixed board is the one F8 puts up as well");
     }
 
-    // The fail-open board is moved and faded, never taken away: a screen with no table is the defect that path exists to
+    // The generic fail-open board keeps its move/fade policy; host failure is vetoed by Draw if its strip is unproven.
     private static void TheFallbackBoardIsNeverTakenAway(Action<bool, string> check)
     {
         string display = Source("ResultsDisplay.cs");
         string repaint = Between(display, "private static void RefreshFallbackSafety()", "internal static bool ToggleForcedFallback()");
         check(!repaint.Contains("ResetPlacement") && !repaint.Contains("_grid = null") && !repaint.Contains("return;   // no band"),
-            "the fail-open re-check never withdraws the board: it moves it or fades it");
+            "the recheck itself never resets the placement; the host-only veto runs before draw");
         check(repaint.Contains("float opacity = ResultFallbackOpacity.Resolve(planned, rect.Bottom, strip.Top, strip.Bottom);"),
             "the fade is derived from the same band the move is, on every repaint");
         check(repaint.Contains("_holdOpacity = opacity;"),
-            "and the drawn opacity follows it, so a board that cannot fit is faint rather than invisible");
+            "the generic fallback's drawn opacity continues to follow the recheck");
         check(display.Contains("The place and the strip are committed together, the band's foot is read,")
               && display.Contains("a board that no longer fits is fitted smaller inside the same band instead of being drawn past it."),
             "the log line says the same thing in words: the band's foot is read, the place and the strip are one measurement, and a board that no longer fits is re-fitted instead of drawn past it");

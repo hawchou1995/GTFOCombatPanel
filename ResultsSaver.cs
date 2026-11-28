@@ -55,7 +55,7 @@ internal static class ResultsSaver
     // on every launch, so it is stable only inside a session - the file name carries the write time to the
     // millisecond, the run, the rundown/level key and success/failure, which is what makes the record's
     // identity stable across launches too.
-    internal static void Save(Component page, bool succeeded, ImpactBoardLayout board, ImpactReport report, uint run)
+    internal static void Save(Component page, bool succeeded, ImpactBoardLayout board, ImpactReport report, uint run, bool isMaster)
     {
         try
         {
@@ -65,7 +65,22 @@ internal static class ResultsSaver
             ExpeditionMetadata metadata = CurrentMetadata();
             string json = ResultsLog.Build(succeeded, writtenAt, PluginInfo.Version, board, report, metadata, run);
             if (json.Length == 0) return;
+            // 1.19.62: the round's created-enemy figure, printed from the same global ledger the page and this record
+            // read - one line per expedition, never one per player. It sits beside the scan comparison for the same
+            // reason that one does: this is where the settlement's final figures exist. Like it, this is logging only:
+            // it never gates, delays or rewrites the record, and a machine that cannot prove a figure still writes
+            // exactly the file it always wrote, with `spawns.scope = unknown`.
+            string spawns = SettlementSpawns.Line(report, run);
+            if (spawns.Length > 0) Plugin.Logger?.LogInfo(spawns);
 
+            // 1.19.62: the host's own scan-batch estimate beside the figure each of those players reported, written
+            // here because this is the one point where the settlement board's final rows exist. `ScanRoundComparison`
+            // prints at most one line per player, prints it again only when the numbers on it change, and asks the
+            // ledger directly - so the line survives the owner's figure arriving, which is the comparison it exists
+            // for. `isMaster` keeps a migrated machine from printing the previous host's figure. This loop is logging
+            // only: it never gates, delays or rewrites the record below, so a client or a host that grouped nothing
+            // writes exactly the file it always wrote.
+            foreach (string comparison in ScanRoundComparison.Lines(report, run, isMaster)) Plugin.Logger?.LogInfo(comparison);
             if (newScreen)
             {
                 string folder = Folder(out bool persistentUsed, out string legacyArchive);

@@ -230,7 +230,7 @@ internal static class Release11923Scenarios
         check(hidden.Contains("ArchiveScreen(succeeded);") && hidden.Contains("ResetPlacement();"),
             "the archive runs first in the hidden branch, before the placement reset - nothing downstream gates it");
         string screen = Between(display, "private static void ArchiveScreen(bool succeeded)", "private static void ResetPlacement()");
-        check(screen.Contains("ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation);"),
+        check(screen.Contains("ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation, HostProven());"),
             "the hidden screen saves through the same ResultsSaver path a drawn board uses");
         check(screen.Contains("if (report.Entries.Count == 0)") && screen.Contains("\"archive-empty-roster\"")
               && screen.Length > 0,

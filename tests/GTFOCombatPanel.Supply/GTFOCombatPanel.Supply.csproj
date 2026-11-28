@@ -18,6 +18,8 @@
     <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
     <Compile Include="..\..\PackApplication.cs" Link="PackApplication.cs" />
     <Compile Include="..\..\ImpactMetrics.cs" Link="ImpactMetrics.cs" />
+    <!-- 1.19.62: `ImpactReport` carries the round's created-enemy figure, so the ledger that supplies it is linked here too. -->
+    <Compile Include="..\..\SquadSpawns.cs" Link="SquadSpawns.cs" />
     <Compile Include="..\..\CombatStats.cs" Link="CombatStats.cs" />
     <Compile Include="..\..\Localization.cs" Link="Localization.cs" />
   </ItemGroup>

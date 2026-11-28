@@ -407,11 +407,11 @@ internal static class GuestSettlementBandScenarios
             "1.19.47 (review #1): F8 asks the page's *request* - the player's switches, this page's own hide and an outstanding show request - not the last painted frame and not the `Forced` override, which is false for a board the fail-open path put up itself");
         check(display.Contains("_boardDrawnFrame = -1;") && display.Contains("_boardDrawnFrame = Time.frameCount;"),
             "the drawn frame is written before every early return of a repaint and set again only by the draw at its end");
-        // 1.19.45: two draw paths record a drawn board now - the adaptive one at the end of `Draw`, and the fixed-mode one
-        // in `FixedLayoutDraw` (which returns before the adaptive tail). Both write the same fact, so F8's answer stays
-        // one fact; the count is pinned so a third, accidental writer still fails here.
-        check(CountOf(display, "_boardDrawnFrame = Time.frameCount;") == 2,
-            "exactly two places record a drawn board, each right after its own table draw call: the adaptive repaint and the fixed-mode one");
+        int resolutionDraw = display.IndexOf("private static void PaintResolutionBoard()", StringComparison.Ordinal);
+        int paint = resolutionDraw < 0 ? -1 : display.IndexOf("HudTable.Draw(", resolutionDraw, StringComparison.Ordinal);
+        int record = resolutionDraw < 0 ? -1 : display.IndexOf("_boardDrawnFrame = Time.frameCount;", resolutionDraw, StringComparison.Ordinal);
+        check(CountOf(display, "_boardDrawnFrame = Time.frameCount;") == 3 && paint > resolutionDraw && record > paint,
+            "the new resolution board records the painted frame only after drawing; no extra writer is allowed");
     }
 
     // The fit spends the ceiling of the strip it was given, and the failure/success placements build that strip from the

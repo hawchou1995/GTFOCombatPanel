@@ -68,7 +68,7 @@ public sealed class Plugin : BasePlugin
         ShowResults = Config.Bind("Results", "ShowResults", true, "成功/失败结算页上是否显示结算板。这是总开关；下面两个键决定它画什么。");
         ShowResultOverlay = Config.Bind("Results", "ShowResultOverlay", true, "把本模组的板子画在结算页之上。设 false 则结算页保持游戏原样：不画板，也不放回旧统计表。");
         ResultsOffsetX = Config.Bind("Results", "OffsetX", 0f, "结算表相对页面默认位置的像素偏移；正数向右移。");
-        ResultsOffsetY = Config.Bind("Results", "OffsetY", 0f, "结算表相对页面默认位置的像素偏移；正数向下移。");
+        ResultsOffsetY = Config.Bind("Results", "OffsetY", 0f, "旧版垂直偏移，保留已有配置；默认统一条带不使用此键。手动位置请用 FixedLayout / FixedAnchorY。");
         // 固定模式：把「板子多大、放在哪里」的主动权交给玩家。自适应那条链仍然是默认，这一组只是兜底/覆盖。
         FixedLayoutConfig = Config.Bind("Results", "FixedLayout", false,
             "固定模式（兜底，默认关闭）：打开后结算板不再按页面自适应，而由下面三个键指定的字号与「表格底边中点」决定大小和位置，成功页与失败页共用这一组值。"
@@ -103,10 +103,10 @@ public sealed class Plugin : BasePlugin
         // It scrolls the table; a size a player chose in the file is applied to the fitted glyph and clamped to the
         // readable floor, so a preference can never make the table unreadable - it scrolls instead.
         SuccessFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.SuccessKey, ResultsZoom.Default,
-            new ConfigDescription("SUCCESS 页结算板的字号倍率（手动）。1.0 是页面自身为这张表量出的可读字号；0.5-2.0 之间按这个倍率乘上去，并且永远不会低于可读下限——放不下的行改为用滚轮上下滚动，而不是把字缩到看不清。滚轮不再改这个值（滚轮=滚动），只有改文件（或热重载）才会变。",
+            new ConfigDescription("旧版成功页字号倍率，保留已有配置；统一结算布局不使用此键。手动字号请用 FixedLayout / FixedFontPixels。",
                 new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
         FailureFontScale = Config.Bind(ResultsZoom.Section, ResultsZoom.FailureKey, ResultsZoom.Default,
-            new ConfigDescription("FAILURE 页结算板的字号倍率（手动）。1.0 是页面自身为这张表量出的可读字号；0.5-2.0 之间按这个倍率乘上去，并且永远不会低于可读下限——放不下的行改为用滚轮上下滚动，而不是把字缩到看不清。滚轮不再改这个值（滚轮=滚动），只有改文件（或热重载）才会变。",
+            new ConfigDescription("旧版失败页字号倍率，保留已有配置；统一结算布局不使用此键。手动字号请用 FixedLayout / FixedFontPixels。",
                 new AcceptableValueRange<float>(ResultsZoom.Minimum, ResultsZoom.Maximum)));
         // The influence board, and the thirteen metrics it scores.
         ShowImpactBoard = Config.Bind("Results", "ShowImpactBoard", true, "在结算页画影响力看板（每位玩家按 100 分制打分并排名，配一句称号与十三项指标）。设 false 则结算页保持游戏原样：没有旧统计表可回落。在关卡内切换 HUD 的同一个键（ToggleKey，默认 F8）在结算页也用于隐藏与显示这块板，但它从不写这个键：F8 保存的是 ShowPanel 和 ShowResultOverlay，此值始终保持这里设置的样子。");

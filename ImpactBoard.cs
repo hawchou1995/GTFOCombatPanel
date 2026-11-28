@@ -27,6 +27,12 @@ public sealed class ImpactBoardLayout
     public string[][][] Text;
     public ImpactTone[][] Tones;
     public ImpactRowKind[] Kinds;
+    // 1.19.62: the round's created-enemy figure as the settlement header prints it - one string for the whole
+    // board, never one per column. It is a property of the run, not of a player, so it is not a row and not a cell:
+    // the table keeps exactly the rows and columns it had, and the header band draws this line through its own
+    // measured slot (`ResultChromeLayout.PlanHeader` / `DrawChromeHeader`). Empty only if a caller builds a layout
+    // without a report; `Build` always fills it, with the explicit unknown when no figure could be proven.
+    public string Figure;
 
     public int Rows { get { return Text != null ? Text.Length : 0; } }
     public int ColumnCount { get { return Columns != null ? Columns.Length : 0; } }
@@ -203,8 +209,8 @@ public static class ImpactBoard
             // The sentence is never left as a bare word: the row under it says what it was earned
             // with, in the player's own figures.
             Put(text, tones, (int)ImpactRowKind.RatingReason, column, Single(ReasonText(entry, squadDamage)));
-            Put(text, tones, (int)ImpactRowKind.PrimaryWeapon, column, Single(Name(input.PrimaryName)));
-            Put(text, tones, (int)ImpactRowKind.SecondaryWeapon, column, Single(Name(input.SecondaryName)));
+            Put(text, tones, (int)ImpactRowKind.PrimaryWeapon, column, Single(SlotWeaponName(input.PrimaryName, input.PrimaryOthers)));
+            Put(text, tones, (int)ImpactRowKind.SecondaryWeapon, column, Single(SlotWeaponName(input.SecondaryName, input.SecondaryOthers)));
             Put(text, tones, (int)ImpactRowKind.MeleeWeapon, column, Single(Name(input.MeleeName)));
             Put(text, tones, (int)ImpactRowKind.ToolWeapon, column, Single(input.SupportRole ? Name(input.ToolName) + CombatStrings.SupportMark : Name(input.ToolName)));
 
@@ -234,7 +240,15 @@ public static class ImpactBoard
             metricRow = MetricRow(report, text, tones, kinds, metricRow, entries, metric, KillTier.Minor, false, expeditionSucceeded, squadDamage);
         }
 
-        return new ImpactBoardLayout { Columns = columnsArray, Text = text, Tones = tones, Kinds = kinds };
+        // 1.19.62: the round's created-enemy figure travels with the board it belongs to, as one line for the whole
+        // squad. It changes no row, no column and no cell: `Rows`, `ColumnCount` and every `Joined(...)` answer are
+        // exactly what they were before this existed, which is what keeps the fit, the band and every recorded page
+        // geometry untouched.
+        return new ImpactBoardLayout
+        {
+            Columns = columnsArray, Text = text, Tones = tones, Kinds = kinds,
+            Figure = SettlementSpawns.Figure(report.Spawns)
+        };
     }
 
     // The line under the sentence: what the title was earned with, in the player's own figures. It is
@@ -491,17 +505,15 @@ public static class ImpactBoard
         if (entry == null || entry.Input == null) return CombatStrings.Placeholder;
         ImpactCounters counters = entry.Counters ?? new ImpactCounters();
         string name = entry.Input.ToolName ?? string.Empty;
-        string scan = IsScannerTool(name)
-            ? counters.ScanUses > 0 || counters.ScanFirstMarks > 0 || counters.ScanUsesKnown
-                // 1.19.41: a row whose scanner cooldown this machine read (`ScanUsesKnown`) has a *counted* figure -
-                // including a counted zero for a scanner that never recharged. A row with marks but no readable cooldown
-                // - a teammate's row here, or a row that arrived over the v8 pair - prints `—` for the count beside the
-                // marks it did prove, instead of the precise 0 that would claim a scanner nobody could see.
-                ? CombatStrings.ToolScan(counters.ScanEstimated,
-                    counters.ScanUses > 0 || counters.ScanUsesKnown ? Count(counters.ScanUses) : CombatStrings.Placeholder,
-                    Count(counters.ScanFirstMarks), Count(counters.ScanMarks))
-                : CombatStrings.ToolScanUnavailable
-            : string.Empty;
+        // 1.19.64: every row that carries a scanner prints the whole cell - the count, the first marks and the
+        // cumulative marks - so nothing a scanner player did drops off the board for being equal to the field
+        // beside it or for being zero. What varies between rows is only the *value* of each field: a measured
+        // count (the holder's own readable cooldown, including a counted zero, or a positive figure that player's
+        // machine reported), the host's grouped estimate in the count slot, the dash for a count nobody could
+        // observe beside the marks that were really proved, and the three labelled placeholders when this machine
+        // holds no evidence about the row at all. `ScanCell` decides which of those a row gets; the old gate that
+        // collapsed an all-zero row to a single `扫描 —` is gone with the omission it encoded.
+        string scan = IsScannerTool(name) ? ScanCell(counters, entry) : string.Empty;
         string details;
         switch (ToolDetailOf(counters, name))
         {
@@ -527,6 +539,31 @@ public static class ImpactBoard
         => Contains(name, "Bio Tracker") || Contains(name, "Biotracker") || Contains(name, "Enemy Scanner")
             || Contains(name, "Scanner") || Contains(name, "生物追踪") || Contains(name, "追踪仪") || Contains(name, "扫描仪");
     private static bool Contains(string value, string part) => !string.IsNullOrEmpty(value) && value.IndexOf(part, StringComparison.OrdinalIgnoreCase) >= 0;
+    // The scan cell of a row that carries a scanner, in the four cases this board distinguishes. The cell always
+    // holds all three fields; only their values differ.
+    //   * a measured activation count this machine trusts - the holder's readable cooldown (including a counted
+    //     zero) or a positive count that player's machine reported: the count, the first marks and the cumulative
+    //     marks, estimate marker and all, exactly as that row printed it before 1.19.64;
+    //   * no measured count, but the host grouped this player's confirmed marks: the batch count fills that same
+    //     slot as a plain number (`扫描 2 次` / `scan 2x`), so the row that used to print `扫描 — 次` beside its
+    //     marks now prints the figure there. It carries no `~`, no 约, no （估算）/est. and no second clause;
+    //   * no measured count and no estimate, but marks this machine really counted: `扫描 — 次` for the count
+    //     nobody could observe, then the first and the cumulative marks as the numbers they are - a first-mark
+    //     zero included, because a sweep made entirely of repeats is a counted zero and not an absence;
+    //   * no evidence at all: the three labelled placeholders, so the row still says which figures are missing.
+    //     The estimate exists only because the round ledger saw confirmed marks, so a guess never replaces an
+    //     absence.
+    private static string ScanCell(ImpactCounters counters, ImpactEntry entry)
+        => counters.ScanUses > 0 || counters.ScanUsesKnown
+            ? CombatStrings.ToolScan(counters.ScanEstimated, Count(counters.ScanUses),
+                Count(counters.ScanFirstMarks), Count(counters.ScanMarks))
+            : entry.Input.ScanRoundsEstimated > 0
+                ? CombatStrings.ToolScan(false, Count(entry.Input.ScanRoundsEstimated),
+                    Count(counters.ScanFirstMarks), Count(counters.ScanMarks))
+                : counters.ScanFirstMarks > 0 || counters.ScanMarks > 0
+                    ? CombatStrings.ToolScan(counters.ScanEstimated, CombatStrings.Placeholder,
+                        Count(counters.ScanFirstMarks), Count(counters.ScanMarks))
+                    : CombatStrings.ToolScanUnavailable;
     // The gold star goes to the squad's outright leader in the metric, and to nobody when there is a tie or no data.
     public static ImpactTone IsMetricGold(ImpactReport report, ImpactEntry entry, int index, ImpactMetric metric,
         KillTier tier, bool split, bool expeditionSucceeded)
@@ -567,6 +604,13 @@ public static class ImpactBoard
         string visible = CombatStatsFormatter.VisibleName(name);
         return string.IsNullOrEmpty(visible) ? CombatStrings.Placeholder : visible;
     }
+    // 1.19.64: the name a gear slot's row draws. When that slot really held more than one measured weapon the row
+    // also says how many of the slot's rows the board cannot draw (`另有 N 把` / `(+N more)`), so the one name on
+    // screen is never read as the whole slot and the figures beside it are never read as the slot's whole damage.
+    // A slot that held one weapon - every row any recording of this build has shown - prints its name alone, byte
+    // for byte, including the placeholder a nameless row still gets.
+    public static string SlotWeaponName(string name, int others)
+        => Name(name) + (others > 0 ? CombatStrings.SlotOthers(others) : string.Empty);
 
     private static string Count(long value) => value > 0 ? value.ToString(CultureInfo.InvariantCulture) : "0";
 

@@ -434,7 +434,7 @@ internal static class RevealNameAndLogPolicyScenarios
             "while the same '</c' inside a name that really carries the game's opening tag is the cut closing tag, and its visible text is kept (N1)");
 
         // The one production entry point: the settlement board's four gear rows.
-        var input = new ImpactInput { Name = "A1pha", SecondaryName = "<color=#FF4005>Long Gun<" };
+        var input = new ImpactInput { Name = "Brav0", SecondaryName = "<color=#FF4005>Long Gun<" };
         input.PrimaryName = "<color=#FF4005>Long Gun</color>";
         input.MeleeName = "大锤";
         input.ToolName = "生物追踪仪";
@@ -458,7 +458,7 @@ internal static class RevealNameAndLogPolicyScenarios
         var words = new uint[SyncSnapshot.NameWords];
         SyncProtocol.PackName("<color=#FF4005>大锤</c", words);
         string overWire = SyncProtocol.UnpackName(words);
-        var cut = new ImpactInput { Name = "A1pha", PrimaryName = overWire, MeleeName = overWire };
+        var cut = new ImpactInput { Name = "Brav0", PrimaryName = overWire, MeleeName = overWire };
         ImpactReport cutReport = ImpactScoring.Evaluate(new[] { cut }, ImpactScoring.DefaultWeights, 1.0, 1.0);
         ImpactBoardLayout cutBoard = ImpactBoard.Build(cutReport, true, true);
         check(overWire == "<color=#FF4005>大锤</c" && Encoding.UTF8.GetByteCount(overWire) == SyncSnapshot.NameCapacity,

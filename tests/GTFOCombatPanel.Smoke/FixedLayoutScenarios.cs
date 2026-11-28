@@ -603,9 +603,11 @@ internal static partial class Program
               && display.Contains("&& (!FixedLayoutActive() || _fixedPlan.HidesVanilla))")
               && display.Contains("if (vanillaPage != null) ApplyVanillaBlocks(vanillaPage, vanillaSucceeded);"),
             "M2b -> 1.19.55: the adaptive draw path is still guarded by the fixed layout's plan - with FixedLayout on it cannot hide the blocks behind a plan that says keep them - and it now also asks the early-board contract, so a board drawn before the page proved its own boundary puts none of the page's blocks away; the page it hands over is the live one (`LivePage`, 1.19.57)");
-        check(FixedLayoutCount(display, "ApplyVanillaBlocks(") == 3,
-            "the file has one declaration and exactly two call sites (" + FixedLayoutCount(display, "ApplyVanillaBlocks(") + " total): "
-            + "the adaptive draw and the fixed draw, both after their own `HudTable.Draw` - no third way to hide the page");
+        string resolutionDraw = FixedLayoutMethodBody(display, "private static void PaintResolutionBoard()");
+        check(FixedLayoutCount(display, "ApplyVanillaBlocks(") == 4 && resolutionDraw != null
+              && resolutionDraw.Contains("HudTable.Draw(") && resolutionDraw.Contains("ApplyVanillaBlocks(")
+              && resolutionDraw.IndexOf("HudTable.Draw(", StringComparison.Ordinal) < resolutionDraw.IndexOf("ApplyVanillaBlocks(", StringComparison.Ordinal),
+            "the resolution board adds exactly one call, and it too hides optional blocks only after painting");
     }
 
     // ---- 读生产源码：路径、剥注释、取方法体、数出现次数 ------------------------------------------------

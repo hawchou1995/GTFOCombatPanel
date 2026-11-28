@@ -10,5 +10,14 @@
     <Compile Include="..\..\RemoteScanPatches.cs" Link="RemoteScanPatches.cs" />
     <Compile Include="..\..\ScanTagLedger.cs" Link="ScanTagLedger.cs" />
     <Compile Include="..\..\ScannerCooldown.cs" Link="ScannerCooldown.cs" />
+    <!-- 1.19.62: the bot-sweep ordering proof needs the real session, counters and labels the plugin uses. These are the
+         same pure files the supply suite links; none of them touches Unity or the game's assemblies. -->
+    <Compile Include="..\..\ScanSession.cs" Link="ScanSession.cs" />
+    <Compile Include="..\..\ImpactMetrics.cs" Link="ImpactMetrics.cs" />
+    <Compile Include="..\..\SquadSpawns.cs" Link="SquadSpawns.cs" />
+    <Compile Include="..\..\CombatStats.cs" Link="CombatStats.cs" />
+    <Compile Include="..\..\SupplyUse.cs" Link="SupplyUse.cs" />
+    <Compile Include="..\..\PackApplication.cs" Link="PackApplication.cs" />
+    <Compile Include="..\..\Localization.cs" Link="Localization.cs" />
   </ItemGroup>
 </Project>

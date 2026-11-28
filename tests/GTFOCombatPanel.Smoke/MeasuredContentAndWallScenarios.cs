@@ -183,7 +183,7 @@ internal static class MeasuredContentAndWallScenarios
             "while a single-letter *opening* fragment and every literal comparison stay exactly as they are");
 
         // The settlement board is the production entry point: the row it draws carries only the visible name.
-        var input = new ImpactInput { Name = "A1pha", SecondaryName = unpacked };
+        var input = new ImpactInput { Name = "Brav0", SecondaryName = unpacked };
         ImpactReport report = ImpactScoring.Evaluate(new[] { input }, ImpactScoring.DefaultWeights, 1.0, 1.0);
         ImpactBoardLayout board = ImpactBoard.Build(report, true, true);
         check(board.Cell((int)ImpactRowKind.SecondaryWeapon, 1)[0] == "大锤",

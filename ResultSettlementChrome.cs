@@ -110,6 +110,11 @@ public static class ResultChromeTheme
     // has no room for a row the table would have to give up. Since 1.19.42 it is planned *first* - a player who cannot
     // see how to bring the board back has nothing, while a missing name costs only the label (`PlanHeader`).
     public static string KeyHintLabel => CombatStrings.Language == "en" ? "F8 show/hide  wheel scroll" : "F8 显示/隐藏  滚轮 滚动";
+    // 1.19.62: the run's created-enemy figure is the band's third run - the one line of *data* on it. It is planned
+    // after the name and only in the room the name did not use, so it can never push the name into its short form, and
+    // it is dropped (not the name, not the hint) when that room is too small. Same quiet ink as the key hint: it is an
+    // aside about the run, not a headline.
+    public const string FigureStyleLabel = "spawn-figure";
     // WCAG 2.1 contrast between two inks, as a ratio from 1 to 21. It exists so that "the close is
     // readable" is a number a test can assert instead of an opinion: the alpha of neither ink is part of
     // it, because the question is what the player's eye sees between the word and the face under it.
@@ -407,13 +412,21 @@ public static partial class ResultChromeLayout
     // board can be brought back) and the name drops to its short form and then away. The band carries no control of this
     // mod's own since 1.19.45, so there is nothing else for it to spend its room on. The hint stays a single line inside
     // the band and never a second row: a row would have to be taken out of the table's own measured strip.
+    //
+    // 1.19.62 adds the third run and gives it the lowest priority of all three: the run's created-enemy figure is
+    // planned *after* the name, only in the room the name did not use, and is dropped alone when that room is too
+    // small. A figure can therefore never shorten the name or displace the key hint.
     public struct ResultChromeHeaderPlan
     {
-        public LayoutRect Band, Rule, Title, Hint, Toggle;
-        public bool HasTitle, HasHint, HasToggle;
+        public LayoutRect Band, Rule, Title, Hint, Figure, Toggle;
+        public bool HasTitle, HasHint, HasFigure, HasToggle;
         // The name the renderer must draw in `Title`: the full label, or the short one when the full one does not fit.
         // Empty whenever `HasTitle` is false, so a caller can never draw a label the plan did not measure.
         public string TitleLabel;
+        // 1.19.62: the run's created-enemy figure, drawn in `Figure` when the band had room for it beside the name.
+        // The plan answers the exact string it measured, so a caller never draws a figure that was not fitted, and an
+        // empty label means exactly "this band has no room for it" - the name and the key hint keep their own room.
+        public string FigureLabel;
         // What the band gave up this repaint: "none" (everything the band can carry is on it), "short-title" (the name
         // is the short form), "title" (no room for a name), "hint" (no room for the keys either), "hint+title", or
         // "no-band" - and `no-band` now means exactly one thing: the page drew no band to plan on. It used to be the
@@ -424,7 +437,7 @@ public static partial class ResultChromeLayout
 
         public string Describe()
             => "band=" + RectText(Band) + ", rule=" + RectText(Rule) + ", title=" + RectText(Title) + ", hint=" + RectText(Hint)
-               + ", yielded=" + (string.IsNullOrEmpty(Yield) ? "none" : Yield);
+               + ", figure=" + RectText(Figure) + ", yielded=" + (string.IsNullOrEmpty(Yield) ? "none" : Yield);
 
         private static string RectText(LayoutRect rect)
             => rect.Width > 0f && rect.Height > 0f
@@ -507,8 +520,13 @@ public static partial class ResultChromeLayout
     // commit), so the band can never describe a different button from the one drawn; it is described here only when it
     // really stands on the band - the page's own dock never does, and since 1.19.45 no control of this mod's own lives on
     // the band either.
+    //
+    // 1.19.62: `figure` is the run's created-enemy figure as the board's own model answers it (`ImpactBoardLayout.Figure`).
+    // It gets the last word on the band: planned after the name, only in the room the name left, and dropped alone when
+    // that room cannot hold it. A default of null is the pre-1.19.62 plan exactly - every existing caller and every
+    // recorded header assertion keeps the behaviour it had.
     public static ResultChromeHeaderPlan PlanHeader(LayoutRect band, ResultChromeMetrics metrics,
-        LayoutRect toggle, bool hasToggle)
+        LayoutRect toggle, bool hasToggle, string figure = null)
     {
         // `no-band` is the answer to one question only - did this page draw a band? - and a plan that fits everything
         // says `none`. It used to be the initial value of every plan, so the normal header reported the failure's name.
@@ -555,6 +573,26 @@ public static partial class ResultChromeLayout
         plan.Yield = !plan.HasTitle
             ? (hintDropped ? "hint+title" : "title")
             : hintDropped ? "hint" : shortForm ? "short-title" : "none";
+        // 1.19.62: the run's created-enemy figure, in the room the name left. It is measured with the band's own
+        // `TextFits`, placed with the same inset and height as the name, and it is the only run that is ever dropped
+        // for want of room: a figure that does not fit leaves the name and the key hint exactly as they were.
+        //
+        // The room it may use already excludes the key hint. `right` is the band's own edge (pulled in by a control that
+        // stands on it) and the hint was planned at `right - hintInk` - so the figure's room must stop at the hint, minus
+        // one control pad, exactly as the name's room does (`rest`). Measuring it against `right` would hand it the
+        // hint's own rectangle on a narrow band; the assertion in the suite pins `Figure.Right <= Hint.X` at every width.
+        if (!string.IsNullOrEmpty(figure) && plan.HasTitle)
+        {
+            float figureLeft = left + plan.Title.Width + ResultChromeTheme.ControlPadX;
+            float figureRight = plan.HasHint ? plan.Hint.X - ResultChromeTheme.ControlPadX : right;
+            float figureRoom = figureRight - figureLeft;
+            if (figureRoom > 0f && TextFits(figure, metrics.HeaderHintFont, figureRoom, out float figureInk))
+            {
+                plan.Figure = new LayoutRect(figureLeft, band.Y + inset, figureInk, height);
+                plan.HasFigure = plan.Figure.Width > 0f && plan.Figure.Height > 0f;
+                plan.FigureLabel = plan.HasFigure ? figure : null;
+            }
+        }
         return plan;
     }
 

@@ -390,6 +390,30 @@ public static class ResultFallbackBandPolicy
     }
 }
 
+// Host failure exposes a trustworthy action top, not a trustworthy free band below the scanned rectangles.
+public static class ResultHostFailureBand
+{
+    public static bool TryResolve(float screenHeight, float anchorBottom, ResultBoundSource anchorSource,
+        ResultPageWalls walls, float nativeButtonTop, float measuredControlTop, out ResultFallbackPlan plan)
+    {
+        plan = ResultFallbackPlan.None;
+        if (!float.IsFinite(anchorBottom) || !float.IsFinite(nativeButtonTop)) return false;
+        float controlTop = float.IsFinite(walls.PressableTop) ? Math.Min(nativeButtonTop, walls.PressableTop) : nativeButtonTop;
+        if (!ResultsBounds.TryResolve(screenHeight, anchorBottom, anchorSource, controlTop, walls.FooterTextTop,
+                walls.FooterTextSource, measuredControlTop, out ResultsBand band) || !band.Fits) return false;
+        float bottom = walls.CapBottom(band.Bottom);
+        if (bottom <= band.Top + 0.5f) return false;
+        // TryFit can use its existing clipped/scrolling plate. The font floor cannot buy space across the action wall.
+        band = new ResultsBand(band.Top, bottom, band.TopSource, band.BottomSource, band.Clamped);
+        plan = new ResultFallbackPlan(band.Top, band.Bottom, 1f, ResultFallbackReason.PageBand, band);
+        return true;
+    }
+
+    public static bool Allows(LayoutRect plate, float nativeButtonTop, float screenHeight)
+        => float.IsFinite(nativeButtonTop) && plate.Height > 0f && float.IsFinite(plate.Bottom)
+            && plate.Bottom <= nativeButtonTop - ResultsBounds.Clearance(screenHeight) + 0.5f;
+}
+
 // What one measurement of a result page ended in.
 //
 // `PlacedStrict` is the only outcome that may clear the refusal count: it means `Fit` really put a grid on the page, not

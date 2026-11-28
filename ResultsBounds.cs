@@ -333,6 +333,35 @@ public static class ResultAutoBoardContract
         return pixels;
     }
 
+    // One window-relative strip for all four settlement contexts. Native text/control geometry is not an input.
+    public static bool TryResolutionStrip(int width, int height, out BoardStrip strip)
+    {
+        strip = default;
+        if (width <= 2f * ResultsBounds.ScreenMargin || height <= 2f * ResultsBounds.ScreenMargin) return false;
+        float top = Math.Max(ResultsBounds.ScreenMargin, height * 0.25f);
+        float bottom = Math.Min(height - ResultsBounds.ScreenMargin, height * 0.8f);
+        if (!(bottom > top)) return false;
+        strip = new BoardStrip(top, bottom, false, float.NaN, float.NaN);
+        return true;
+    }
+
+    // Narrow windows may clip long cell text; never shrink the shared glyph size to fit a name.
+    public static PanelGrid ConstrainWidth(PanelGrid grid, float width)
+    {
+        if (grid == null || !(width > 0f) || grid.Width <= width) return grid;
+        float ratio = width / grid.Width;
+        var cells = (float[])grid.CellWidths.Clone();
+        var fields = new float[grid.FieldWidths.Length][];
+        for (int i = 0; i < cells.Length; i++) cells[i] *= ratio;
+        for (int i = 0; i < fields.Length; i++)
+        {
+            fields[i] = (float[])grid.FieldWidths[i].Clone();
+            for (int j = 0; j < fields[i].Length; j++) fields[i][j] *= ratio;
+        }
+        return new PanelGrid(cells, fields, grid.SeparatorWidth * ratio, grid.Gap * ratio,
+            grid.RowHeight, grid.FontPixels, grid.Rows, grid.Density, grid.RightAligned);
+    }
+
     // The failure page's own top margin: the same eight design pixels a 1080p window gets, scaled with the height,
     // and never below the margin every other placement in this mod keeps from the window's edge.
     public static float TopMargin(float screenHeight)

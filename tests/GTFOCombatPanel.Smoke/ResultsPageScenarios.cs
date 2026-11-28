@@ -316,8 +316,35 @@ internal static class ResultsPageScenarios
         FailOpenEscape(check);
         // ---- 1.19.47：自动模式的最新用户合同 ---------------------------------------------------------------
         AutoModeContract(check);
+        ResolutionOnlyBoard(check);
     }
 
+
+    private static void ResolutionOnlyBoard(Action<bool, string> check)
+    {
+        const int rows = 30;
+        foreach ((int width, int height, int glyph, int top, int bottom) in new[]
+                 { (1280, 720, 8, 180, 576), (1920, 1080, 12, 270, 864), (2560, 1440, 16, 360, 1152) })
+        {
+            check(ResultAutoBoardContract.TryResolutionStrip(width, height, out BoardStrip strip)
+                  && strip.Top == top && strip.Bottom == bottom && ResultAutoBoardContract.TargetGlyphPixels(height) == glyph,
+                $"{height}p uses the same viewport and glyph before any native title/actions exist");
+            float pitch = ResultsBandFit.RowHeight(glyph, PanelDensity.Compact);
+            float header = ResultChromeMetrics.For(width, height).HeaderHeight;
+            check(ResultsScroll.Viewport(rows, ResultsScroll.FrozenRows, strip.Bottom - strip.Top - header, pitch, 1).Visible == rows,
+                $"{height}p compact board holds all 30 rows with its own header");
+            check(ResultBoardHold.TryPlace(width, height, strip, width / 2f, rows * pitch + header,
+                      0f, out LayoutRect plate, bottomAligned: true, screenEdgeCeiling: true)
+                  && plate.Y >= top && Math.Abs(plate.Bottom - bottom) < 0.01f,
+                $"{height}p places all rows inside the shared strip");
+        }
+        check(!ResultAutoBoardContract.TryResolutionStrip(0, 1440, out _), "invalid window is not a placement");
+        var grid = new PanelGrid(new[] {1000f, 1000f}, new[] {new[] {1000f}, new[] {1000f}}, 0, 10, 24, 16, 30, PanelDensity.Compact);
+        PanelGrid narrow = ResultAutoBoardContract.ConstrainWidth(grid, 500f);
+        check(narrow.Width <= 500.01f && narrow.RowHeight == grid.RowHeight && narrow.FontPixels == grid.FontPixels
+              && narrow.Rows == grid.Rows && grid.CellWidths[0] == 1000f,
+            "a narrow window changes column space, not the glyph, row height, row count or source grid");
+    }
 
     // The production sources are read here the way the review-fix scenarios read them: not to pin wording, but to
     // pin that the decisions asserted above are the decisions the runtime actually reaches - the geometry question
@@ -365,12 +392,10 @@ internal static class ResultsPageScenarios
         check(results.Contains("ResultsScroll.Viewport(grid.Rows, ResultsScroll.FrozenRows") 
               && results.Contains("HudTable.Draw(_grid, _origin.X, _origin.Y, _content, opacity, _scrollFirst, _scrollVisible, _scrollPlate)"),
             "the adaptive board is drawn through its scroll window, and the plate it occupies is measured from the rows its strip really holds");
-        check(results.Contains("if (!FallbackRecoveryDue(succeeded, _page) && RefreshBoardData")
-              && results.Contains("ResultAnchorRecovery.ShouldRetry(_fallbackRecoveries")
-              && results.Contains("ResultAnchorRecovery.Record(_fallbackRecoveries)")
-              && results.Contains("ResultAnchorRecovery.LatchFallback(_fallbackRecoveries")
-              && policy.Contains("public const int MaximumRecoveries = 1;"),
-            "the fallback recovery hangs off the refresh path and stays bounded to one attempt per page");
+        int refreshStart = results.IndexOf("internal static void Refresh(eGameStateName state)", StringComparison.Ordinal);
+        string refresh = Between(results, refreshStart, results.IndexOf("private static void ArchiveScreen", refreshStart, StringComparison.Ordinal));
+        check(refresh.Contains("else PrepareResolutionBoard(page, succeeded);") && refresh.Contains("PrepareResolutionBoard(_page, succeeded);")
+              && !refresh.Contains("FallbackRecoveryDue("), "first and late snapshots both use the resolution layout without native-edge recovery");
 
         // ---- review #1: a refreshed snapshot is committed as a PAIR, or not at all ------------------------
         //
@@ -944,7 +969,7 @@ internal static class ResultsPageScenarios
 
         // ---- 同一个 roster，两种分辨率：归一化位置与大小一致 ------------------------------------------
         //
-        // 回放日志里的两帧（scratch/survival-retest-20261122-225706-193/LogOutput.log:3320 与 :4943）：两条带的下界都是
+        // 回放两种分辨率的条带：两条带的下界都是
         // 主机「返回大厅」按钮上沿减 MessageGap，上界都是上面那条窗口上沿，room 就分别是 806px 与 1082px。
         const float wall1080 = 846f, wall1440 = 1130f, messageGap = 16f;
         float top1080 = ResultAutoBoardContract.TopMargin(1080f) + ResultsBounds.Clearance(1080f);

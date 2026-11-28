@@ -262,6 +262,50 @@ try {
         }
     }
     Write-Host 'GTFO_TMP_FONT_WIRING: PASS'
+    # 1.19.65: a client's own effective enemy damage is spent from ONE balance per enemy instance, and an estimate the
+    # enemy's own confirmed reading cannot support is taken back off the board again. The rules are pure and asserted by
+    # the smoke suite; these lines assert the runtime routes both estimate entry points through the balance, that the
+    # correction acts on the same three places the credit went, that the two client-side damage entrances consume a
+    # pending spawn first, that the host's authority is still refused at its one place, and that the balance is cleared
+    # with the expedition and on an enemy's own spawn edge. Comments are stripped first, so a rule read out of a comment
+    # is not a rule.
+    $budgetSource = Get-Content (Join-Path $projectRoot 'OptionalDamageEvents.cs') -Raw
+    $budgetCode = (($budgetSource -split "`n") | ForEach-Object { ($_ -split '//')[0] }) -join "`n"
+    $trackerSource = Get-Content (Join-Path $projectRoot 'CombatTracker.cs') -Raw
+    $trackerCode = (($trackerSource -split "`n") | ForEach-Object { ($_ -split '//')[0] }) -join "`n"
+    $statsCode = (($((Get-Content (Join-Path $projectRoot 'CombatStats.cs') -Raw) -split "`n") | ForEach-Object { ($_ -split '//')[0] }) -join "`n")
+    $impactCode = (($((Get-Content (Join-Path $projectRoot 'ImpactMetrics.cs') -Raw) -split "`n") | ForEach-Object { ($_ -split '//')[0] }) -join "`n")
+    $oneBalancePerEnemy = $budgetCode.Contains('internal sealed class EnemyHealthBudget') -and `
+        $budgetCode.Contains('taken = Math.Min(wanted, row.Remaining)') -and `
+        $budgetCode.Contains('if (attributable) withdrawn = WithdrawUnsupported(row, healthBefore);') -and `
+        $budgetCode.Contains('if (health < row.Remaining) row.Opened = health + row.Credited;') -and `
+        $budgetCode.Contains('bool reused = row != null && owner != IntPtr.Zero && row.Owner != IntPtr.Zero && row.Owner != owner;')
+    $correctionReachesEveryPlace = $budgetCode.Contains('estimate.Player?.Total.WithdrawEnemyDamage(take);') -and `
+        $budgetCode.Contains('estimate.Weapon?.Counters.WithdrawEnemyDamage(take);') -and `
+        $budgetCode.Contains('if (estimate.Scout) estimate.Player?.Impact.WithdrawScoutDamage(take);') -and `
+        $budgetCode.Contains('if (!attributable && player != null)') -and `
+        $statsCode.Contains('public void WithdrawEnemyDamage(double amount)') -and `
+        $impactCode.Contains('public void WithdrawScoutDamage(double amount)')
+    $localPathUsesTheBalance = $trackerCode.Contains('Budget.Charge(limb.m_base.Pointer, OwnerPointer(limb.m_base), player, weapon, scout,') -and `
+        $trackerCode.Contains('LocalOutgoingRule.Amount(healthBefore, healthAfter, dam), measured,') -and `
+        -not $trackerCode.Contains('float amount = (float)LocalOutgoingRule.Amount(')
+    $ewcPathUsesTheBalance = $trackerCode.Contains('bool client = !SNet.IsMaster && !CombatSync.HostRunsMod;') -and `
+        $trackerCode.Contains('amount = Budget.Charge(target.Pointer, OwnerPointer(target), sample.Player, sample.Weapon, scout,') -and `
+        $trackerCode.Contains('sample.HealthBefore, healthAfter, residual, measured, out withdrawn);')
+    $hostAuthorityKept = ([regex]::Matches($trackerCode, [regex]::Escape('if (SNet.IsMaster || CombatSync.HostRunsMod) return;'))).Count -eq 1 -and `
+        ([regex]::Matches($trackerCode, [regex]::Escape('bool client = !SNet.IsMaster && !CombatSync.HostRunsMod;'))).Count -eq 1
+    $pendingSpawnConsumedFirst = ([regex]::Matches($trackerCode, [regex]::Escape('ConsumePendingSpawn('))).Count -eq 3 -and `
+        $trackerCode.Contains('private static void ConsumePendingSpawn(Dam_EnemyDamageBase damage)') -and `
+        $trackerCode.Contains('!PendingEnemySpawns.Take(damage.Owner.Pointer)') -and `
+        $trackerCode.Contains('ConsumePendingSpawn(limb.m_base);') -and `
+        $trackerCode.Contains('if (client) ConsumePendingSpawn(target);')
+    $balanceResetWiring = $trackerCode.Contains('EnemyCredits.Clear(); Budget.Clear();') -and `
+        $trackerCode.Contains('Deaths.Spawn(pointer); EnemyCredits.Spawn(pointer); Budget.Spawn(pointer);')
+    if (-not $oneBalancePerEnemy -or -not $correctionReachesEveryPlace -or -not $localPathUsesTheBalance -or `
+        -not $ewcPathUsesTheBalance -or -not $hostAuthorityKept -or -not $pendingSpawnConsumedFirst -or -not $balanceResetWiring) {
+        throw 'The client''s own damage estimate must be spent from one balance per enemy instance (`EnemyHealthBudget`), an attributable reading must be able to take back only the estimates it cannot support - on the player''s total, the weapon row and the Scout row alike, never a confirmed credit, and never on an unattributed reading - both estimate entry points must route through it behind the host refusal at its one place, the two client-side entrances must consume a pending spawn before touching anything keyed by a pointer, and the balance must be cleared with the expedition and on an enemy''s own spawn edge.'
+    }
+    Write-Host 'LOCAL_DAMAGE_BALANCE_WIRING: PASS (static source check; the rules themselves are asserted by the smoke suite)'
     Write-Host 'VERIFY: PASS'
 }
 finally {

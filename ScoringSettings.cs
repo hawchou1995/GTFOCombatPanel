@@ -144,7 +144,11 @@ public sealed class ScoringSettings
             case "FriendlyFire": return "友伤 {damage}，致倒 {deaths} 次";
             case "MeleeKills": return "近战击杀 {kills} 次，伤害 {damage}";
             case "ScoutKills": return "触手击杀 {kills} 只";
-            case "AllRound": return "综合评分全队第一，无单项领先";
+            // 1.19.67: the sentence says what it is - the top of the overall score with no category title -
+            // instead of claiming the top led no single category, which the printed 救援 row can contradict.
+            // The replaced wording is recognised as an untouched default in `ApplyReasons` (see
+            // `CombatStrings.PreviousReasonAllRound*`), so a file still holding it keeps following Language.
+            case "AllRound": return "综合分居首，未获单项称号";
             default: return string.Empty;
         }
     }
@@ -381,7 +385,7 @@ public sealed class ScoringSettings
             ImpactRating rating = RatingOf(name);
             ScoringTitle entry = Titles != null && Titles.TryGetValue(name, out ScoringTitle found) ? found : null;
             string title = entry != null && !IsShippedText(entry.Title, CombatStrings.DefaultTitle(rating)) ? entry.Title : null;
-            string description = entry != null && !IsShippedText(entry.Description, CombatStrings.DefaultTitleDescription(rating)) ? entry.Description : null;
+            string description = entry != null && !IsShippedDescription(rating, entry.Description) ? entry.Description : null;
             CombatStrings.SetTitleOverride(rating, title, description);
         }
     }
@@ -435,13 +439,24 @@ public sealed class ScoringSettings
             ImpactRating rating = RatingOf(name);
             string template = Reasons != null && Reasons.TryGetValue(name, out string found) ? found : null;
             string trimmed = template == null ? null : template.Trim();
-            string custom = trimmed != null && !string.Equals(trimmed, shipped[name], StringComparison.Ordinal) ? trimmed : null;
+            // 1.19.67: the published line this release replaced is an untouched default too, so a file that
+            // still holds it verbatim keeps following the language setting instead of pinning the old claim.
+            string custom = trimmed != null && !string.Equals(trimmed, shipped[name], StringComparison.Ordinal)
+                && !CombatStrings.IsPreviousDefaultReason(rating, trimmed) ? trimmed : null;
             CombatStrings.SetReasonOverride(rating, custom);
         }
     }
 
     private static bool IsShippedText(string text, string shipped)
         => string.IsNullOrWhiteSpace(text) || string.Equals(text.Trim(), shipped, StringComparison.Ordinal);
+
+    // A description that still reads exactly as this build - or as a build whose wording this release
+    // replaced - published it is a default, not the player's text, so it keeps following the language
+    // setting. Only the exact published strings of a replaced sentence are recognised; anything else,
+    // however close, stays the player's own wording and is pinned.
+    private static bool IsShippedDescription(ImpactRating rating, string text)
+        => IsShippedText(text, CombatStrings.DefaultTitleDescription(rating))
+            || CombatStrings.IsPreviousDefaultDescription(rating, text);
 
     // What "this file changed" means: the settings that affect a score, in a stable order. The revision is
     // what the runtime compares to decide whether a result screen has to be rebuilt; a mere data update

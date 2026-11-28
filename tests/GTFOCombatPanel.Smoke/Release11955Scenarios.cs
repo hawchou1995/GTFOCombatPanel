@@ -448,16 +448,13 @@ internal static class Release11955Scenarios
         int at = info.IndexOf(carrier, StringComparison.Ordinal);
         string version = at < 0 ? string.Empty
             : info.Substring(at + carrier.Length, info.IndexOf('"', at + carrier.Length) - at - carrier.Length);
-        // 1.19.61: this assertion is the release's own version carrier, so it moves with the patch digit - the four
-        // files below are the ones the delivery number has to reach (source, manifest, changelog section, README's
-        // current state). Its meaning is unchanged: one number, carried everywhere, never an old number with
-        // different code behind it.
-        check(version == "1.19.61", "this release's carrier is its own unused patch number: " + version);
-        check(ProductionText(Path.Combine("Thunderstore", "manifest.json")).Contains("\"version_number\": \"1.19.61\""),
+        // Keep the build identity synchronized across all four carriers.
+        check(version == "1.19.71", "this release's carrier is its own unused patch number: " + version);
+        check(ProductionText(Path.Combine("Thunderstore", "manifest.json")).Contains("\"version_number\": \"1.19.71\""),
             "the manifest carries it");
-        check(ProductionText(Path.Combine("Thunderstore", "CHANGELOG.md")).Contains("## 1.19.61"),
+        check(ProductionText(Path.Combine("Thunderstore", "CHANGELOG.md")).Contains("## 1.19.71"),
             "the changelog has this build's own section");
-        check(ProductionText("README.md").Contains("源码版本为 **1.19.61**"),
+        check(ProductionText("README.md").Contains("源码版本为 **1.19.71**"),
             "and the README's current state names it");
     }
 

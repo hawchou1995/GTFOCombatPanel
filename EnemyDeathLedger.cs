@@ -10,6 +10,20 @@ namespace HawChow.GTFOCombatPanel;
 // covers every enemy but the Scout. ScoutSleepPolicy holds this machine's capture of the Scout's own
 // state and overrides that reading only for an enemy it captured, so the two rules stay separate: an
 // enemy nobody captured keeps exactly the answer the game gave.
+// The enemies whose own `Setup` edge this machine saw but whose damage base (or its owner) was not readable at that
+// instant. 1.19.65: it is consumed by the first place that can see that base - normally `Setup` itself, otherwise
+// the first client-side damage entrance for that enemy - so no ledger keyed by a reused damage or owner pointer is
+// inherited from the previous occupant. `Take` answers once per spawn: a second caller for the same enemy gets
+// nothing and does nothing at all, which is what keeps the resolution idempotent.
+internal sealed class PendingSpawns
+{
+    private readonly HashSet<IntPtr> _pending = new();
+    internal int Count => _pending.Count;
+    internal void Add(IntPtr agent) { if (agent != IntPtr.Zero) _pending.Add(agent); }
+    internal bool Take(IntPtr agent) => agent != IntPtr.Zero && _pending.Remove(agent);
+    internal void Clear() => _pending.Clear();
+}
+
 internal sealed class EnemyDeathLedger
 {
     internal sealed class Scope

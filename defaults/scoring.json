@@ -123,7 +123,7 @@
     },
     "AllRound": {
       "Title": "全能中坚",
-      "Description": "综合评分全队第一，各项没有单独领先。"
+      "Description": "综合得分居首，未获单项称号。"
     }
   },
   "Reasons": {
@@ -144,6 +144,6 @@
     "FriendlyFire": "友伤 {damage}，致倒 {deaths} 次",
     "MeleeKills": "近战击杀 {kills} 次，伤害 {damage}",
     "ScoutKills": "触手击杀 {kills} 只",
-    "AllRound": "综合评分全队第一，无单项领先"
+    "AllRound": "综合分居首，未获单项称号"
   }
 }

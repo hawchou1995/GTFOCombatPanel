@@ -57,6 +57,15 @@ public static class CombatStrings
     public static string Accuracy { get { return Pick("命中率", "Accuracy"); } }
     public static string Weakspot { get { return Pick("弱点率", "Weakspot"); } }
     public static string Pellets { get { return Pick("弹丸", "Pellets"); } }
+
+    // ---- 1.19.62: the round's created-enemy figure, on the settlement header ----------------------
+    // One label for the whole squad, never one per column: the figure answers "how many enemies were created this
+    // round", which is not a player's figure. The three forms are the figure itself, the same figure marked as this
+    // machine's own observation, and the explicit unknown - never a zero that nobody measured. The wording is the
+    // build's existing zh/en pair like every other label here; there is no new setting behind it.
+    public static string SpawnFigureLabel { get { return Pick("累计刷怪量：", "Spawned: "); } }
+    public static string SpawnFigureLocal { get { return Pick("（本机观测）", " (this machine)"); } }
+    public static string SpawnFigureUnknown { get { return Pick("（未知）", " (unknown)"); } }
     public static string TotalHeader { get { return Pick("综合统计", "TOTAL"); } }
     public static string WeaponsHeader { get { return Pick("武器", "WEAPONS"); } }
     public static string SquadHeader { get { return Pick("玩家/综合", "Player/TOTAL"); } }
@@ -171,6 +180,41 @@ public static class CombatStrings
     // file entry is compared against, so an untouched entry is not mistaken for a hand-written title.
     public static string DefaultTitle(ImpactRating rating) { return TitleText(rating, false); }
     public static string DefaultTitleDescription(ImpactRating rating) { return DescriptionText(rating, false); }
+    // ---- the wording this release replaced ---------------------------------------------------------
+    // 1.19.67: the all-round sentence used to say the top led no single row, and its description said the
+    // same thing twice over. That assertion is false on any board where the top really does lead a row the
+    // run could not score: the rescue floor is two, so a player with one rescue leads the 救援 row printed
+    // beside it and still wears this sentence. Both texts now say only what the sentence is - top of the
+    // overall score, no category title - which is true for a unique first and for an exact tie alike.
+    //
+    // A scoring file written by an earlier build carries the then-published wording verbatim, from an entry
+    // nobody touched. Those exact strings are recognised as defaults here, so such a file keeps following
+    // the Language setting instead of freezing the old claim into a line the player never typed. Nothing
+    // else is recognised: any text a player wrote, however close to these, stays that player's own.
+    public const string PreviousReasonAllRoundZh = "综合评分全队第一，无单项领先";
+    public const string PreviousReasonAllRoundEn = "top composite score, no single row led";
+    public const string PreviousDescriptionAllRoundZh = "综合评分全队第一，各项没有单独领先。";
+    public const string PreviousDescriptionAllRoundEn = "First on the composite score without leading a single row.";
+
+    // True when this text is the factory wording of an earlier release for that sentence - an untouched
+    // entry rather than the player's own line. Only the sentences whose published text this build replaced
+    // answer true, and only for the exact string: the comparison is ordinal, after trimming the whitespace
+    // the scoring file's own reader trims.
+    internal static bool IsPreviousDefaultReason(ImpactRating rating, string text)
+    {
+        if (rating != ImpactRating.AllRound || text == null) return false;
+        string trimmed = text.Trim();
+        return string.Equals(trimmed, PreviousReasonAllRoundZh, StringComparison.Ordinal)
+            || string.Equals(trimmed, PreviousReasonAllRoundEn, StringComparison.Ordinal);
+    }
+
+    internal static bool IsPreviousDefaultDescription(ImpactRating rating, string text)
+    {
+        if (rating != ImpactRating.AllRound || text == null) return false;
+        string trimmed = text.Trim();
+        return string.Equals(trimmed, PreviousDescriptionAllRoundZh, StringComparison.Ordinal)
+            || string.Equals(trimmed, PreviousDescriptionAllRoundEn, StringComparison.Ordinal);
+    }
 
     private static string TitleText(ImpactRating rating, bool english)
     {
@@ -268,7 +312,7 @@ public static class CombatStrings
             case ImpactRating.ScoutKills:
                 return english ? "Most Scouts killed in the squad; a sleeping kill counts double." : "触手击杀数全队最高，沉睡击杀加倍计入。";
             case ImpactRating.AllRound:
-                return english ? "First on the composite score without leading a single row." : "综合评分全队第一，各项没有单独领先。";
+                return english ? "Top overall composite score; no category title." : "综合得分居首，未获单项称号。";
             default:
                 return english ? "No single lead this run; steady work." : "本局没有单项领先，稳定完成本职。";
         }
@@ -413,9 +457,16 @@ public static class CombatStrings
         => TryReason(ImpactRating.ScoutKills, out string template)
             ? Substitute(template, ("kills", Count(kills)))
             : Pick("触手击杀 " + Count(kills) + " 只", Count(kills) + " Scouts killed");
-    // The first place that leads no single row: it has no figure of its own to print, so the line says what
-    // the sentence is about. Like every other line it is the scoring file's when the file carries one.
-    public static string ReasonAllRound { get { return TryReason(ImpactRating.AllRound, out string template) ? Substitute(template) : Pick("综合评分全队第一，无单项领先", "top composite score, no single row led"); } }
+    // The first place on the overall score: it has no figure of its own to print, so the line says what the
+    // sentence is about. 1.19.67: it says that and nothing more - "top overall; no category title". The
+    // earlier line asserted the top led no single category, which the board beside it can contradict: a
+    // rescue below the scoring floor (the floor is two) is printed as the 救援 row's figure while it earns
+    // no point and no sentence, so a 1/0/0/0 player leads that printed row and still wears this one. The
+    // sentence is granted on first place in the raw Score - `Rank == 1`, exact ties included - and a score
+    // the board prints as 0.0 only decides eligibility: such a row has no first place to stand on, so that
+    // arithmetic never moves the rank this sentence is granted on. No wording may promise a unique lead
+    // either. Like every other line it is the scoring file's when the file carries one.
+    public static string ReasonAllRound { get { return TryReason(ImpactRating.AllRound, out string template) ? Substitute(template) : Pick("综合分居首，未获单项称号", "top overall; no category title"); } }
 
     // The rating each kill class is scored as, so a custom template for 小怪/精英/BOSS takes effect on
     // the one sentence it names.
@@ -436,26 +487,30 @@ public static class CombatStrings
     // table may hold a different tool, so each figure keeps its own one-word tag and the fields are held
     // apart by the board's one separator instead of by a run of spaces.
     //
-    // The cumulative figure is only printed when it really differs from the first-mark figure: while both
-    // counts were driven by the same reveal they were always equal, so the third clause repeated the
-    // second one and cost the cell a third of its width for nothing. Equal counts - both of them whole
-    // and non-negative, which is how the board formats them - print the two clauses; differing counts
-    // print all three, with the separator and the estimate marker untouched.
+    // 1.19.64: a scanner row prints all three fields, always. Until this delivery the third clause was dropped
+    // whenever the cumulative figure equalled the first-mark one. That was defensible only while both counts came
+    // out of the same reveal; since 1.19.42 the cumulative figure is the per-sweep mark count, so a live row that
+    // marked ten enemies and revealed ten of them printed `扫描 2 次 / 首次 10 只` and lost the figure the player
+    // asked for (the recorded Survival board's Dauda row). Equal counts now print the same three clauses as
+    // differing ones. The separator and the estimate marker are untouched, and a counted zero is printed as the
+    // zero it is - nothing on this cell is omitted for being equal to its neighbour or for being zero.
     public static string ToolScan(bool estimated, string uses, string marks, string totalMarks)
-        => (estimated ? "~" : string.Empty) + (SameMarkCount(totalMarks, marks)
-            ? Compound(Pick("扫描 " + uses + " 次", "scan " + uses + "x"), Pick("首次 " + marks + " 只", "first " + marks))
-            : Compound(Pick("扫描 " + uses + " 次", "scan " + uses + "x"),
-                Pick("首次 " + marks + " 只", "first " + marks), Pick("累计 " + totalMarks + " 只", "cumulative " + totalMarks)));
-    // The two figures arrive formatted by the board itself, so an identical string is an identical count;
-    // the numeric comparison is the same answer for any other pair of plain whole numbers.
-    private static bool SameMarkCount(string totalMarks, string marks)
-        => string.Equals(totalMarks, marks, StringComparison.Ordinal)
-            || long.TryParse(totalMarks, NumberStyles.Integer, CultureInfo.InvariantCulture, out long total)
-            && long.TryParse(marks, NumberStyles.Integer, CultureInfo.InvariantCulture, out long first)
-            && total == first && total >= 0;
-    public static string ToolScanUnavailable => Pick("扫描 —", "Scan —");
+        => (estimated ? "~" : string.Empty) + Compound(
+            Pick("扫描 " + uses + " 次", "scan " + uses + "x"),
+            Pick("首次 " + marks + " 只", "first " + marks),
+            Pick("累计 " + totalMarks + " 只", "cumulative " + totalMarks));
+    // 1.19.64: a scanner row this machine holds no evidence for says which three figures are missing instead of
+    // collapsing to a single dash, so every scanner carrier shows its scan count, its first marks and its
+    // cumulative marks on the settlement board and in the archive. The placeholder is the labelled one - each
+    // value keeps its own clause - and it is never a zero, because nothing measured it.
+    public static string ToolScanUnavailable => ToolScan(false, Placeholder, Placeholder, Placeholder);
     public static string ToolSentry(string shots, string hits, string damage)
         => Compound(Pick("射击 " + shots, "shots " + shots), Pick("命中 " + hits, "hits " + hits), Pick("伤害 " + damage, "damage " + damage));
+    // 1.19.64: the marker a gear slot's name row carries when the slot really held more than one measured weapon.
+    // It says how many of that slot's rows the one-cell-per-slot board cannot draw; it never names one of them, it is
+    // never a sum, and a slot that held one weapon prints the name alone exactly as it always did.
+    public static string SlotOthers(int others)
+        => Pick("（另有 " + Count(others) + " 把）", " (+" + Count(others) + " more)");
     public static string ToolMine(string deployed, string triggered, string damage)
         => Compound(Pick("部署 " + deployed, "deployed " + deployed), Pick("触发 " + triggered, "triggered " + triggered), Pick("伤害 " + damage, "damage " + damage));
     public static string ToolGlue(string shots, string hits, string glued)

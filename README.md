@@ -2,7 +2,7 @@
 
 独立 GTFO 战斗统计面板：局内看战斗数据，成功或失败结算看队伍贡献。表格由 IMGUI 画在窗口像素里，不写入任何原版文字对象。
 
-- **当前状态**：源码版本为 **1.19.61**，是 1.19.60 之后的定点修正——客机失败页的页脚只认「同一个原生返回位置」的几何（主机页量的同一个「返回大厅」按钮的已布局矩形，与等待提示真正渲染出来的字形，取更靠上者；边界只认同一来源连续两次一致才放宽，两者都量不到就保留原版重测，`F8` 也不给带）。1.19.49 是只做过托管验证的评审构建，从未打包、从未上传、也不算已发布，不能读成一个发布版本。**验证范围**：`scripts/Verify.ps1` 在本机 Survival 档案上用该档自己的 BepInEx core／IL2CPP interop 重编并跑完整回归（插件构建、ScoutHookSafety 引用检查、smoke／ConfigWatcher／Supply／Scan 四套测试、EWC API 契约门），逐项 `VERIFY: PASS`；实机日志只覆盖这份代码的 **Test 档案（主机）2 局成功 / 2 局失败** 与 **Survival 档案（客机）1 局失败**（该失败页条带底 1143、槽顶 1163、净空 20），**客机成功页、`F8` 强制出板与跨机收到他人数据本轮没有实证，不作宣称**。本工程构建非确定性：同源不同输出目录会得到**同尺寸但不同 SHA-256** 的 DLL（MVID 含源绝对路径），跨目录 hash 不能当作一致性判据，一致性与验证只用「同一输出目录原地重编，hash 与字节均不变」证明。近期变更见 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)；包内 `Thunderstore/README.md` 保留功能、配置与安装文档。
+- **当前状态**：源码版本为 **1.19.71**。默认结算板的落位和字号由分辨率决定；同一分辨率下，主客机、成功与失败页共用。各版改动见 [更新日志](Thunderstore/CHANGELOG.md)。
 - **安装**：模组包管理器（Thunderstore Mod Manager 等）搜索 `CombatPanel`（自动带上 BepInEx 依赖）；或手动把包内 `BepInEx/plugins/GTFOCombatPanel/` 整个目录放进 GTFO 目录下的同一路径。`CombatPanel-config/scoring.json` 放在**游戏持久数据目录**下（GTFO 即 `…\AppData\LocalLow\10 Chambers Collective\GTFO\`）并只在缺失时创建一次；插件目录里的旧副本会在首次使用时自动导入、此后以持久目录为准，手改过的配置不会被覆盖，也不会被升级包替换。已有 `.cfg` 在升级时保留，新配置项下次加载自动补齐。
 - **兼容**：仅依赖 **BepInEx-BepInExPack_GTFO-3.2.4**；EWC（ExtraWeaponCustomization）是可选集成，公共 DLL 不带它的程序集引用。多人快照协议为 **v8**，与旧协议不兼容（旧协议包会被明确拒收）。需要共享统计的每台机器装同一版本。
 - **反馈**：<https://qingju.me>；开黑语音频道（小黑盒语音）<https://chat.xiaoheihe.cn/in1wpsjd>。
@@ -243,7 +243,7 @@ StaggerNeedsAttack = true
 - 人类扫描以 `m_tagging` 的上升沿记标记尝试；每个 scanner 带自己的揭示账本。机器人扫描钩机器人自己的 `Player.PlayerBotActionUseEnemyScanner.UpdateStateScan()` 取归属，只有读不到时才退回近似规则，结果标 `~`。跨玩家去重与归属钩子在实战中的命中仍待确认。
 - 近战推击走游戏自己的链路（`Dam_SyncedDamageBase.PushDamage` → `Dam_EnemyDamageBase.ReceivePushDamage`），钩子挂在推击入口、在处理前读敌人的攻击状态：打断正在进行的攻击才记一次硬直，且同一帧同一敌人只记一次。
 - 补给效率按每次补给事件的「实际有效量 ÷ 应有量」实测取平均：弹药在 `PlayerAmmoStorage.PickupAmmo` 前后读包内储量，医疗在 `ReceiveAddHealth` 前后读血量，远程发送者由 `SNet.Replication.TryGetLastSender` 解析；自己给自己用同样计入，拾取不计入分母。任何一次读数失败只跳过那一次，该项显示 `—`。
-- 两个结算页的板子落位时机与字号观感、结算板滚轮滚动的实机手感（一格一行、表头固定、滚到底），都还没有实机证据；滚动的窗口与可达性由 `ResultsScroll` 的无头断言覆盖。
+- 默认结算板已实测主机与客机的成功／失败页：主机覆盖 1024×768、1920×1080、2560×1440，客机覆盖 1920×1080。短窗口下的滚动与末行可达性由托管断言覆盖；这里不把日志中的绘制回执当成滚轮手感实测。
 
 ## 构建 / 验证
 
@@ -259,6 +259,8 @@ StaggerNeedsAttack = true
 DLL 默认位于 `bin/Release/GTFOCombatPanel.dll`，也可用 `-BuildOutputDirectory` 输出到独立目录。安装后核对 DLL 哈希；已有 `.cfg` 与 `CombatPanel-config/scoring.json` 保留。
 
 ## 验证边界
+
+1.19.49 是只做过托管验证的评审构建，从未打包或公开发布。
 
 结论分两类，不混用：**编译与托管重放断言**（`scripts\Verify.ps1`，可复现）；**实机观察**（截图、日志、手感，只在明确记录时才算证据）。断言覆盖不到 Unity 原生回调时序、页面动画的实际轨迹和屏幕前的观感，这类结论一律需要实机复核才能成立。逐版的验证记录、断言数与未验证项写在 [`Thunderstore/CHANGELOG.md`](Thunderstore/CHANGELOG.md)。
 

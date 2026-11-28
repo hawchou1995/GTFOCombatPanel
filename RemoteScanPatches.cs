@@ -136,7 +136,7 @@ internal static class ScanTagPipeline
                 var target = entry.Enemy;
                 if (!target.TryGet(out var enemy) || enemy == null || !enemy.IsTagged) continue;
                 ulong owner = Pending.Confirm(enemy.Pointer, entry.Owner, entry.Time, enemy.GetInstanceID());
-                if (owner != 0) CombatTracker.CreditExecutedScanTag(enemy, owner, entry.Owner == 0);
+                if (owner != 0) CombatTracker.CreditExecutedScanTag(enemy, owner, entry.Owner == 0, entry.Time);
             }
             catch (Exception error) { CombatTracker.LogToolError("scan confirmation", error); }
         }

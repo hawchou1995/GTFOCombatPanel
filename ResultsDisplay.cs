@@ -232,6 +232,12 @@ internal static class ResultsDisplay
         // Polls refresh the text and archive; geometry is remeasured only when updated data outgrows it, or when
         // `FallbackRecoveryDue` says the strip this board was measured into no longer describes this page: a
         // placement that had to fall back before one of the page's own edges was readable, or a page that has
+        VanillaHideExpired();
+        if (_resolutionWidth != 0 && _succeeded == succeeded && PageActive(_page) && !FixedLayoutActive())
+        {
+            PrepareResolutionBoard(_page, succeeded);
+            return;
+        }
         // moved since (another mod's footer, a resolution change, a section that finished drawing later). Both
         // are budgeted per page, so a settled board is never rebuilt for a frame of the page's own animation.
         if (_placed && !_earlyBoard && _placedSucceeded == succeeded && _grid != null && _content != null &&
@@ -241,7 +247,7 @@ internal static class ResultsDisplay
             // stuck on a non-interactive picture with no way to mature. While an early board stands, the re-measure runs
             // on the retry cadence and the early board keeps drawing meanwhile (`_holdValid` is deliberately not cleared
             // by `ResetPlacement`), so the promotion is measured, bounded and non-destructive.
-            if (!FallbackRecoveryDue(succeeded, _page) && RefreshBoardData(_page, succeeded)) return;
+            if (_fixedPlaced && FixedLayoutActive() && RefreshBoardData(_page, succeeded)) return;
         }
         // A page whose own anchors have not arrived yet is measured every frame while its reveal runs, then at a
         // bounded cadence: measuring a page walks its renderers and every button it drew, and a page that never hands
@@ -335,7 +341,8 @@ internal static class ResultsDisplay
             // on the deferred frame of a board that is about to come back. A repaint is the right place for the question: it
             // runs once per attached page, and the answer needs no new observation.
             VanillaHideExpired();
-            Prepare(page, succeeded);
+            if (FixedLayoutActive()) Prepare(page, succeeded);
+            else PrepareResolutionBoard(page, succeeded);
             // 原版块只在这一帧**真的画出表格之后**才让位（`Draw` 里，`HudTable.Draw` 之后同一帧）。这里不再预隐藏：
             // 预隐藏是 review #3 找到的那条旁路——`_placed` 为真、`Prepare` 也量到了板，但 `Draw` 在 1793 行之前
             // 还有七道门（可见性、无页面、无 placement、固定模式、`BoardStillSafe`、band 不变式、settle），任何一道
@@ -372,7 +379,7 @@ internal static class ResultsDisplay
                 return;
             }
             ImpactBoardLayout board = ImpactBoard.Build(report, true, succeeded);
-            ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation);
+            ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation, HostProven());
         }
         catch (Exception error)
         {
@@ -394,6 +401,8 @@ internal static class ResultsDisplay
         // player's scroll position was dropped with it.
         Component previousPage = _page;
         int previousRows = _grid != null ? _grid.Rows : 0;
+        _resolutionWidth = _resolutionHeight = 0;
+        _resolutionRetryAt = 0f;
         _grid = null; _content = null; _page = null; _succeeded = false; _placed = false; _placedSucceeded = false;
         // 1.19.52: the measured table width and the probe budget belong to the page as well - a new page must not
         // inherit the previous table's column, and its own two-phase measurement starts from its own first frame.
@@ -1915,8 +1924,12 @@ internal static class ResultsDisplay
         if (white == null) return;
         if (!(header.Width > 0f) || !(header.Height > 0f)) return;
         ResultChromeMetrics metrics = ChromeMetrics();
+        // 1.19.62: the run's created-enemy figure is the third run on this band. It comes from the table's own content
+        // (`_content.Figure`, filled by `ImpactBoard.Build`), is measured by the plan with this band's own font and
+        // insets, and is drawn by the same `DrawChromeLabel` call the name and the key hint use. A null figure - the
+        // plan's default - is the pre-1.19.62 band exactly.
         ResultChromeLayout.ResultChromeHeaderPlan plan = ResultChromeLayout.PlanHeader(header, metrics,
-            _chromeToggleRect, _chromeToggleValid);
+            _chromeToggleRect, _chromeToggleValid, _content != null ? _content.Figure : null);
         Color previous = GUI.color;
         Color previousContent = GUI.contentColor;
         try
@@ -1935,6 +1948,9 @@ internal static class ResultsDisplay
             // with `战斗结算看板` six ems wide inside it, spilling over the close.
             if (plan.HasTitle) DrawChromeLabel(plan.Title, metrics.HeaderFont, plan.TitleLabel, ResultChromeTheme.HeaderTitle, false);
             if (plan.HasHint) DrawChromeLabel(plan.Hint, metrics.HeaderHintFont, ResultChromeTheme.KeyHintLabel, ResultChromeTheme.HeaderHint, true);
+            // 1.19.62: the run's created-enemy figure, in the room the plan measured for it after the name. Same call,
+            // same face, same band - the one difference is the string, which is the board model's own figure.
+            if (plan.HasFigure) DrawChromeLabel(plan.Figure, metrics.HeaderHintFont, plan.FigureLabel, ResultChromeTheme.HeaderHint, false);
         }
         finally
         {
@@ -2453,6 +2469,11 @@ internal static class ResultsDisplay
             return;
         }
 
+        if (_resolutionWidth != 0)
+        {
+            if (_resolutionWidth == Screen.width && _resolutionHeight == Screen.height) PaintResolutionBoard();
+            return;
+        }
         // 固定模式：位置和字号来自玩家的配置，不来自页面条带，所以这里既不重排也不缩放，只重新验证控件安全。
         if (_fixedPlaced)
         {
@@ -2519,8 +2540,12 @@ internal static class ResultsDisplay
                 // outside the band.
                 float plateHeight = PlateFor(_grid, bottom - top, header, out int scrollVisible, out int scrollFirst);
                 float total = plateHeight + header;
+                // The plate stops where this page's own wall left its band: a host failure strip is already the action
+                // button's top minus this page's clearance (`ResultsBounds.TryResolve`), so it is never extended outward
+                // the way an animated footer's strip is - the gate that judges it (`ResultHostFailureBand.Allows`) is
+                // half a pixel wide and the plate now stops on the band's own foot (`ResultBoardHold.PlacementSlack`).
                 if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, new BoardStrip(top, bottom, buttonMeasured, buttonTop, buttonHeight), _grid.Width, total,
-                    Plugin.ResultsOffsetX.Value, out LayoutRect fitted, BoardSlack, bottomAligned: true))
+                    Plugin.ResultsOffsetX.Value, out LayoutRect fitted, ResultBoardHold.PlacementSlack(!_succeeded && !GuestClient(), BoardSlack), bottomAligned: true))
                 {
                     if (ResultReportPolicy.OncePerPage(HeadingReports, "fail-no-room", Forced, _forcedOutcomePending))
                         Plugin.Logger?.LogInfo($"[DIAG] failure board held back: strip=({top:0}..{bottom:0}), have={(bottom - top):0}px cannot hold a {_grid.Width:0}x{_grid.Height:0} (need={total:0}px with the {header:0}px header) board, so the vanilla screen is left alone rather than a button covered.{(Forced ? " forcedByF8=true - this press is answered by a refusal line, never silence." : string.Empty)}");
@@ -2566,11 +2591,23 @@ internal static class ResultsDisplay
         }
         else
         {
-            // A fail-open board is checked against the page on every repaint too, and the answer is a move or a fainter
-            // board - never a blank screen. A page whose controls moved under it keeps its table.
+            // Recheck the fallback plate on every repaint; a host failure may not reuse an unproven strip.
             RefreshFallbackSafety();
             opacity = _fallbackOpacity;
         }
+        if (!_succeeded && !GuestClient())
+        {
+            float actionTop = HostFailureButtonTop(_page);
+            if (!_holdValid || !ResultHostFailureBand.Allows(_holdBoard, actionTop, Screen.height))
+            {
+                ReportHeldBack("draw", !_holdValid ? "host-failure-strip-unproven" : "host-failure-button-wall",
+                    $"plateBottom={_holdBoard.Bottom:0}, actionTop={WallText(actionTop)}");
+                DeferBoardForInteraction();
+                RestoreHidden();
+                return;
+            }
+        }
+
         // The whole board, header included, inside the band it was measured into - asked of the rectangle that is
         // really on the screen, every repaint, before anything is painted or any vanilla block is touched.
         if (!ResultChromeLayout.PlateInsideBand(_holdBoard, _holdStrip.Top, _holdStrip.Bottom, Screen.height, BoardSlack))
@@ -3122,6 +3159,7 @@ internal static class ResultsDisplay
         _fallbackPlaced = false;
         // 控件相交与扫描证明在这一帧就判一次：板照画，但这块 overlay 让不让原版块让位、用多大不透明度由它决定。
         _fixedPlan = FixedLayoutDecision(plan.Rect, out string evidence);
+        _fixedPlan = FullOpacity(_fixedPlan);
         ReportFixedPlacement(plan, _fixedPlan, evidence,
             " rows=" + board.Rows + ",columns=" + board.ColumnCount + ",players=" + report.Entries.Count
             + ",density=" + Plugin.Density.Name);
@@ -3249,6 +3287,9 @@ internal static class ResultsDisplay
     }
 
     // 一次配置尝试的签名，日志限频键的一半：窗口 / 字号 / 锚点 / 板自己的矩形，全是玩家这次给的值。
+    private static ResultFixedDrawPlan FullOpacity(ResultFixedDrawPlan plan)
+        => new ResultFixedDrawPlan(plan.Draws, plan.Overlap, plan.Proven, 1f, plan.Reason, plan.Blocker, plan.Evidence);
+
     private static string FixedSignature(float screenWidth, float screenHeight, float font, float anchorX, float anchorY,
         float rectWidth, float rectHeight)
         => ResultFixedLayout.Attempt(font, anchorX, anchorY, screenWidth, screenHeight, rectWidth, rectHeight);
@@ -3361,6 +3402,7 @@ internal static class ResultsDisplay
         _scrollPlate = plateHeight;
         LayoutRect rect = plan.Rect;
         ResultFixedDrawPlan draw = FixedLayoutDecision(rect, out string evidence);
+        draw = FullOpacity(draw);
         // 证据不足的这一帧把之前挪走的放回去，页面保持原版、板淡画在上面。**让位**放到下面 `HudTable.Draw` 之后：
         // 一帧里的任何早退都不能把原版块留在 6000 以外（review #3）。
         try
@@ -3614,8 +3656,16 @@ internal static class ResultsDisplay
         // 客机失败页上那行字已经作为 `walls.FooterTextTop` 进了条带算术（它就是这一页的槽位边界），所以扫描自己的
         // `FooterTop`（含那行字，也含可按控件）只在不是客机失败页时作为「量到的控件」那一路补一次。
         float measuredWall = walls.GuestFailure ? float.NaN : controls.FooterTop;
-        if (!ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,
-                controls.BelowActions.Top, controls.BelowActions.Bottom, FallbackFloor(), out ResultFallbackPlan band))
+        // A scan can measure the text inside the host button without measuring its visual extent.
+        // This page uses only the strip above a measured native action, never the carved/extended band below it.
+        bool hostFailure = !succeeded && !guestFailure;
+        ResultFallbackPlan band;
+        bool resolvedBand = hostFailure
+            ? ResultHostFailureBand.TryResolve(Screen.height, anchorBottom, anchorSource, walls,
+                pageReadable ? HostFailureButtonTop(page) : float.NaN, measuredWall, out band)
+            : ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,
+                controls.BelowActions.Top, controls.BelowActions.Bottom, FallbackFloor(), out band);
+        if (!resolvedBand)
         {
             why = "no-safe-area: anchorBottom=" + (float.IsFinite(anchorBottom) ? anchorBottom.ToString("0") : "unmeasurable")
                 + ",footerTop=" + WallText(walls.PressableTop)
@@ -3650,6 +3700,7 @@ internal static class ResultsDisplay
             + ", footerTop=" + WallText(walls.PressableTop)
             + ", pageFloor=" + WallText(walls.PageFloor) + " (cap only)"
             + ", controls=" + controls.Count + ", hidden=" + controls.Hidden + ", unmeasurable=" + controls.Unmeasurable
+            + (hostFailure ? ", host-action-wall=required" : string.Empty)
             + ResultFailureWallPolicy.AnswerNote(wallMeasured, wallWait, walls.GuestFailure);
         return room > 0f;
     }
@@ -3666,6 +3717,8 @@ internal static class ResultsDisplay
     // defect this whole path exists to remove.
     private static void RefreshFallbackSafety()
     {
+        bool hostFailure = !_succeeded && !GuestClient();
+        if (hostFailure) _holdValid = false;
         if (_page == null || _grid == null || _content == null) return;
         if (!FallbackPlacement(_page, _succeeded, out float top, out float room, out BoardStrip strip, out _)) return;
         if (room <= 0f) return;
@@ -3707,7 +3760,8 @@ internal static class ResultsDisplay
         // The question is asked of the rectangle that is on the screen (`_origin`), never of the destination just computed, and
         // it is asked of both of the band's edges: a band whose top slid down into the board is as much an intrusion as a band
         // whose foot rose into it.
-        bool intrudes = ResultLateControlPolicy.MustMove(_origin.Y, _origin.Bottom, strip.Top, strip.Bottom);
+        bool intrudes = ResultLateControlPolicy.MustMove(_origin.Y, _origin.Bottom, strip.Top, strip.Bottom)
+            || (hostFailure && !ResultChromeLayout.PlateInsideBand(_holdBoard, strip.Top, strip.Bottom, Screen.height, 0.5f));
         bool moved = refitted || sizeChanged || horizontal || (intrudes && vertical);
         if (moved)
         {
@@ -3719,8 +3773,7 @@ internal static class ResultsDisplay
             _grid = grid;
             _scrollVisible = scrollVisible; _scrollFirst = scrollFirst; _scrollPlate = plateHeight;
         }
-        // The board is up whether it moved or not, and it belongs to this page.
-        _holdValid = true;
+        _holdValid = !hostFailure || ResultChromeLayout.PlateInsideBand(_holdBoard, strip.Top, strip.Bottom, Screen.height, 0.5f);
         _holdPage = _page != null ? _page.Pointer : IntPtr.Zero;
         _fallbackOpacity = opacity;
         _holdOpacity = opacity;
@@ -3868,13 +3921,17 @@ internal static class ResultsDisplay
         Plugin.Logger?.LogInfo($"[DIAG] F8 forced frame: board draw issued, {_grid.Width:0}x{_grid.Height:0}px at ({origin.X:0},{origin.Y:0}) of a {Screen.width}x{Screen.height} window, band=({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), bandSource={_holdStrip.FooterSource}, forcedByF8=true; the press is answered on the repaint that issued the board's draw calls (this line reports that call, not a pixel readback of the page).");
     }
     private static bool _placed;             // a placement has been computed for the screen now up
+    private static int _resolutionWidth, _resolutionHeight;
+    private static float _resolutionRetryAt;
     private static bool _placedSucceeded;    // and it was computed for this kind of results screen
     internal static bool NeedsAttach()
     {
         if (!Plugin.ShowResults.Value) return false;
+        if (!FixedLayoutActive() && Time.unscaledTime < _resolutionRetryAt) return false;
         var state = GameStateManager.CurrentStateName;
         if (state != eGameStateName.ExpeditionSuccess && state != eGameStateName.ExpeditionFail) return false;
         bool succeeded = state == eGameStateName.ExpeditionSuccess;
+        if (_resolutionWidth != 0 && (_resolutionWidth != Screen.width || _resolutionHeight != Screen.height)) return true;
         // A placement belongs to the screen it was measured on. The success page measures its strip once, so a
         // failure placement carried onto a success page would leave the board on the failure coordinates -
         // straight over the completion icons. A different kind of results screen always re-attaches.
@@ -4221,6 +4278,75 @@ internal static class ResultsDisplay
 
     // ---- the influence board -------------------------------------------------------------------
 
+    private static void PrepareResolutionBoard(Component page, bool succeeded)
+    {
+        ImpactReport report = BuildReport(succeeded);
+        if (report.Entries.Count == 0) { ResolutionRefused("empty-roster"); return; }
+        ImpactBoardLayout board = ImpactBoard.Build(report, splitKillTiers: true, succeeded);
+        ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation, HostProven());
+        int width = Screen.width, height = Screen.height;
+        if (!ResultAutoBoardContract.TryResolutionStrip(width, height, out BoardStrip strip))
+        { ResolutionRefused("invalid-window"); return; }
+        var content = new TableContent
+        {
+            Columns = board.Columns, Text = board.Text, Colors = Colors(board, report),
+            FieldSeparator = ImpactBoard.ValueSeparator, Dividers = Dividers(board), Kinds = board.Kinds, Figure = board.Figure
+        };
+        int pixels = ResultAutoBoardContract.TargetGlyphPixels(height);
+        PanelGrid grid = ResultAutoBoardContract.ConstrainWidth(BoardGrid(content, pixels, pixels, float.PositiveInfinity),
+            width - 2f * ResultsBounds.ScreenMargin);
+        float header = ChromeHeader();
+        if (grid == null || !ResultsScroll.PlateFits(strip.Bottom - strip.Top, grid.RowHeight, header, ResultsScroll.MinimumVisibleRows))
+        { ResolutionRefused("viewport-too-small"); return; }
+        float plateHeight = PlateFor(grid, strip.Bottom - strip.Top, header, out int visible, out int first);
+        float edge = ResultsBounds.ScreenMargin;
+        float maxX = Math.Max(edge, width - edge - grid.Width);
+        float x = Math.Clamp((width - grid.Width) * 0.5f + Plugin.ResultsOffsetX.Value, edge, maxX);
+        if (!ResultBoardHold.TryPlace(width, height, strip, grid.Width, plateHeight + header,
+                x - (width - grid.Width) * 0.5f, out LayoutRect plate, bottomAligned: true))
+        { ResolutionRefused("plate-outside-window"); return; }
+
+        _grid = grid; _content = content;
+        _origin = new LayoutRect(plate.X, plate.Y + header, plate.Width, plateHeight);
+        _scrollPlate = plateHeight; _scrollVisible = visible; _scrollFirst = first;
+        _holdBoard = plate; _holdStrip = strip; _holdValid = true; _holdPage = page.Pointer;
+        if (_resolutionWidth != width || _resolutionHeight != height) _loggedDraw = false;
+        _resolutionWidth = width; _resolutionHeight = height;
+        _resolutionRetryAt = 0f;
+        _placed = true;
+        _placedSucceeded = succeeded;
+    }
+
+    private static void ResolutionRefused(string reason)
+    {
+        // Keep a standing board on a transient empty snapshot, but never paint it in a different window.
+        _resolutionRetryAt = Time.unscaledTime + 0.25f;
+        if (_resolutionWidth != Screen.width || _resolutionHeight != Screen.height) RestoreHidden();
+        ReportHeldBack("prepare", "resolution-" + reason, $"screen={Screen.width}x{Screen.height}");
+    }
+
+    private static void PaintResolutionBoard()
+    {
+        HudTable.Draw(_grid, _origin.X, _origin.Y, _content, 1f, _scrollFirst, _scrollVisible, _scrollPlate);
+        DrawOverflowHint();
+        _boardDrawnFrame = Time.frameCount;
+        _hitRect = _holdBoard; _hitSucceeded = _succeeded; _hitValid = true; _scrollValid = true;
+        try { ApplyVanillaBlocks(_page, _succeeded); }
+        catch (Exception error)
+        {
+            if (HeadingReports.Add("resolution-board-vanilla"))
+                Plugin.Logger?.LogWarning("[DIAG] could not update the settlement page's optional blocks: " + error.Message);
+        }
+        ReportForcedDraw(_origin);
+        if (!_loggedDraw)
+        {
+            _loggedDraw = true;
+            Plugin.Logger?.LogInfo($"[DIAG] resolution settlement board: screen={_resolutionWidth}x{_resolutionHeight}, "
+                + $"band=({_holdStrip.Top:0}..{_holdStrip.Bottom:0}), glyph={_grid.FontPixels:0}px, "
+                + $"rows shown {_scrollVisible}/{_grid.Rows}, role={ResultPageRolePolicy.Name(Role())}, success={_succeeded}; draw calls issued.");
+        }
+    }
+
     private static void Prepare(Component page, bool succeeded)
     {
         // Two floors, two questions, deliberately kept apart.
@@ -4288,7 +4414,7 @@ internal static class ResultsDisplay
         // only case in which this build ever collapsed them.
         ImpactBoardLayout board = ImpactBoard.Build(report, splitTiers, succeeded);
         // The initial accepted projection is archived; later snapshots refresh the same file in place.
-        ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation);
+                ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation, HostProven());
         var content = new TableContent
         {
             Columns = board.Columns,
@@ -4296,7 +4422,10 @@ internal static class ResultsDisplay
             Colors = Colors(board, report),
             FieldSeparator = ImpactBoard.ValueSeparator,
             Dividers = Dividers(board),
-            Kinds = board.Kinds
+            Kinds = board.Kinds,
+            // 1.19.62: the round's created-enemy figure travels with the table it belongs to, so the header band draws
+            // the same string the board model produced - one line for the whole squad, never one per column.
+            Figure = board.Figure
         };
         // The strict attempt is a strict attempt: whatever the previous frame ended in, this one asks the fit to place
         // inside the strip the page itself measured.
@@ -4767,7 +4896,11 @@ internal static class ResultsDisplay
         if (!(plate > 0f) || !float.IsFinite(plate)) return false;
         float total = plate + header;
         if (!ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, total,
-                Plugin.ResultsOffsetX.Value, out LayoutRect candidate, BoardSlack, bottomAligned: true))
+                Plugin.ResultsOffsetX.Value, out LayoutRect candidate, ResultBoardHold.PlacementSlack(!_succeeded && !GuestClient(), BoardSlack), bottomAligned: true,
+                // 1.19.68: a host success strip whose foot is only the window's edge caps its own 2 px tolerance (`TryPlace`),
+                // so a refreshed plate is judged against the same edge the first placement stopped on - otherwise the growth
+                // candidate would stand 2 px past the edge `HeldGridFits` below judges it with and never be committed.
+                screenEdgeCeiling: _succeeded && !GuestClient()))
             return false;
         if (!ResultChromeLayout.PlateInsideBand(candidate, strip.Top, strip.Bottom, Screen.height, BoardSlack))
             return false;
@@ -4794,7 +4927,7 @@ internal static class ResultsDisplay
         ImpactReport report = BuildReport(succeeded);
         if (report.Entries.Count == 0) return true;
         ImpactBoardLayout board = ImpactBoard.Build(report, true, succeeded);
-        ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation);
+            ResultsSaver.Save(page, succeeded, board, report, CombatSync.Generation, HostProven());
         // 固定模式：人数或内容变了就是同一张表的新尺寸，底边中点不动，所以这里不按自适应那套「行/列变了就放弃」处理。
         if (!_fixedPlaced && (board.Rows != _grid.Rows || board.ColumnCount != _grid.Columns)) return false;
         var content = new TableContent
@@ -4804,7 +4937,10 @@ internal static class ResultsDisplay
             Colors = Colors(board, report),
             FieldSeparator = ImpactBoard.ValueSeparator,
             Dividers = Dividers(board),
-            Kinds = board.Kinds
+            Kinds = board.Kinds,
+            // 1.19.62: the same one line for the whole squad, from the same board model. It is carried, never measured
+            // as a cell: rows, columns and the fixed-layout row/column guard above are exactly what they were.
+            Figure = board.Figure
         };
         // 固定模式：展开/收起的行数只由完整看板决定（上面 `ImpactBoard.Build(report, true, ...)`），表格在自己指定的
         // 字号下重量一次，矩形按同一个锚点重算——底边中点因此不随人数变化而移动。
@@ -4877,16 +5013,33 @@ internal static class ResultsDisplay
                 melee != null ? melee.Counters : null,
                 tool);
             input.Lookup = player.Lookup;
+            // 1.19.62 (unreleased): the host's scan estimate for this row, read from the host-local ledger. `Display`
+            // answers 0 whenever the row has a measured activation figure of its own - the holder's readable
+            // cooldown, including a counted zero, or a positive count that player's machine reported - so the
+            // measured figure always wins, even when it is smaller than the estimate this host accumulated. It also
+            // answers 0 to a machine that is not a readable host (`HostProven`, the one role read this file owns),
+            // so a row keeps its dash after a host migration instead of showing the previous host's figure.
+            input.ScanRoundsEstimated = ScanRoundEstimates.Display(player.Impact, player.Lookup, HostProven());
             input.PrimaryName = Name(primary);
             input.SecondaryName = Name(secondary);
             input.MeleeName = Name(melee);
+            // 1.19.64: a gun slot that really held more than one measured weapon is written down here instead of
+            // being folded into the one name and one set of figures those cells can draw.
+            input.AttachSlotWeapons(player.Weapons, primary, secondary,
+                (int)InventorySlot.GearStandard, (int)InventorySlot.GearSpecial);
             inputs.Add(input);
         }
         double firepower = Plugin.SupportRoleFirepowerBonus != null ? Plugin.SupportRoleFirepowerBonus.Value : 1.0;
         double utility = Plugin.SupportRoleUtilityBonus != null ? Plugin.SupportRoleUtilityBonus.Value : 1.0;
         // A failed expedition neither shows nor scores the last-one-standing metric, so the two halves
         // are decided together here rather than by hiding a figure the score still counted.
-        return ImpactScoring.Evaluate(inputs, Plugin.ScoringWeights(), firepower, utility, countLoneSurvivor);
+        ImpactReport report = ImpactScoring.Evaluate(inputs, Plugin.ScoringWeights(), firepower, utility, countLoneSurvivor);
+        // 1.19.62: the round's created-enemy figure, read once from the one squad ledger and carried on the report the
+        // settlement board and the archive share. It is the same read for the success page and the failure page -
+        // `BuildReport` is the only report this file builds - so neither page can show a figure of its own, and no
+        // column, row or cell of the board changes because of it.
+        report.Spawns = CombatTracker.SpawnTotal;
+        return report;
     }
 
     // The row of one slot the settlement board reads. One slot can hold more than one row - the placeholder the
@@ -4900,6 +5053,8 @@ internal static class ResultsDisplay
     private static string Name(WeaponCombatStats weapon)
         => weapon == null || string.IsNullOrEmpty(weapon.Name) ? string.Empty : weapon.Name;
 
+    // (1.19.64: the two gun slots' extra rows are projected by `ImpactInput.AttachSlotWeapons`, which the headless
+    // regression drives directly; this file only names the two slots the board draws.)
     // The tone the board decided is turned into a colour here, which is the only place in the mod that
     // knows what gold or copper look like.
     private static Color[,] Colors(ImpactBoardLayout board, ImpactReport report)
@@ -4970,8 +5125,17 @@ internal static class ResultsDisplay
         }
         float plateHeight = PlateFor(grid, strip.Bottom - strip.Top, header, out int scrollVisible, out int scrollFirst);
         float total = plateHeight + header;
+        // 1.19.68: the fit is the one placement a host success page gets - strict, early, F8 and the fail-open band alike
+        // all come back through here (`TryFit` -> `Fit`). A strip whose foot is only the window's own edge therefore stops
+        // on that edge instead of taking the 2 px tolerance past it: the tolerance exists for an animating page element and
+        // there is none under a screen-foot strip, while the per-repaint checks that judge this very plate
+        // (`BoardStillSafe` -> `HeldGridFits`) take `Screen.height - 8` as a hard limit. The recorded 2560x1440 host success
+        // page is that shape: `band=(846..1432)`/`bandSource=InteractiveBand`, plate placed to `boardBottom=1434` and then
+        // `grid-would-reach-edge` on every repaint (log 7224-7225). Client pages keep their own arithmetic - this cap belongs
+        // to the host success band only, and a strip that ends on a measured button or a measured page element is unchanged.
         bool placedStrictly = ResultBoardHold.TryPlace(Screen.width, Screen.height, strip, grid.Width, total,
-            Plugin.ResultsOffsetX.Value, out LayoutRect plate, BoardSlack, bottomAligned: true);
+            Plugin.ResultsOffsetX.Value, out LayoutRect plate, ResultBoardHold.PlacementSlack(!succeeded && !GuestClient(), BoardSlack), bottomAligned: true,
+            screenEdgeCeiling: succeeded && !GuestClient());
         // 1.19.21 (the hard band invariant): a board is never placed taller than its band and merely faded. The grid
         // handed in here is already fitted to the strip's own room (`FitBoard` steps the glyph down until it fits), so
         // the strip's top-aligned placement is the whole answer for both the strict and the fail-open board; the band
@@ -6744,6 +6908,18 @@ internal static class ResultsDisplay
 
     // Revalidate the failure board's current lower wall for the held-board lift. The trusted title edge is
     // whichever measured mission-title path authorized placement; the waiting-status is never used as an anchor.
+    private static float HostFailureButtonTop(Component page)
+    {
+        try
+        {
+            var fail = page != null ? page.TryCast<CM_PageExpeditionFail>() : null;
+            return fail != null
+                ? ResultsRegion.HighestTop(VisibleTop(fail.m_btnRestartCheckpoint), VisibleTop(fail.m_btnGoToLobby))
+                : float.NaN;
+        }
+        catch { return float.NaN; }
+    }
+
     private static bool LobbyButtonTop(Component page, out float top)
     {
         top = float.NaN;

@@ -63,7 +63,7 @@ internal static class Release11960Scenarios
 
         // This machine's own row: the one row a client always measures itself.
         CombatPlayer own = store.GetOrCreate(Local);
-        own.Name = "A1pha";
+        own.Name = "Brav0";
         own.DisplaySlot = 1;
         own.Total.AddAccuracy(40, 30, 6);
         own.Total.AddEnemyDamage(900);
@@ -144,7 +144,7 @@ internal static class Release11960Scenarios
     {
         SquadExchange exchange = ClientExchange(out CombatStatsStore store);
         CombatPlayer own = store.GetOrCreate(Local);
-        own.Name = "A1pha";
+        own.Name = "Brav0";
         own.Total.AddEnemyDamage(900);
 
         ApplyPack(store, Local, Teammate);
@@ -401,7 +401,7 @@ internal static class Release11960Scenarios
         // The same row eligibility on a failure page: the shared projection is the one answer both pages read.
         SquadExchange exchange = ClientExchange(out CombatStatsStore store);
         CombatPlayer own = store.GetOrCreate(Local);
-        own.Name = "A1pha";
+        own.Name = "Brav0";
         own.Total.AddEnemyDamage(310);
         ApplyPack(store, Local, Teammate);
         List<CombatPlayer> rows = exchange.Project(store.Snapshot(), Local);

@@ -25,6 +25,12 @@ public static class ResultsLog
         text.Append("  \"run\": ").Append(run.ToString(CultureInfo.InvariantCulture)).Append(",\n");
         text.Append("  \"rundown\": \"").Append(Escape(metadata.Rundown)).Append("\",\n");
         text.Append("  \"levelName\": \"").Append(Escape(metadata.LevelName)).Append("\",\n");
+        // 1.19.62: the round's created-enemy figure - one value for the squad, written beside the player rows
+        // instead of inside them, because it is not a player's figure. `created` is the number the settlement line
+        // printed, and `null` when this machine could not prove one: an unproven figure is archived as unknown and
+        // never as a guessed zero, which is what `scope` and `known` are there to say. No existing key, row label or
+        // player figure moves or changes type because of this one.
+        AppendSpawns(text, report.Spawns);
         text.Append("  \"players\": [\n");
         for (int index = 0; index < report.Entries.Count; index++)
         {
@@ -57,6 +63,9 @@ public static class ResultsLog
                 if (string.IsNullOrEmpty(label)) continue;
                 text.Append("      \"").Append(Escape(label)).Append("\": \"").Append(Escape(board.Joined(row, column))).Append("\",\n");
             }
+            // 1.19.64: the rows of a slot that held more than one measured weapon, one entry each. Nothing above
+            // changes: the board's own keys still carry the one row the slot drew, and this block carries the rest.
+            AppendSlotWeapons(text, entry.Input);
             text.Append("      \"nameCell\": \"").Append(Escape(board.Joined(0, column))).Append("\"\n");
             text.Append(index + 1 == report.Entries.Count ? "    }\n" : "    },\n");
         }
@@ -96,9 +105,63 @@ public static class ResultsLog
         text.Append("        \"healthLost\": ").Append(Decimal(counters.HealthLost)).Append("\n");
         text.Append("      },\n");
     }
+    // 1.19.64: one entry per measured row of a gear slot that held more than one weapon. The board draws a single row
+    // per slot, so the others are written here with the figures they measured - `shown` marks the entry the slot's
+    // cells belong to, and nothing in this block is a sum, a difference or a remainder. A player whose slots each
+    // hold one weapon writes no block at all: the file is exactly the file it always was.
+    //
+    // Every figure keeps the observation it came from (review): a figure the row never measured is `null`, never a 0 a
+    // reader would count as measured; a counted zero stays 0; damage and accuracy are estimated separately, each under
+    // its own flag, so a row whose damage was estimated is not written as if its accuracy were too. A shot count of 0
+    // beside positive hits was never read and is written as `null` with the hits kept.
+    private static void AppendSlotWeapons(StringBuilder text, ImpactInput input)
+    {
+        if (input == null || input.SlotWeapons == null || input.SlotWeapons.Count == 0) return;
+        text.Append("      \"weapons\": [\n");
+        for (int index = 0; index < input.SlotWeapons.Count; index++)
+        {
+            SlotWeapon weapon = input.SlotWeapons[index];
+            text.Append("        { \"slot\": ").Append(weapon.Slot.ToString(CultureInfo.InvariantCulture));
+            text.Append(", \"name\": \"").Append(Escape(weapon.Name)).Append("\"");
+            text.Append(", \"shown\": ").Append(weapon.Shown ? "true" : "false");
+            text.Append(", \"damage\": ").Append(weapon.Damage.HasValue ? Decimal(weapon.Damage.Value) : "null");
+            text.Append(", \"damageEstimated\": ").Append(weapon.DamageEstimated ? "true" : "false");
+            text.Append(", \"shots\": ").Append(Count(weapon.Shots));
+            text.Append(", \"hits\": ").Append(Count(weapon.Hits));
+            text.Append(", \"weakspots\": ").Append(Count(weapon.Weakspots));
+            text.Append(", \"accuracyEstimated\": ").Append(weapon.AccuracyEstimated ? "true" : "false");
+            text.Append(index + 1 == input.SlotWeapons.Count ? " }\n" : " },\n");
+        }
+        text.Append("      ],\n");
+    }
+
+
+    // The round's created-enemy figure as the archive keeps it: the same number the settlement line printed, or the
+    // explicit unknown. Written as an object of its own so a reader can never mistake it for a player row, and so the
+    // shape of every existing key stays exactly as it was.
+    //
+    //   created - the figure, or `null` when this machine could not prove one (never a guessed 0)
+    //   scope   - "squad" (this machine owned the round's level start and still hosts), "local" (its own
+    //             observation only) or "unknown"
+    //   known   - true only for "squad", the one case where the number is the round's total
+    private static void AppendSpawns(StringBuilder text, SpawnTotal total)
+    {
+        text.Append("  \"").Append(SettlementSpawns.JsonKey).Append("\": {\n");
+        text.Append("    \"created\": ");
+        if (total.Any) text.Append(Count(total.Created)); else text.Append("null");
+        text.Append(",\n");
+        text.Append("    \"scope\": \"").Append(SettlementSpawns.ScopeName(total.Scope)).Append("\",\n");
+        text.Append("    \"known\": ").Append(total.Known ? "true" : "false").Append("\n");
+        text.Append("  },\n");
+    }
 
     private static string Count(long value)
         => (value < 0 ? 0 : value).ToString(CultureInfo.InvariantCulture);
+
+    // 1.19.64: a figure that was never observed is written as JSON null rather than as a 0 - the two are different
+    // measurements, and a reader of the file must be able to tell them apart.
+    private static string Count(long? value)
+        => value.HasValue ? Count(value.Value) : "null";
 
     private static string Label(ImpactBoardLayout board, int row)
     {

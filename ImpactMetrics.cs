@@ -363,6 +363,13 @@ public sealed class ImpactCounters
         ScoutDamageObserved = true;
         ScoutDamageEstimated |= estimated;
     }
+    // 1.19.65: the same withdrawal on the Scout row, so a taken-back estimate leaves no trace in a figure the
+    // Scout cell reports. Only ever downwards, only for an estimate this machine made itself.
+    public void WithdrawScoutDamage(double amount)
+    {
+        if (!double.IsFinite(amount) || amount <= 0 || !(ScoutDamage > 0)) return;
+        ScoutDamage = Math.Max(0, ScoutDamage - amount);
+    }
     public void Reset()
     {
         MinorKills = EliteKills = BossKills = MeleeKills = ScoutKills = 0;
@@ -427,9 +434,87 @@ public sealed class ImpactInput
     public double FriendlyFireDamage;
     public long ShotsFired, Hits, WeakspotHits;
     public bool AccuracyEstimated;
+    // 1.19.62: the host's estimate of how many scan rounds this player's confirmed marks came in, for a row that
+    // has no measured activation figure of its own. It is display input only, and it is deliberately *not* a field
+    // of `ImpactCounters`: it never enters a snapshot, a merge, a settlement cache or a score, so no packet, no
+    // version and no scoring or title rule is touched by it. 0 means "nothing to show", never "zero rounds".
+    public long ScanRoundsEstimated;
     public ImpactCounters Counters = new ImpactCounters();
     public PlayerCombatStats Primary, Secondary, Melee;
     public string PrimaryName = string.Empty, SecondaryName = string.Empty, MeleeName = string.Empty, ToolName = string.Empty;
+    // 1.19.64: the measured rows of a gear slot that the one-row-per-slot board cannot draw, for a slot that really
+    // held more than one weapon. `SlotWeapons` is the archive's copy of those rows (the drawn one included, marked
+    // by `Shown`), `PrimaryOthers` / `SecondaryOthers` are the two counts the board's name rows print as `另有 N 把`.
+    // Display only: no total, no score, no title, no packet and no merge reads any of it, and nothing in it is ever
+    // a sum - each entry is one row's own measurement. A player whose slots each hold one weapon carries an empty
+    // list and a zero count, which is every row the board drew before this existed.
+    public List<SlotWeapon> SlotWeapons = new List<SlotWeapon>();
+    public int PrimaryOthers, SecondaryOthers;
+    public int SlotOthers(int slot)
+    {
+        int others = 0;
+        for (int index = 0; index < SlotWeapons.Count; index++)
+            if (SlotWeapons[index] != null && !SlotWeapons[index].Shown && SlotWeapons[index].Slot == slot) others++;
+        return others;
+    }
+    // 1.19.64: the production projection of one player's two gun slots. `primarySlot` / `secondarySlot` are the slot
+    // numbers `WeaponRows` keys on, so this reads exactly the rows the board draws. It lives here, beside the fields it
+    // fills, so the board, the settlement archive and the headless regression all run this one rule.
+    public void AttachSlotWeapons(IEnumerable<WeaponCombatStats> rows, WeaponCombatStats primary, WeaponCombatStats secondary,
+        int primarySlot, int secondarySlot)
+    {
+        // 1.19.64 (review): attaching is idempotent. The call rewrites the carried rows from scratch, so a second call
+        // on the same input - a cached input re-projected, a page rebuilt in place - answers the same list instead of
+        // appending a copy of it. The counts are derived from the rewritten list for the same reason.
+        SlotWeapons.Clear();
+        CollectSlotWeapons(rows, primarySlot, primary);
+        CollectSlotWeapons(rows, secondarySlot, secondary);
+        PrimaryOthers = SlotOthers(primarySlot);
+        SecondaryOthers = SlotOthers(secondarySlot);
+    }
+
+    private void CollectSlotWeapons(IEnumerable<WeaponCombatStats> rows, int slot, WeaponCombatStats drawn)
+    {
+        if (drawn == null) return;
+        List<WeaponCombatStats> others = WeaponRows.Others(rows, slot, drawn);
+        if (others.Count == 0) return;
+        SlotWeapons.Add(SlotWeaponNote(drawn, slot, true));
+        for (int index = 0; index < others.Count; index++)
+            SlotWeapons.Add(SlotWeaponNote(others[index], slot, false));
+    }
+
+    // 1.19.64: one entry per row, each figure written exactly as the row observed it. Damage and accuracy carry their
+    // own observation and estimate flags, so an unobserved figure is null instead of a 0 a reader would count as
+    // measured, a counted zero stays 0, and only the field that really was estimated is marked as estimated.
+    private static SlotWeapon SlotWeaponNote(WeaponCombatStats row, int slot, bool shown)
+    {
+        PlayerCombatStats counters = row != null ? row.Counters : null;
+        var note = new SlotWeapon
+        {
+            Slot = slot,
+            ArchetypeId = row != null ? row.ArchetypeId : 0,
+            Name = row != null ? (CombatStatsFormatter.VisibleName(row.Name) ?? string.Empty) : string.Empty,
+            Shown = shown
+        };
+        if (counters == null) return note;
+        // Damage: the figure this row observed, or the zero it counted; nothing at all when it never measured damage.
+        if (counters.EnemyDamageObserved)
+        {
+            note.Damage = counters.EnemyDamage;
+            note.DamageEstimated = counters.EnemyDamageEstimated;
+        }
+        // Accuracy: the three figures are one sample. A shot count of zero beside positive hits was never read, so it
+        // is written as no figure while the hits it did see are kept; a shot count that really is zero (nothing hit)
+        // is the counted zero it is.
+        if (counters.AccuracyObserved)
+        {
+            note.Hits = counters.Hits;
+            note.Weakspots = counters.WeakspotHits;
+            note.Shots = counters.ShotsFired > 0 || counters.Hits <= 0 ? (long?)counters.ShotsFired : null;
+            note.AccuracyEstimated = counters.AccuracyEstimated;
+        }
+        return note;
+    }
     public static ImpactInput From(string name, PlayerCombatStats combat, ImpactCounters counters, bool support,
         PlayerCombatStats primary = null, PlayerCombatStats secondary = null, PlayerCombatStats melee = null,
         WeaponCombatStats tool = null)
@@ -457,6 +542,27 @@ public sealed class ImpactInput
     }
 }
 
+// 1.19.64: one measured row of one gear slot, as the settlement projection saw it. The board draws one row per slot,
+// so when a slot really held more than one weapon the ones it cannot draw are described here - named on the slot's
+// own name row (`另有 N 把`) and written one entry per row into the settlement archive. `Shown` marks the entry the
+// slot's cells belong to, so a reader can pair each cell with its weapon.
+//
+// Every figure is that one row's own measurement, and a figure the row never measured is `null` rather than a 0 a
+// reader would take for measured data: damage and accuracy are observed and estimated *separately*
+// (`DamageEstimated` / `AccuracyEstimated`), a counted zero stays a zero, and a row that saw hits without a readable
+// shot count keeps its hits while `Shots` stays null. Nothing here is a remainder, a difference or a sum, and no
+// total or score is derived from it.
+public sealed class SlotWeapon
+{
+    public int Slot;
+    public uint ArchetypeId;
+    public string Name = string.Empty;
+    public bool Shown;
+    public double? Damage;
+    public bool DamageEstimated;
+    public long? Shots, Hits, Weakspots;
+    public bool AccuracyEstimated;
+}
 // One player's evaluated row: what they scored, where they placed, and which metric earned them
 // their sentence.
 public sealed class ImpactEntry
@@ -491,6 +597,12 @@ public sealed class ImpactReport
     public readonly double[] MinRaw;
     public readonly int[] CountAtMin;
     public readonly double FirepowerBonus, UtilityBonus;
+    // 1.19.62: the round's created-enemy figure, read once from the one squad ledger (`CombatTracker.SpawnTotal`)
+    // when the settlement view is built. It is one value for the whole squad and deliberately not a field of
+    // `ImpactCounters`: it is never per player, never in a snapshot, never merged and never scored, so no packet,
+    // no version and no scoring or title rule is touched by it. `SpawnTotal.Unknown` means the machine could not
+    // prove a figure and says so; nothing here ever fabricates a zero for it.
+    public SpawnTotal Spawns = SpawnTotal.Unknown;
 
     internal ImpactReport(double[] weights, double firepowerBonus, double utilityBonus)
     {

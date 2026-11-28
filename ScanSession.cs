@@ -36,6 +36,42 @@ public sealed class ScanReveals
     public void Clear() { _revealed.Clear(); }
 }
 
+// The expedition's one reveal namespace and the scanner sessions that share it (1.19.62).
+//
+// Every scanner in the squad - the local human, a remote human, a bot - is handed a session over this same
+// `ScanReveals`, so an enemy instance is a *squad* reveal exactly once and only the sweep that really put it on
+// the bio tracker earns a first mark. The tracker used to build one ledger per player (`new ScanReveals()` per
+// probe), which is how the recorded Survival FX.3 host archive came to read human 21 + bots 21 / 21 / 15 = 78
+// first marks for a round whose command spawns created 21 enemies: every tracker re-revealed what the others had
+// already tagged, and each of them was "first" inside its own namespace.
+//
+// What stays per player is everything that is per player: the sweep window (`ScanMarks`), the cooldown session
+// (`ScanUses`) and the bot-callback throttle. First-mark exclusivity therefore never moves a cumulative mark or a
+// scan count; it only decides who may claim an enemy the squad had not seen yet.
+public sealed class SquadScanLedger
+{
+    private readonly ScanReveals _reveals = new ScanReveals();
+    private readonly Dictionary<ulong, ScanSession> _sessions = new Dictionary<ulong, ScanSession>();
+
+    // How many enemy instances the squad has revealed this expedition.
+    public int Count { get { return _reveals.Count; } }
+
+    // The one session of one squad member. A lookup of zero names nobody, so it gets a session of its own that no
+    // player row can ever read; the alternative - handing it the shared namespace - would credit a nameless sweep.
+    public ScanSession For(ulong lookup)
+    {
+        if (lookup == 0) return new ScanSession();
+        if (!_sessions.TryGetValue(lookup, out ScanSession session))
+        {
+            session = new ScanSession(_reveals);
+            _sessions[lookup] = session;
+        }
+        return session;
+    }
+
+    public void Clear() { _reveals.Clear(); _sessions.Clear(); }
+}
+
 // One scanner: its own tag-attempt edges, its own bot callback throttle, and the expedition's
 // shared reveal ledger. Passive radar updates do not count as attempts. Bot static callbacks have
 // no owner: attribution and timing remain estimates.

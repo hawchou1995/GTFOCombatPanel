@@ -279,8 +279,11 @@ internal static partial class Program
             "a first place that leads no single row wears the all-round sentence and names no metric");
         Check(CombatStrings.Title(steadyEntry.Rating) == "全能中坚",
             "the sentence for the top that leads no row is 全能中坚");
-        Check(ImpactBoard.ReasonText(steadyEntry, allRoundReport.Entries.Sum(entry => entry.Input.EnemyDamage)) == "综合评分全队第一，无单项领先",
-            "its explanation line says why it was earned without claiming a figure it never led");
+        // 1.19.67: the line no longer claims the top led no single category. It cannot: the board prints a
+        // rescue below the scoring floor (the floor is two) as the 救援 row's figure, so a player who leads
+        // that printed row still wears this sentence, and an exact tie for first wears it twice.
+        Check(ImpactBoard.ReasonText(steadyEntry, allRoundReport.Entries.Sum(entry => entry.Input.EnemyDamage)) == "综合分居首，未获单项称号",
+            "its explanation line says what the sentence is and claims no more");
         Check(allRoundReport.Entries.First(entry => entry.Name == "Heavy").Rating == ImpactRating.Damage
             && allRoundReport.Entries.First(entry => entry.Name == "Stopper").Rating == ImpactRating.Stagger,
             "the rows the others really led are still their own sentences");

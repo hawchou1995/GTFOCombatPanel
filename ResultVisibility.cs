@@ -279,6 +279,23 @@ public static class ResultBoardHold
     // leaves: that gap is comfort, the button is the one thing the player has to be able to press.
     public const float ButtonClearance = 6f;
 
+    // The slack a placement may take past the foot of its own strip.
+    //
+    // `slack` is tolerance for a strip whose foot is a *page element* that keeps animating: the plate may stand a couple
+    // of pixels past the measured edge and the next repaint measures it again. A host failure strip is not that shape.
+    // Its foot is already `native action button top - ResultsBounds.Clearance(screen)` - the page's own wall minus the
+    // page's own gap - and the gate that stands between the placement and the pixels (`ResultHostFailureBand.Allows`,
+    // `FallbackLayout.cs`) tolerates half a pixel, not two. Taking the slack there put every host failure plate 2 px
+    // *below* the wall that produced it: the recorded 2560x1440 host failure page (log 14694-14912,
+    // `evidence-combatpanel-20261128-112653`) placed `plateBottom=1124` into a band ending at 1122.67 with
+    // `actionTop=1144` and was refused on 49 consecutive repaints, so that page never drew one frame of board.
+    //
+    // The placement therefore answers with the contract the page really offered - the band it measured, no outward
+    // extension - instead of the gate being widened to accept the overhang. Every other page keeps `slack` unchanged, and
+    // a plate that would really reach a control that arrived later is still refused by the same half-pixel rule.
+    public static float PlacementSlack(bool hostFailure, float slack)
+        => hostFailure ? 0f : (float.IsFinite(slack) && slack > 0f ? slack : 0f);
+
     // The first placement: the board fits inside the strip between the two measured edges, with the same
     // tolerance the draw path allows for a button whose bounds moved between the measurement and the
     // draw. A board that cannot fit is refused here rather than pushed over a button.
@@ -287,8 +304,25 @@ public static class ResultBoardHold
     // the strip's top. The strip ends where the button begins, so a table shorter than the room it was
     // given lands in the gap the player is really looking at - right above the button - rather than leaving
     // an empty band there and clinging to the completion section above.
+    //
+    // `screenEdgeCeiling` asks for one more cap on `slack`, and it is the window's own edge that does the capping. The
+    // tolerance above exists for a strip whose foot is a *page element* that keeps animating (the plate may stand a
+    // couple of pixels past the measured edge and the next repaint measures it again), but nothing in the page's own
+    // geometry makes `min(foot, screenHeight - 8) + slack` land *on* that edge - and every check that judges the standing
+    // plate takes `screenHeight - 8` as a hard limit with no tolerance at all (`HeldGridFits`). A strip whose foot merely
+    // comes close to the edge is therefore placed 2 px past it and refused on every repaint afterwards: the recorded
+    // 2560x1440 host success page read `band=(846..1432)` with `bandSource=InteractiveBand` and `blankBelow=0px`
+    // (2026-11-28 13:21 snapshot, log 7224-7225), the plate went in at `boardBottom=1434` against a
+    // `heldStripBottom=1432`, and `grid-would-reach-edge` refused it on every repaint, so the page never drew one frame.
+    // The cap therefore answers the edge it names, unconditionally: whatever this call's strip foot reads - the edge
+    // itself, a foot 1 px or half a pixel under it, or the smallest float step below it - the plate it places never
+    // stands below `screenHeight - 8`. Review F1: an earlier revision capped only a foot that read *at or past* the
+    // edge, which left the identical 2 px overflow reachable from every foot within 2 px under it. It only ever *stops*
+    // a plate on the edge the window really offers - it never moves one already above it - and a strip that ends on a
+    // measured button or a measured page element well clear of that edge (the recorded success footer at 1274/1287) is
+    // placed by exactly the arithmetic it always was.
     public static bool TryPlace(float screenWidth, float screenHeight, BoardStrip strip, float width, float height,
-        float offsetX, out LayoutRect rect, float slack = 0f, bool bottomAligned = false)
+        float offsetX, out LayoutRect rect, float slack = 0f, bool bottomAligned = false, bool screenEdgeCeiling = false)
     {
         rect = default;
         if (!float.IsFinite(screenWidth) || !float.IsFinite(screenHeight) || screenHeight <= 0f) return false;
@@ -296,7 +330,11 @@ public static class ResultBoardHold
         if (!float.IsFinite(strip.Top) || !float.IsFinite(strip.Bottom)) return false;
         if (!float.IsFinite(slack) || slack < 0f) slack = 0f;
         float top = Math.Max(0f, strip.Top);
-        float bottom = Math.Min(strip.Bottom, screenHeight - 8f) + slack;
+        float screenFoot = screenHeight - 8f;
+        float bottom = Math.Min(strip.Bottom, screenFoot) + slack;
+        // The window's own edge is this call's hard limit: the slack may never carry the plate past it, whatever the
+        // strip's foot reads (review F1 - gating this on `strip.Bottom >= screenFoot` let 1431/1431.5 land on 1433/1433.5).
+        if (screenEdgeCeiling) bottom = Math.Min(bottom, screenFoot);
         if (!(bottom > top) || top + height > bottom) return false;
         float x = (screenWidth - width) * 0.5f + (float.IsFinite(offsetX) ? offsetX : 0f);
         rect = bottomAligned

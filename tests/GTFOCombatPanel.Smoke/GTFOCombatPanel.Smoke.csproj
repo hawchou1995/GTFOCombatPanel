@@ -62,9 +62,11 @@
     <Compile Include="..\..\ResultSettlementChrome.cs" Link="ResultSettlementChrome.cs" />
     <Compile Include="..\..\SettlementPointer.cs" Link="SettlementPointer.cs" />
     <Compile Include="..\..\SettlementStorage.cs" Link="SettlementStorage.cs" />
+    <Compile Include="..\..\ScanRoundEstimates.cs" Link="ScanRoundEstimates.cs" />
     <Compile Include="..\..\HudAbsenceLedger.cs" Link="HudAbsenceLedger.cs" />
     <Compile Include="..\..\ResultWheel.cs" Link="ResultWheel.cs" />
     <Compile Include="..\..\ResultVanillaHold.cs" Link="ResultVanillaHold.cs" />
     <Compile Include="..\..\ResultFrameSample.cs" Link="ResultFrameSample.cs" />
+    <Compile Include="..\..\SquadSpawns.cs" Link="SquadSpawns.cs" />
   </ItemGroup>
 </Project>

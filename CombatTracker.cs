@@ -49,6 +49,10 @@ internal static class CombatTracker
     private static readonly ExpeditionLifecycle Lifecycle = new ExpeditionLifecycle();
     private static readonly SettlementRows ResultRows = new SettlementRows();
     private static readonly DamageCreditLedger EnemyCredits = new DamageCreditLedger();
+    // 1.19.65: the one balance per enemy instance that every estimate this machine makes for that enemy is spent
+    // from while this machine is a client with no authority over it. Its rules - and what it is deliberately not -
+    // are in `OptionalDamageEvents.cs`, beside the local-outgoing rule it serves.
+    private static readonly EnemyHealthBudget Budget = new EnemyHealthBudget();
     internal static double DamageCredit(Dam_EnemyDamageBase enemy, ulong owner) => EnemyCredits.Read(enemy.Pointer, owner);
     private static bool _inResults;
     internal static List<CombatPlayer> SettlementView()
@@ -101,9 +105,20 @@ internal static class CombatTracker
         }
         EwcDamageBridge.Reset();
         Store.Reset(); ToolStatsTracker.Reset(); Colors.Clear(); PendingRemoteShots.Clear(); ActiveFire = null;
-        ResultRows.Clear(); EnemyCredits.Clear();
-        LastAttacker.Clear(); LastDamageKind.Clear(); Deaths.Clear(); PendingEnemySpawns.Clear(); Alive.Clear(); ScanLedger.Clear(); ScanRevealed.Clear();
+        ResultRows.Clear(); EnemyCredits.Clear(); Budget.Clear();
+        LastAttacker.Clear(); LastDamageKind.Clear(); Deaths.Clear(); PendingEnemySpawns.Clear(); Alive.Clear(); ScanLedger.Clear(); ScanSquad.Clear();
+        // 1.19.62: the round's created-enemy figure begins on this very edge, and this call is the ONLY thing that empties
+        // it - `Generating -> InLevel` is the same round and does not, and a settlement screen only reads it. `state` is
+        // which edge raised the reset: `Generating` means this machine was waiting for the level, so every enemy that
+        // level creates belongs to its count (a preset set up before the first in-level frame included); any other state
+        // here is a machine that walked into a level already running, and it may only report its own observation.
+        Spawns.Begin(SNet.IsMaster, state == eGameStateName.Generating);
+        // The settlement line's own latch goes with the round, so the next run's figure is written once.
+        SettlementSpawns.Reset();
         ScanTagPipeline.Reset();
+        // 1.19.62: the host's scan-round estimate belongs to one expedition, like every other ledger here. The
+        // comparison latch goes with it, so the next run's first settlement line is always written.
+        ScanRoundEstimates.Reset(); ScanRoundComparison.Reset();
         ReviveLedger.Clear();
         InterruptedFrame.Clear();
         SupplyTracker.Reset(); HealthLossPatches.Reset();
@@ -366,12 +381,37 @@ internal static class CombatTracker
     internal static void CompleteEwcDamage(Dam_EnemyDamageBase target, DamageSample sample, double recordedBefore)
     {
         if (target == null || sample.Player == null) return;
-        double amount = DamageObservation.Uncredited(sample.HealthBefore, target.Health, recordedBefore, DamageCredit(target, sample.Player.Lookup));
+        bool client = !SNet.IsMaster && !CombatSync.HostRunsMod;
+        // 1.19.65 (M2): an enemy whose damage base was not readable at its own `Setup` left a pending spawn behind.
+        // This is the first client-side damage entrance that can see that base, so the spawn is consumed before any
+        // ledger keyed by the pointer is read - a reused pointer never inherits the previous occupant's spent
+        // balance, its death scope or its native credit. `Remove` is the gate, so this is idempotent.
+        if (client) ConsumePendingSpawn(target);
+        float healthAfter = target.Health;
+        double residual = DamageObservation.Uncredited(sample.HealthBefore, healthAfter, recordedBefore, DamageCredit(target, sample.Player.Lookup));
+        bool measured = LocalOutgoingRule.Measured(sample.HealthBefore, healthAfter);
+        bool scout = target.Owner != null && target.Owner.IsScout;
+        // 1.19.65: on a client with no authority over this enemy that residual is still this machine's own estimate,
+        // so it is spent from the same one balance the native fallback uses - a DOT, an explosion and a shot landing
+        // on one enemy can then never together credit more health than that enemy had to lose. An event whose own
+        // health really moved is also the only kind of reading allowed to correct an older estimate. The host's
+        // branch is untouched: there the residual is a measurement, and `DamageCreditLedger` keeps its own job of not
+        // counting one event twice.
+        double amount = residual;
+        double withdrawn = 0;
+        if (client)
+            amount = Budget.Charge(target.Pointer, OwnerPointer(target), sample.Player, sample.Weapon, scout,
+                sample.HealthBefore, healthAfter, residual, measured, out withdrawn);
+        if (withdrawn > 0 && !_loggedWithdrawal)
+        {
+            _loggedWithdrawal = true;
+            Plugin.Logger.LogInfo($"[DIAG] EWC damage estimate withdrawn: {withdrawn:0.0} for player={sample.Player.Name} on {sample.Weapon?.Name ?? "unknown weapon"}, because this enemy really read {sample.HealthBefore:0.0} -> {healthAfter:0.0}; the residual this event is worth ({amount:0.0}) and the {Budget.Remaining(target.Pointer):0.0} left are measured, not the older estimate.");
+        }
         if (amount > 0)
         {
             sample.Player.RecordDamage(sample.Weapon, amount, false);
             EnemyCredits.Add(target.Pointer, sample.Player.Lookup, amount);
-            if (target.Owner != null && target.Owner.IsScout) sample.Player.Impact.AddScoutDamage(amount, false);
+            if (scout) sample.Player.Impact.AddScoutDamage(amount, false);
         }
         CompleteDamage(target, sample, null);
     }
@@ -506,6 +546,14 @@ internal static class CombatTracker
         catch (Exception) { return float.NaN; }
     }
 
+    // The enemy agent behind one damage instance, used only to tell one occupant of a reused pointer from the
+    // next. A read that is unavailable is zero and therefore never matches an occupant.
+    private static IntPtr OwnerPointer(Dam_EnemyDamageBase enemy)
+    {
+        try { return enemy == null || enemy.Owner == null ? IntPtr.Zero : enemy.Owner.Pointer; }
+        catch (Exception) { return IntPtr.Zero; }
+    }
+
     // A blow this machine dealt that the game will not hand back to it. The host applies every blow and
     // every other machine is told the result, but a machine is not sent its own damage back: that is why a
     // client that has received no usable host data for the run used to show no damage of its own at all, and
@@ -518,10 +566,18 @@ internal static class CombatTracker
     // health afterwards is the damage that was applied - the same measurement the receive path takes
     // from its packet - and it is what makes the fallback agree with a host that runs this mod.
     //
-    // A client whose host applies the blow is never told the result inside the same call, so the two
-    // reads can come back as one number and that loss is zero. `dam` is then the only figure there is,
-    // capped by the health the limb still had; it is read as the estimate it is, and a host that does run
-    // this mod replaces it with the blow it applied, which outranks an estimate by construction.
+    // A client whose host applies the blow is never told the result inside the same call, so the two reads can
+    // come back as one number and that loss is zero. `dam` is then the only figure there is; it is read as the
+    // estimate it is, and a host that does run this mod replaces it with the blow it applied, which outranks an
+    // estimate by construction.
+    //
+    // 1.19.65: that estimate is spent from the ONE remaining-health balance this enemy instance has on this
+    // machine (`EnemyHealthBudget`), not from the health of the limb that was struck and not from anything the
+    // enemy's maximum health would allow. Two limbs, two weapons and the five pellets of one shotgun all draw
+    // on the same balance, so the 34 a shotgun's pellets carry cannot be credited to an enemy whose readable
+    // health was 20, and an enemy met with 25 of its 30 left credits 25. A health this machine reads lower than
+    // that balance is a sync change it did not cause: it only lowers the balance and is never credited, while a
+    // lagging higher snapshot never hands spent budget back.
     //
     // Nobody counts a blow here twice: the host never enters this path (it reads every blow through the
     // record path) and neither does a client whose host runs this mod (the host's record of that blow
@@ -537,21 +593,44 @@ internal static class CombatTracker
             var agent = source == null ? null : source.TryCast<PlayerAgent>();
             SNet_Player owner = agent == null ? null : agent.Owner;
             if (owner == null || !owner.IsLocal || !ShouldTrack(owner)) return;
+            // 1.19.65 (M2): an enemy whose damage base was still unreadable at its own `Setup` left a pending spawn
+            // behind. This is the first client-side place that sees that base, so the spawn is consumed here, before
+            // any ledger keyed by the pointer is read - otherwise a later enemy reusing the same pointer would
+            // inherit the previous occupant's spent balance and its death scope.
+            ConsumePendingSpawn(limb.m_base);
             float healthAfter = Math.Max(0f, limb.m_base.Health);
-            float amount = (float)LocalOutgoingRule.Amount(healthBefore, healthAfter, dam);
-            if (!float.IsFinite(amount) || amount <= 0f) return;
             var player = ObservePlayer(owner);
             InventorySlot slot = kind == DamageKind.Melee
                 ? InventorySlot.GearMelee
                 : (agent.Inventory == null ? InventorySlot.GearStandard : agent.Inventory.WieldedSlot);
             var entry = ResolveWeapon(player, owner, slot);
+            var weapon = CombatPlayer.MatchDamage(player, entry, gearCategoryId);
+            bool scout = limb.m_base.Owner != null && limb.m_base.Owner.IsScout;
+            bool measured = LocalOutgoingRule.Measured(healthBefore, healthAfter);
+            // 1.19.65: the figure is either the health this call really moved or, when it moved none because the host
+            // applied the blow, the figure the weapon carried in - and either one is spent from the ONE balance this
+            // enemy instance has left (`EnemyHealthBudget`), shared by its limbs and every weapon. A reading that
+            // really moved is also a checkpoint: estimates this machine cannot support any more are taken back off the
+            // board first, total / weapon row / Scout row alike, so a stale 20 that was estimated in full no longer
+            // swallows the 7 that really happened.
+            double amount = Budget.Charge(limb.m_base.Pointer, OwnerPointer(limb.m_base), player, weapon, scout,
+                healthBefore, healthAfter, LocalOutgoingRule.Amount(healthBefore, healthAfter, dam), measured,
+                out double withdrawn);
+            if (withdrawn > 0 && !_loggedWithdrawal)
+            {
+                _loggedWithdrawal = true;
+                // Two different things can lower a figure and only one of them is correction: a sync this machine did
+                // not cause only lowers the balance and is never booked, while an estimate the enemy's own confirmed
+                // reading cannot support is taken back. The log says which one this was.
+                Plugin.Logger.LogInfo($"[DIAG] local damage estimate withdrawn: {withdrawn:0.0} on {entry?.Name ?? "unknown weapon"} for player={player.Name}, because this enemy really read {healthBefore:0.0} -> {healthAfter:0.0} and that reading cannot support it; this blow is worth {amount:0.0} and {Budget.Remaining(limb.m_base.Pointer):0.0} is what the enemy has left. Only estimates this machine made itself are taken back - a credit it measured across a call is confirmed and stays, and a health change it did not cause is never booked here in either direction.");
+            }
+            if (!double.IsFinite(amount) || amount <= 0) return;
             RememberAttacker(limb.m_base, owner.Lookup, kind);
-            player.RecordDamage(CombatPlayer.MatchDamage(player, entry, gearCategoryId), amount, false, true);
-            // The Scout row reports the damage that went into Scouts, so the same figure is put there too
-            // when the enemy under this limb is one. It is an estimate for the same reason the row above
-            // is: this machine measured its own blow, and a host that runs the panel overrules it.
-            if (limb.m_base.Owner != null && limb.m_base.Owner.IsScout)
-                player.Impact.AddScoutDamage(amount, true);
+            player.RecordDamage(weapon, amount, false, true);
+            // The Scout row reports the damage that went into Scouts, so the same figure is put there too when the
+            // enemy under this limb is one. It is an estimate for the same reason the row above is: this machine
+            // measured its own blow, and a host that runs the panel overrules it.
+            if (scout) player.Impact.AddScoutDamage(amount, true);
             if (!_loggedOutgoing)
             {
                 _loggedOutgoing = true;
@@ -559,7 +638,7 @@ internal static class CombatTracker
                 // so what was observed is that no usable host data arrived for this run - never that the host runs no panel.
                 // A host that runs the panel but was never reached looks identical here, and the log must not tell the
                 // two apart on this machine's behalf.
-                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client that has received no usable host data for this run (the host has not answered on this build's protocol, so it is not the authority this machine is reading), so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry?.Name ?? "unknown weapon"}, from healthBefore={healthBefore:0.0}, healthAfter={healthAfter:0.0}, dam={dam:0.0} - because the game never sends a machine its own damage back. The health the enemy lost across the call is used whenever it moved; when it did not, the figure the weapon carried in is used instead and capped by the health the limb had left. Either way the figure is marked as an estimate, and a host that does answer this build's protocol replaces it with the blow it applied.");
+                Plugin.Logger.LogInfo($"[DIAG] local damage fallback: this machine is a client that has received no usable host data for this run (the host has not answered on this build's protocol, so it is not the authority this machine is reading), so a blow it deals itself has to be measured here - {amount:0.0} damage on {entry?.Name ?? "unknown weapon"}, from healthBefore={healthBefore:0.0}, healthAfter={healthAfter:0.0}, dam={dam:0.0}, out of the one balance this enemy instance has left ({Budget.Remaining(limb.m_base.Pointer):0.0} after this blow) - because the game never sends a machine its own damage back. The health the enemy lost across the call is used whenever it moved; when it did not, the figure the weapon carried in is used instead. Either way the figure is capped by that enemy's own remaining health, shared by all its limbs and weapons and never by its maximum health: a lower health this machine later reads is a sync change it did not cause, it only lowers the balance and is never credited here, while a lagging higher snapshot never hands spent budget back. A reading that really moved is the one thing that can also take an estimate back - see the withdrawal line. The figure is marked as an estimate, and a host that does answer this build's protocol replaces it with the blow it applied.");
             }
         }
         catch (Exception error) { LogImpact("local outgoing damage", error); }
@@ -705,16 +784,25 @@ internal static class CombatTracker
     private static readonly Dictionary<IntPtr, ulong> LastAttacker = new Dictionary<IntPtr, ulong>();
     private static readonly Dictionary<IntPtr, DamageKind> LastDamageKind = new Dictionary<IntPtr, DamageKind>();
     private static readonly EnemyDeathLedger Deaths = new EnemyDeathLedger();
-    private static readonly HashSet<IntPtr> PendingEnemySpawns = new();
+    private static readonly PendingSpawns PendingEnemySpawns = new PendingSpawns();
     // The frame each enemy last had an attack broken in, so the push and the damage it comes with
     // reported inside one frame still count as the one interrupt they are.
     private static readonly Dictionary<IntPtr, int> InterruptedFrame = new Dictionary<IntPtr, int>();
     private static readonly Dictionary<ulong, bool> Alive = new Dictionary<ulong, bool>();
     private static readonly Dictionary<ulong, ScanProbe> ScanLedger = new Dictionary<ulong, ScanProbe>();
-    // The expedition's reveal ledger, shared across scanners: it is a diagnostic only, so the tracker
-    // can say how many of a sweep's enemies the squad had already seen. The credit itself lives in each
-    // scanner's own ledger, so this one never takes a first mark away from the scanner doing the sweep.
-    private static readonly ScanReveals ScanRevealed = new ScanReveals();
+    // 1.19.62: the expedition's one reveal namespace, and therefore the squad's one answer to "who put this enemy
+    // on the bio tracker first". Every probe below is handed its session from this factory, so humans and bots share
+    // the same revealed set: one enemy instance is a first mark for exactly one sweep in the squad. What is per
+    // player stays per player - the sweep window behind `ScanMarks`, the cooldown session behind `ScanUses` and the
+    // bot-callback throttle - so exclusive first marks never touch a cumulative figure or a scan count.
+    private static readonly SquadScanLedger ScanSquad = new SquadScanLedger();
+    // 1.19.62: the round's created-enemy figure. One ledger for the whole squad, fed by each enemy's own successful
+    // `EnemyAgent.Setup` edge (natural and command spawns alike), never by a hit or a death, and never per player.
+    // See `SquadSpawns.cs` for the rules a machine has to satisfy before it may call that number the squad's.
+    private static readonly SquadSpawnLedger Spawns = new SquadSpawnLedger();
+    // The one figure the success and the failure settlement read: the same global ledger, resolved against this
+    // machine's role, so neither page ever shows a copy per player and neither invents a number.
+    internal static SpawnTotal SpawnTotal => Spawns.Total(SNet.IsMaster);
     // The bot whose scan action is currently on the stack: its call to the static BotTag arrives
     // inside that window, which is what makes the attribution exact rather than a guess. Since 1.19.42 the
     // scope also carries the action's own scan start, so the one scan this window belongs to is named: the
@@ -723,7 +811,7 @@ internal static class CombatTracker
     private static int NearbyBotCandidates;
     private static float NearbyBotDistance = float.PositiveInfinity;
     private static bool _loneSurvivorAwarded;
-    private static bool _loggedStagger, _loggedKill, _loggedReviveState, _loggedReviveUnmatched, _loggedScan, _loggedScanRepeat, _loggedDown, _loggedLone, _loggedAttackState, _loggedBotScan, _loggedBotScanUnresolved, _loggedBotAction, _loggedBotScanUse, _loggedBotScanStart, _loggedOutgoing, _loggedEwcDamage;
+    private static bool _loggedStagger, _loggedKill, _loggedReviveState, _loggedReviveUnmatched, _loggedScan, _loggedScanRepeat, _loggedDown, _loggedLone, _loggedAttackState, _loggedBotScan, _loggedBotScanUnresolved, _loggedBotAction, _loggedBotScanUse, _loggedBotScanStart, _loggedOutgoing, _loggedEwcDamage, _loggedWithdrawal;
     // Which weapon classes this build has already reported a firing window for. One line per class is what
     // turns "this weapon's shots are missing" into a decision: either the class reaches a hooked `Fire` and
     // the window is here (so the figures are missing for another reason), or it never appears - which means
@@ -910,17 +998,53 @@ internal static class CombatTracker
         try
         {
             if (agent == null) return;
+            // 1.19.62 (review of the previous round): the spawn reset the death accounting depends on comes FIRST and has
+            // its own guard, exactly as it always had. `EnemyAgent.Setup` is also where a death is prepared
+            // (`Deaths.Spawn` / `EnemyCredits.Spawn` clear the previous occupant of this pointer), so anything added
+            // here must never be able to skip it: an interop read that throws would otherwise cost an enemy its fresh
+            // death ledger entry for the rest of the run.
             PendingEnemySpawns.Add(agent.Pointer);
             if (agent.Damage != null) ResolvePendingEnemySpawn(agent.Damage);
         }
         catch (Exception error) { LogImpact("enemy spawn", error); }
+        // 1.19.62: the round's created-enemy figure, taken at the enemy's own successful `Setup` edge - the one
+        // lifecycle every created enemy passes, natural and command spawn alike, whatever happens to it later. A preset
+        // enemy the level sets up before its first in-level frame counts exactly like a wave spawned twenty minutes
+        // later: what decides whether the figure may speak for the squad is the round edge this machine saw, not the
+        // state at this instant. It is deliberately not derived from a hit, a death, a scan or survival, and it is
+        // isolated from the block above: the identity read is an interop call, an unreadable one counts nothing
+        // (identity 0), and a failure here can never touch the pending-spawn set the death path reads.
+        try
+        {
+            int identity = 0;
+            try { identity = agent.GetInstanceID(); }
+            catch (Exception error) { LogImpact("enemy spawn identity", error); }
+            Spawns.Observe(SNet.IsMaster, identity);
+        }
+        catch (Exception error) { LogImpact("enemy spawn figure", error); }
     }
 
     private static void ResolvePendingEnemySpawn(Dam_EnemyDamageBase damage)
     {
-        if (damage?.Owner == null || !PendingEnemySpawns.Remove(damage.Owner.Pointer)) return;
-        IntPtr pointer = damage.Pointer;
-        Deaths.Spawn(pointer); EnemyCredits.Spawn(pointer); LastAttacker.Remove(pointer); LastDamageKind.Remove(pointer); InterruptedFrame.Remove(pointer);
+        if (damage?.Owner == null || !PendingEnemySpawns.Take(damage.Owner.Pointer)) return;
+        ResetDamageInstance(damage.Pointer);
+    }
+
+    // 1.19.65 (M2): an enemy whose damage base (or its owner) was still unreadable at its own `Setup` leaves its
+    // spawn pending for ever, so the first place that *can* see that base has to consume it - otherwise a later
+    // enemy that reuses the same damage or owner pointer inherits the previous occupant's spent balance, its death
+    // scope and its native credit. Only the client-side damage entrances call this; `Remove` is the idempotent
+    // gate, so the second caller of the same spawn finds nothing pending and does nothing at all.
+    private static void ConsumePendingSpawn(Dam_EnemyDamageBase damage)
+    {
+        if (damage?.Owner == null || !PendingEnemySpawns.Take(damage.Owner.Pointer)) return;
+        ResetDamageInstance(damage.Pointer);
+    }
+
+    // Everything one damage pointer holds for one occupant. Cleared only on that pointer's own spawn edge.
+    private static void ResetDamageInstance(IntPtr pointer)
+    {
+        Deaths.Spawn(pointer); EnemyCredits.Spawn(pointer); Budget.Spawn(pointer); LastAttacker.Remove(pointer); LastDamageKind.Remove(pointer); InterruptedFrame.Remove(pointer);
     }
 
     private static bool? ReadSleeping(Dam_EnemyDamageBase enemy)
@@ -996,7 +1120,6 @@ internal static class CombatTracker
         catch (Exception error) { LogImpact("revive-complete", error); }
     }
 
-
     // Everything the board scores that no event reports: who is still standing, who is the last one
     // standing, and what the bio tracker has revealed. Polled from the per-frame state observer, so
     // no patch is spent on a signal that only ever needs comparing with its own previous value.
@@ -1004,6 +1127,11 @@ internal static class CombatTracker
     {
         try
         {
+            // 1.19.62: the created-enemy figure's role is sampled on every in-level frame - before anything else in the
+            // frame can refuse - so a host that was demoted and promoted again inside one round cannot pass a start/end
+            // comparison and publish a complete total it did not have. The figure itself begins at the expedition edge
+            // (`Spawns.Begin` in `ObserveState`), never here: `Generating -> InLevel` is the same round and clears nothing.
+            Spawns.NoteRole(SNet.IsMaster);
             var agents = PlayerManager.PlayerAgentsInLevel;
             if (agents == null) return;
             int alive = 0;
@@ -1055,21 +1183,29 @@ internal static class CombatTracker
     private sealed class ScanProbe
     {
         public bool Announced, RemoteAnnounced;
+        // 1.19.62: one line per player and expedition when this host's estimate first appears - never one per
+        // mark or per enemy.
+        public bool EstimateAnnounced;
         // Confirmation diagnostics are per player and per expedition.
         public readonly ScanSession Session;
-        public ScanProbe(ScanReveals reveals) { Session = new ScanSession(reveals); }
+        // 1.19.62: the session is handed in, never built here, because which reveal namespace it belongs to is the
+        // whole question: the tracker passes the expedition's one shared session factory (`SquadScanLedger`), while a
+        // single-scanner test builds `new ScanSession()` and keeps its own namespace.
+        public ScanProbe(ScanSession session) { Session = session; }
     }
 
     private static ScanProbe Ledger(SNet_Player owner)
     {
         if (!ScanLedger.TryGetValue(owner.Lookup, out ScanProbe probe))
         {
-            // Each scanner carries its own reveal ledger: an enemy that the squad's other tracker
-            // already revealed is still a first mark for this tracker, which is what makes two human
-            // bio trackers both count instead of the second one showing nothing at all. The shared
-            // `ScanRevealed` ledger is kept only so the diagnostic can say how many of a sweep's
-            // enemies the squad had already seen.
-            probe = new ScanProbe(new ScanReveals()); ScanLedger[owner.Lookup] = probe;
+            // 1.19.62: every probe takes its session from the expedition's one factory, so the revealed set - and
+            // therefore the first mark - is the squad's, humans and bots together. This is the whole fix for the
+            // recorded archive that read 78 first marks off a round of 21 created enemies: this call used to build a
+            // fresh reveal set per player, which made every tracker "first" in a namespace of its own.
+            //
+            // A session that is only this scanner's is still what a single-scanner test builds (`new ScanSession()`),
+            // and it keeps exactly the semantics such a session always had.
+            probe = new ScanProbe(ScanSquad.For(owner.Lookup)); ScanLedger[owner.Lookup] = probe;
         }
         return probe;
     }
@@ -1125,8 +1261,11 @@ internal static class CombatTracker
         finally { if (ReferenceEquals(_humanScan, capture)) _humanScan = capture.Previous; }
     }
 
-    // Invoked only from the main-thread confirmation drain; no remote scanner object is required.
-    internal static void CreditExecutedScanTag(EnemyAgent enemy, ulong lookup, bool estimated)
+    // Invoked only from the main-thread confirmation drain; no remote scanner object is required. `receivedAt` is
+    // the monotonic stamp this confirmation was *captured* with (`ScanTagPipeline`'s `Event.Time`), never the time
+    // this drain got round to it: a backlogged drain must neither spread one sweep's marks apart nor make the gap
+    // between two real sweeps look shorter than it was.
+    internal static void CreditExecutedScanTag(EnemyAgent enemy, ulong lookup, bool estimated, double receivedAt)
     {
         if (GameStateManager.CurrentStateName != eGameStateName.InLevel || enemy == null || !enemy.IsTagged) return;
         var players = SNet.Slots?.SlottedPlayers;
@@ -1142,10 +1281,20 @@ internal static class CombatTracker
             // so without this its window stayed open for the whole expedition and the cumulative figure was
             // pinned to the first-mark figure - two columns printing the same number off one event source.
             probe.Session.BeginConfirmWindow();
-            probe.Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
+            ScanMark mark = probe.Session.ObserveConfirmed(enemy.GetInstanceID(), player.Impact, true);
             // A remote request identifies its player, but not the scanner's sweep/empty-attempt edges.
             estimated |= !owner.IsLocal;
             player.Impact.ScanEstimated |= estimated;
+            // 1.19.62: the host's own estimate of scan batches, kept beside the measured figures and never inside
+            // them. `CreditConfirmed` owns the whole gate: only a confirmed mark of *another* machine's human feeds it,
+            // a `First` and a `Repeat` both open the next batch (a sweep of enemies the squad already knows still cost
+            // a scan), and a mark the session rejected names no enemy, so it feeds nothing.
+            if (ScanRoundEstimates.CreditConfirmed(SNet.IsMaster, owner.IsLocal, owner.IsBot, lookup, mark, receivedAt)
+                && ScanRoundEstimates.TryRounds(lookup, out long rounds) && !probe.EstimateAnnounced)
+            {
+                probe.EstimateAnnounced = true;
+                Plugin.Logger?.LogInfo($"[DIAG] scan rounds estimated: {player.Name}; estimate={rounds}; measured={(player.Impact.ScanUsesKnown ? player.Impact.ScanUses.ToString() : "—")}; one round is one short cluster of that player's confirmed marks, never the native activation count.");
+            }
             if (player.Impact.ScanMarks > before && !probe.RemoteAnnounced)
             {
                 probe.RemoteAnnounced = true;
@@ -1296,6 +1445,19 @@ internal static class CombatTracker
                 }
                 return;
             }
+
+            // 1.19.62 (review of the previous round): a human tag the game already executed is credited BEFORE this bot's
+            // tag snapshot is looked at, so the human keeps the squad's first reveal and the bot sees a repeat. The old
+            // guard asked a request ledger that only a *client* fills (`ScanTagPipeline.Request` runs only when
+            // `!SNet.IsMaster`), while a bot's tag only ever runs on the host - so it could never fire. This is the queue
+            // that really holds "executed, not yet credited": `ScanTagPipeline.Events`. Draining it here applies exactly
+            // the same validation the frame drain applies (generation, resolved target, tagged state, owner, native
+            // exception), and it runs on this thread, which is the main thread `BotTag` was called on.
+            //
+            // Order is the whole rule: a human tag that executed earlier takes the first mark; a bot that really tagged
+            // first keeps it, and the human's later execution is the repeat. Neither order changes any count - the same
+            // marks are credited either way, only the owner of the squad's single first reveal follows the real order.
+            ScanTagPipeline.Drain();
             ScanProbe probe = Ledger(owner);
             var player = ObservePlayer(owner);
             bool started = probe.Session.BeginBotTag(Time.time, EnemyScanner.s_tagDuration, player.Impact);
@@ -1364,9 +1526,23 @@ internal static class CombatTracker
 
     private static int ListCount(Il2CppSystem.Collections.Generic.List<EnemyAgent> enemies) => enemies == null ? 0 : enemies.Count;
 
-    // Sweeps the taggable list and reports how many of those enemies this scanner had already revealed.
-    // A repeat is a repeat for this scanner alone; whether the squad's other tracker had already seen
-    // the enemy is a diagnostic and never takes the credit away from the scanner in front of us.
+    // Sweeps the list a BotTag call handed back and reports how many of those enemies the squad had already
+    // revealed. 1.19.62: the reveal namespace is the squad's, shared with every human tracker and every other
+    // bot, so an enemy that is already on the bio tracker is a repeat for this sweep too - it is not a first
+    // mark for the bot simply because the bot had not swept it before.
+    //
+    // The one honest limit left in this path: `foundEnemies` is a snapshot of enemies that are tagged, and it
+    // cannot say whether *this* sweep tagged them or an earlier one did. That is why a bot's marks stay an
+    // estimate (`ScanEstimated`, printed with `~`) and why nothing here is allowed to outrank a confirmation the
+    // native `ToolSyncManager.DoTagEnemy` path actually executed: a human's first mark is credited from that
+    // execution (`CreditExecutedScanTag`), never from a tag-state snapshot like this one.
+    //
+    // 1.19.62 (review of the previous round): "nothing here outranks a confirmation" is enforced by ORDER, where the two
+    // can actually meet: `CreditBotScan` drains the executed-and-not-yet-credited confirmations before this sweep runs,
+    // so a human tag the game really executed already holds the squad's first reveal and this snapshot sees the repeat.
+    // A bot that really tagged first keeps it, and the human's later execution is the repeat - the same marks either way.
+    // (The guard this replaced asked a *request* ledger that only a client fills, while a bot's tag only runs on the
+    // host, so it could never fire; it is gone, not left behind.)
     private static int MarkEnemies(Il2CppSystem.Collections.Generic.List<EnemyAgent> enemies, ScanSession session, ImpactCounters counters, bool bot)
     {
         if (enemies == null) return 0;
@@ -1376,11 +1552,12 @@ internal static class CombatTracker
             EnemyAgent enemy = enemies[index];
             if (enemy == null) continue;
             int identity = enemy.GetInstanceID();
+            // `IsTagged` is the confirmation this sweep can offer; the session decides the reveal against the one
+            // squad namespace, so a repeat costs nothing and takes nothing away from whoever revealed it first. A human
+            // tag that executed earlier has already been credited by the drain above, which is what makes this bot's
+            // sweep see a repeat instead of stealing the first reveal.
             ScanMark mark = session.ObserveConfirmed(identity, counters, enemy.IsTagged, bot);
-            if (mark == ScanMark.Repeat) { repeats++; continue; }
-            // The squad-wide ledger is a diagnostic only: it says whether the enemy the squad's other
-            // tracker had already revealed, which never takes the credit away from this tracker.
-            if (mark == ScanMark.First) ScanRevealed.Reveal(identity);
+            if (mark == ScanMark.Repeat) repeats++;
         }
         return repeats;
     }

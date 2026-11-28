@@ -359,13 +359,13 @@ internal static class Release11918Scenarios
             "and only that answer clears the refusal count");
         check(!results.Contains("if (Placement(page, succeeded, out _"),
             "the placement's own answer no longer clears anything by itself");
-        // 1.19.40 re-point: the floor gate and the page's own band were extracted into one policy that both paths call
-        // (`ResultFallbackBandPolicy`, FallbackLayout.cs), so the assertion follows them there instead of pinning a line
-        // that no longer lives in the display. Its own order is asserted below.
+        // The shared fallback still uses the floor gate; host failure can only use its measured action strip.
         string bandPolicy = File.ReadAllText(Path.Combine(root, "FallbackLayout.cs"));
+        string fallbackPlacement = MethodBody(results, "private static bool FallbackPlacement(Component page");
         check(bandPolicy.Contains("ResultFallbackTier.AcceptsPageBand(room, boardFloor)")
-              && results.Contains("if (!ResultFallbackBandPolicy.TryResolve(Screen.height, anchorBottom, anchorSource, walls, measuredWall,"),
-            "the fail-open band is gated on the board's own floor - a band that cannot hold it is refused inside the one policy this path calls, where the fallback board's floor is asked rather than assumed");
+              && fallbackPlacement != null && fallbackPlacement.Contains(": ResultFallbackBandPolicy.TryResolve(")
+              && fallbackPlacement.Contains("controls.BelowActions.Top, controls.BelowActions.Bottom, FallbackFloor(), out band)"),
+            "the shared fail-open policy still reads and enforces the board's own floor");
         string fitBody = MethodBody(results, "private static bool Fit(BoardStrip strip");
         check(fitBody != null && !fitBody.Contains("ResultFallbackLayout.OverlapOpacity")
               && results.Contains("total <= strip.Bottom - strip.Top + 0.5f"),

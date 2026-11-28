@@ -111,8 +111,75 @@ internal static class PluginInfo
     // (4) One measurement per frame and page (`ClientSlot`), and only the two named native objects - no subtree scan
     //     for unrelated or hidden text. The host failure page, the success pages, the fixed-layout contract and the
     //     scoring/protocol paths are untouched.
+    // 1.19.62 (the local version of the reviewed scan-batch build): the host's estimate of how many batches a remote
+    // human's confirmed Bio Tracker marks came in now fills that player's activation-count slot on the settlement
+    // board - `扫描 2 次` / `scan 2x`, the form a measured count prints in - instead of the dash such a row used to
+    // print. Only a row with no measured figure of its own keeps it: the holder's own readable cooldown (including a
+    // counted zero) and a count that player's machine reported always win, a row without a confirmed mark stays `—`,
+    // and a machine that is no longer the host draws nothing rather than the previous host's figure. `First` and
+    // `Repeat` marks both open a batch, so a sweep of enemies the squad already knows counts even when neither mark
+    // total moves. Nothing enters `ScanUses` / `ScanFirstMarks` / `ScanMarks`, the squad packet, the merge, the
+    // settlement cache or the scoring paths, and every scanner cell the estimate does not own is unchanged. The
+    // settlement comparison line reads the ledger's own figure rather than the board's answer, so it still states
+    // "estimate vs the owner's count" once that count has arrived - the only case it exists for - and it is gated on
+    // the same host role, so a migrated machine logs no line at all. That line is logging only: the archive write is
+    // the same string it always was.
+    // 1.19.63 (the delivery carrier of the reviewed 1.19.62 source): 1.19.62 is the build whose DLL is this round's
+    // acceptance reference (SHA-256 F04202D8B1380B9847BC2686CEBF681E21E79F064389D3585C7901450E5BA0EB), so a delivered
+    // build could not be told apart from the reviewed one. The three fixes that review left in place - the round's
+    // created-enemy figure beginning on the `Generating` edge (`Spawns.Begin`), `CreditBotScan` draining the executed
+    // confirmations before its sweep, and the settlement band's `figureRight` stopping short of the key hint's reserved
+    // room - are unchanged, as is every other line. Only this number moves.
+    // 1.19.64: the scan cell's three figures, always. Until 1.19.63 a scanner row printed its cumulative-mark
+    // clause only when it differed from the first-mark clause, so a live board (the user's Survival session, the
+    // Dauda row) showed `扫描 2 次 / 首次 7 只` and no cumulative figure at all. `CombatStrings.ToolScan` now
+    // prints the scan count, the first marks and the cumulative marks unconditionally - equal and zero values
+    // included, so a counted zero reads `0` - and a row no machine has evidence for prints the three labelled
+    // placeholders (`扫描 — 次 / 首次 — 只 / 累计 — 只`) instead of the single `扫描 —` the old gate collapsed it
+    // to. The board and the settlement archive read the same cell text (`ResultsLog` writes `board.Joined`), the
+    // `~` estimate marker and the round estimate's own slot are untouched, and no counter, packet, merge, cache,
+    // weight or title template changed: the host still estimates a remote human's batches locally and never
+    // sends them.
+    // 1.19.65: a client's own effective enemy damage is now spent from ONE balance per enemy instance. On a client
+    // whose host has answered nothing on this build's protocol a blow it deals is not read back from the enemy (the
+    // host applies it; the recorded Survival sample reads `healthBefore=20.0, healthAfter=20.0, dam=4.3`), so the
+    // figure the weapon carried in was credited blow by blow: `NoteLocalOutgoing` capped each one only by the health
+    // of the limb that was struck, which let five shotgun pellets carrying 6.8 each credit 34 to an enemy whose
+    // readable health was 20, and `CompleteEwcDamage` had no ceiling of its own at all. `EnemyHealthBudget` is that
+    // one balance per enemy instance now: opened at the health the first observation could read, shared by every
+    // limb and by every weapon, never the enemy's maximum health, never a refund from a lagging or higher snapshot,
+    // and aligned DOWN - crediting nothing - when this machine reads a lower health than its own balance predicts,
+    // so a sync-down that already reflects the previous 7 leaves 18 for the next blow instead of 18 - 7 = 11. It is
+    // re-opened only by the enemy's own confirmed lifecycle (its `Setup` edge, or a different owner behind a reused
+    // pointer); no revive rule is invented without evidence and no native hook is added. The host, the merge, the
+    // hit / weakspot / kill / scoring formulas, the protocol, the configuration and every other mod's path are
+    // untouched, and on the host the EWC pairing still credits the residual it measured.
     // This number is the one source of the assembly version, the file version, the loader line, the settlement
     // save's own "version" field and the Thunderstore manifest, and every fix delivery bumps the patch digit
     // before it is built - never an old number with different code behind it.
-    internal const string Version = "1.19.61";
+    // 1.19.66 (the delivery carrier of the reviewed 1.19.65 source): the review blocked the one-way balance, because a
+    // stale 20 estimated in full would drop the 7 that really happened (20 -> 13) and lock the remaining 13 for the
+    // rest of the fight. Three point fixes, each one a rule answered at the wrong place: (M1) an estimate this machine
+    // made for its own blow is now kept per enemy instance with the player, weapon and Scout attribution it went to, and
+    // an ATTRIBUTABLE reading - one where this event's own health really moved - takes back only the estimates that
+    // reading cannot support, on the total, the weapon row and the Scout row alike (a credit measured across a call is
+    // confirmed and is never taken back, and an unattributed sync change still only aligns the balance without
+    // crediting or withdrawing anything); (M2) the two client-side damage entrances consume a pending spawn - an enemy
+    // whose damage base was unreadable at its own `Setup` - before they touch anything keyed by a damage or owner
+    // pointer, so a reused pointer never inherits the previous occupant's spent balance, death scope or native credit,
+    // and the consumption stays idempotent; (M3) the EWC regression is driven by the residual the production pairing
+    // computes (`DamageObservation.Uncredited`) in mixed sequences with the native credit instead of a residual no
+    // reading could produce. The host, the protocol, the merge and the scoring formulas are untouched. 1.19.65 is the
+    // reviewed source; this number is its carrier, and the smoke suite pins it.
+    // 1.19.70 (the recorded 1.19.69 Test archive): a level that began with the scanner already recharging credited
+    // the player with one scan they never ran (`ReadyToStartLevel -> InLevel`, `tagging=False`, detected=7,
+    // `activations=1, completions=0, repeats=0`; the r5 freeze archive holds the same 1/0/0, and r4 showed the same
+    // symptom). `ScannerCooldownLedger` started from `_lastStart = NaN`, so the first cooldown it ever saw while busy
+    // had nothing to compare against and was counted. An unseen busy cooldown is now the baseline and counts nothing;
+    // only a start proven against a baseline - strictly later, or observed after a read idle edge before the first
+    // counted scan - is an activation; an unreadable sample is still unknown and never an idle edge; and every real
+    // scan is still counted, including a sweep of enemies the squad already has. That numeric rule is the whole source
+    // change: display, layout, scoring, protocol, bots and remote estimates are untouched, and this number carries it.
+    // 1.19.71: default settlement bounds and glyphs depend on the window, not on native page elements.
+    internal const string Version = "1.19.71";
 }
